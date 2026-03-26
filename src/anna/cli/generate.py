@@ -4,14 +4,15 @@ import argparse
 
 from anna.core.config import GenerateSettings
 from anna.core.logging import setup_logging
+from anna.core.model_path import resolve_model_dir, resolve_model_name
 from anna.runtime.engine import AnnaEngine, GenerationConfig
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate text with Anna.")
     parser.add_argument("--model-dir", required=True)
+    parser.add_argument("--model-name", default=None, help="Model name used in logs and API-compatible output.")
     parser.add_argument("--prompt", required=True)
-    parser.add_argument("--model-id", default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--max-new-tokens", type=int, default=256)
@@ -25,10 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    model_dir = resolve_model_dir(args.model_dir)
+    model_name = resolve_model_name(model_name=args.model_name, model_dir=model_dir)
     settings = GenerateSettings(
-        model_dir=args.model_dir,
+        model_dir=model_dir,
         prompt=args.prompt,
-        model_id=args.model_id,
+        model_id=model_name,
         device=args.device,
         dtype=args.dtype,
         max_new_tokens=args.max_new_tokens,

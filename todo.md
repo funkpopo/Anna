@@ -86,6 +86,9 @@
   - cache 常驻执行设备，必要时通过 `DeviceContext.move_cache()` 迁移
 - [x] Arc A770 真机验证 `torch.xpu` 路径
 - [x] 提供 `anna-bench` 基准入口用于测量延迟与 tokens/s
+- [x] 增加运行时防错机制
+  - 请求前显存预算预估
+  - OOM / device lost / out of resources 自动清理缓存并返回可控错误
 - [ ] 增加基础 profiling
 - [ ] 定位 Arc 上的瓶颈算子
 - [ ] 如有必要，补写自定义融合算子或权重预打包逻辑

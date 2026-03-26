@@ -17,6 +17,88 @@ from anna.weights.tokenizer import QwenTokenizer
 logger = logging.getLogger(__name__)
 
 
+def _common_prefix_length(left: str, right: str) -> int:
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
+
+
+def _format_bytes(num_bytes: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{num_bytes} B"
+
+
+def _strip_think_open_tag(text: str) -> str:
+    normalized = text
+    if normalized.startswith("<think>"):
+        normalized = normalized[len("<think>") :]
+        normalized = normalized.lstrip("\r\n")
+    return normalized
+
+
+class ThinkingStreamParser:
+    CLOSE_TAG = "</think>"
+
+    def __init__(self, *, enable_thinking: bool) -> None:
+        self.enable_thinking = enable_thinking
+        self.state = "reasoning" if enable_thinking else "content"
+        self.buffer = ""
+
+    def _emit_reasoning_prefix(self) -> list[tuple[str, str]]:
+        if self.state != "reasoning":
+            return []
+        self.buffer = _strip_think_open_tag(self.buffer)
+        safe_length = max(0, len(self.buffer) - (len(self.CLOSE_TAG) - 1))
+        if safe_length <= 0:
+            return []
+        reasoning = self.buffer[:safe_length]
+        self.buffer = self.buffer[safe_length:]
+        return [("reasoning", reasoning)]
+
+    def feed(self, text: str) -> list[tuple[str, str]]:
+        outputs: list[tuple[str, str]] = []
+        self.buffer += text
+
+        while True:
+            if self.state == "reasoning":
+                self.buffer = _strip_think_open_tag(self.buffer)
+                close_index = self.buffer.find(self.CLOSE_TAG)
+                if close_index == -1:
+                    outputs.extend(self._emit_reasoning_prefix())
+                    break
+                reasoning = self.buffer[:close_index]
+                if reasoning:
+                    outputs.append(("reasoning", reasoning))
+                self.buffer = self.buffer[close_index + len(self.CLOSE_TAG) :].lstrip("\r\n")
+                self.state = "content"
+                continue
+
+            if self.buffer:
+                outputs.append(("content", self.buffer))
+                self.buffer = ""
+            break
+
+        return outputs
+
+    def flush(self) -> list[tuple[str, str]]:
+        outputs: list[tuple[str, str]] = []
+        if self.state == "reasoning":
+            self.buffer = _strip_think_open_tag(self.buffer)
+            if self.buffer:
+                outputs.append(("reasoning", self.buffer))
+        elif self.buffer:
+            outputs.append(("content", self.buffer))
+        self.buffer = ""
+        return outputs
+
+
 class AnnaEngineError(RuntimeError):
     def __init__(
         self,
@@ -45,6 +127,7 @@ class GenerationConfig:
 @dataclass(slots=True)
 class StreamEvent:
     text: str
+    reasoning_text: str | None = None
     finish_reason: str | None = None
 
 
@@ -54,6 +137,7 @@ class TextGenerationResult:
     finish_reason: str
     prompt_tokens: int
     completion_tokens: int
+    reasoning_text: str | None = None
 
 
 class AnnaEngine:
@@ -91,14 +175,22 @@ class AnnaEngine:
             dtype=dtype,
             model_dtype=config.text_config.dtype,
         )
-        model, quantized_replacements = build_model(
-            config,
-            device=device_context.device,
-            dtype=device_context.dtype,
-        )
-        report = load_model_weights(model, model_path)
-        report.quantized_replacements = quantized_replacements
-        model.eval()
+        try:
+            model, quantized_replacements = build_model(
+                config,
+                device=device_context.device,
+                dtype=device_context.dtype,
+            )
+            report = load_model_weights(model, model_path)
+            report.quantized_replacements = quantized_replacements
+            model.eval()
+        except RuntimeError as exc:
+            if device_context.should_recover(exc):
+                try:
+                    device_context.recover()
+                except Exception:  # pragma: no cover - best-effort recovery
+                    logger.exception("Failed to recover device context after model load failure.")
+            raise
 
         tokenizer = QwenTokenizer.from_model_dir(model_path)
         processor = Qwen3MultimodalProcessor(config, tokenizer)
@@ -129,6 +221,7 @@ class AnnaEngine:
 
     def health(self) -> dict[str, Any]:
         quant_method = self.config.quantization_config.quant_method or "dense"
+        memory_info = self.device_context.get_memory_info()
         return {
             "status": "ok",
             "model": self.default_model_id,
@@ -142,6 +235,14 @@ class AnnaEngine:
             "vision_enabled": self.config.vision_config is not None,
             "cache_device": str(self.device_context.migration_policy.execution_device),
             "preprocess_device": str(self.device_context.migration_policy.preprocess_device),
+            "memory": None
+            if memory_info is None
+            else {
+                "free_bytes": memory_info.free_bytes,
+                "total_bytes": memory_info.total_bytes,
+                "allocated_bytes": memory_info.allocated_bytes,
+                "reserved_bytes": memory_info.reserved_bytes,
+            },
         }
 
     def generate_text(self, prompt: str, *, config: GenerationConfig) -> TextGenerationResult:
@@ -152,23 +253,195 @@ class AnnaEngine:
         prepared = self.processor.encode_text(prompt)
         yield from self._stream(prepared, config=config)
 
-    def generate_chat(self, messages: list[object], *, config: GenerationConfig) -> TextGenerationResult:
-        prepared = self._prepare_messages(messages)
-        return self._generate(prepared, config=config)
+    def generate_chat(
+        self,
+        messages: list[object],
+        *,
+        config: GenerationConfig,
+        enable_thinking: bool = False,
+    ) -> TextGenerationResult:
+        prepared = self._prepare_messages(messages, enable_thinking=enable_thinking)
+        raw = self._generate(prepared, config=config)
+        reasoning_text, content_text = self._split_chat_output(raw.text, enable_thinking=enable_thinking)
+        return TextGenerationResult(
+            text=content_text,
+            reasoning_text=reasoning_text,
+            finish_reason=raw.finish_reason,
+            prompt_tokens=raw.prompt_tokens,
+            completion_tokens=raw.completion_tokens,
+        )
 
-    def stream_chat(self, messages: list[object], *, config: GenerationConfig) -> Iterator[StreamEvent]:
-        prepared = self._prepare_messages(messages)
-        yield from self._stream(prepared, config=config)
+    def stream_chat(
+        self,
+        messages: list[object],
+        *,
+        config: GenerationConfig,
+        enable_thinking: bool = False,
+    ) -> Iterator[StreamEvent]:
+        prepared = self._prepare_messages(messages, enable_thinking=enable_thinking)
+        parser = ThinkingStreamParser(enable_thinking=enable_thinking)
 
-    def _prepare_messages(self, messages: list[object]) -> PreparedInputs:
+        for event in self._stream(prepared, config=config):
+            if event.finish_reason is not None:
+                for kind, chunk in parser.flush():
+                    if kind == "reasoning":
+                        yield StreamEvent(text="", reasoning_text=chunk, finish_reason=None)
+                    else:
+                        yield StreamEvent(text=chunk, reasoning_text=None, finish_reason=None)
+                yield event
+                return
+
+            for kind, chunk in parser.feed(event.text):
+                if kind == "reasoning":
+                    yield StreamEvent(text="", reasoning_text=chunk, finish_reason=None)
+                else:
+                    yield StreamEvent(text=chunk, reasoning_text=None, finish_reason=None)
+
+    def _prepare_messages(self, messages: list[object], *, enable_thinking: bool) -> PreparedInputs:
         try:
-            return self.processor.prepare_messages(messages)
+            return self.processor.prepare_messages(messages, enable_thinking=enable_thinking)
         except FileNotFoundError as exc:
             raise AnnaEngineError(str(exc), status_code=400, code="invalid_media_reference") from exc
         except ValueError as exc:
             raise AnnaEngineError(str(exc), status_code=400) from exc
         except RuntimeError as exc:
             raise AnnaEngineError(str(exc), status_code=500, error_type="server_error") from exc
+
+    def _estimate_generation_memory_bytes(
+        self,
+        prepared: PreparedInputs,
+        *,
+        config: GenerationConfig,
+    ) -> int:
+        text_config = self.config.text_config
+        bytes_per_elem = self.device_context.element_size(self.device_context.dtype)
+        total_tokens = int(prepared.input_ids.shape[1]) + config.max_new_tokens
+        full_layers = sum(1 for layer_type in text_config.layer_types if layer_type == "full_attention")
+        linear_layers = max(0, text_config.num_hidden_layers - full_layers)
+
+        kv_cache_bytes = (
+            full_layers
+            * 2
+            * total_tokens
+            * text_config.num_key_value_heads
+            * text_config.head_dim
+            * bytes_per_elem
+        )
+        linear_key_dim = text_config.linear_num_key_heads * text_config.linear_key_head_dim
+        linear_value_dim = text_config.linear_num_value_heads * text_config.linear_value_head_dim
+        conv_cache_bytes = linear_layers * (linear_key_dim * 2 + linear_value_dim) * text_config.linear_conv_kernel_dim * bytes_per_elem
+        recurrent_bytes = (
+            linear_layers
+            * text_config.linear_num_value_heads
+            * text_config.linear_key_head_dim
+            * text_config.linear_value_head_dim
+            * bytes_per_elem
+        )
+        hidden_working_bytes = total_tokens * text_config.hidden_size * bytes_per_elem * 8
+        media_bytes = 0
+        if prepared.pixel_values is not None:
+            media_bytes += prepared.pixel_values.numel() * bytes_per_elem
+        if prepared.pixel_values_videos is not None:
+            media_bytes += prepared.pixel_values_videos.numel() * bytes_per_elem
+
+        estimated = kv_cache_bytes + conv_cache_bytes + recurrent_bytes + hidden_working_bytes + media_bytes
+        return int(estimated * self.device_context.safety_policy.generation_memory_safety_factor)
+
+    def _guard_generation_memory(
+        self,
+        prepared: PreparedInputs,
+        *,
+        config: GenerationConfig,
+    ) -> None:
+        memory_info = self.device_context.get_memory_info()
+        if memory_info is None:
+            return
+
+        estimated_bytes = self._estimate_generation_memory_bytes(prepared, config=config)
+        policy = self.device_context.safety_policy
+        available_budget = max(0, memory_info.free_bytes - policy.reserve_margin_bytes)
+        max_allowed = int(memory_info.total_bytes * policy.max_estimated_usage_ratio)
+
+        if memory_info.free_bytes < policy.min_free_bytes:
+            raise AnnaEngineError(
+                f"Insufficient free XPU memory before generation: free={_format_bytes(memory_info.free_bytes)}, "
+                f"required reserve={_format_bytes(policy.min_free_bytes)}. Reduce workload or restart the service.",
+                status_code=503,
+                error_type="server_error",
+                code="insufficient_device_memory",
+            )
+
+        if estimated_bytes > available_budget or estimated_bytes > max_allowed:
+            raise AnnaEngineError(
+                f"Request rejected by memory guard: estimated={_format_bytes(estimated_bytes)}, "
+                f"free={_format_bytes(memory_info.free_bytes)}, reserve={_format_bytes(policy.reserve_margin_bytes)}. "
+                "Reduce prompt length, image/video size, or max_completion_tokens.",
+                status_code=400,
+                error_type="invalid_request_error",
+                code="estimated_device_oom",
+            )
+
+    def _handle_runtime_failure(self, exc: RuntimeError) -> AnnaEngineError:
+        category = self.device_context.classify_runtime_error(exc)
+        if self.device_context.should_recover(exc):
+            try:
+                self.device_context.recover()
+            except Exception:  # pragma: no cover - best-effort recovery
+                logger.exception("Failed to recover device context after runtime failure.")
+
+        if category == "out_of_memory":
+            return AnnaEngineError(
+                "XPU out of memory during generation. Reduce prompt length, media size, batch size, or max_completion_tokens.",
+                status_code=503,
+                error_type="server_error",
+                code="device_out_of_memory",
+            )
+        if category == "device_lost":
+            return AnnaEngineError(
+                "XPU device was lost during generation. The runtime cache was cleared; retry the request after the device recovers.",
+                status_code=503,
+                error_type="server_error",
+                code="device_lost",
+            )
+        if category == "out_of_resources":
+            return AnnaEngineError(
+                "XPU runtime ran out of resources during generation. Reduce the request size and retry.",
+                status_code=503,
+                error_type="server_error",
+                code="device_out_of_resources",
+            )
+        return AnnaEngineError(
+            f"Runtime execution failed: {exc}",
+            status_code=500,
+            error_type="server_error",
+            code="runtime_execution_failed",
+        )
+
+    def _split_chat_output(self, raw_text: str, *, enable_thinking: bool) -> tuple[str | None, str]:
+        normalized = raw_text
+        if normalized.startswith("<think>"):
+            normalized = normalized[len("<think>") :].lstrip("\r\n")
+            enable_thinking = True
+
+        closing_tag = "</think>"
+        if enable_thinking:
+            close_index = normalized.find(closing_tag)
+            if close_index == -1:
+                reasoning = normalized.strip()
+                return (reasoning or None), ""
+            reasoning = normalized[:close_index].strip()
+            content = normalized[close_index + len(closing_tag) :].lstrip("\r\n")
+            return (reasoning or None), content
+
+        tagged_prefix = "<think>"
+        if tagged_prefix in normalized and closing_tag in normalized:
+            prefix_index = normalized.find(tagged_prefix)
+            close_index = normalized.find(closing_tag, prefix_index)
+            if prefix_index != -1 and close_index != -1:
+                reasoning = normalized[prefix_index + len(tagged_prefix) : close_index].strip()
+                content = normalized[close_index + len(closing_tag) :].lstrip("\r\n")
+                return (reasoning or None), content
+        return None, raw_text
 
     def _generate(self, prepared: PreparedInputs, *, config: GenerationConfig) -> TextGenerationResult:
         text_parts: list[str] = []
@@ -187,6 +460,7 @@ class AnnaEngine:
 
         return TextGenerationResult(
             text="".join(text_parts),
+            reasoning_text=None,
             finish_reason=finish_reason,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -209,6 +483,24 @@ class AnnaEngine:
         trim_at = min(indexes)
         return text[:trim_at], True
 
+    def _stable_decode_delta(
+        self,
+        *,
+        previous_text: str,
+        current_text: str,
+        emitted_text: str,
+    ) -> tuple[str, str]:
+        stable_length = _common_prefix_length(previous_text, current_text)
+        stable_text = current_text[:stable_length]
+        if not stable_text.startswith(emitted_text):
+            return "", emitted_text
+        return stable_text[len(emitted_text) :], stable_text
+
+    def _flush_decode_tail(self, *, current_text: str, emitted_text: str) -> tuple[str, str]:
+        if not current_text.startswith(emitted_text):
+            return "", emitted_text
+        return current_text[len(emitted_text) :], current_text
+
     @torch.inference_mode()
     def _iter_generation(
         self,
@@ -228,9 +520,14 @@ class AnnaEngine:
                 code="context_length_exceeded",
             )
 
-        prepared = self.device_context.move_prepared_inputs(prepared)
+        self._guard_generation_memory(prepared, config=config)
+        try:
+            prepared = self.device_context.move_prepared_inputs(prepared)
+        except RuntimeError as exc:
+            raise self._handle_runtime_failure(exc) from exc
         completion_ids: list[int] = []
-        decoded_text = ""
+        previous_decoded_text = ""
+        emitted_text = ""
         stop_token_ids = set(self.tokenizer.eos_token_ids)
 
         input_ids = prepared.input_ids
@@ -243,44 +540,57 @@ class AnnaEngine:
         past_key_values = None
 
         for step_idx in range(config.max_new_tokens):
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                mm_token_type_ids=mm_token_type_ids,
-                use_cache=True,
-            )
-            logits = outputs.logits[0, -1]
-            history_ids = prompt_ids + completion_ids
-            history_tensor = (
-                self.device_context.move_token_ids(torch.tensor(history_ids, dtype=torch.long))
-                if history_ids
-                else None
-            )
-            next_token = sample_next_token(
-                logits,
-                generated_ids=history_tensor,
-                temperature=config.temperature,
-                top_p=config.top_p,
-                top_k=config.top_k,
-                repetition_penalty=config.repetition_penalty,
-            )
-            token_id = int(next_token.item())
-            past_key_values = self.device_context.move_cache(outputs.past_key_values)
+            try:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    pixel_values=pixel_values,
+                    pixel_values_videos=pixel_values_videos,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    mm_token_type_ids=mm_token_type_ids,
+                    use_cache=True,
+                )
+                logits = outputs.logits[0, -1]
+                history_ids = prompt_ids + completion_ids
+                history_tensor = (
+                    self.device_context.move_token_ids(torch.tensor(history_ids, dtype=torch.long))
+                    if history_ids
+                    else None
+                )
+                next_token = sample_next_token(
+                    logits,
+                    generated_ids=history_tensor,
+                    temperature=config.temperature,
+                    top_p=config.top_p,
+                    top_k=config.top_k,
+                    repetition_penalty=config.repetition_penalty,
+                )
+                token_id = int(next_token.item())
+                past_key_values = self.device_context.move_cache(outputs.past_key_values)
+            except RuntimeError as exc:
+                raise self._handle_runtime_failure(exc) from exc
 
             if token_id in stop_token_ids:
+                tail, emitted_text = self._flush_decode_tail(
+                    current_text=previous_decoded_text,
+                    emitted_text=emitted_text,
+                )
+                if tail:
+                    yield tail, False, None, prompt_length, len(completion_ids)
                 yield "", True, "stop", prompt_length, len(completion_ids)
                 return
 
             completion_ids.append(token_id)
             new_decoded = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
             trimmed_text, hit_stop_string = self._trim_stop_strings(new_decoded, config.stop_strings)
-            delta = trimmed_text[len(decoded_text) :] if trimmed_text.startswith(decoded_text) else trimmed_text
-            decoded_text = trimmed_text
+            delta, emitted_text = self._stable_decode_delta(
+                previous_text=previous_decoded_text,
+                current_text=trimmed_text,
+                emitted_text=emitted_text,
+            )
+            previous_decoded_text = trimmed_text
 
             input_ids = next_token.view(1, 1)
             attention_mask = None
@@ -294,10 +604,22 @@ class AnnaEngine:
                 yield delta, False, None, prompt_length, len(completion_ids)
 
             if hit_stop_string:
+                tail, emitted_text = self._flush_decode_tail(
+                    current_text=trimmed_text,
+                    emitted_text=emitted_text,
+                )
+                if tail:
+                    yield tail, False, None, prompt_length, len(completion_ids)
                 yield "", True, "stop", prompt_length, len(completion_ids)
                 return
 
             if step_idx + 1 >= config.max_new_tokens:
                 break
 
+        tail, emitted_text = self._flush_decode_tail(
+            current_text=previous_decoded_text,
+            emitted_text=emitted_text,
+        )
+        if tail:
+            yield tail, False, None, prompt_length, len(completion_ids)
         yield "", True, "length", prompt_length, len(completion_ids)

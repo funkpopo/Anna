@@ -15,6 +15,7 @@ class MessageContentPart(BaseModel):
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
     content: str | list[MessageContentPart] | None = None
+    reasoning_content: str | None = None
     name: str | None = None
     tool_call_id: str | None = None
 
@@ -22,6 +23,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[ChatMessage]
+    enable_thinking: bool | None = None
     max_tokens: int | None = Field(default=None, ge=1)
     max_completion_tokens: int | None = Field(default=None, ge=1)
     temperature: float = Field(default=0.7, ge=0.0)

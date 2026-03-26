@@ -38,6 +38,9 @@ def _chat_response_payload(
     model: str,
     result: TextGenerationResult,
 ) -> dict:
+    message = {"role": "assistant", "content": result.text}
+    if result.reasoning_text is not None:
+        message["reasoning_content"] = result.reasoning_text
     return {
         "id": response_id,
         "object": "chat.completion",
@@ -46,7 +49,7 @@ def _chat_response_payload(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": result.text},
+                "message": message,
                 "finish_reason": result.finish_reason,
             }
         ],
@@ -102,6 +105,11 @@ def _stream_sse_chat(
     yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
 
     for event in events:
+        delta: dict[str, str] = {}
+        if event.reasoning_text:
+            delta["reasoning_content"] = event.reasoning_text
+        if event.text:
+            delta["content"] = event.text
         payload = {
             "id": response_id,
             "object": "chat.completion.chunk",
@@ -110,7 +118,7 @@ def _stream_sse_chat(
             "choices": [
                 {
                     "index": 0,
-                    "delta": {"content": event.text} if event.text else {},
+                    "delta": delta,
                     "finish_reason": event.finish_reason,
                 }
             ],
@@ -180,7 +188,11 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
 
     try:
         if payload.stream:
-            events = engine.stream_chat(payload.messages, config=config)
+            events = engine.stream_chat(
+                payload.messages,
+                config=config,
+                enable_thinking=bool(payload.enable_thinking),
+            )
             return StreamingResponse(
                 _stream_sse_chat(
                     response_id=response_id,
@@ -191,7 +203,11 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
                 media_type="text/event-stream",
             )
 
-        result = engine.generate_chat(payload.messages, config=config)
+        result = engine.generate_chat(
+            payload.messages,
+            config=config,
+            enable_thinking=bool(payload.enable_thinking),
+        )
     except AnnaEngineError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 

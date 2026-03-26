@@ -22,6 +22,8 @@
   - `/v1/chat/completions`
   - `/v1/completions`
   - SSE 流式输出
+  - `enable_thinking` 开关
+  - `reasoning_content` 输出
 - 采样
   - greedy
   - temperature
@@ -40,6 +42,8 @@
 - 用户手动准备模型文件，本项目不提供模型下载逻辑。
 - CPU 仅用于必要的图片/视频预处理；prefill 与 decode 的模型执行优先走 `xpu`。
 - 多模态首轮 prefill 会把文本、图像、视频张量迁移到执行设备；后续 decode 只发送新 token，缓存留在执行设备。
+- 运行前会按请求规模预估显存占用；显存预算不足时会提前拒绝请求，避免把 XPU 顶死。
+- 运行期如果遇到 `OOM / device lost / out of resources`，会尝试清理 runtime cache 并返回可控错误。
 
 ## 当前限制
 
@@ -73,10 +77,24 @@
 anna-serve --model-dir /path/to/model --device xpu --dtype bf16
 ```
 
+如果要显式指定对外暴露的模型名称：
+
+```bash
+anna-serve --model-dir D:\Projects\Anna\models\Qwen\Qwen3___5-2B --model-name qwen3.5 --device xpu --dtype bf16
+```
+
+如果不指定 `--model-name`，默认模型名就是 `--model-dir` 的完整路径。
+
 5. 命令行文本生成：
 
 ```bash
 anna-generate --model-dir /path/to/model --device xpu --dtype bf16 --prompt "你好，介绍一下你自己。"
+```
+
+按模型名称生成：
+
+```bash
+anna-generate --model-dir D:\Projects\Anna\models\Qwen\Qwen3___5-2B --model-name qwen3.5 --device xpu --dtype bf16 --prompt "你好，介绍一下你自己。"
 ```
 
 6. 基准测试：
@@ -84,6 +102,21 @@ anna-generate --model-dir /path/to/model --device xpu --dtype bf16 --prompt "你
 ```bash
 anna-bench --model-dir /path/to/model --device xpu --dtype bf16 --prompt "你好，请介绍一下你自己。" --runs 5
 ```
+
+7. 聊天接口思维开关：
+
+```json
+{
+  "model": "qwen3.5",
+  "messages": [
+    {"role": "user", "content": "请解释一下什么是量化推理"}
+  ],
+  "enable_thinking": true,
+  "max_completion_tokens": 256
+}
+```
+
+当 `enable_thinking=true` 时，返回体中的 `message` 和流式 `delta` 会包含独立的 `reasoning_content` 字段；当 `enable_thinking=false` 时，会通过 Qwen3.5 的 closed-think prompt 关闭思维模式，仅返回最终内容。
 
 ## 下一步
 

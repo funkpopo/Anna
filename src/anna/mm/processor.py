@@ -64,8 +64,12 @@ class Qwen3MultimodalProcessor:
             mm_token_type_ids=mm_token_type_ids,
         )
 
-    def prepare_messages(self, messages: list[Any]) -> PreparedInputs:
-        prompt = self.tokenizer.render_messages(messages, add_generation_prompt=True)
+    def prepare_messages(self, messages: list[Any], *, enable_thinking: bool = False) -> PreparedInputs:
+        prompt = self.tokenizer.render_messages(
+            messages,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
         images = self._collect_media(messages, "image_url")
         videos = self._collect_media(messages, "video_url")
         pixel_values = image_grid_thw = None
