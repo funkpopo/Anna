@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
@@ -10,6 +11,7 @@ import torch
 from anna.mm.processor import PreparedInputs, Qwen3MultimodalProcessor
 from anna.model.qwen import Qwen3ForConditionalGeneration
 from anna.runtime.device import DeviceContext
+from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
 from anna.sampling.sampler import sample_next_token
 from anna.weights.loader import build_model, load_model_config, load_model_weights
 from anna.weights.tokenizer import QwenTokenizer
@@ -44,7 +46,7 @@ def _strip_think_open_tag(text: str) -> str:
 
 
 def _strip_unstable_replacement_suffix(text: str) -> str:
-    return text.rstrip("\ufffd")
+    return strip_unstable_replacement_suffix(text)
 
 
 class ThinkingStreamParser:
@@ -162,6 +164,8 @@ class AnnaEngine:
         self.device_context = device_context
         self.config = model.config
         self.quantized_replacements = quantized_replacements
+        self.execution_lock = threading.Lock()
+        self.scheduler = None
 
     @classmethod
     def from_model_dir(
@@ -222,6 +226,9 @@ class AnnaEngine:
 
     def list_models(self) -> list[str]:
         return [self.default_model_id]
+
+    def set_scheduler(self, scheduler: object | None) -> None:
+        self.scheduler = scheduler
 
     def health(self) -> dict[str, Any]:
         quant_method = self.config.quantization_config.quant_method or "dense"
@@ -310,6 +317,45 @@ class AnnaEngine:
             raise AnnaEngineError(str(exc), status_code=400) from exc
         except RuntimeError as exc:
             raise AnnaEngineError(str(exc), status_code=500, error_type="server_error") from exc
+
+    def _can_use_scheduler(self, prepared: PreparedInputs) -> bool:
+        return (
+            self.scheduler is not None
+            and prepared.pixel_values is None
+            and prepared.pixel_values_videos is None
+        )
+
+    def _validate_generation_request(
+        self,
+        prepared: PreparedInputs,
+        *,
+        config: GenerationConfig,
+    ) -> tuple[list[int], int]:
+        prompt_ids = prepared.input_ids[0].tolist()
+        prompt_length = int(prepared.input_ids.shape[1])
+        if prompt_length == 0:
+            raise AnnaEngineError("Prompt produced zero tokens.")
+
+        max_total = prompt_length + config.max_new_tokens
+        if max_total > self.config.text_config.max_position_embeddings:
+            raise AnnaEngineError(
+                f"Requested sequence length {max_total} exceeds model context limit {self.config.text_config.max_position_embeddings}.",
+                status_code=400,
+                code="context_length_exceeded",
+            )
+        return prompt_ids, prompt_length
+
+    def _move_prepared_for_generation(
+        self,
+        prepared: PreparedInputs,
+        *,
+        config: GenerationConfig,
+    ) -> PreparedInputs:
+        self._guard_generation_memory(prepared, config=config)
+        try:
+            return self.device_context.move_prepared_inputs(prepared)
+        except RuntimeError as exc:
+            raise self._handle_runtime_failure(exc) from exc
 
     def _estimate_generation_memory_bytes(
         self,
@@ -448,6 +494,14 @@ class AnnaEngine:
         return None, raw_text
 
     def _generate(self, prepared: PreparedInputs, *, config: GenerationConfig) -> TextGenerationResult:
+        if self._can_use_scheduler(prepared):
+            return self.scheduler.generate(prepared, config=config)
+        return self._generate_direct(prepared, config=config)
+
+    def _generate_direct(self, prepared: PreparedInputs, *, config: GenerationConfig) -> TextGenerationResult:
+        if not config.stop_strings:
+            return self._generate_without_streaming_overhead(prepared, config=config)
+
         text_parts: list[str] = []
         finish_reason = "length"
         prompt_tokens = 0
@@ -470,7 +524,32 @@ class AnnaEngine:
             completion_tokens=completion_tokens,
         )
 
+    def _generate_without_streaming_overhead(
+        self,
+        prepared: PreparedInputs,
+        *,
+        config: GenerationConfig,
+    ) -> TextGenerationResult:
+        completion_ids, finish_reason, prompt_tokens, completion_tokens = self._generate_token_ids(
+            prepared,
+            config=config,
+        )
+        text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
+        return TextGenerationResult(
+            text=text,
+            reasoning_text=None,
+            finish_reason=finish_reason,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
     def _stream(self, prepared: PreparedInputs, *, config: GenerationConfig) -> Iterator[StreamEvent]:
+        if self._can_use_scheduler(prepared):
+            yield from self.scheduler.stream(prepared, config=config)
+            return
+        yield from self._stream_direct(prepared, config=config)
+
+    def _stream_direct(self, prepared: PreparedInputs, *, config: GenerationConfig) -> Iterator[StreamEvent]:
         for delta, finished, reason, _, _ in self._iter_generation(prepared, config):
             if delta:
                 yield StreamEvent(text=delta, finish_reason=None)
@@ -506,34 +585,50 @@ class AnnaEngine:
             return "", emitted_text
         return current_text[len(emitted_text) :], current_text
 
+    def _init_repetition_penalty_state(self, prompt_ids: list[int], penalty: float) -> tuple[torch.Tensor | None, set[int] | None]:
+        if penalty == 1.0:
+            return None, None
+        unique_ids = list(dict.fromkeys(prompt_ids))
+        if not unique_ids:
+            return None, set()
+        history_tensor = self.device_context.move_token_ids(torch.tensor(unique_ids, dtype=torch.long))
+        return history_tensor, set(unique_ids)
+
+    def _append_repetition_penalty_token(
+        self,
+        *,
+        history_tensor: torch.Tensor | None,
+        history_ids: set[int] | None,
+        next_token: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, set[int] | None]:
+        if history_tensor is None or history_ids is None:
+            return history_tensor, history_ids
+
+        token_id = int(next_token.item())
+        if token_id in history_ids:
+            return history_tensor, history_ids
+
+        history_ids.add(token_id)
+        appended = next_token.view(1)
+        if history_tensor.numel() == 0:
+            return appended, history_ids
+        return torch.cat([history_tensor, appended]), history_ids
+
     @torch.inference_mode()
-    def _iter_generation(
+    def _generate_token_ids(
         self,
         prepared: PreparedInputs,
         config: GenerationConfig,
-    ) -> Iterator[tuple[str, bool, str | None, int, int]]:
-        prompt_ids = prepared.input_ids[0].tolist()
-        prompt_length = int(prepared.input_ids.shape[1])
-        if prompt_length == 0:
-            raise AnnaEngineError("Prompt produced zero tokens.")
+    ) -> tuple[list[int], str, int, int]:
+        prompt_ids, prompt_length = self._validate_generation_request(prepared, config=config)
+        prepared = self._move_prepared_for_generation(prepared, config=config)
 
-        max_total = prompt_length + config.max_new_tokens
-        if max_total > self.config.text_config.max_position_embeddings:
-            raise AnnaEngineError(
-                f"Requested sequence length {max_total} exceeds model context limit {self.config.text_config.max_position_embeddings}.",
-                status_code=400,
-                code="context_length_exceeded",
-            )
-
-        self._guard_generation_memory(prepared, config=config)
-        try:
-            prepared = self.device_context.move_prepared_inputs(prepared)
-        except RuntimeError as exc:
-            raise self._handle_runtime_failure(exc) from exc
         completion_ids: list[int] = []
-        previous_decoded_text = ""
-        emitted_text = ""
         stop_token_ids = set(self.tokenizer.eos_token_ids)
+        repetition_history, repetition_history_ids = self._init_repetition_penalty_state(
+            prompt_ids,
+            config.repetition_penalty,
+        )
 
         input_ids = prepared.input_ids
         attention_mask = prepared.attention_mask
@@ -546,56 +641,127 @@ class AnnaEngine:
 
         for step_idx in range(config.max_new_tokens):
             try:
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values,
-                    pixel_values=pixel_values,
-                    pixel_values_videos=pixel_values_videos,
-                    image_grid_thw=image_grid_thw,
-                    video_grid_thw=video_grid_thw,
-                    mm_token_type_ids=mm_token_type_ids,
-                    use_cache=True,
-                )
+                with self.execution_lock:
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        pixel_values=pixel_values,
+                        pixel_values_videos=pixel_values_videos,
+                        image_grid_thw=image_grid_thw,
+                        video_grid_thw=video_grid_thw,
+                        mm_token_type_ids=mm_token_type_ids,
+                        use_cache=True,
+                        logits_to_keep=1,
+                    )
                 logits = outputs.logits[0, -1]
-                history_ids = prompt_ids + completion_ids
-                history_tensor = (
-                    self.device_context.move_token_ids(torch.tensor(history_ids, dtype=torch.long))
-                    if history_ids
-                    else None
-                )
                 next_token = sample_next_token(
                     logits,
-                    generated_ids=history_tensor,
+                    generated_ids=repetition_history,
                     temperature=config.temperature,
                     top_p=config.top_p,
                     top_k=config.top_k,
                     repetition_penalty=config.repetition_penalty,
                 )
                 token_id = int(next_token.item())
-                past_key_values = self.device_context.move_cache(outputs.past_key_values)
+                past_key_values = outputs.past_key_values
             except RuntimeError as exc:
                 raise self._handle_runtime_failure(exc) from exc
 
             if token_id in stop_token_ids:
-                tail, emitted_text = self._flush_decode_tail(
-                    current_text=previous_decoded_text,
-                    emitted_text=emitted_text,
+                return completion_ids, "stop", prompt_length, len(completion_ids)
+
+            completion_ids.append(token_id)
+            repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
+                history_tensor=repetition_history,
+                history_ids=repetition_history_ids,
+                next_token=next_token,
+            )
+
+            input_ids = next_token.view(1, 1)
+            attention_mask = None
+            mm_token_type_ids = None
+            pixel_values = None
+            image_grid_thw = None
+            pixel_values_videos = None
+            video_grid_thw = None
+
+            if step_idx + 1 >= config.max_new_tokens:
+                break
+
+        return completion_ids, "length", prompt_length, len(completion_ids)
+
+    @torch.inference_mode()
+    def _iter_generation(
+        self,
+        prepared: PreparedInputs,
+        config: GenerationConfig,
+    ) -> Iterator[tuple[str, bool, str | None, int, int]]:
+        prompt_ids, prompt_length = self._validate_generation_request(prepared, config=config)
+        prepared = self._move_prepared_for_generation(prepared, config=config)
+        completion_ids: list[int] = []
+        stop_token_ids = set(self.tokenizer.eos_token_ids)
+        repetition_history, repetition_history_ids = self._init_repetition_penalty_state(
+            prompt_ids,
+            config.repetition_penalty,
+        )
+        text_assembler = IncrementalTextAssembler(
+            tokenizer=self.tokenizer,
+            stop_strings=config.stop_strings,
+        )
+
+        input_ids = prepared.input_ids
+        attention_mask = prepared.attention_mask
+        mm_token_type_ids = prepared.mm_token_type_ids
+        pixel_values = prepared.pixel_values
+        image_grid_thw = prepared.image_grid_thw
+        pixel_values_videos = prepared.pixel_values_videos
+        video_grid_thw = prepared.video_grid_thw
+        past_key_values = None
+
+        for step_idx in range(config.max_new_tokens):
+            try:
+                with self.execution_lock:
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        pixel_values=pixel_values,
+                        pixel_values_videos=pixel_values_videos,
+                        image_grid_thw=image_grid_thw,
+                        video_grid_thw=video_grid_thw,
+                        mm_token_type_ids=mm_token_type_ids,
+                        use_cache=True,
+                        logits_to_keep=1,
+                    )
+                logits = outputs.logits[0, -1]
+                next_token = sample_next_token(
+                    logits,
+                    generated_ids=repetition_history,
+                    temperature=config.temperature,
+                    top_p=config.top_p,
+                    top_k=config.top_k,
+                    repetition_penalty=config.repetition_penalty,
                 )
+                token_id = int(next_token.item())
+                past_key_values = outputs.past_key_values
+            except RuntimeError as exc:
+                raise self._handle_runtime_failure(exc) from exc
+
+            if token_id in stop_token_ids:
+                tail, _ = text_assembler.flush()
                 if tail:
                     yield tail, False, None, prompt_length, len(completion_ids)
                 yield "", True, "stop", prompt_length, len(completion_ids)
                 return
 
             completion_ids.append(token_id)
-            new_decoded = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
-            trimmed_text, hit_stop_string = self._trim_stop_strings(new_decoded, config.stop_strings)
-            delta, emitted_text = self._stable_decode_delta(
-                previous_text=previous_decoded_text,
-                current_text=trimmed_text,
-                emitted_text=emitted_text,
+            repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
+                history_tensor=repetition_history,
+                history_ids=repetition_history_ids,
+                next_token=next_token,
             )
-            previous_decoded_text = trimmed_text
+            delta, hit_stop_string = text_assembler.feed_token(token_id)
 
             input_ids = next_token.view(1, 1)
             attention_mask = None
@@ -609,22 +775,13 @@ class AnnaEngine:
                 yield delta, False, None, prompt_length, len(completion_ids)
 
             if hit_stop_string:
-                tail, emitted_text = self._flush_decode_tail(
-                    current_text=trimmed_text,
-                    emitted_text=emitted_text,
-                )
-                if tail:
-                    yield tail, False, None, prompt_length, len(completion_ids)
                 yield "", True, "stop", prompt_length, len(completion_ids)
                 return
 
             if step_idx + 1 >= config.max_new_tokens:
                 break
 
-        tail, emitted_text = self._flush_decode_tail(
-            current_text=previous_decoded_text,
-            emitted_text=emitted_text,
-        )
+        tail, _ = text_assembler.flush()
         if tail:
             yield tail, False, None, prompt_length, len(completion_ids)
         yield "", True, "length", prompt_length, len(completion_ids)

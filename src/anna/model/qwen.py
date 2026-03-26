@@ -75,11 +75,10 @@ class Qwen3TextModel(nn.Module):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for idx, decoder_layer in enumerate(self.layers):
-            layer_mask = attention_mask if self.config.layer_types[idx] == "linear_attention" else None
             hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
-                attention_mask=layer_mask,
+                attention_mask=attention_mask,
                 past_key_values=past_key_values,
             )
 
@@ -581,6 +580,7 @@ class Qwen3ForCausalLM(nn.Module):
         past_key_values: Qwen3DynamicCache | None = None,
         inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
+        logits_to_keep: int | None = None,
     ) -> CausalLMOutput:
         outputs = self.model(
             input_ids=input_ids,
@@ -590,7 +590,10 @@ class Qwen3ForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
         )
-        logits = self.lm_head(outputs.last_hidden_state)
+        hidden_states = outputs.last_hidden_state
+        if logits_to_keep is not None and logits_to_keep > 0:
+            hidden_states = hidden_states[:, -logits_to_keep:, :]
+        logits = self.lm_head(hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)
 
 
@@ -621,6 +624,7 @@ class Qwen3ForConditionalGeneration(nn.Module):
         video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
         use_cache: bool | None = None,
+        logits_to_keep: int | None = None,
     ) -> CausalLMOutput:
         outputs = self.model(
             input_ids=input_ids,
@@ -635,5 +639,8 @@ class Qwen3ForConditionalGeneration(nn.Module):
             mm_token_type_ids=mm_token_type_ids,
             use_cache=use_cache,
         )
-        logits = self.lm_head(outputs.last_hidden_state)
+        hidden_states = outputs.last_hidden_state
+        if logits_to_keep is not None and logits_to_keep > 0:
+            hidden_states = hidden_states[:, -logits_to_keep:, :]
+        logits = self.lm_head(hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values, rope_deltas=outputs.rope_deltas)

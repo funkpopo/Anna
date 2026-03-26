@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from anna.runtime.engine import AnnaEngine, ThinkingStreamParser
+from anna.runtime.engine import AnnaEngine, GenerationConfig, ThinkingStreamParser
+from anna.runtime.streaming import IncrementalTextAssembler
 
 
 def test_stable_decode_delta_avoids_repeated_prefix_output() -> None:
@@ -93,3 +94,73 @@ def test_thinking_stream_parser_splits_reasoning_chunks() -> None:
 
     assert reasoning == "先分析问题。"
     assert content == "最终答案。"
+
+
+def test_generate_without_streaming_overhead_decodes_once() -> None:
+    class DummyTokenizer:
+        def decode(self, token_ids: list[int], *, skip_special_tokens: bool = False) -> str:
+            assert skip_special_tokens is False
+            return ",".join(str(token_id) for token_id in token_ids)
+
+    engine = object.__new__(AnnaEngine)
+    engine.tokenizer = DummyTokenizer()
+    engine._generate_token_ids = lambda prepared, config: ([3, 4, 5], "stop", 7, 3)
+
+    result = engine._generate_without_streaming_overhead(object(), config=GenerationConfig())
+
+    assert result.text == "3,4,5"
+    assert result.finish_reason == "stop"
+    assert result.prompt_tokens == 7
+    assert result.completion_tokens == 3
+
+
+def test_incremental_text_assembler_handles_unstable_unicode_suffix() -> None:
+    class DummyTokenizer:
+        mapping = {
+            (1,): "\ufffd",
+            (1, 2): "🌞",
+            (3,): " 夏",
+            (4,): "天",
+        }
+
+        def decode(self, token_ids: list[int], *, skip_special_tokens: bool = False) -> str:
+            return self.mapping[tuple(token_ids)]
+
+    assembler = IncrementalTextAssembler(tokenizer=DummyTokenizer(), stop_strings=[])
+    outputs = []
+    for token_id in [1, 2, 3, 4]:
+        delta, stopped = assembler.feed_token(token_id)
+        assert stopped is False
+        if delta:
+            outputs.append(delta)
+    tail, stopped = assembler.flush()
+    assert stopped is False
+    if tail:
+        outputs.append(tail)
+
+    assert "".join(outputs) == "🌞 夏天"
+
+
+def test_incremental_text_assembler_uses_suffix_window_for_stop_strings() -> None:
+    class DummyTokenizer:
+        mapping = {
+            (10,): "ABE",
+            (11,): "N",
+            (12,): "D!",
+        }
+
+        def decode(self, token_ids: list[int], *, skip_special_tokens: bool = False) -> str:
+            return self.mapping[tuple(token_ids)]
+
+    assembler = IncrementalTextAssembler(tokenizer=DummyTokenizer(), stop_strings=["END"])
+    outputs = []
+    stopped = False
+    for token_id in [10, 11, 12]:
+        delta, stopped = assembler.feed_token(token_id)
+        if delta:
+            outputs.append(delta)
+        if stopped:
+            break
+
+    assert stopped is True
+    assert "".join(outputs) == "AB"

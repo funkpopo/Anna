@@ -10,6 +10,8 @@ class ServeSettings:
     model_id: str | None = None
     device: str = "auto"
     dtype: str = "auto"
+    scheduler_max_batch_size: int = 4
+    scheduler_batch_wait_ms: float = 2.0
     host: str = "127.0.0.1"
     port: int = 8000
     log_level: str = "info"
