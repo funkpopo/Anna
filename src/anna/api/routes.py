@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from typing import Iterator
@@ -17,6 +18,7 @@ from anna.runtime.engine import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _engine(request: Request):
@@ -88,6 +90,20 @@ def _completion_response_payload(
     }
 
 
+def _error_payload_from_exception(exc: AnnaEngineError) -> dict:
+    return {
+        "error": {
+            "message": str(exc),
+            "type": exc.error_type,
+            "code": exc.code,
+        }
+    }
+
+
+def _sse_error_frame(exc: AnnaEngineError) -> str:
+    return f"event: error\ndata: {json.dumps(_error_payload_from_exception(exc), ensure_ascii=False)}\n\n"
+
+
 def _stream_sse_chat(
     *,
     response_id: str,
@@ -104,26 +120,39 @@ def _stream_sse_chat(
     }
     yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
 
-    for event in events:
-        delta: dict[str, str] = {}
-        if event.reasoning_text:
-            delta["reasoning_content"] = event.reasoning_text
-        if event.text:
-            delta["content"] = event.text
-        payload = {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": event.finish_reason,
-                }
-            ],
-        }
-        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    try:
+        for event in events:
+            delta: dict[str, str] = {}
+            if event.reasoning_text:
+                delta["reasoning_content"] = event.reasoning_text
+            if event.text:
+                delta["content"] = event.text
+            payload = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": delta,
+                        "finish_reason": event.finish_reason,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    except AnnaEngineError as exc:
+        yield _sse_error_frame(exc)
+    except Exception:  # pragma: no cover - defensive fallback
+        logger.exception("Unhandled chat streaming failure.")
+        yield _sse_error_frame(
+            AnnaEngineError(
+                "Streaming response failed.",
+                status_code=500,
+                error_type="server_error",
+                code="streaming_failed",
+            )
+        )
 
     yield "data: [DONE]\n\n"
 
@@ -135,15 +164,28 @@ def _stream_sse_completion(
     model: str,
     events: Iterator[StreamEvent],
 ) -> Iterator[str]:
-    for event in events:
-        payload = {
-            "id": response_id,
-            "object": "text_completion",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "text": event.text, "finish_reason": event.finish_reason}],
-        }
-        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    try:
+        for event in events:
+            payload = {
+                "id": response_id,
+                "object": "text_completion",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "text": event.text, "finish_reason": event.finish_reason}],
+            }
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    except AnnaEngineError as exc:
+        yield _sse_error_frame(exc)
+    except Exception:  # pragma: no cover - defensive fallback
+        logger.exception("Unhandled text streaming failure.")
+        yield _sse_error_frame(
+            AnnaEngineError(
+                "Streaming response failed.",
+                status_code=500,
+                error_type="server_error",
+                code="streaming_failed",
+            )
+        )
 
     yield "data: [DONE]\n\n"
 

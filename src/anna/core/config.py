@@ -32,6 +32,10 @@ class ServeSettings:
     resident_expert_layers: int | None = None
     resident_expert_layer_indices: tuple[int, ...] | None = None
     cached_experts_per_layer: int | None = None
+    min_free_memory_mib: int | None = None
+    reserve_memory_mib: int | None = None
+    max_estimated_usage_ratio: float | None = None
+    generation_memory_safety_factor: float | None = None
     scheduler_max_batch_size: int = 4
     scheduler_batch_wait_ms: float = 2.0
     host: str = "127.0.0.1"

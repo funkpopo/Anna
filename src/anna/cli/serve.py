@@ -8,8 +8,68 @@ from anna.api.app import create_app
 from anna.core.config import ServeSettings, parse_resident_expert_layer_indices
 from anna.core.logging import setup_logging
 from anna.core.model_path import resolve_model_dir, resolve_model_name
+from anna.runtime.device import RuntimeSafetyPolicy
 from anna.runtime.engine import AnnaEngine
 from anna.runtime.scheduler import AnnaScheduler
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return parsed
+
+
+def _ratio(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 < parsed <= 1.0:
+        raise argparse.ArgumentTypeError("value must be in the range (0, 1]")
+    return parsed
+
+
+def _safety_factor(value: str) -> float:
+    parsed = float(value)
+    if parsed < 1.0:
+        raise argparse.ArgumentTypeError("value must be >= 1.0")
+    return parsed
+
+
+def _build_safety_policy(settings: ServeSettings) -> RuntimeSafetyPolicy | None:
+    if (
+        settings.min_free_memory_mib is None
+        and settings.reserve_memory_mib is None
+        and settings.max_estimated_usage_ratio is None
+        and settings.generation_memory_safety_factor is None
+    ):
+        return None
+
+    defaults = RuntimeSafetyPolicy()
+    min_free_bytes = (
+        defaults.min_free_bytes
+        if settings.min_free_memory_mib is None
+        else settings.min_free_memory_mib << 20
+    )
+    reserve_margin_bytes = (
+        defaults.reserve_margin_bytes
+        if settings.reserve_memory_mib is None
+        else settings.reserve_memory_mib << 20
+    )
+    max_estimated_usage_ratio = (
+        defaults.max_estimated_usage_ratio
+        if settings.max_estimated_usage_ratio is None
+        else settings.max_estimated_usage_ratio
+    )
+    generation_memory_safety_factor = (
+        defaults.generation_memory_safety_factor
+        if settings.generation_memory_safety_factor is None
+        else settings.generation_memory_safety_factor
+    )
+    return RuntimeSafetyPolicy(
+        min_free_bytes=min_free_bytes,
+        reserve_margin_bytes=reserve_margin_bytes,
+        max_estimated_usage_ratio=max_estimated_usage_ratio,
+        generation_memory_safety_factor=generation_memory_safety_factor,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,6 +102,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Max number of offloaded experts to keep cached on XPU per sparse MoE layer. Omit to auto-estimate; set 0 to disable.",
     )
+    parser.add_argument(
+        "--min-free-memory-mib",
+        type=_non_negative_int,
+        default=None,
+        help="Minimum free XPU memory required before generation starts. Defaults to 1024 MiB.",
+    )
+    parser.add_argument(
+        "--reserve-memory-mib",
+        type=_non_negative_int,
+        default=None,
+        help="Extra XPU memory margin preserved during request admission. Defaults to 512 MiB.",
+    )
+    parser.add_argument(
+        "--max-estimated-usage-ratio",
+        type=_ratio,
+        default=None,
+        help="Reject requests whose estimated usage exceeds this fraction of total XPU memory. Defaults to 0.9.",
+    )
+    parser.add_argument(
+        "--generation-memory-safety-factor",
+        type=_safety_factor,
+        default=None,
+        help="Multiplier applied to estimated generation memory. Defaults to 2.0.",
+    )
     parser.add_argument("--scheduler-max-batch-size", type=int, default=4)
     parser.add_argument("--scheduler-batch-wait-ms", type=float, default=2.0)
     parser.add_argument("--host", default="127.0.0.1")
@@ -64,6 +148,10 @@ def main() -> None:
         resident_expert_layers=args.resident_expert_layers,
         resident_expert_layer_indices=parse_resident_expert_layer_indices(args.resident_expert_layer_indices),
         cached_experts_per_layer=args.cached_experts_per_layer,
+        min_free_memory_mib=args.min_free_memory_mib,
+        reserve_memory_mib=args.reserve_memory_mib,
+        max_estimated_usage_ratio=args.max_estimated_usage_ratio,
+        generation_memory_safety_factor=args.generation_memory_safety_factor,
         scheduler_max_batch_size=args.scheduler_max_batch_size,
         scheduler_batch_wait_ms=args.scheduler_batch_wait_ms,
         host=args.host,
@@ -77,6 +165,7 @@ def main() -> None:
         model_id=settings.model_id,
         device=settings.device,
         dtype=settings.dtype,
+        safety_policy=_build_safety_policy(settings),
         offload_mode=settings.offload_mode,
         expert_quant=settings.expert_quant,
         resident_expert_layers=settings.resident_expert_layers,

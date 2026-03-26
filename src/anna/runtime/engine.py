@@ -13,7 +13,7 @@ from anna.mm.processor import PreparedInputs, Qwen3MultimodalProcessor
 from anna.model.quantization import estimate_module_xpu_int4_bytes
 from anna.model.qwen import Qwen3ForConditionalGeneration
 from anna.model.ops import Qwen3PageAllocator, Qwen3SparseMoeBlock
-from anna.runtime.device import DeviceContext
+from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
 from anna.sampling.sampler import sample_next_token
 from anna.weights.loader import build_model, estimate_model_weight_bytes, load_model_config, load_model_weights
@@ -189,6 +189,7 @@ class AnnaEngine:
         model_id: str | None = None,
         device: str = "auto",
         dtype: str = "auto",
+        safety_policy: RuntimeSafetyPolicy | None = None,
         offload_mode: str = "auto",
         expert_quant: str = "auto",
         resident_expert_layers: int | None = None,
@@ -202,6 +203,8 @@ class AnnaEngine:
             dtype=dtype,
             model_dtype=config.text_config.dtype,
         )
+        if safety_policy is not None:
+            device_context.safety_policy = safety_policy
         resolved_offload_mode = cls._resolve_offload_mode(
             requested_mode=offload_mode,
             model_path=model_path,
@@ -653,6 +656,12 @@ class AnnaEngine:
             "vision_enabled": self.config.vision_config is not None,
             "cache_device": str(self.device_context.migration_policy.execution_device),
             "preprocess_device": str(self.device_context.migration_policy.preprocess_device),
+            "safety_policy": {
+                "min_free_bytes": self.device_context.safety_policy.min_free_bytes,
+                "reserve_margin_bytes": self.device_context.safety_policy.reserve_margin_bytes,
+                "max_estimated_usage_ratio": self.device_context.safety_policy.max_estimated_usage_ratio,
+                "generation_memory_safety_factor": self.device_context.safety_policy.generation_memory_safety_factor,
+            },
             "memory": None
             if memory_info is None
             else {

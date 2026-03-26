@@ -6,6 +6,20 @@ from pathlib import Path
 from typing import Any
 
 
+def _first_non_null(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _int_from_candidates(*values: Any) -> int:
+    value = _first_non_null(*values)
+    if value is None:
+        raise ValueError("Expected an integer config value, but every candidate was null.")
+    return int(value)
+
+
 @dataclass(slots=True)
 class RopeParameters:
     rope_type: str = "default"
@@ -158,6 +172,16 @@ class Qwen3TextConfig:
                 "linear_attention" if (layer_idx + 1) % interval else "full_attention"
                 for layer_idx in range(num_hidden_layers)
             ]
+        eos_token_id = _int_from_candidates(
+            text_config.get("eos_token_id"),
+            data.get("eos_token_id"),
+            248044,
+        )
+        pad_token_id = _int_from_candidates(
+            text_config.get("pad_token_id"),
+            data.get("pad_token_id"),
+            eos_token_id,
+        )
 
         return cls(
             model_type=text_config.get("model_type", "qwen3_5_text"),
@@ -179,9 +203,9 @@ class Qwen3TextConfig:
             max_position_embeddings=int(text_config.get("max_position_embeddings", 262144)),
             rms_norm_eps=float(text_config.get("rms_norm_eps", 1e-6)),
             vocab_size=int(text_config["vocab_size"]),
-            tie_word_embeddings=bool(text_config.get("tie_word_embeddings", data.get("tie_word_embeddings", True))),
-            eos_token_id=int(text_config.get("eos_token_id", 248044)),
-            pad_token_id=int(text_config.get("pad_token_id", text_config.get("eos_token_id", 248044))),
+            tie_word_embeddings=bool(_first_non_null(text_config.get("tie_word_embeddings"), data.get("tie_word_embeddings"), True)),
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
             dtype=str(text_config.get("dtype", text_config.get("torch_dtype", "bfloat16"))),
             cache_block_size=int(text_config.get("cache_block_size", 32)),
             layer_types=layer_types,
@@ -257,11 +281,11 @@ class Qwen3Config:
             vision_config=Qwen3VisionConfig.from_dict(config_data.get("vision_config")),
             preprocessor_config=VisionPreprocessorConfig.from_dict(preprocessor_data),
             quantization_config=QuantizationConfig.from_dict(config_data.get("quantization_config")),
-            tie_word_embeddings=bool(config_data.get("tie_word_embeddings", True)),
-            image_token_id=int(config_data.get("image_token_id", 248056)),
-            video_token_id=int(config_data.get("video_token_id", 248057)),
-            vision_start_token_id=int(config_data.get("vision_start_token_id", 248053)),
-            vision_end_token_id=int(config_data.get("vision_end_token_id", 248054)),
+            tie_word_embeddings=bool(_first_non_null(config_data.get("tie_word_embeddings"), True)),
+            image_token_id=_int_from_candidates(config_data.get("image_token_id"), 248056),
+            video_token_id=_int_from_candidates(config_data.get("video_token_id"), 248057),
+            vision_start_token_id=_int_from_candidates(config_data.get("vision_start_token_id"), 248053),
+            vision_end_token_id=_int_from_candidates(config_data.get("vision_end_token_id"), 248054),
         )
 
     @classmethod

@@ -132,6 +132,34 @@ def test_qwen3_config_keeps_multimodal_fields() -> None:
     assert config.preprocessor_config.merge_size == 2
 
 
+def test_qwen3_config_uses_top_level_pad_token_when_text_config_value_is_null() -> None:
+    config = Qwen3Config.from_dict(
+        {
+            "pad_token_id": 248055,
+            "eos_token_id": 248046,
+            "text_config": {
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_num_key_heads": 4,
+                "linear_num_value_heads": 4,
+                "vocab_size": 256,
+                "layer_types": ["linear_attention", "full_attention"],
+                "eos_token_id": 248044,
+                "pad_token_id": None,
+            },
+        }
+    )
+
+    assert config.text_config.eos_token_id == 248044
+    assert config.text_config.pad_token_id == 248055
+
+
 def test_tokenizer_renders_native_multimodal_placeholders() -> None:
     tokenizer = _tokenizer()
     rendered = tokenizer.render_messages(
