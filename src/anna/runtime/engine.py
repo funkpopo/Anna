@@ -43,6 +43,10 @@ def _strip_think_open_tag(text: str) -> str:
     return normalized
 
 
+def _strip_unstable_replacement_suffix(text: str) -> str:
+    return text.rstrip("\ufffd")
+
+
 class ThinkingStreamParser:
     CLOSE_TAG = "</think>"
 
@@ -491,12 +495,13 @@ class AnnaEngine:
         emitted_text: str,
     ) -> tuple[str, str]:
         stable_length = _common_prefix_length(previous_text, current_text)
-        stable_text = current_text[:stable_length]
+        stable_text = _strip_unstable_replacement_suffix(current_text[:stable_length])
         if not stable_text.startswith(emitted_text):
             return "", emitted_text
         return stable_text[len(emitted_text) :], stable_text
 
     def _flush_decode_tail(self, *, current_text: str, emitted_text: str) -> tuple[str, str]:
+        current_text = _strip_unstable_replacement_suffix(current_text)
         if not current_text.startswith(emitted_text):
             return "", emitted_text
         return current_text[len(emitted_text) :], current_text

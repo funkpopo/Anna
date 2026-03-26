@@ -45,6 +45,29 @@ def test_flush_decode_tail_returns_remaining_buffer() -> None:
     assert emitted == "冰镇西瓜🍉"
 
 
+def test_stable_decode_skips_unstable_replacement_suffix() -> None:
+    engine = object.__new__(AnnaEngine)
+    emitted = ""
+    previous = ""
+    outputs: list[str] = []
+
+    for current in ["夏天。", "夏天。�", "夏天。�", "夏天。🌞", "夏天。🌞�", "夏天。🌞🍃"]:
+        delta, emitted = engine._stable_decode_delta(
+            previous_text=previous,
+            current_text=current,
+            emitted_text=emitted,
+        )
+        if delta:
+            outputs.append(delta)
+        previous = current
+
+    tail, emitted = engine._flush_decode_tail(current_text=previous, emitted_text=emitted)
+    if tail:
+        outputs.append(tail)
+
+    assert "".join(outputs) == "夏天。🌞🍃"
+
+
 def test_split_chat_output_separates_reasoning_and_content() -> None:
     engine = object.__new__(AnnaEngine)
     reasoning, content = engine._split_chat_output(
