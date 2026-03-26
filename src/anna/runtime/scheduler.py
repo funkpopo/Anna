@@ -46,16 +46,24 @@ class AnnaScheduler:
         engine: "AnnaEngine",
         *,
         max_batch_size: int = 4,
+        max_batched_tokens: int | None = None,
         batch_wait_ms: float = 2.0,
     ) -> None:
         self.engine = engine
         self.max_batch_size = max(1, max_batch_size)
+        self.max_batched_tokens = None if max_batched_tokens is None else max(1, max_batched_tokens)
         self.batch_wait_seconds = max(0.0, batch_wait_ms) / 1000.0
         self._pending: deque[SchedulerRequest] = deque()
         self._condition = threading.Condition()
         self._stop = False
         self._worker = threading.Thread(target=self._run_loop, name="anna-scheduler", daemon=True)
         self._worker.start()
+
+    def can_schedule(self, prepared: PreparedInputs) -> bool:
+        if self.max_batched_tokens is None:
+            return True
+        prompt_length = int(prepared.input_ids.shape[1])
+        return prompt_length > 0 and prompt_length <= self.max_batched_tokens
 
     def shutdown(self) -> None:
         with self._condition:
@@ -119,8 +127,9 @@ class AnnaScheduler:
                 if request.past_key_values is None:
                     self._fail_request(request, RuntimeError("Missing decode cache for active request."))
 
-            for chunk_start in range(0, len(ready), self.max_batch_size):
-                chunk = ready[chunk_start : chunk_start + self.max_batch_size]
+            decode_chunk_size = self._decode_chunk_size()
+            for chunk_start in range(0, len(ready), decode_chunk_size):
+                chunk = ready[chunk_start : chunk_start + decode_chunk_size]
                 try:
                     next_active.extend(self._decode_batch(chunk))
                 except Exception as exc:  # pragma: no cover - worker-level best effort
@@ -149,8 +158,23 @@ class AnnaScheduler:
             groups[request.prompt_length].append(request)
 
         for _, group in sorted(groups.items()):
-            active.extend(self._prefill_same_length_group(group))
+            chunk_size = self._prefill_chunk_size(group[0].prompt_length)
+            for chunk_start in range(0, len(group), chunk_size):
+                active.extend(self._prefill_same_length_group(group[chunk_start : chunk_start + chunk_size]))
         return active
+
+    def _prefill_chunk_size(self, prompt_length: int) -> int:
+        chunk_size = self.max_batch_size
+        if self.max_batched_tokens is None:
+            return chunk_size
+        if prompt_length <= 0:
+            return 1
+        return max(1, min(chunk_size, self.max_batched_tokens // prompt_length or 1))
+
+    def _decode_chunk_size(self) -> int:
+        if self.max_batched_tokens is None:
+            return self.max_batch_size
+        return max(1, min(self.max_batch_size, self.max_batched_tokens))
 
     def _prefill_same_length_group(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest]:
         batched = self._batch_text_inputs(requests)

@@ -225,3 +225,91 @@ def test_scheduler_batches_mixed_length_requests_during_decode() -> None:
         assert fake_model.decode_batch_sizes == [2]
     finally:
         scheduler.shutdown()
+
+
+def test_scheduler_splits_prefill_batch_by_max_batched_tokens() -> None:
+    config = Qwen3Config(
+        text_config=Qwen3TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            vocab_size=16,
+            eos_token_id=9,
+            pad_token_id=0,
+            layer_types=["full_attention"],
+        )
+    )
+    fake_model = _FakeModel(config)
+    engine = AnnaEngine(
+        model=fake_model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="fake",
+        device_context=_FakeDeviceContext(),
+    )
+    scheduler = AnnaScheduler(engine, max_batch_size=4, max_batched_tokens=2, batch_wait_ms=20.0)
+    engine.set_scheduler(scheduler)
+
+    try:
+        request_a = scheduler._submit(_prepared([4, 5]), config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0), stream=False)
+        request_b = scheduler._submit(_prepared([6, 7]), config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0), stream=False)
+
+        assert request_a.done.wait(timeout=2.0)
+        assert request_b.done.wait(timeout=2.0)
+        assert request_a.error is None
+        assert request_b.error is None
+        assert fake_model.prefill_batch_sizes == [1, 1]
+        assert fake_model.decode_batch_sizes == [2]
+    finally:
+        scheduler.shutdown()
+
+
+def test_scheduler_splits_decode_batch_by_max_batched_tokens() -> None:
+    config = Qwen3Config(
+        text_config=Qwen3TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            vocab_size=16,
+            eos_token_id=9,
+            pad_token_id=0,
+            layer_types=["full_attention"],
+        )
+    )
+    fake_model = _FakeModel(config)
+    engine = AnnaEngine(
+        model=fake_model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="fake",
+        device_context=_FakeDeviceContext(),
+    )
+    scheduler = AnnaScheduler(engine, max_batch_size=4, max_batched_tokens=1, batch_wait_ms=20.0)
+    engine.set_scheduler(scheduler)
+
+    try:
+        request_a = scheduler._submit(_prepared([4]), config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0), stream=False)
+        request_b = scheduler._submit(_prepared([6]), config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0), stream=False)
+
+        assert request_a.done.wait(timeout=2.0)
+        assert request_b.done.wait(timeout=2.0)
+        assert request_a.error is None
+        assert request_b.error is None
+        assert fake_model.prefill_batch_sizes == [1, 1]
+        assert fake_model.decode_batch_sizes == [1, 1]
+    finally:
+        scheduler.shutdown()

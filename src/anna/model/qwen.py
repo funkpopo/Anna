@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from anna.model.config import Qwen3Config, Qwen3TextConfig, Qwen3VisionConfig
+from anna.model.linear_backend import project_linear
 from anna.model.ops import Qwen3DecoderLayer, Qwen3DynamicCache, Qwen3PageAllocator, Qwen3RMSNorm, Qwen3TextRotaryEmbedding, rotate_half
 
 
@@ -110,7 +111,8 @@ class Qwen3VisionMLP(nn.Module):
         self.linear_fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=True)
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        return self.linear_fc2(F.gelu(self.linear_fc1(hidden_state), approximate="tanh"))
+        hidden_state = project_linear(self.linear_fc1, hidden_state, activation="gelu", algorithm="tanh")
+        return project_linear(self.linear_fc2, hidden_state)
 
 
 class Qwen3VisionPatchEmbed(nn.Module):
@@ -141,7 +143,8 @@ class Qwen3VisionPatchMerger(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.norm(x).view(-1, self.hidden_size)
-        return self.linear_fc2(F.gelu(self.linear_fc1(x)))
+        x = project_linear(self.linear_fc1, x, activation="gelu", algorithm="tanh")
+        return project_linear(self.linear_fc2, x)
 
 
 def apply_rotary_pos_emb_vision(
@@ -179,7 +182,7 @@ class Qwen3VisionAttention(nn.Module):
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
         query, key, value = (
-            self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+            project_linear(self.qkv, hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
         query, key = apply_rotary_pos_emb_vision(query, key, cos, sin)
         query = query.transpose(0, 1)
@@ -189,7 +192,7 @@ class Qwen3VisionAttention(nn.Module):
         attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query.dtype)
         attn_output = torch.matmul(attn_probs, value)
         attn_output = attn_output.transpose(0, 1).reshape(seq_length, -1).contiguous()
-        return self.proj(attn_output)
+        return project_linear(self.proj, attn_output)
 
     def forward(
         self,
@@ -601,7 +604,7 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
             hidden_states = hidden_states[:, -logits_to_keep:, :]
-        logits = self.lm_head(hidden_states)
+        logits = project_linear(self.lm_head, hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)
 
 
@@ -650,5 +653,5 @@ class Qwen3ForConditionalGeneration(nn.Module):
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
             hidden_states = hidden_states[:, -logits_to_keep:, :]
-        logits = self.lm_head(hidden_states)
+        logits = project_linear(self.lm_head, hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values, rope_deltas=outputs.rope_deltas)
