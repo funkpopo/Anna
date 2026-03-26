@@ -71,6 +71,22 @@ class TensorMigrationPolicy:
 
 
 @dataclass(slots=True)
+class RuntimeSafetyPolicy:
+    min_free_bytes: int = 1 << 30
+    reserve_margin_bytes: int = 512 << 20
+    max_estimated_usage_ratio: float = 0.9
+    generation_memory_safety_factor: float = 2.0
+
+
+@dataclass(slots=True)
+class DeviceMemoryInfo:
+    free_bytes: int
+    total_bytes: int
+    allocated_bytes: int | None = None
+    reserved_bytes: int | None = None
+
+
+@dataclass(slots=True)
 class DeviceContext:
     device: torch.device
     dtype: torch.dtype
@@ -79,6 +95,7 @@ class DeviceContext:
     reported_dtype: str
     float8_available: bool
     migration_policy: TensorMigrationPolicy
+    safety_policy: RuntimeSafetyPolicy
 
     @classmethod
     def resolve(
@@ -135,6 +152,7 @@ class DeviceContext:
             reported_dtype=reported_dtype,
             float8_available=_float8_dtype() is not None,
             migration_policy=migration_policy,
+            safety_policy=RuntimeSafetyPolicy(),
         )
 
     def _move_tensor(
@@ -174,6 +192,62 @@ class DeviceContext:
         if cache is None:
             return None
         return cache.to(device=self.device, dtype=self.migration_policy.cache_dtype)
+
+    def element_size(self, dtype: torch.dtype | None = None) -> int:
+        dtype = dtype or self.dtype
+        return torch.empty((), dtype=dtype).element_size()
+
+    def get_memory_info(self) -> DeviceMemoryInfo | None:
+        if self.device.type != "xpu":
+            return None
+        xpu = _xpu_module()
+        if xpu is None:
+            return None
+
+        free_bytes = total_bytes = allocated_bytes = reserved_bytes = None
+        if hasattr(xpu, "mem_get_info"):
+            free_bytes, total_bytes = xpu.mem_get_info()
+        if hasattr(xpu, "memory_allocated"):
+            allocated_bytes = int(xpu.memory_allocated(self.device))
+        if hasattr(xpu, "memory_reserved"):
+            reserved_bytes = int(xpu.memory_reserved(self.device))
+        if free_bytes is None or total_bytes is None:
+            return None
+        return DeviceMemoryInfo(
+            free_bytes=int(free_bytes),
+            total_bytes=int(total_bytes),
+            allocated_bytes=allocated_bytes,
+            reserved_bytes=reserved_bytes,
+        )
+
+    @staticmethod
+    def classify_runtime_error(exc: BaseException) -> str:
+        message = str(exc).lower()
+        if "out of memory" in message or "memory" in message and "allocation" in message:
+            return "out_of_memory"
+        if "device lost" in message or "ur_result_error_device_lost" in message:
+            return "device_lost"
+        if "out of resources" in message:
+            return "out_of_resources"
+        return "runtime_error"
+
+    def should_recover(self, exc: BaseException) -> bool:
+        category = self.classify_runtime_error(exc)
+        return category in {"out_of_memory", "device_lost", "out_of_resources"}
+
+    def recover(self) -> None:
+        self.synchronize()
+        if self.device.type != "xpu":
+            return
+        xpu = _xpu_module()
+        if xpu is None:
+            return
+        empty_cache = getattr(xpu, "empty_cache", None)
+        if callable(empty_cache):
+            empty_cache()
+        synchronize = getattr(xpu, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
 
     def synchronize(self) -> None:
         if self.device.type == "xpu":

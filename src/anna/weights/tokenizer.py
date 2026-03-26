@@ -64,6 +64,19 @@ class QwenTokenizer:
         tokens = {"<|im_end|>", "<|endoftext|>"}
         return {token_id for token in tokens if (token_id := self.token_id(token)) is not None}
 
+    @staticmethod
+    def _split_reasoning_content(text: str) -> tuple[str | None, str]:
+        normalized = text.strip()
+        if not normalized.startswith("<think>"):
+            return None, text
+        closing_tag = "</think>"
+        closing_index = normalized.find(closing_tag)
+        if closing_index == -1:
+            return normalized.removeprefix("<think>").strip(), ""
+        reasoning = normalized[len("<think>") : closing_index].strip()
+        content = normalized[closing_index + len(closing_tag) :].lstrip()
+        return reasoning or None, content
+
     def _flatten_content(self, content: Any) -> str:
         if content is None:
             return ""
@@ -90,7 +103,13 @@ class QwenTokenizer:
             return "".join(chunks)
         raise ValueError("Unsupported chat content format.")
 
-    def render_messages(self, messages: list[Any], *, add_generation_prompt: bool = True) -> str:
+    def render_messages(
+        self,
+        messages: list[Any],
+        *,
+        add_generation_prompt: bool = True,
+        enable_thinking: bool = False,
+    ) -> str:
         parts: list[str] = []
         for idx, message in enumerate(messages):
             role = getattr(message, "role", None) or message["role"]
@@ -98,6 +117,9 @@ class QwenTokenizer:
             if content is None and isinstance(message, dict):
                 content = message.get("content")
             text = self._flatten_content(content).strip()
+            reasoning_content = getattr(message, "reasoning_content", None)
+            if reasoning_content is None and isinstance(message, dict):
+                reasoning_content = message.get("reasoning_content")
 
             if role == "system" and idx != 0:
                 raise ValueError("System message must be the first message.")
@@ -106,8 +128,18 @@ class QwenTokenizer:
                 role = "user"
             if role not in {"system", "user", "assistant"}:
                 raise ValueError(f"Unsupported chat role: {role}")
+            if role == "assistant":
+                parsed_reasoning, parsed_content = self._split_reasoning_content(text)
+                if reasoning_content is None:
+                    reasoning_content = parsed_reasoning
+                    text = parsed_content.strip()
+                if reasoning_content:
+                    text = f"<think>\n{reasoning_content.strip()}\n</think>\n\n{text}"
             parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
 
         if add_generation_prompt:
-            parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+            if enable_thinking:
+                parts.append("<|im_start|>assistant\n<think>\n")
+            else:
+                parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
         return "".join(parts)

@@ -144,12 +144,36 @@ def test_tokenizer_renders_native_multimodal_placeholders() -> None:
                     {"type": "video_url", "video_url": {"url": "local-video.mp4"}},
                 ],
             }
-        ]
+        ],
+        enable_thinking=False,
     )
 
     assert "<|vision_start|><|image_pad|><|vision_end|>" in rendered
     assert "<|vision_start|><|video_pad|><|vision_end|>" in rendered
     assert rendered.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+
+
+def test_tokenizer_renders_open_think_prompt_when_enabled() -> None:
+    tokenizer = _tokenizer()
+    rendered = tokenizer.render_messages(
+        [{"role": "user", "content": "你好"}],
+        enable_thinking=True,
+    )
+
+    assert rendered.endswith("<|im_start|>assistant\n<think>\n")
+
+
+def test_tokenizer_renders_assistant_reasoning_history() -> None:
+    tokenizer = _tokenizer()
+    rendered = tokenizer.render_messages(
+        [
+            {"role": "user", "content": "1+1=?"},
+            {"role": "assistant", "content": "答案是2。", "reasoning_content": "我先做加法。"},
+        ],
+        add_generation_prompt=False,
+    )
+
+    assert "<think>\n我先做加法。\n</think>\n\n答案是2。" in rendered
 
 
 def test_processor_expands_qwen3_native_placeholders() -> None:
