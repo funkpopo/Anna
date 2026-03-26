@@ -5,7 +5,7 @@ import argparse
 import uvicorn
 
 from anna.api.app import create_app
-from anna.core.config import ServeSettings
+from anna.core.config import ServeSettings, parse_resident_expert_layer_indices
 from anna.core.logging import setup_logging
 from anna.core.model_path import resolve_model_dir, resolve_model_name
 from anna.runtime.engine import AnnaEngine
@@ -22,8 +22,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resident-expert-layers",
         type=int,
-        default=0,
-        help="Keep the first N sparse MoE layers fully resident on the execution device.",
+        default=None,
+        help="Keep the first N sparse MoE layers fully resident on the execution device. Omit to auto-estimate in experts offload mode.",
+    )
+    parser.add_argument(
+        "--resident-expert-layer-indices",
+        default=None,
+        help="Comma-separated 0-based decoder layer indices to keep fully resident on the execution device. Overrides --resident-expert-layers.",
     )
     parser.add_argument("--scheduler-max-batch-size", type=int, default=4)
     parser.add_argument("--scheduler-batch-wait-ms", type=float, default=2.0)
@@ -44,6 +49,7 @@ def main() -> None:
         dtype=args.dtype,
         offload_mode=args.offload_mode,
         resident_expert_layers=args.resident_expert_layers,
+        resident_expert_layer_indices=parse_resident_expert_layer_indices(args.resident_expert_layer_indices),
         scheduler_max_batch_size=args.scheduler_max_batch_size,
         scheduler_batch_wait_ms=args.scheduler_batch_wait_ms,
         host=args.host,
@@ -59,6 +65,7 @@ def main() -> None:
         dtype=settings.dtype,
         offload_mode=settings.offload_mode,
         resident_expert_layers=settings.resident_expert_layers,
+        resident_expert_layer_indices=settings.resident_expert_layer_indices,
     )
     scheduler = AnnaScheduler(
         engine,

@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import torch
 
 from anna.mm.processor import PreparedInputs
+from anna.model.config import Qwen3TextConfig, RopeParameters
+from anna.model.qwen import Qwen3ForCausalLM
 from anna.runtime.device import DeviceMemoryInfo, RuntimeSafetyPolicy
 from anna.runtime.engine import AnnaEngine, AnnaEngineError, GenerationConfig
 
@@ -55,3 +57,62 @@ def test_guard_generation_memory_rejects_oversized_request() -> None:
         assert exc.code == "estimated_device_oom"
     else:  # pragma: no cover - defensive
         raise AssertionError("Expected memory guard to reject the oversized request.")
+
+
+def test_auto_resident_expert_estimation_uses_conservative_free_memory_budget() -> None:
+    config = Qwen3TextConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        vocab_size=256,
+        max_position_embeddings=128,
+        layer_types=["linear_attention", "full_attention", "linear_attention", "full_attention"],
+        rope_parameters=RopeParameters(
+            rope_type="default",
+            rope_theta=10000.0,
+            partial_rotary_factor=0.25,
+            mrope_section=(1, 1, 0),
+        ),
+        decoder_sparse_step=1,
+        moe_intermediate_size=96,
+        shared_expert_intermediate_size=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+        mlp_only_layers=[3],
+    )
+    model = Qwen3ForCausalLM(config)
+    layer_bytes = AnnaEngine._module_nbytes(model.model.layers[0].mlp.experts)
+    budget_bytes = (layer_bytes * 5) // 2
+    free_bytes = budget_bytes * 2
+
+    fake_device_context = SimpleNamespace(
+        device=torch.device("xpu"),
+        safety_policy=RuntimeSafetyPolicy(
+            min_free_bytes=0,
+            reserve_margin_bytes=0,
+            max_estimated_usage_ratio=1.0,
+            generation_memory_safety_factor=2.0,
+        ),
+        synchronize=lambda: None,
+        get_memory_info=lambda: DeviceMemoryInfo(
+            free_bytes=free_bytes,
+            total_bytes=free_bytes + 1024,
+            allocated_bytes=0,
+            reserved_bytes=0,
+        ),
+    )
+
+    selected = AnnaEngine._estimate_resident_expert_layer_indices(
+        model=model,
+        device_context=fake_device_context,
+    )
+
+    assert budget_bytes >= layer_bytes > 0
+    assert selected == (0, 1)

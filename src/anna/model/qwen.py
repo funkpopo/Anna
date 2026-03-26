@@ -78,14 +78,16 @@ class Qwen3TextModel(nn.Module):
         offload_experts: bool = False,
         offload_token_io: bool = False,
         resident_expert_layers: int = 0,
+        resident_expert_layer_indices: tuple[int, ...] | None = None,
     ) -> None:
         self.execution_device = execution_device
         self.embed_tokens.to(torch.device("cpu") if offload_token_io else execution_device)
         self.rotary_emb.to(execution_device)
         self.norm.to(execution_device)
         resident_sparse_layers_remaining = max(0, int(resident_expert_layers))
+        resident_layer_indices = None if resident_expert_layer_indices is None else set(resident_expert_layer_indices)
 
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             layer.input_layernorm.to(execution_device)
             layer.post_attention_layernorm.to(execution_device)
             if layer.layer_type == "linear_attention":
@@ -97,7 +99,10 @@ class Qwen3TextModel(nn.Module):
                 layer.mlp.gate.to(execution_device)
                 layer.mlp.shared_expert.to(execution_device)
                 layer.mlp.shared_expert_gate.to(execution_device)
-                resident_experts = offload_experts and resident_sparse_layers_remaining > 0
+                if resident_layer_indices is None:
+                    resident_experts = offload_experts and resident_sparse_layers_remaining > 0
+                else:
+                    resident_experts = layer_idx in resident_layer_indices
                 if resident_experts:
                     resident_sparse_layers_remaining -= 1
                 layer.mlp.configure_runtime(
@@ -425,12 +430,14 @@ class Qwen3Model(nn.Module):
         offload_vision: bool = False,
         offload_token_io: bool = False,
         resident_expert_layers: int = 0,
+        resident_expert_layer_indices: tuple[int, ...] | None = None,
     ) -> None:
         self.language_model.configure_runtime(
             execution_device,
             offload_experts=offload_experts,
             offload_token_io=offload_token_io,
             resident_expert_layers=resident_expert_layers,
+            resident_expert_layer_indices=resident_expert_layer_indices,
         )
         if self.visual is not None:
             self.visual.to(torch.device("cpu") if offload_vision else execution_device)
@@ -683,12 +690,14 @@ class Qwen3ForCausalLM(nn.Module):
         offload_experts: bool = False,
         offload_token_io: bool = False,
         resident_expert_layers: int = 0,
+        resident_expert_layer_indices: tuple[int, ...] | None = None,
     ) -> None:
         self.model.configure_runtime(
             execution_device,
             offload_experts=offload_experts,
             offload_token_io=offload_token_io,
             resident_expert_layers=resident_expert_layers,
+            resident_expert_layer_indices=resident_expert_layer_indices,
         )
         self.lm_head.to(torch.device("cpu") if offload_token_io else execution_device)
 
@@ -739,6 +748,7 @@ class Qwen3ForConditionalGeneration(nn.Module):
         offload_vision: bool = False,
         offload_token_io: bool = False,
         resident_expert_layers: int = 0,
+        resident_expert_layer_indices: tuple[int, ...] | None = None,
     ) -> None:
         self.model.configure_runtime(
             execution_device,
@@ -746,6 +756,7 @@ class Qwen3ForConditionalGeneration(nn.Module):
             offload_vision=offload_vision,
             offload_token_io=offload_token_io,
             resident_expert_layers=resident_expert_layers,
+            resident_expert_layer_indices=resident_expert_layer_indices,
         )
         self.lm_head.to(torch.device("cpu") if offload_token_io else execution_device)
 

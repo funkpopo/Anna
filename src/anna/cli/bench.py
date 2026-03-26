@@ -4,7 +4,7 @@ import argparse
 import statistics
 import time
 
-from anna.core.config import BenchmarkSettings
+from anna.core.config import BenchmarkSettings, parse_resident_expert_layer_indices
 from anna.core.logging import setup_logging
 from anna.core.model_path import resolve_model_dir, resolve_model_name
 from anna.runtime.engine import AnnaEngine, GenerationConfig
@@ -23,8 +23,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resident-expert-layers",
         type=int,
-        default=0,
-        help="Keep the first N sparse MoE layers fully resident on the execution device.",
+        default=None,
+        help="Keep the first N sparse MoE layers fully resident on the execution device. Omit to auto-estimate in experts offload mode.",
+    )
+    parser.add_argument(
+        "--resident-expert-layer-indices",
+        default=None,
+        help="Comma-separated 0-based decoder layer indices to keep fully resident on the execution device. Overrides --resident-expert-layers.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -63,6 +68,7 @@ def main() -> None:
         dtype=args.dtype,
         offload_mode=args.offload_mode,
         resident_expert_layers=args.resident_expert_layers,
+        resident_expert_layer_indices=parse_resident_expert_layer_indices(args.resident_expert_layer_indices),
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
@@ -80,6 +86,7 @@ def main() -> None:
         dtype=settings.dtype,
         offload_mode=settings.offload_mode,
         resident_expert_layers=settings.resident_expert_layers,
+        resident_expert_layer_indices=settings.resident_expert_layer_indices,
     )
     generation = GenerationConfig(
         max_new_tokens=settings.max_new_tokens,
@@ -119,6 +126,7 @@ def main() -> None:
     print(f"compute_dtype={engine.device_context.dtype}")
     print(f"offload_mode={engine.offload_mode}")
     print(f"resident_expert_layers={engine.resident_expert_layers}")
+    print(f"resident_expert_layer_indices={','.join(str(idx) for idx in engine.resident_expert_layer_indices)}")
     print(f"runs={len(latencies)}")
     print(f"avg_latency_seconds={avg_latency:.4f}")
     print(f"min_latency_seconds={min(latencies):.4f}")

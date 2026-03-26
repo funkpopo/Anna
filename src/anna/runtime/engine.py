@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -10,7 +11,7 @@ import torch
 
 from anna.mm.processor import PreparedInputs, Qwen3MultimodalProcessor
 from anna.model.qwen import Qwen3ForConditionalGeneration
-from anna.model.ops import Qwen3PageAllocator
+from anna.model.ops import Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.runtime.device import DeviceContext
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
 from anna.sampling.sampler import sample_next_token
@@ -158,7 +159,7 @@ class AnnaEngine:
         device_context: DeviceContext,
         quantized_replacements: int = 0,
         offload_mode: str = "none",
-        resident_expert_layers: int = 0,
+        resident_expert_layer_indices: tuple[int, ...] = (),
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -168,7 +169,8 @@ class AnnaEngine:
         self.config = model.config
         self.quantized_replacements = quantized_replacements
         self.offload_mode = offload_mode
-        self.resident_expert_layers = max(0, int(resident_expert_layers))
+        self.resident_expert_layer_indices = tuple(resident_expert_layer_indices)
+        self.resident_expert_layers = len(self.resident_expert_layer_indices)
         self.cache_allocator = Qwen3PageAllocator(self.config.text_config)
         self._attach_cache_allocator()
         self.execution_lock = threading.Lock()
@@ -183,7 +185,8 @@ class AnnaEngine:
         device: str = "auto",
         dtype: str = "auto",
         offload_mode: str = "auto",
-        resident_expert_layers: int = 0,
+        resident_expert_layers: int | None = None,
+        resident_expert_layer_indices: tuple[int, ...] | None = None,
     ) -> "AnnaEngine":
         model_path = Path(model_dir)
         config = load_model_config(model_path)
@@ -198,8 +201,9 @@ class AnnaEngine:
             config=config,
             device_context=device_context,
         )
-        resolved_resident_expert_layers = cls._resolve_resident_expert_layers(
+        resolved_resident_expert_layer_indices = cls._resolve_resident_expert_layer_indices(
             requested_layers=resident_expert_layers,
+            requested_indices=resident_expert_layer_indices,
             config=config,
             resolved_offload_mode=resolved_offload_mode,
         )
@@ -212,13 +216,29 @@ class AnnaEngine:
             )
             report = load_model_weights(model, model_path)
             report.quantized_replacements = quantized_replacements
+            auto_resident_indices = resolved_resident_expert_layer_indices is None
             model.configure_runtime(
                 device_context.device,
                 offload_experts=resolved_offload_mode == "experts",
                 offload_vision=resolved_offload_mode == "experts",
                 offload_token_io=False,
-                resident_expert_layers=resolved_resident_expert_layers,
+                resident_expert_layers=0,
+                resident_expert_layer_indices=() if auto_resident_indices else resolved_resident_expert_layer_indices,
             )
+            if auto_resident_indices:
+                resolved_resident_expert_layer_indices = cls._estimate_resident_expert_layer_indices(
+                    model=model,
+                    device_context=device_context,
+                )
+                if resolved_resident_expert_layer_indices:
+                    model.configure_runtime(
+                        device_context.device,
+                        offload_experts=True,
+                        offload_vision=True,
+                        offload_token_io=False,
+                        resident_expert_layers=0,
+                        resident_expert_layer_indices=resolved_resident_expert_layer_indices,
+                    )
             model.eval()
         except RuntimeError as exc:
             if device_context.should_recover(exc):
@@ -233,13 +253,14 @@ class AnnaEngine:
         resolved_model_id = model_id or model_path.name
 
         logger.info(
-            "Loaded model %s on %s (compute=%s, requested=%s, offload=%s, resident_expert_layers=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
+            "Loaded model %s on %s (compute=%s, requested=%s, offload=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
             resolved_model_id,
             device_context.device,
             device_context.dtype,
             device_context.reported_dtype,
             resolved_offload_mode,
-            resolved_resident_expert_layers,
+            len(resolved_resident_expert_layer_indices or ()),
+            list(resolved_resident_expert_layer_indices or ()),
             model_device,
             report.loaded,
             report.skipped,
@@ -254,7 +275,7 @@ class AnnaEngine:
             device_context=device_context,
             quantized_replacements=quantized_replacements,
             offload_mode=resolved_offload_mode,
-            resident_expert_layers=resolved_resident_expert_layers,
+            resident_expert_layer_indices=tuple(resolved_resident_expert_layer_indices or ()),
         )
 
     @staticmethod
@@ -283,20 +304,132 @@ class AnnaEngine:
         return "none"
 
     @staticmethod
-    def _resolve_resident_expert_layers(
+    def _sparse_moe_layer_indices(config: object) -> list[int]:
+        return [
+            layer_idx
+            for layer_idx in range(config.text_config.num_hidden_layers)
+            if config.text_config.uses_sparse_moe(layer_idx)
+        ]
+
+    @classmethod
+    def _validate_resident_expert_layer_indices(
+        cls,
         *,
-        requested_layers: int,
+        requested_indices: tuple[int, ...],
+        config: object,
+    ) -> tuple[int, ...]:
+        if not requested_indices:
+            return ()
+
+        num_hidden_layers = int(config.text_config.num_hidden_layers)
+        sparse_layer_indices = cls._sparse_moe_layer_indices(config)
+        sparse_layer_index_set = set(sparse_layer_indices)
+        requested_set: set[int] = set()
+        for layer_idx in requested_indices:
+            index = int(layer_idx)
+            if index < 0 or index >= num_hidden_layers:
+                raise ValueError(f"Resident expert layer index out of range: {index}")
+            if index not in sparse_layer_index_set:
+                raise ValueError(f"Decoder layer {index} does not use sparse MoE experts.")
+            requested_set.add(index)
+        return tuple(layer_idx for layer_idx in sparse_layer_indices if layer_idx in requested_set)
+
+    @classmethod
+    def _resolve_resident_expert_layer_indices(
+        cls,
+        *,
+        requested_layers: int | None,
+        requested_indices: tuple[int, ...] | None,
         config: object,
         resolved_offload_mode: str,
-    ) -> int:
-        requested = max(0, int(requested_layers))
-        if requested == 0 or resolved_offload_mode != "experts":
-            return 0
+    ) -> tuple[int, ...] | None:
+        if resolved_offload_mode != "experts":
+            return ()
 
-        sparse_layer_count = sum(
-            1 for layer_idx in range(config.text_config.num_hidden_layers) if config.text_config.uses_sparse_moe(layer_idx)
+        if requested_indices is not None:
+            return cls._validate_resident_expert_layer_indices(
+                requested_indices=requested_indices,
+                config=config,
+            )
+
+        if requested_layers is None:
+            return None
+
+        requested = max(0, int(requested_layers))
+        if requested == 0:
+            return ()
+
+        sparse_layer_indices = cls._sparse_moe_layer_indices(config)
+        return tuple(sparse_layer_indices[:requested])
+
+    @staticmethod
+    def _module_nbytes(module: torch.nn.Module) -> int:
+        total = 0
+        for tensor in itertools.chain(module.parameters(), module.buffers()):
+            total += tensor.nelement() * tensor.element_size()
+        return total
+
+    @classmethod
+    def _estimate_resident_expert_layer_indices(
+        cls,
+        *,
+        model: Qwen3ForConditionalGeneration,
+        device_context: DeviceContext,
+    ) -> tuple[int, ...]:
+        if device_context.device.type != "xpu":
+            return ()
+
+        device_context.synchronize()
+        memory_info = device_context.get_memory_info()
+        if memory_info is None:
+            return ()
+
+        text_model = getattr(getattr(model, "model", None), "language_model", None)
+        if text_model is None:
+            text_model = getattr(model, "model", None)
+        if text_model is None or not hasattr(text_model, "layers"):
+            return ()
+
+        safety = device_context.safety_policy
+        reserve_bytes = max(
+            int(safety.min_free_bytes),
+            int(safety.reserve_margin_bytes),
+            int(memory_info.total_bytes * (1.0 - safety.max_estimated_usage_ratio)),
         )
-        return min(requested, sparse_layer_count)
+        usable_free_bytes = max(0, int(memory_info.free_bytes) - reserve_bytes)
+        budget_bytes = int(usable_free_bytes / max(1.0, float(safety.generation_memory_safety_factor)))
+        if budget_bytes <= 0:
+            logger.info(
+                "Auto resident expert placement skipped: free=%s reserve=%s budget=%s",
+                _format_bytes(memory_info.free_bytes),
+                _format_bytes(reserve_bytes),
+                _format_bytes(budget_bytes),
+            )
+            return ()
+
+        selected_indices: list[int] = []
+        consumed_bytes = 0
+        layer_sizes: list[tuple[int, int]] = []
+        for layer_idx, layer in enumerate(text_model.layers):
+            if not isinstance(layer.mlp, Qwen3SparseMoeBlock):
+                continue
+            layer_bytes = cls._module_nbytes(layer.mlp.experts)
+            layer_sizes.append((layer_idx, layer_bytes))
+            if layer_bytes <= 0 or consumed_bytes + layer_bytes > budget_bytes:
+                break
+            selected_indices.append(layer_idx)
+            consumed_bytes += layer_bytes
+
+        logger.info(
+            "Auto resident expert placement: free=%s reserve=%s budget=%s selected_layers=%s selected_bytes=%s candidate_layer_bytes=%s",
+            _format_bytes(memory_info.free_bytes),
+            _format_bytes(reserve_bytes),
+            _format_bytes(budget_bytes),
+            selected_indices,
+            _format_bytes(consumed_bytes),
+            {layer_idx: _format_bytes(layer_bytes) for layer_idx, layer_bytes in layer_sizes[:8]},
+        )
+        return tuple(selected_indices)
 
     def list_models(self) -> list[str]:
         return [self.default_model_id]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from anna.core.config import GenerateSettings
+from anna.core.config import GenerateSettings, parse_resident_expert_layer_indices
 from anna.core.logging import setup_logging
 from anna.core.model_path import resolve_model_dir, resolve_model_name
 from anna.runtime.engine import AnnaEngine, GenerationConfig
@@ -19,8 +19,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resident-expert-layers",
         type=int,
-        default=0,
-        help="Keep the first N sparse MoE layers fully resident on the execution device.",
+        default=None,
+        help="Keep the first N sparse MoE layers fully resident on the execution device. Omit to auto-estimate in experts offload mode.",
+    )
+    parser.add_argument(
+        "--resident-expert-layer-indices",
+        default=None,
+        help="Comma-separated 0-based decoder layer indices to keep fully resident on the execution device. Overrides --resident-expert-layers.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -43,6 +48,7 @@ def main() -> None:
         dtype=args.dtype,
         offload_mode=args.offload_mode,
         resident_expert_layers=args.resident_expert_layers,
+        resident_expert_layer_indices=parse_resident_expert_layer_indices(args.resident_expert_layer_indices),
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
@@ -58,6 +64,7 @@ def main() -> None:
         dtype=settings.dtype,
         offload_mode=settings.offload_mode,
         resident_expert_layers=settings.resident_expert_layers,
+        resident_expert_layer_indices=settings.resident_expert_layer_indices,
     )
     result = engine.generate_text(
         settings.prompt,
