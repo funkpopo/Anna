@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from anna.model.config import Qwen3TextConfig, RopeParameters
-from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
+from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.model.qwen import Qwen3ForCausalLM
 
 
@@ -33,6 +33,41 @@ def _tiny_config() -> Qwen3TextConfig:
             partial_rotary_factor=0.25,
             mrope_section=(1, 1, 0),
         ),
+    )
+
+
+def _tiny_moe_config() -> Qwen3TextConfig:
+    return Qwen3TextConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        vocab_size=256,
+        max_position_embeddings=128,
+        layer_types=[
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "full_attention",
+        ],
+        rope_parameters=RopeParameters(
+            rope_type="default",
+            rope_theta=10000.0,
+            partial_rotary_factor=0.25,
+            mrope_section=(1, 1, 0),
+        ),
+        decoder_sparse_step=1,
+        moe_intermediate_size=96,
+        shared_expert_intermediate_size=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+        mlp_only_layers=[3],
     )
 
 
@@ -134,3 +169,20 @@ def test_dynamic_cache_release_reuses_freed_pages() -> None:
 def test_qwen3_allows_out_of_range_padding_idx_for_tiny_configs() -> None:
     model = Qwen3ForCausalLM(_tiny_config())
     assert model.model.embed_tokens.padding_idx is None
+
+
+def test_qwen3_runtime_can_pin_first_sparse_moe_layers() -> None:
+    model = Qwen3ForCausalLM(_tiny_moe_config())
+
+    model.configure_runtime(
+        torch.device("cpu"),
+        offload_experts=True,
+        resident_expert_layers=1,
+    )
+
+    sparse_layers = [layer.mlp for layer in model.model.layers if isinstance(layer.mlp, Qwen3SparseMoeBlock)]
+    assert len(sparse_layers) == 3
+    assert sparse_layers[0].resident_experts is True
+    assert sparse_layers[0].offload_experts is False
+    assert all(layer.resident_experts is False for layer in sparse_layers[1:])
+    assert all(layer.offload_experts is True for layer in sparse_layers[1:])

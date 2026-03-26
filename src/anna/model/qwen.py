@@ -8,7 +8,15 @@ import torch.nn.functional as F
 from torch import nn
 
 from anna.model.config import Qwen3Config, Qwen3TextConfig, Qwen3VisionConfig
-from anna.model.ops import Qwen3DecoderLayer, Qwen3DynamicCache, Qwen3PageAllocator, Qwen3RMSNorm, Qwen3TextRotaryEmbedding, rotate_half
+from anna.model.ops import (
+    Qwen3DecoderLayer,
+    Qwen3DynamicCache,
+    Qwen3PageAllocator,
+    Qwen3RMSNorm,
+    Qwen3SparseMoeBlock,
+    Qwen3TextRotaryEmbedding,
+    rotate_half,
+)
 
 
 @dataclass(slots=True)
@@ -37,16 +45,68 @@ class MultimodalModelOutput:
     rope_deltas: torch.Tensor | None = None
 
 
+def _module_device(module: nn.Module) -> torch.device:
+    for parameter in module.parameters():
+        return parameter.device
+    for buffer in module.buffers():
+        return buffer.device
+    return torch.device("cpu")
+
+
+def _align_tensor_device(tensor: torch.Tensor | None, device: torch.device) -> torch.Tensor | None:
+    if tensor is None or tensor.device == device:
+        return tensor
+    return tensor.to(device=device)
+
+
 class Qwen3TextModel(nn.Module):
     def __init__(self, config: Qwen3TextConfig):
         super().__init__()
         self.config = config
         self.cache_allocator: Qwen3PageAllocator | None = None
+        self.execution_device: torch.device | None = None
         padding_idx = config.pad_token_id if 0 <= config.pad_token_id < config.vocab_size else None
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config, idx) for idx in range(config.num_hidden_layers)])
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3TextRotaryEmbedding(config)
+
+    def configure_runtime(
+        self,
+        execution_device: torch.device,
+        *,
+        offload_experts: bool = False,
+        offload_token_io: bool = False,
+        resident_expert_layers: int = 0,
+    ) -> None:
+        self.execution_device = execution_device
+        self.embed_tokens.to(torch.device("cpu") if offload_token_io else execution_device)
+        self.rotary_emb.to(execution_device)
+        self.norm.to(execution_device)
+        resident_sparse_layers_remaining = max(0, int(resident_expert_layers))
+
+        for layer in self.layers:
+            layer.input_layernorm.to(execution_device)
+            layer.post_attention_layernorm.to(execution_device)
+            if layer.layer_type == "linear_attention":
+                layer.linear_attn.to(execution_device)
+            else:
+                layer.self_attn.to(execution_device)
+
+            if isinstance(layer.mlp, Qwen3SparseMoeBlock):
+                layer.mlp.gate.to(execution_device)
+                layer.mlp.shared_expert.to(execution_device)
+                layer.mlp.shared_expert_gate.to(execution_device)
+                resident_experts = offload_experts and resident_sparse_layers_remaining > 0
+                if resident_experts:
+                    resident_sparse_layers_remaining -= 1
+                layer.mlp.configure_runtime(
+                    execution_device,
+                    offload_experts=offload_experts,
+                    resident_experts=resident_experts,
+                )
+            else:
+                layer.mlp.to(execution_device)
 
     def forward(
         self,
@@ -61,10 +121,21 @@ class Qwen3TextModel(nn.Module):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds.")
 
         if inputs_embeds is None:
+            embed_device = self.embed_tokens.weight.device
+            if input_ids.device != embed_device:
+                input_ids = input_ids.to(device=embed_device)
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
             past_key_values = Qwen3DynamicCache(self.config, allocator=self.cache_allocator)
+
+        execution_device = self.execution_device or _module_device(self.norm)
+        if inputs_embeds.device != execution_device:
+            inputs_embeds = inputs_embeds.to(device=execution_device)
+        if attention_mask is not None and attention_mask.device != execution_device:
+            attention_mask = attention_mask.to(device=execution_device)
+        if position_ids is not None and position_ids.device != execution_device:
+            position_ids = position_ids.to(device=execution_device)
 
         if position_ids is None:
             seq_len = inputs_embeds.shape[1]
@@ -346,6 +417,24 @@ class Qwen3Model(nn.Module):
         self.visual = Qwen3VisionModel(config.vision_config) if config.vision_config is not None else None
         self.language_model = Qwen3TextModel(config.text_config)
 
+    def configure_runtime(
+        self,
+        execution_device: torch.device,
+        *,
+        offload_experts: bool = False,
+        offload_vision: bool = False,
+        offload_token_io: bool = False,
+        resident_expert_layers: int = 0,
+    ) -> None:
+        self.language_model.configure_runtime(
+            execution_device,
+            offload_experts=offload_experts,
+            offload_token_io=offload_token_io,
+            resident_expert_layers=resident_expert_layers,
+        )
+        if self.visual is not None:
+            self.visual.to(torch.device("cpu") if offload_vision else execution_device)
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.embed_tokens
 
@@ -381,6 +470,11 @@ class Qwen3Model(nn.Module):
         video_grid_thw: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        metadata_device = input_ids.device
+        mm_token_type_ids = _align_tensor_device(mm_token_type_ids, metadata_device)
+        attention_mask = _align_tensor_device(attention_mask, metadata_device)
+        image_grid_thw = _align_tensor_device(image_grid_thw, metadata_device)
+        video_grid_thw = _align_tensor_device(video_grid_thw, metadata_device)
         if video_grid_thw is not None:
             video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
             video_grid_thw[:, 0] = 1
@@ -439,7 +533,9 @@ class Qwen3Model(nn.Module):
     def get_image_features(self, pixel_values: torch.Tensor, image_grid_thw: torch.LongTensor) -> tuple[torch.Tensor, list[int]]:
         if self.visual is None:
             raise ValueError("The loaded model does not include a vision tower.")
-        pixel_values = pixel_values.to(dtype=next(self.visual.parameters()).dtype, device=next(self.visual.parameters()).device)
+        visual_device = next(self.visual.parameters()).device
+        pixel_values = pixel_values.to(dtype=next(self.visual.parameters()).dtype, device=visual_device)
+        image_grid_thw = _align_tensor_device(image_grid_thw, visual_device)
         vision_output = self.visual(pixel_values, grid_thw=image_grid_thw)
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         return vision_output.pooler_output, split_sizes
@@ -529,6 +625,9 @@ class Qwen3Model(nn.Module):
             )
 
         if inputs_embeds is None:
+            embedding_device = self.get_input_embeddings().weight.device
+            if input_ids.device != embedding_device:
+                input_ids = input_ids.to(device=embedding_device)
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
         if pixel_values is not None:
@@ -544,14 +643,15 @@ class Qwen3Model(nn.Module):
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         if position_ids is None:
+            metadata_device = input_ids.device if input_ids is not None else inputs_embeds.device
             position_ids = self.compute_3d_position_ids(
-                input_ids=input_ids,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
+                input_ids=_align_tensor_device(input_ids, metadata_device),
+                image_grid_thw=_align_tensor_device(image_grid_thw, metadata_device),
+                video_grid_thw=_align_tensor_device(video_grid_thw, metadata_device),
                 inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
+                attention_mask=_align_tensor_device(attention_mask, metadata_device),
                 past_key_values=past_key_values,
-                mm_token_type_ids=mm_token_type_ids,
+                mm_token_type_ids=_align_tensor_device(mm_token_type_ids, metadata_device),
             )
 
         outputs = self.language_model(
@@ -575,6 +675,22 @@ class Qwen3ForCausalLM(nn.Module):
         self.config = config
         self.model = Qwen3TextModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def configure_runtime(
+        self,
+        execution_device: torch.device,
+        *,
+        offload_experts: bool = False,
+        offload_token_io: bool = False,
+        resident_expert_layers: int = 0,
+    ) -> None:
+        self.model.configure_runtime(
+            execution_device,
+            offload_experts=offload_experts,
+            offload_token_io=offload_token_io,
+            resident_expert_layers=resident_expert_layers,
+        )
+        self.lm_head.to(torch.device("cpu") if offload_token_io else execution_device)
 
     def tie_weights(self) -> None:
         if self.config.tie_word_embeddings:
@@ -601,6 +717,9 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
             hidden_states = hidden_states[:, -logits_to_keep:, :]
+        lm_head_device = self.lm_head.weight.device
+        if hidden_states.device != lm_head_device:
+            hidden_states = hidden_states.to(device=lm_head_device)
         logits = self.lm_head(hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)
 
@@ -611,6 +730,24 @@ class Qwen3ForConditionalGeneration(nn.Module):
         self.config = config
         self.model = Qwen3Model(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+
+    def configure_runtime(
+        self,
+        execution_device: torch.device,
+        *,
+        offload_experts: bool = False,
+        offload_vision: bool = False,
+        offload_token_io: bool = False,
+        resident_expert_layers: int = 0,
+    ) -> None:
+        self.model.configure_runtime(
+            execution_device,
+            offload_experts=offload_experts,
+            offload_vision=offload_vision,
+            offload_token_io=offload_token_io,
+            resident_expert_layers=resident_expert_layers,
+        )
+        self.lm_head.to(torch.device("cpu") if offload_token_io else execution_device)
 
     def tie_weights(self) -> None:
         if self.config.tie_word_embeddings:
@@ -650,5 +787,8 @@ class Qwen3ForConditionalGeneration(nn.Module):
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
             hidden_states = hidden_states[:, -logits_to_keep:, :]
+        lm_head_device = self.lm_head.weight.device
+        if hidden_states.device != lm_head_device:
+            hidden_states = hidden_states.to(device=lm_head_device)
         logits = self.lm_head(hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values, rope_deltas=outputs.rope_deltas)

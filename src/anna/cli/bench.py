@@ -19,6 +19,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video", default=None, help="Optional local video path.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
+    parser.add_argument("--offload-mode", choices=("auto", "none", "experts"), default="auto")
+    parser.add_argument(
+        "--resident-expert-layers",
+        type=int,
+        default=0,
+        help="Keep the first N sparse MoE layers fully resident on the execution device.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -54,6 +61,8 @@ def main() -> None:
         model_id=model_name,
         device=args.device,
         dtype=args.dtype,
+        offload_mode=args.offload_mode,
+        resident_expert_layers=args.resident_expert_layers,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
@@ -69,6 +78,8 @@ def main() -> None:
         model_id=settings.model_id,
         device=settings.device,
         dtype=settings.dtype,
+        offload_mode=settings.offload_mode,
+        resident_expert_layers=settings.resident_expert_layers,
     )
     generation = GenerationConfig(
         max_new_tokens=settings.max_new_tokens,
@@ -106,6 +117,8 @@ def main() -> None:
     print(f"mode={mode}")
     print(f"device={engine.device_context.device}")
     print(f"compute_dtype={engine.device_context.dtype}")
+    print(f"offload_mode={engine.offload_mode}")
+    print(f"resident_expert_layers={engine.resident_expert_layers}")
     print(f"runs={len(latencies)}")
     print(f"avg_latency_seconds={avg_latency:.4f}")
     print(f"min_latency_seconds={min(latencies):.4f}")

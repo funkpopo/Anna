@@ -14,7 +14,7 @@ from anna.model.ops import Qwen3PageAllocator
 from anna.runtime.device import DeviceContext
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
 from anna.sampling.sampler import sample_next_token
-from anna.weights.loader import build_model, load_model_config, load_model_weights
+from anna.weights.loader import build_model, estimate_model_weight_bytes, load_model_config, load_model_weights
 from anna.weights.tokenizer import QwenTokenizer
 
 logger = logging.getLogger(__name__)
@@ -157,6 +157,8 @@ class AnnaEngine:
         model_id: str,
         device_context: DeviceContext,
         quantized_replacements: int = 0,
+        offload_mode: str = "none",
+        resident_expert_layers: int = 0,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -165,6 +167,8 @@ class AnnaEngine:
         self.device_context = device_context
         self.config = model.config
         self.quantized_replacements = quantized_replacements
+        self.offload_mode = offload_mode
+        self.resident_expert_layers = max(0, int(resident_expert_layers))
         self.cache_allocator = Qwen3PageAllocator(self.config.text_config)
         self._attach_cache_allocator()
         self.execution_lock = threading.Lock()
@@ -178,6 +182,8 @@ class AnnaEngine:
         model_id: str | None = None,
         device: str = "auto",
         dtype: str = "auto",
+        offload_mode: str = "auto",
+        resident_expert_layers: int = 0,
     ) -> "AnnaEngine":
         model_path = Path(model_dir)
         config = load_model_config(model_path)
@@ -186,14 +192,33 @@ class AnnaEngine:
             dtype=dtype,
             model_dtype=config.text_config.dtype,
         )
+        resolved_offload_mode = cls._resolve_offload_mode(
+            requested_mode=offload_mode,
+            model_path=model_path,
+            config=config,
+            device_context=device_context,
+        )
+        resolved_resident_expert_layers = cls._resolve_resident_expert_layers(
+            requested_layers=resident_expert_layers,
+            config=config,
+            resolved_offload_mode=resolved_offload_mode,
+        )
+        model_device = torch.device("cpu") if resolved_offload_mode == "experts" else device_context.device
         try:
             model, quantized_replacements = build_model(
                 config,
-                device=device_context.device,
+                device=model_device,
                 dtype=device_context.dtype,
             )
             report = load_model_weights(model, model_path)
             report.quantized_replacements = quantized_replacements
+            model.configure_runtime(
+                device_context.device,
+                offload_experts=resolved_offload_mode == "experts",
+                offload_vision=resolved_offload_mode == "experts",
+                offload_token_io=False,
+                resident_expert_layers=resolved_resident_expert_layers,
+            )
             model.eval()
         except RuntimeError as exc:
             if device_context.should_recover(exc):
@@ -208,11 +233,14 @@ class AnnaEngine:
         resolved_model_id = model_id or model_path.name
 
         logger.info(
-            "Loaded model %s on %s (compute=%s, requested=%s); tensors loaded=%s skipped=%s quantized=%s",
+            "Loaded model %s on %s (compute=%s, requested=%s, offload=%s, resident_expert_layers=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
             resolved_model_id,
             device_context.device,
             device_context.dtype,
             device_context.reported_dtype,
+            resolved_offload_mode,
+            resolved_resident_expert_layers,
+            model_device,
             report.loaded,
             report.skipped,
             report.quantized_replacements,
@@ -225,7 +253,50 @@ class AnnaEngine:
             model_id=resolved_model_id,
             device_context=device_context,
             quantized_replacements=quantized_replacements,
+            offload_mode=resolved_offload_mode,
+            resident_expert_layers=resolved_resident_expert_layers,
         )
+
+    @staticmethod
+    def _resolve_offload_mode(
+        *,
+        requested_mode: str,
+        model_path: Path,
+        config: object,
+        device_context: DeviceContext,
+    ) -> str:
+        normalized = requested_mode.lower()
+        if normalized not in {"auto", "none", "experts"}:
+            raise ValueError(f"Unsupported offload mode: {requested_mode}")
+        if device_context.device.type != "xpu":
+            return "none"
+        if normalized != "auto":
+            return normalized
+
+        memory_info = device_context.get_memory_info()
+        if memory_info is None:
+            return "none"
+
+        weight_bytes = estimate_model_weight_bytes(model_path)
+        if config.text_config.is_moe_model and weight_bytes > int(memory_info.total_bytes * 0.85):
+            return "experts"
+        return "none"
+
+    @staticmethod
+    def _resolve_resident_expert_layers(
+        *,
+        requested_layers: int,
+        config: object,
+        resolved_offload_mode: str,
+    ) -> int:
+        requested = max(0, int(requested_layers))
+        if requested == 0 or resolved_offload_mode != "experts":
+            return 0
+
+        sparse_layer_count = sum(
+            1 for layer_idx in range(config.text_config.num_hidden_layers) if config.text_config.uses_sparse_moe(layer_idx)
+        )
+        return min(requested, sparse_layer_count)
 
     def list_models(self) -> list[str]:
         return [self.default_model_id]
@@ -253,6 +324,9 @@ class AnnaEngine:
             "float8_available": self.device_context.float8_available,
             "quantization": quant_method,
             "quantized_replacements": self.quantized_replacements,
+            "offload_mode": self.offload_mode,
+            "resident_expert_layers": self.resident_expert_layers,
+            "resident_expert_layer_indices": self._resident_expert_layer_indices(),
             "vision_enabled": self.config.vision_config is not None,
             "cache_device": str(self.device_context.migration_policy.execution_device),
             "preprocess_device": str(self.device_context.migration_policy.preprocess_device),
@@ -265,6 +339,20 @@ class AnnaEngine:
                 "reserved_bytes": memory_info.reserved_bytes,
             },
         }
+
+    def _resident_expert_layer_indices(self) -> list[int]:
+        text_model = getattr(getattr(self.model, "model", None), "language_model", None)
+        if text_model is None:
+            text_model = getattr(self.model, "model", None)
+        if text_model is None or not hasattr(text_model, "layers"):
+            return []
+
+        indices: list[int] = []
+        for layer_idx, layer in enumerate(text_model.layers):
+            mlp = getattr(layer, "mlp", None)
+            if getattr(mlp, "resident_experts", False):
+                indices.append(layer_idx)
+        return indices
 
     def generate_text(self, prompt: str, *, config: GenerationConfig) -> TextGenerationResult:
         prepared = self.processor.encode_text(prompt)
@@ -620,6 +708,8 @@ class AnnaEngine:
 
         history_ids.add(token_id)
         appended = next_token.view(1)
+        if history_tensor.device != appended.device:
+            appended = appended.to(device=history_tensor.device)
         if history_tensor.numel() == 0:
             return appended, history_ids
         return torch.cat([history_tensor, appended]), history_ids
