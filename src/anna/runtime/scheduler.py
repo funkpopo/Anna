@@ -114,20 +114,17 @@ class AnnaScheduler:
                 continue
 
             next_active: list[SchedulerRequest] = []
-            grouped: dict[int, list[SchedulerRequest]] = defaultdict(list)
+            ready = [request for request in active if request.past_key_values is not None]
             for request in active:
                 if request.past_key_values is None:
                     self._fail_request(request, RuntimeError("Missing decode cache for active request."))
-                    continue
-                grouped[request.past_key_values.get_seq_length()].append(request)
 
-            for _, group in sorted(grouped.items()):
-                for chunk_start in range(0, len(group), self.max_batch_size):
-                    chunk = group[chunk_start : chunk_start + self.max_batch_size]
-                    try:
-                        next_active.extend(self._decode_batch(chunk))
-                    except Exception as exc:  # pragma: no cover - worker-level best effort
-                        self._fail_requests(chunk, self._normalize_error(exc))
+            for chunk_start in range(0, len(ready), self.max_batch_size):
+                chunk = ready[chunk_start : chunk_start + self.max_batch_size]
+                try:
+                    next_active.extend(self._decode_batch(chunk))
+                except Exception as exc:  # pragma: no cover - worker-level best effort
+                    self._fail_requests(chunk, self._normalize_error(exc))
 
             active = next_active
 
@@ -327,6 +324,9 @@ class AnnaScheduler:
             tail, _ = request.assembler.flush()
             if tail:
                 self._emit_text(request, tail)
+        if request.past_key_values is not None:
+            request.past_key_values.release()
+            request.past_key_values = None
 
         if request.stream:
             from anna.runtime.engine import StreamEvent
@@ -364,6 +364,9 @@ class AnnaScheduler:
 
         normalized = exc if isinstance(exc, AnnaEngineError) else self._normalize_error(exc)
         request.error = normalized
+        if request.past_key_values is not None:
+            request.past_key_values.release()
+            request.past_key_values = None
         if request.stream:
             request.events.put(normalized)
             request.events.put(_DONE)

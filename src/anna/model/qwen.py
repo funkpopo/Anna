@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from anna.model.config import Qwen3Config, Qwen3TextConfig, Qwen3VisionConfig
-from anna.model.ops import Qwen3DecoderLayer, Qwen3DynamicCache, Qwen3RMSNorm, Qwen3TextRotaryEmbedding, rotate_half
+from anna.model.ops import Qwen3DecoderLayer, Qwen3DynamicCache, Qwen3PageAllocator, Qwen3RMSNorm, Qwen3TextRotaryEmbedding, rotate_half
 
 
 @dataclass(slots=True)
@@ -41,6 +41,7 @@ class Qwen3TextModel(nn.Module):
     def __init__(self, config: Qwen3TextConfig):
         super().__init__()
         self.config = config
+        self.cache_allocator: Qwen3PageAllocator | None = None
         padding_idx = config.pad_token_id if 0 <= config.pad_token_id < config.vocab_size else None
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config, idx) for idx in range(config.num_hidden_layers)])
@@ -63,13 +64,17 @@ class Qwen3TextModel(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = Qwen3DynamicCache(self.config)
+            past_key_values = Qwen3DynamicCache(self.config, allocator=self.cache_allocator)
 
         if position_ids is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             seq_len = inputs_embeds.shape[1]
-            position_ids = torch.arange(seq_len, device=inputs_embeds.device).view(1, -1) + past_seen_tokens
-            position_ids = position_ids.expand(inputs_embeds.shape[0], -1)
+            batch_size = inputs_embeds.shape[0]
+            if past_key_values is None or past_key_values.get_batch_size() == 0:
+                past_seen_tokens = torch.zeros(batch_size, device=inputs_embeds.device, dtype=torch.long)
+            else:
+                past_seen_tokens = past_key_values.get_seq_lengths(device=inputs_embeds.device)
+            position_ids = torch.arange(seq_len, device=inputs_embeds.device).view(1, -1)
+            position_ids = position_ids + past_seen_tokens.view(-1, 1)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -518,7 +523,10 @@ class Qwen3Model(nn.Module):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
 
         if use_cache and past_key_values is None:
-            past_key_values = Qwen3DynamicCache(self.config.text_config)
+            past_key_values = Qwen3DynamicCache(
+                self.config.text_config,
+                allocator=self.language_model.cache_allocator,
+            )
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)

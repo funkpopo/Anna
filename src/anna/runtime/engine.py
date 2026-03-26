@@ -10,6 +10,7 @@ import torch
 
 from anna.mm.processor import PreparedInputs, Qwen3MultimodalProcessor
 from anna.model.qwen import Qwen3ForConditionalGeneration
+from anna.model.ops import Qwen3PageAllocator
 from anna.runtime.device import DeviceContext
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
 from anna.sampling.sampler import sample_next_token
@@ -164,6 +165,8 @@ class AnnaEngine:
         self.device_context = device_context
         self.config = model.config
         self.quantized_replacements = quantized_replacements
+        self.cache_allocator = Qwen3PageAllocator(self.config.text_config)
+        self._attach_cache_allocator()
         self.execution_lock = threading.Lock()
         self.scheduler = None
 
@@ -226,6 +229,13 @@ class AnnaEngine:
 
     def list_models(self) -> list[str]:
         return [self.default_model_id]
+
+    def _attach_cache_allocator(self) -> None:
+        text_model = getattr(getattr(self.model, "model", None), "language_model", None)
+        if text_model is None:
+            text_model = getattr(self.model, "model", None)
+        if text_model is not None and hasattr(text_model, "cache_allocator"):
+            text_model.cache_allocator = self.cache_allocator
 
     def set_scheduler(self, scheduler: object | None) -> None:
         self.scheduler = scheduler
@@ -639,57 +649,61 @@ class AnnaEngine:
         video_grid_thw = prepared.video_grid_thw
         past_key_values = None
 
-        for step_idx in range(config.max_new_tokens):
-            try:
-                with self.execution_lock:
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        past_key_values=past_key_values,
-                        pixel_values=pixel_values,
-                        pixel_values_videos=pixel_values_videos,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        mm_token_type_ids=mm_token_type_ids,
-                        use_cache=True,
-                        logits_to_keep=1,
+        try:
+            for step_idx in range(config.max_new_tokens):
+                try:
+                    with self.execution_lock:
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            past_key_values=past_key_values,
+                            pixel_values=pixel_values,
+                            pixel_values_videos=pixel_values_videos,
+                            image_grid_thw=image_grid_thw,
+                            video_grid_thw=video_grid_thw,
+                            mm_token_type_ids=mm_token_type_ids,
+                            use_cache=True,
+                            logits_to_keep=1,
+                        )
+                    logits = outputs.logits[0, -1]
+                    next_token = sample_next_token(
+                        logits,
+                        generated_ids=repetition_history,
+                        temperature=config.temperature,
+                        top_p=config.top_p,
+                        top_k=config.top_k,
+                        repetition_penalty=config.repetition_penalty,
                     )
-                logits = outputs.logits[0, -1]
-                next_token = sample_next_token(
-                    logits,
-                    generated_ids=repetition_history,
-                    temperature=config.temperature,
-                    top_p=config.top_p,
-                    top_k=config.top_k,
-                    repetition_penalty=config.repetition_penalty,
+                    token_id = int(next_token.item())
+                    past_key_values = outputs.past_key_values
+                except RuntimeError as exc:
+                    raise self._handle_runtime_failure(exc) from exc
+
+                if token_id in stop_token_ids:
+                    return completion_ids, "stop", prompt_length, len(completion_ids)
+
+                completion_ids.append(token_id)
+                repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
+                    history_tensor=repetition_history,
+                    history_ids=repetition_history_ids,
+                    next_token=next_token,
                 )
-                token_id = int(next_token.item())
-                past_key_values = outputs.past_key_values
-            except RuntimeError as exc:
-                raise self._handle_runtime_failure(exc) from exc
 
-            if token_id in stop_token_ids:
-                return completion_ids, "stop", prompt_length, len(completion_ids)
+                input_ids = next_token.view(1, 1)
+                attention_mask = None
+                mm_token_type_ids = None
+                pixel_values = None
+                image_grid_thw = None
+                pixel_values_videos = None
+                video_grid_thw = None
 
-            completion_ids.append(token_id)
-            repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
-                history_tensor=repetition_history,
-                history_ids=repetition_history_ids,
-                next_token=next_token,
-            )
+                if step_idx + 1 >= config.max_new_tokens:
+                    break
 
-            input_ids = next_token.view(1, 1)
-            attention_mask = None
-            mm_token_type_ids = None
-            pixel_values = None
-            image_grid_thw = None
-            pixel_values_videos = None
-            video_grid_thw = None
-
-            if step_idx + 1 >= config.max_new_tokens:
-                break
-
-        return completion_ids, "length", prompt_length, len(completion_ids)
+            return completion_ids, "length", prompt_length, len(completion_ids)
+        finally:
+            if past_key_values is not None:
+                past_key_values.release()
 
     @torch.inference_mode()
     def _iter_generation(
@@ -719,69 +733,73 @@ class AnnaEngine:
         video_grid_thw = prepared.video_grid_thw
         past_key_values = None
 
-        for step_idx in range(config.max_new_tokens):
-            try:
-                with self.execution_lock:
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        past_key_values=past_key_values,
-                        pixel_values=pixel_values,
-                        pixel_values_videos=pixel_values_videos,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        mm_token_type_ids=mm_token_type_ids,
-                        use_cache=True,
-                        logits_to_keep=1,
+        try:
+            for step_idx in range(config.max_new_tokens):
+                try:
+                    with self.execution_lock:
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            past_key_values=past_key_values,
+                            pixel_values=pixel_values,
+                            pixel_values_videos=pixel_values_videos,
+                            image_grid_thw=image_grid_thw,
+                            video_grid_thw=video_grid_thw,
+                            mm_token_type_ids=mm_token_type_ids,
+                            use_cache=True,
+                            logits_to_keep=1,
+                        )
+                    logits = outputs.logits[0, -1]
+                    next_token = sample_next_token(
+                        logits,
+                        generated_ids=repetition_history,
+                        temperature=config.temperature,
+                        top_p=config.top_p,
+                        top_k=config.top_k,
+                        repetition_penalty=config.repetition_penalty,
                     )
-                logits = outputs.logits[0, -1]
-                next_token = sample_next_token(
-                    logits,
-                    generated_ids=repetition_history,
-                    temperature=config.temperature,
-                    top_p=config.top_p,
-                    top_k=config.top_k,
-                    repetition_penalty=config.repetition_penalty,
+                    token_id = int(next_token.item())
+                    past_key_values = outputs.past_key_values
+                except RuntimeError as exc:
+                    raise self._handle_runtime_failure(exc) from exc
+
+                if token_id in stop_token_ids:
+                    tail, _ = text_assembler.flush()
+                    if tail:
+                        yield tail, False, None, prompt_length, len(completion_ids)
+                    yield "", True, "stop", prompt_length, len(completion_ids)
+                    return
+
+                completion_ids.append(token_id)
+                repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
+                    history_tensor=repetition_history,
+                    history_ids=repetition_history_ids,
+                    next_token=next_token,
                 )
-                token_id = int(next_token.item())
-                past_key_values = outputs.past_key_values
-            except RuntimeError as exc:
-                raise self._handle_runtime_failure(exc) from exc
+                delta, hit_stop_string = text_assembler.feed_token(token_id)
 
-            if token_id in stop_token_ids:
-                tail, _ = text_assembler.flush()
-                if tail:
-                    yield tail, False, None, prompt_length, len(completion_ids)
-                yield "", True, "stop", prompt_length, len(completion_ids)
-                return
+                input_ids = next_token.view(1, 1)
+                attention_mask = None
+                mm_token_type_ids = None
+                pixel_values = None
+                image_grid_thw = None
+                pixel_values_videos = None
+                video_grid_thw = None
 
-            completion_ids.append(token_id)
-            repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
-                history_tensor=repetition_history,
-                history_ids=repetition_history_ids,
-                next_token=next_token,
-            )
-            delta, hit_stop_string = text_assembler.feed_token(token_id)
+                if delta:
+                    yield delta, False, None, prompt_length, len(completion_ids)
 
-            input_ids = next_token.view(1, 1)
-            attention_mask = None
-            mm_token_type_ids = None
-            pixel_values = None
-            image_grid_thw = None
-            pixel_values_videos = None
-            video_grid_thw = None
+                if hit_stop_string:
+                    yield "", True, "stop", prompt_length, len(completion_ids)
+                    return
 
-            if delta:
-                yield delta, False, None, prompt_length, len(completion_ids)
+                if step_idx + 1 >= config.max_new_tokens:
+                    break
 
-            if hit_stop_string:
-                yield "", True, "stop", prompt_length, len(completion_ids)
-                return
-
-            if step_idx + 1 >= config.max_new_tokens:
-                break
-
-        tail, _ = text_assembler.flush()
-        if tail:
-            yield tail, False, None, prompt_length, len(completion_ids)
-        yield "", True, "length", prompt_length, len(completion_ids)
+            tail, _ = text_assembler.flush()
+            if tail:
+                yield tail, False, None, prompt_length, len(completion_ids)
+            yield "", True, "length", prompt_length, len(completion_ids)
+        finally:
+            if past_key_values is not None:
+                past_key_values.release()

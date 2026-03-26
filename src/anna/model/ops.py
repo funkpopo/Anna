@@ -7,83 +7,227 @@ from torch import nn
 from anna.model.config import Qwen3TextConfig
 
 
-class Qwen3DynamicCache:
+class Qwen3PagedLayerAllocator:
+    def __init__(self, block_size: int) -> None:
+        self.block_size = block_size
+        self.key_pages: torch.Tensor | None = None
+        self.value_pages: torch.Tensor | None = None
+        self.free_pages: list[int] = []
+
+    def allocate(
+        self,
+        num_pages: int,
+        *,
+        key_template: torch.Tensor,
+        value_template: torch.Tensor,
+    ) -> list[int]:
+        page_ids: list[int] = []
+        while self.free_pages and len(page_ids) < num_pages:
+            page_ids.append(self.free_pages.pop())
+
+        missing = num_pages - len(page_ids)
+        if missing > 0:
+            page_ids.extend(self._grow(missing, key_template=key_template, value_template=value_template))
+        return page_ids
+
+    def free(self, page_ids: list[int]) -> None:
+        for page_id in reversed(page_ids):
+            self.free_pages.append(page_id)
+
+    def _grow(
+        self,
+        num_pages: int,
+        *,
+        key_template: torch.Tensor,
+        value_template: torch.Tensor,
+    ) -> list[int]:
+        old_capacity = 0 if self.key_pages is None else int(self.key_pages.shape[0])
+        grow_by = max(num_pages, old_capacity or 16)
+        new_capacity = old_capacity + grow_by
+        key_shape = (new_capacity, key_template.shape[1], self.block_size, key_template.shape[3])
+        value_shape = (new_capacity, value_template.shape[1], self.block_size, value_template.shape[3])
+        new_key_pages = key_template.new_empty(key_shape)
+        new_value_pages = value_template.new_empty(value_shape)
+        if self.key_pages is not None:
+            new_key_pages[:old_capacity].copy_(self.key_pages)
+        if self.value_pages is not None:
+            new_value_pages[:old_capacity].copy_(self.value_pages)
+        self.key_pages = new_key_pages
+        self.value_pages = new_value_pages
+
+        new_page_ids = list(range(old_capacity, new_capacity))
+        allocated = new_page_ids[:num_pages]
+        retained_free = new_page_ids[num_pages:]
+        for page_id in reversed(retained_free):
+            self.free_pages.append(page_id)
+        return allocated
+
+    def to(
+        self,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        kwargs: dict[str, object] = {}
+        if device is not None:
+            kwargs["device"] = device
+        if self.key_pages is not None:
+            if dtype is not None and self.key_pages.is_floating_point():
+                kwargs["dtype"] = dtype
+            self.key_pages = self.key_pages.to(**kwargs)
+        kwargs = {}
+        if device is not None:
+            kwargs["device"] = device
+        if self.value_pages is not None:
+            if dtype is not None and self.value_pages.is_floating_point():
+                kwargs["dtype"] = dtype
+            self.value_pages = self.value_pages.to(**kwargs)
+
+
+class Qwen3PageAllocator:
     def __init__(self, config: Qwen3TextConfig):
         self.config = config
-        self.key_cache: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
-        self.value_cache: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
+        self.block_size = max(1, int(config.cache_block_size))
+        self.layers = [Qwen3PagedLayerAllocator(self.block_size) for _ in range(config.num_hidden_layers)]
+
+    def allocate(
+        self,
+        layer_idx: int,
+        num_pages: int,
+        *,
+        key_template: torch.Tensor,
+        value_template: torch.Tensor,
+    ) -> list[int]:
+        return self.layers[layer_idx].allocate(
+            num_pages,
+            key_template=key_template,
+            value_template=value_template,
+        )
+
+    def free(self, layer_idx: int, page_ids: list[int]) -> None:
+        if page_ids:
+            self.layers[layer_idx].free(page_ids)
+
+    def to(
+        self,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> "Qwen3PageAllocator":
+        for layer in self.layers:
+            layer.to(device=device, dtype=dtype)
+        return self
+
+
+class Qwen3DynamicCache:
+    def __init__(
+        self,
+        config: Qwen3TextConfig,
+        *,
+        allocator: Qwen3PageAllocator | None = None,
+        batch_size: int = 0,
+    ):
+        self.config = config
+        self.allocator = allocator or Qwen3PageAllocator(config)
         self.conv_states: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
         self.recurrent_states: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
-        self.layer_lengths: list[int] = [0 for _ in range(config.num_hidden_layers)]
-        self.seen_tokens = 0
         self.block_size = max(1, int(config.cache_block_size))
+        self.layer_lengths: list[list[int]] = [
+            [0 for _ in range(batch_size)]
+            for _ in range(config.num_hidden_layers)
+        ]
+        self.page_tables: list[list[list[int]]] = [
+            [[] for _ in range(batch_size)]
+            for _ in range(config.num_hidden_layers)
+        ]
+        self.seen_tokens = 0
         self.rope_deltas: torch.Tensor | None = None
+        self._released = False
 
     @property
     def has_previous_state(self) -> bool:
         return any(state is not None for state in self.conv_states) or any(state is not None for state in self.recurrent_states)
 
-    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        current_length = self.layer_lengths[layer_idx]
-        append_length = int(key_states.shape[2])
-        required_length = current_length + append_length
+    def _ensure_batch_size(self, batch_size: int) -> None:
+        if not self.layer_lengths or not self.layer_lengths[0]:
+            self.layer_lengths = [[0 for _ in range(batch_size)] for _ in range(self.config.num_hidden_layers)]
+            self.page_tables = [[[] for _ in range(batch_size)] for _ in range(self.config.num_hidden_layers)]
+            return
+        if len(self.layer_lengths[0]) != batch_size:
+            raise ValueError(f"Cache batch size mismatch: expected {len(self.layer_lengths[0])}, got {batch_size}")
 
-        key_cache = self._ensure_capacity(
-            cache=self.key_cache[layer_idx],
-            source=key_states,
-            current_length=current_length,
-            required_length=required_length,
-        )
-        value_cache = self._ensure_capacity(
-            cache=self.value_cache[layer_idx],
-            source=value_states,
-            current_length=current_length,
-            required_length=required_length,
-        )
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, _, append_length, _ = key_states.shape
+        self._ensure_batch_size(batch_size)
+        past_lengths = torch.tensor(self.layer_lengths[layer_idx], device=key_states.device, dtype=torch.long)
 
-        key_cache[:, :, current_length:required_length, :].copy_(key_states)
-        value_cache[:, :, current_length:required_length, :].copy_(value_states)
+        for batch_idx in range(batch_size):
+            current_length = self.layer_lengths[layer_idx][batch_idx]
+            required_length = current_length + append_length
+            required_blocks = (required_length + self.block_size - 1) // self.block_size
+            page_table = self.page_tables[layer_idx][batch_idx]
+            if len(page_table) < required_blocks:
+                page_table.extend(
+                    self.allocator.allocate(
+                        layer_idx,
+                        required_blocks - len(page_table),
+                        key_template=key_states,
+                        value_template=value_states,
+                    )
+                )
 
-        self.key_cache[layer_idx] = key_cache
-        self.value_cache[layer_idx] = value_cache
-        self.layer_lengths[layer_idx] = required_length
-        self.seen_tokens = max(self.seen_tokens, required_length)
+            self._write_pages(
+                layer_idx=layer_idx,
+                page_ids=page_table,
+                start_position=current_length,
+                key_states=key_states[batch_idx],
+                value_states=value_states[batch_idx],
+            )
+            self.layer_lengths[layer_idx][batch_idx] = required_length
 
-        return key_cache[:, :, :required_length, :], value_cache[:, :, :required_length, :]
+        self.seen_tokens = max(self.get_seq_lengths().tolist(), default=0)
+        gathered_key, gathered_value, _ = self._gather_layer_cache(layer_idx)
+        return gathered_key, gathered_value, past_lengths
 
-    def _ensure_capacity(
+    def _write_pages(
         self,
         *,
-        cache: torch.Tensor | None,
-        source: torch.Tensor,
-        current_length: int,
-        required_length: int,
-    ) -> torch.Tensor:
-        if cache is None:
-            capacity = self._round_capacity(required_length)
-            shape = (*source.shape[:2], capacity, source.shape[3])
-            return source.new_empty(shape)
+        layer_idx: int,
+        page_ids: list[int],
+        start_position: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> None:
+        layer = self.allocator.layers[layer_idx]
+        if layer.key_pages is None or layer.value_pages is None:
+            raise RuntimeError(f"Layer {layer_idx} pages are not initialized.")
 
-        if required_length <= cache.shape[2]:
-            return cache
-
-        new_capacity = self._round_capacity(required_length)
-        expanded = cache.new_empty((*cache.shape[:2], new_capacity, cache.shape[3]))
-        if current_length > 0:
-            expanded[:, :, :current_length, :].copy_(cache[:, :, :current_length, :])
-        return expanded
-
-    def _round_capacity(self, required_length: int) -> int:
-        return max(self.block_size, ((required_length + self.block_size - 1) // self.block_size) * self.block_size)
-
-    def get_seq_length(self) -> int:
-        return self.seen_tokens
+        remaining = int(key_states.shape[1])
+        src_offset = 0
+        current_position = start_position
+        while remaining > 0:
+            block_idx = current_position // self.block_size
+            block_offset = current_position % self.block_size
+            take = min(remaining, self.block_size - block_offset)
+            page_id = page_ids[block_idx]
+            layer.key_pages[page_id, :, block_offset : block_offset + take, :].copy_(
+                key_states[:, src_offset : src_offset + take, :]
+            )
+            layer.value_pages[page_id, :, block_offset : block_offset + take, :].copy_(
+                value_states[:, src_offset : src_offset + take, :]
+            )
+            current_position += take
+            src_offset += take
+            remaining -= take
 
     def get_batch_size(self) -> int:
-        for layer_idx in range(self.config.num_hidden_layers):
-            key_tensor = self.key_cache[layer_idx]
-            if key_tensor is not None:
-                return int(key_tensor.shape[0])
+        if self.layer_lengths and self.layer_lengths[0]:
+            return len(self.layer_lengths[0])
         for state_group in (self.conv_states, self.recurrent_states):
             for state in state_group:
                 if state is not None:
@@ -92,44 +236,94 @@ class Qwen3DynamicCache:
             return int(self.rope_deltas.shape[0])
         return 0
 
+    def get_seq_length(self, batch_idx: int | None = None) -> int:
+        if batch_idx is not None:
+            return self._request_seq_length(batch_idx)
+        batch_size = self.get_batch_size()
+        if batch_size == 0:
+            return 0
+        if batch_size == 1:
+            return self._request_seq_length(0)
+        return max(self._request_seq_length(idx) for idx in range(batch_size))
+
+    def get_seq_lengths(self, *, device: torch.device | None = None) -> torch.Tensor:
+        lengths = [self._request_seq_length(idx) for idx in range(self.get_batch_size())]
+        return torch.tensor(lengths, dtype=torch.long, device=device)
+
+    def _request_seq_length(self, batch_idx: int) -> int:
+        for layer_idx in range(self.config.num_hidden_layers):
+            length = self.layer_lengths[layer_idx][batch_idx]
+            if length > 0:
+                return length
+        return 0
+
     def visible_key_cache(self, layer_idx: int) -> torch.Tensor | None:
-        tensor = self.key_cache[layer_idx]
-        if tensor is None:
-            return None
-        return tensor[:, :, : self.layer_lengths[layer_idx], :]
+        key_tensor, _, _ = self._gather_layer_cache(layer_idx)
+        return key_tensor
 
     def visible_value_cache(self, layer_idx: int) -> torch.Tensor | None:
-        tensor = self.value_cache[layer_idx]
-        if tensor is None:
-            return None
-        return tensor[:, :, : self.layer_lengths[layer_idx], :]
+        _, value_tensor, _ = self._gather_layer_cache(layer_idx)
+        return value_tensor
+
+    def _gather_layer_cache(self, layer_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+        batch_size = self.get_batch_size()
+        if batch_size == 0:
+            empty_lengths = torch.zeros(0, dtype=torch.long)
+            return None, None, empty_lengths
+
+        visible_lengths = torch.tensor(self.layer_lengths[layer_idx], dtype=torch.long)
+        max_length = int(visible_lengths.max().item()) if visible_lengths.numel() > 0 else 0
+        if max_length <= 0:
+            return None, None, visible_lengths
+
+        layer = self.allocator.layers[layer_idx]
+        if layer.key_pages is None or layer.value_pages is None:
+            return None, None, visible_lengths
+
+        key_batch = layer.key_pages.new_zeros(
+            (batch_size, layer.key_pages.shape[1], max_length, layer.key_pages.shape[3])
+        )
+        value_batch = layer.value_pages.new_zeros(
+            (batch_size, layer.value_pages.shape[1], max_length, layer.value_pages.shape[3])
+        )
+
+        for batch_idx, length in enumerate(self.layer_lengths[layer_idx]):
+            copied = 0
+            for page_id in self.page_tables[layer_idx][batch_idx]:
+                if copied >= length:
+                    break
+                take = min(self.block_size, length - copied)
+                key_batch[batch_idx, :, copied : copied + take, :].copy_(layer.key_pages[page_id, :, :take, :])
+                value_batch[batch_idx, :, copied : copied + take, :].copy_(layer.value_pages[page_id, :, :take, :])
+                copied += take
+
+        return key_batch, value_batch, visible_lengths
 
     @classmethod
     def stack(cls, caches: list["Qwen3DynamicCache"], config: Qwen3TextConfig) -> "Qwen3DynamicCache":
         if not caches:
             return cls(config)
 
-        seq_lengths = {cache.get_seq_length() for cache in caches}
-        if len(seq_lengths) > 1:
-            raise ValueError(f"Cannot stack caches with mixed sequence lengths: {sorted(seq_lengths)}")
+        if any(cache.allocator is not caches[0].allocator for cache in caches):
+            raise ValueError("Cannot stack caches from different allocators.")
 
-        stacked = cls(config)
-        stacked.seen_tokens = caches[0].get_seq_length()
-        stacked.layer_lengths = list(caches[0].layer_lengths)
-        stacked.rope_deltas = None if caches[0].rope_deltas is None else torch.cat([cache.rope_deltas for cache in caches], dim=0)
+        rows: list[Qwen3DynamicCache] = []
+        for cache in caches:
+            if cache.get_batch_size() <= 1:
+                rows.append(cache)
+            else:
+                rows.extend(cache.split_batch())
+
+        stacked = cls(config, allocator=rows[0].allocator, batch_size=len(rows))
+        for layer_idx in range(config.num_hidden_layers):
+            stacked.layer_lengths[layer_idx] = [row.layer_lengths[layer_idx][0] for row in rows]
+        stacked.seen_tokens = max(stacked.get_seq_lengths().tolist(), default=0)
+        stacked.rope_deltas = None if rows[0].rope_deltas is None else torch.cat([row.rope_deltas for row in rows], dim=0)
 
         for layer_idx in range(config.num_hidden_layers):
-            keys = [cache.visible_key_cache(layer_idx) for cache in caches]
-            if all(key is None for key in keys):
-                stacked.key_cache[layer_idx] = None
-                stacked.value_cache[layer_idx] = None
-            elif any(key is None for key in keys):
-                raise ValueError(f"Cannot stack partially initialized key/value caches at layer {layer_idx}")
-            else:
-                stacked.key_cache[layer_idx] = torch.cat(keys, dim=0)
-                stacked.value_cache[layer_idx] = torch.cat([cache.visible_value_cache(layer_idx) for cache in caches], dim=0)
+            stacked.page_tables[layer_idx] = [list(row.page_tables[layer_idx][0]) for row in rows]
 
-            conv_states = [cache.conv_states[layer_idx] for cache in caches]
+            conv_states = [row.conv_states[layer_idx] for row in rows]
             if all(state is None for state in conv_states):
                 stacked.conv_states[layer_idx] = None
             elif any(state is None for state in conv_states):
@@ -137,7 +331,7 @@ class Qwen3DynamicCache:
             else:
                 stacked.conv_states[layer_idx] = torch.cat(conv_states, dim=0)
 
-            recurrent_states = [cache.recurrent_states[layer_idx] for cache in caches]
+            recurrent_states = [row.recurrent_states[layer_idx] for row in rows]
             if all(state is None for state in recurrent_states):
                 stacked.recurrent_states[layer_idx] = None
             elif any(state is None for state in recurrent_states):
@@ -152,10 +346,11 @@ class Qwen3DynamicCache:
         if batch_size <= 1:
             return [self]
 
-        outputs = [Qwen3DynamicCache(self.config) for _ in range(batch_size)]
-        for cache in outputs:
-            cache.seen_tokens = self.seen_tokens
-            cache.layer_lengths = list(self.layer_lengths)
+        outputs = [Qwen3DynamicCache(self.config, allocator=self.allocator, batch_size=1) for _ in range(batch_size)]
+        for batch_idx, cache in enumerate(outputs):
+            for layer_idx in range(self.config.num_hidden_layers):
+                cache.layer_lengths[layer_idx][0] = self.layer_lengths[layer_idx][batch_idx]
+            cache.seen_tokens = cache.get_seq_length()
 
         if self.rope_deltas is not None:
             rope_chunks = self.rope_deltas.split(1, dim=0)
@@ -163,35 +358,32 @@ class Qwen3DynamicCache:
                 outputs[idx].rope_deltas = chunk
 
         for layer_idx in range(self.config.num_hidden_layers):
-            key_tensor = self.visible_key_cache(layer_idx)
-            value_tensor = self.visible_value_cache(layer_idx)
-            conv_state = self.conv_states[layer_idx]
-            recurrent_state = self.recurrent_states[layer_idx]
-            if key_tensor is not None:
-                key_chunks = key_tensor.split(1, dim=0)
-                value_chunks = value_tensor.split(1, dim=0) if value_tensor is not None else []
-                for idx, chunk in enumerate(key_chunks):
-                    outputs[idx].key_cache[layer_idx] = outputs[idx]._ensure_capacity(
-                        cache=None,
-                        source=chunk,
-                        current_length=0,
-                        required_length=self.layer_lengths[layer_idx],
-                    )
-                    outputs[idx].value_cache[layer_idx] = outputs[idx]._ensure_capacity(
-                        cache=None,
-                        source=value_chunks[idx],
-                        current_length=0,
-                        required_length=self.layer_lengths[layer_idx],
-                    )
-                    outputs[idx].key_cache[layer_idx][:, :, : self.layer_lengths[layer_idx], :].copy_(chunk)
-                    outputs[idx].value_cache[layer_idx][:, :, : self.layer_lengths[layer_idx], :].copy_(value_chunks[idx])
-            if conv_state is not None:
-                for idx, chunk in enumerate(conv_state.split(1, dim=0)):
+            for idx in range(batch_size):
+                outputs[idx].page_tables[layer_idx][0] = list(self.page_tables[layer_idx][idx])
+            if self.conv_states[layer_idx] is not None:
+                for idx, chunk in enumerate(self.conv_states[layer_idx].split(1, dim=0)):
                     outputs[idx].conv_states[layer_idx] = chunk.clone()
-            if recurrent_state is not None:
-                for idx, chunk in enumerate(recurrent_state.split(1, dim=0)):
+            if self.recurrent_states[layer_idx] is not None:
+                for idx, chunk in enumerate(self.recurrent_states[layer_idx].split(1, dim=0)):
                     outputs[idx].recurrent_states[layer_idx] = chunk.clone()
         return outputs
+
+    def release(self) -> None:
+        if self._released:
+            return
+
+        for layer_idx in range(self.config.num_hidden_layers):
+            for page_ids in self.page_tables[layer_idx]:
+                self.allocator.free(layer_idx, page_ids)
+                page_ids.clear()
+            for batch_idx in range(len(self.layer_lengths[layer_idx])):
+                self.layer_lengths[layer_idx][batch_idx] = 0
+            self.conv_states[layer_idx] = None
+            self.recurrent_states[layer_idx] = None
+
+        self.seen_tokens = 0
+        self.rope_deltas = None
+        self._released = True
 
     def to(
         self,
@@ -209,11 +401,10 @@ class Qwen3DynamicCache:
                 kwargs["dtype"] = dtype
             return tensor.to(**kwargs)
 
-        self.key_cache = [_move_tensor(tensor) for tensor in self.key_cache]
-        self.value_cache = [_move_tensor(tensor) for tensor in self.value_cache]
         self.conv_states = [_move_tensor(tensor) for tensor in self.conv_states]
         self.recurrent_states = [_move_tensor(tensor) for tensor in self.recurrent_states]
         self.rope_deltas = _move_tensor(self.rope_deltas)
+        self.allocator.to(device=device, dtype=dtype)
         return self
 
 
@@ -476,12 +667,18 @@ class Qwen3Attention(nn.Module):
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-    def _causal_mask(self, query_len: int, key_len: int, past_len: int, device: torch.device) -> torch.Tensor | None:
+    def _causal_mask(
+        self,
+        query_len: int,
+        key_len: int,
+        past_lengths: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor | None:
         if query_len == 1:
             return None
-        q_positions = past_len + torch.arange(query_len, device=device)
-        k_positions = torch.arange(key_len, device=device)
-        return k_positions.unsqueeze(0) > q_positions.unsqueeze(-1)
+        q_positions = past_lengths[:, None] + torch.arange(query_len, device=device)[None, :]
+        k_positions = torch.arange(key_len, device=device)[None, None, :]
+        return k_positions > q_positions[:, :, None]
 
     def forward(
         self,
@@ -508,19 +705,23 @@ class Qwen3Attention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        past_len = 0
+        past_lengths = torch.zeros(batch_size, device=hidden_states.device, dtype=torch.long)
         if past_key_values is not None:
-            past_len = past_key_values.get_seq_length()
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+            key_states, value_states, past_lengths = past_key_values.update(key_states, value_states, self.layer_idx)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         attn_scores = torch.matmul(query_states, key_states.transpose(-1, -2)) * self.scaling
+        visible_lengths = past_lengths + seq_len
 
-        causal_mask = self._causal_mask(seq_len, key_states.shape[-2], past_len, hidden_states.device)
+        causal_mask = self._causal_mask(seq_len, key_states.shape[-2], past_lengths, hidden_states.device)
         if causal_mask is not None:
-            attn_scores = attn_scores.masked_fill(causal_mask.view(1, 1, seq_len, -1), float("-inf"))
-        if attention_mask is not None and past_len == 0:
+            attn_scores = attn_scores.masked_fill(causal_mask.unsqueeze(1), float("-inf"))
+
+        key_positions = torch.arange(key_states.shape[-2], device=hidden_states.device)[None, :]
+        visible_mask = key_positions < visible_lengths[:, None]
+        attn_scores = attn_scores.masked_fill(~visible_mask[:, None, None, :], float("-inf"))
+        if attention_mask is not None and past_key_values is None:
             key_padding_mask = attention_mask[:, None, None, :].to(dtype=torch.bool)
             attn_scores = attn_scores.masked_fill(~key_padding_mask, float("-inf"))
 
