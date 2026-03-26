@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from anna.model.config import Qwen3TextConfig
+from anna.model.quantization import convert_module_linears_to_xpu_int4
 
 
 def _module_device(module: nn.Module) -> torch.device:
@@ -867,6 +868,8 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.offload_experts = False
         self.resident_experts = False
         self.execution_device: torch.device | None = None
+        self.expert_quant: str = "none"
+        self.expert_quant_group_size: int = 128
         self.cached_experts_per_layer: int = max(self.top_k, 8)
         self._expert_cache: OrderedDict[int, Qwen3MLP] = OrderedDict()
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
@@ -882,15 +885,37 @@ class Qwen3SparseMoeBlock(nn.Module):
         *,
         offload_experts: bool,
         resident_experts: bool = False,
+        expert_quant: str = "none",
+        expert_quant_group_size: int = 128,
+        cached_experts_per_layer: int | None = None,
     ) -> None:
         self.execution_device = execution_device
         self.resident_experts = resident_experts
         self.offload_experts = offload_experts and not resident_experts
+        self.expert_quant = expert_quant
+        self.expert_quant_group_size = expert_quant_group_size
+        if cached_experts_per_layer is not None:
+            self.cached_experts_per_layer = max(0, min(int(cached_experts_per_layer), self.num_experts))
         self._expert_cache.clear()
 
-        expert_device = execution_device if resident_experts or not offload_experts else torch.device("cpu")
-        for expert in self.experts:
-            expert.to(expert_device)
+        if resident_experts and self._should_use_xpu_int4():
+            for expert in self.experts:
+                convert_module_linears_to_xpu_int4(
+                    expert,
+                    group_size=self.expert_quant_group_size,
+                    device=execution_device,
+                )
+        else:
+            expert_device = execution_device if resident_experts or not offload_experts else torch.device("cpu")
+            for expert in self.experts:
+                expert.to(expert_device)
+
+    def _should_use_xpu_int4(self) -> bool:
+        return (
+            self.execution_device is not None
+            and self.execution_device.type == "xpu"
+            and self.expert_quant == "int4"
+        )
 
     def _get_cached_expert(self, expert_idx: int) -> Qwen3MLP | None:
         if not self.offload_experts or self.execution_device is None or self.cached_experts_per_layer <= 0:
@@ -901,7 +926,15 @@ class Qwen3SparseMoeBlock(nn.Module):
             return cached
 
         source = self.experts[expert_idx]
-        cached = copy.deepcopy(source).to(self.execution_device)
+        cached = copy.deepcopy(source)
+        if self._should_use_xpu_int4():
+            convert_module_linears_to_xpu_int4(
+                cached,
+                group_size=self.expert_quant_group_size,
+                device=self.execution_device,
+            )
+        else:
+            cached = cached.to(self.execution_device)
         if len(self._expert_cache) >= self.cached_experts_per_layer:
             self._expert_cache.popitem(last=False)
         self._expert_cache[expert_idx] = cached

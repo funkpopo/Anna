@@ -196,6 +196,7 @@ def test_qwen3_runtime_can_pin_sparse_moe_layers_by_decoder_index() -> None:
         torch.device("cpu"),
         offload_experts=True,
         resident_expert_layer_indices=(1,),
+        cached_experts_per_layer=3,
     )
 
     resident_layer_indices = [
@@ -204,6 +205,8 @@ def test_qwen3_runtime_can_pin_sparse_moe_layers_by_decoder_index() -> None:
         if isinstance(layer.mlp, Qwen3SparseMoeBlock) and layer.mlp.resident_experts
     ]
     assert resident_layer_indices == [1]
+    offloaded_sparse_layers = [layer.mlp for layer in model.model.layers if isinstance(layer.mlp, Qwen3SparseMoeBlock) and layer.mlp.offload_experts]
+    assert all(layer.cached_experts_per_layer == 3 for layer in offloaded_sparse_layers)
 
 
 def test_engine_resolves_explicit_resident_expert_indices() -> None:

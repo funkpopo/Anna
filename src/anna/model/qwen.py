@@ -79,6 +79,8 @@ class Qwen3TextModel(nn.Module):
         offload_token_io: bool = False,
         resident_expert_layers: int = 0,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
+        expert_quant: str = "none",
+        cached_experts_per_layer: int | None = None,
     ) -> None:
         self.execution_device = execution_device
         self.embed_tokens.to(torch.device("cpu") if offload_token_io else execution_device)
@@ -109,6 +111,8 @@ class Qwen3TextModel(nn.Module):
                     execution_device,
                     offload_experts=offload_experts,
                     resident_experts=resident_experts,
+                    expert_quant=expert_quant,
+                    cached_experts_per_layer=cached_experts_per_layer,
                 )
             else:
                 layer.mlp.to(execution_device)
@@ -431,6 +435,8 @@ class Qwen3Model(nn.Module):
         offload_token_io: bool = False,
         resident_expert_layers: int = 0,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
+        expert_quant: str = "none",
+        cached_experts_per_layer: int | None = None,
     ) -> None:
         self.language_model.configure_runtime(
             execution_device,
@@ -438,6 +444,8 @@ class Qwen3Model(nn.Module):
             offload_token_io=offload_token_io,
             resident_expert_layers=resident_expert_layers,
             resident_expert_layer_indices=resident_expert_layer_indices,
+            expert_quant=expert_quant,
+            cached_experts_per_layer=cached_experts_per_layer,
         )
         if self.visual is not None:
             self.visual.to(torch.device("cpu") if offload_vision else execution_device)
@@ -691,6 +699,8 @@ class Qwen3ForCausalLM(nn.Module):
         offload_token_io: bool = False,
         resident_expert_layers: int = 0,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
+        expert_quant: str = "none",
+        cached_experts_per_layer: int | None = None,
     ) -> None:
         self.model.configure_runtime(
             execution_device,
@@ -698,6 +708,8 @@ class Qwen3ForCausalLM(nn.Module):
             offload_token_io=offload_token_io,
             resident_expert_layers=resident_expert_layers,
             resident_expert_layer_indices=resident_expert_layer_indices,
+            expert_quant=expert_quant,
+            cached_experts_per_layer=cached_experts_per_layer,
         )
         self.lm_head.to(torch.device("cpu") if offload_token_io else execution_device)
 
@@ -749,6 +761,8 @@ class Qwen3ForConditionalGeneration(nn.Module):
         offload_token_io: bool = False,
         resident_expert_layers: int = 0,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
+        expert_quant: str = "none",
+        cached_experts_per_layer: int | None = None,
     ) -> None:
         self.model.configure_runtime(
             execution_device,
@@ -757,6 +771,8 @@ class Qwen3ForConditionalGeneration(nn.Module):
             offload_token_io=offload_token_io,
             resident_expert_layers=resident_expert_layers,
             resident_expert_layer_indices=resident_expert_layer_indices,
+            expert_quant=expert_quant,
+            cached_experts_per_layer=cached_experts_per_layer,
         )
         self.lm_head.to(torch.device("cpu") if offload_token_io else execution_device)
 

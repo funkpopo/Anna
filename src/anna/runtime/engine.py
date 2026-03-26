@@ -10,6 +10,7 @@ from typing import Any, Iterator
 import torch
 
 from anna.mm.processor import PreparedInputs, Qwen3MultimodalProcessor
+from anna.model.quantization import estimate_module_xpu_int4_bytes
 from anna.model.qwen import Qwen3ForConditionalGeneration
 from anna.model.ops import Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.runtime.device import DeviceContext
@@ -159,7 +160,9 @@ class AnnaEngine:
         device_context: DeviceContext,
         quantized_replacements: int = 0,
         offload_mode: str = "none",
+        expert_quant: str = "none",
         resident_expert_layer_indices: tuple[int, ...] = (),
+        cached_experts_per_layer: int = 0,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -169,8 +172,10 @@ class AnnaEngine:
         self.config = model.config
         self.quantized_replacements = quantized_replacements
         self.offload_mode = offload_mode
+        self.expert_quant = expert_quant
         self.resident_expert_layer_indices = tuple(resident_expert_layer_indices)
         self.resident_expert_layers = len(self.resident_expert_layer_indices)
+        self.cached_experts_per_layer = max(0, int(cached_experts_per_layer))
         self.cache_allocator = Qwen3PageAllocator(self.config.text_config)
         self._attach_cache_allocator()
         self.execution_lock = threading.Lock()
@@ -185,8 +190,10 @@ class AnnaEngine:
         device: str = "auto",
         dtype: str = "auto",
         offload_mode: str = "auto",
+        expert_quant: str = "auto",
         resident_expert_layers: int | None = None,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
+        cached_experts_per_layer: int | None = None,
     ) -> "AnnaEngine":
         model_path = Path(model_dir)
         config = load_model_config(model_path)
@@ -201,10 +208,19 @@ class AnnaEngine:
             config=config,
             device_context=device_context,
         )
+        resolved_expert_quant = cls._resolve_expert_quant(
+            requested_quant=expert_quant,
+            resolved_offload_mode=resolved_offload_mode,
+            device_context=device_context,
+        )
         resolved_resident_expert_layer_indices = cls._resolve_resident_expert_layer_indices(
             requested_layers=resident_expert_layers,
             requested_indices=resident_expert_layer_indices,
             config=config,
+            resolved_offload_mode=resolved_offload_mode,
+        )
+        resolved_cached_experts_per_layer = cls._resolve_cached_experts_per_layer(
+            requested_cached_experts_per_layer=cached_experts_per_layer,
             resolved_offload_mode=resolved_offload_mode,
         )
         model_device = torch.device("cpu") if resolved_offload_mode == "experts" else device_context.device
@@ -217,28 +233,53 @@ class AnnaEngine:
             report = load_model_weights(model, model_path)
             report.quantized_replacements = quantized_replacements
             auto_resident_indices = resolved_resident_expert_layer_indices is None
+            auto_cached_experts_per_layer = resolved_cached_experts_per_layer is None
+            initial_resident_expert_layer_indices = () if auto_resident_indices else resolved_resident_expert_layer_indices
+            initial_cached_experts_per_layer = 0 if auto_cached_experts_per_layer else resolved_cached_experts_per_layer
+
             model.configure_runtime(
                 device_context.device,
                 offload_experts=resolved_offload_mode == "experts",
                 offload_vision=resolved_offload_mode == "experts",
                 offload_token_io=False,
                 resident_expert_layers=0,
-                resident_expert_layer_indices=() if auto_resident_indices else resolved_resident_expert_layer_indices,
+                resident_expert_layer_indices=initial_resident_expert_layer_indices,
+                expert_quant=resolved_expert_quant,
+                cached_experts_per_layer=initial_cached_experts_per_layer,
             )
             if auto_resident_indices:
                 resolved_resident_expert_layer_indices = cls._estimate_resident_expert_layer_indices(
                     model=model,
                     device_context=device_context,
+                    expert_quant=resolved_expert_quant,
                 )
-                if resolved_resident_expert_layer_indices:
-                    model.configure_runtime(
-                        device_context.device,
-                        offload_experts=True,
-                        offload_vision=True,
-                        offload_token_io=False,
-                        resident_expert_layers=0,
-                        resident_expert_layer_indices=resolved_resident_expert_layer_indices,
-                    )
+                model.configure_runtime(
+                    device_context.device,
+                    offload_experts=resolved_offload_mode == "experts",
+                    offload_vision=resolved_offload_mode == "experts",
+                    offload_token_io=False,
+                    resident_expert_layers=0,
+                    resident_expert_layer_indices=resolved_resident_expert_layer_indices,
+                    expert_quant=resolved_expert_quant,
+                    cached_experts_per_layer=initial_cached_experts_per_layer,
+                )
+            if auto_cached_experts_per_layer:
+                resolved_cached_experts_per_layer = cls._estimate_cached_experts_per_layer(
+                    model=model,
+                    device_context=device_context,
+                    expert_quant=resolved_expert_quant,
+                )
+                model.configure_runtime(
+                    device_context.device,
+                    offload_experts=resolved_offload_mode == "experts",
+                    offload_vision=resolved_offload_mode == "experts",
+                    offload_token_io=False,
+                    resident_expert_layers=0,
+                    resident_expert_layer_indices=resolved_resident_expert_layer_indices,
+                    expert_quant=resolved_expert_quant,
+                    cached_experts_per_layer=resolved_cached_experts_per_layer,
+                )
+            resolved_cached_experts_per_layer = cls._effective_cached_experts_per_layer(model)
             model.eval()
         except RuntimeError as exc:
             if device_context.should_recover(exc):
@@ -253,14 +294,16 @@ class AnnaEngine:
         resolved_model_id = model_id or model_path.name
 
         logger.info(
-            "Loaded model %s on %s (compute=%s, requested=%s, offload=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
+            "Loaded model %s on %s (compute=%s, requested=%s, offload=%s, expert_quant=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
             resolved_model_id,
             device_context.device,
             device_context.dtype,
             device_context.reported_dtype,
             resolved_offload_mode,
+            resolved_expert_quant,
             len(resolved_resident_expert_layer_indices or ()),
             list(resolved_resident_expert_layer_indices or ()),
+            resolved_cached_experts_per_layer,
             model_device,
             report.loaded,
             report.skipped,
@@ -275,7 +318,9 @@ class AnnaEngine:
             device_context=device_context,
             quantized_replacements=quantized_replacements,
             offload_mode=resolved_offload_mode,
+            expert_quant=resolved_expert_quant,
             resident_expert_layer_indices=tuple(resolved_resident_expert_layer_indices or ()),
+            cached_experts_per_layer=int(resolved_cached_experts_per_layer or 0),
         )
 
     @staticmethod
@@ -302,6 +347,34 @@ class AnnaEngine:
         if config.text_config.is_moe_model and weight_bytes > int(memory_info.total_bytes * 0.85):
             return "experts"
         return "none"
+
+    @staticmethod
+    def _resolve_expert_quant(
+        *,
+        requested_quant: str,
+        resolved_offload_mode: str,
+        device_context: DeviceContext,
+    ) -> str:
+        normalized = requested_quant.lower()
+        if normalized not in {"auto", "none", "int4"}:
+            raise ValueError(f"Unsupported expert quant mode: {requested_quant}")
+        if resolved_offload_mode != "experts" or device_context.device.type != "xpu":
+            return "none"
+        if normalized == "auto":
+            return "int4"
+        return normalized
+
+    @staticmethod
+    def _resolve_cached_experts_per_layer(
+        *,
+        requested_cached_experts_per_layer: int | None,
+        resolved_offload_mode: str,
+    ) -> int | None:
+        if resolved_offload_mode != "experts":
+            return 0
+        if requested_cached_experts_per_layer is None:
+            return None
+        return max(0, int(requested_cached_experts_per_layer))
 
     @staticmethod
     def _sparse_moe_layer_indices(config: object) -> list[int]:
@@ -369,12 +442,67 @@ class AnnaEngine:
             total += tensor.nelement() * tensor.element_size()
         return total
 
+    @staticmethod
+    def _text_model(model: Qwen3ForConditionalGeneration) -> object | None:
+        text_model = getattr(getattr(model, "model", None), "language_model", None)
+        if text_model is None:
+            text_model = getattr(model, "model", None)
+        return text_model
+
+    @classmethod
+    def _offloaded_sparse_moe_blocks(cls, model: Qwen3ForConditionalGeneration) -> list[tuple[int, Qwen3SparseMoeBlock]]:
+        text_model = cls._text_model(model)
+        if text_model is None or not hasattr(text_model, "layers"):
+            return []
+        blocks: list[tuple[int, Qwen3SparseMoeBlock]] = []
+        for layer_idx, layer in enumerate(text_model.layers):
+            if isinstance(getattr(layer, "mlp", None), Qwen3SparseMoeBlock) and layer.mlp.offload_experts:
+                blocks.append((layer_idx, layer.mlp))
+        return blocks
+
+    @classmethod
+    def _effective_cached_experts_per_layer(cls, model: Qwen3ForConditionalGeneration) -> int:
+        offloaded_blocks = cls._offloaded_sparse_moe_blocks(model)
+        if offloaded_blocks:
+            return int(offloaded_blocks[0][1].cached_experts_per_layer)
+
+        text_model = cls._text_model(model)
+        if text_model is None or not hasattr(text_model, "layers"):
+            return 0
+        for layer in text_model.layers:
+            if isinstance(getattr(layer, "mlp", None), Qwen3SparseMoeBlock):
+                return int(layer.mlp.cached_experts_per_layer)
+        return 0
+
+    @staticmethod
+    def _estimate_resident_budget_bytes(
+        *,
+        memory_info: object,
+        safety: object,
+        expert_quant: str,
+    ) -> tuple[int, int, float]:
+        if expert_quant == "int4":
+            target_free_bytes = max(2304 << 20, int(memory_info.total_bytes * 0.16))
+            budget_factor = 1.10
+            budget_bytes = int(max(0, int(memory_info.free_bytes) - target_free_bytes) / budget_factor)
+            return budget_bytes, target_free_bytes, budget_factor
+
+        reserve_bytes = max(
+            int(safety.min_free_bytes),
+            int(safety.reserve_margin_bytes),
+            int(memory_info.total_bytes * (1.0 - safety.max_estimated_usage_ratio)),
+        )
+        budget_factor = max(1.0, float(safety.generation_memory_safety_factor))
+        budget_bytes = int(max(0, int(memory_info.free_bytes) - reserve_bytes) / budget_factor)
+        return budget_bytes, reserve_bytes, budget_factor
+
     @classmethod
     def _estimate_resident_expert_layer_indices(
         cls,
         *,
         model: Qwen3ForConditionalGeneration,
         device_context: DeviceContext,
+        expert_quant: str,
     ) -> tuple[int, ...]:
         if device_context.device.type != "xpu":
             return ()
@@ -384,25 +512,23 @@ class AnnaEngine:
         if memory_info is None:
             return ()
 
-        text_model = getattr(getattr(model, "model", None), "language_model", None)
-        if text_model is None:
-            text_model = getattr(model, "model", None)
+        text_model = cls._text_model(model)
         if text_model is None or not hasattr(text_model, "layers"):
             return ()
 
         safety = device_context.safety_policy
-        reserve_bytes = max(
-            int(safety.min_free_bytes),
-            int(safety.reserve_margin_bytes),
-            int(memory_info.total_bytes * (1.0 - safety.max_estimated_usage_ratio)),
+        budget_bytes, reserve_bytes, budget_factor = cls._estimate_resident_budget_bytes(
+            memory_info=memory_info,
+            safety=safety,
+            expert_quant=expert_quant,
         )
-        usable_free_bytes = max(0, int(memory_info.free_bytes) - reserve_bytes)
-        budget_bytes = int(usable_free_bytes / max(1.0, float(safety.generation_memory_safety_factor)))
         if budget_bytes <= 0:
             logger.info(
-                "Auto resident expert placement skipped: free=%s reserve=%s budget=%s",
+                "Auto resident expert placement skipped: expert_quant=%s free=%s reserve=%s budget_factor=%.2f budget=%s",
+                expert_quant,
                 _format_bytes(memory_info.free_bytes),
                 _format_bytes(reserve_bytes),
+                budget_factor,
                 _format_bytes(budget_bytes),
             )
             return ()
@@ -413,7 +539,11 @@ class AnnaEngine:
         for layer_idx, layer in enumerate(text_model.layers):
             if not isinstance(layer.mlp, Qwen3SparseMoeBlock):
                 continue
-            layer_bytes = cls._module_nbytes(layer.mlp.experts)
+            layer_bytes = (
+                estimate_module_xpu_int4_bytes(layer.mlp.experts)
+                if expert_quant == "int4"
+                else cls._module_nbytes(layer.mlp.experts)
+            )
             layer_sizes.append((layer_idx, layer_bytes))
             if layer_bytes <= 0 or consumed_bytes + layer_bytes > budget_bytes:
                 break
@@ -421,15 +551,73 @@ class AnnaEngine:
             consumed_bytes += layer_bytes
 
         logger.info(
-            "Auto resident expert placement: free=%s reserve=%s budget=%s selected_layers=%s selected_bytes=%s candidate_layer_bytes=%s",
+            "Auto resident expert placement: expert_quant=%s free=%s reserve=%s budget_factor=%.2f budget=%s selected_layers=%s selected_bytes=%s candidate_layer_bytes=%s",
+            expert_quant,
             _format_bytes(memory_info.free_bytes),
             _format_bytes(reserve_bytes),
+            budget_factor,
             _format_bytes(budget_bytes),
             selected_indices,
             _format_bytes(consumed_bytes),
             {layer_idx: _format_bytes(layer_bytes) for layer_idx, layer_bytes in layer_sizes[:8]},
         )
         return tuple(selected_indices)
+
+    @classmethod
+    def _estimate_cached_experts_per_layer(
+        cls,
+        *,
+        model: Qwen3ForConditionalGeneration,
+        device_context: DeviceContext,
+        expert_quant: str,
+    ) -> int:
+        if device_context.device.type != "xpu":
+            return 0
+
+        offloaded_blocks = cls._offloaded_sparse_moe_blocks(model)
+        if not offloaded_blocks:
+            return 0
+
+        device_context.synchronize()
+        memory_info = device_context.get_memory_info()
+        if memory_info is None:
+            return 0
+
+        exemplar_block = offloaded_blocks[0][1]
+        exemplar_expert = exemplar_block.experts[0]
+        per_expert_bytes = (
+            estimate_module_xpu_int4_bytes(exemplar_expert)
+            if expert_quant == "int4"
+            else cls._module_nbytes(exemplar_expert)
+        )
+        if per_expert_bytes <= 0:
+            return max(exemplar_block.top_k, 0)
+
+        cache_target_free_bytes = max(768 << 20, int(memory_info.total_bytes * 0.06))
+        cache_budget_fraction = 0.65 if expert_quant == "int4" else 0.35
+        cache_budget_bytes = int(max(0, int(memory_info.free_bytes) - cache_target_free_bytes) * cache_budget_fraction)
+        auto_cached = cache_budget_bytes // max(1, per_expert_bytes * len(offloaded_blocks))
+
+        minimum_cache = exemplar_block.top_k
+        max_cache = exemplar_block.num_experts
+        minimum_budget_bytes = per_expert_bytes * len(offloaded_blocks) * minimum_cache
+        if cache_budget_bytes < minimum_budget_bytes:
+            resolved = max(0, min(max_cache, auto_cached))
+        else:
+            resolved = max(minimum_cache, min(max_cache, auto_cached))
+
+        logger.info(
+            "Auto expert cache sizing: expert_quant=%s free=%s target_free=%s cache_budget_fraction=%.2f cache_budget=%s offloaded_layers=%s per_expert=%s cached_experts_per_layer=%s",
+            expert_quant,
+            _format_bytes(memory_info.free_bytes),
+            _format_bytes(cache_target_free_bytes),
+            cache_budget_fraction,
+            _format_bytes(cache_budget_bytes),
+            len(offloaded_blocks),
+            _format_bytes(per_expert_bytes),
+            resolved,
+        )
+        return resolved
 
     def list_models(self) -> list[str]:
         return [self.default_model_id]
@@ -458,8 +646,10 @@ class AnnaEngine:
             "quantization": quant_method,
             "quantized_replacements": self.quantized_replacements,
             "offload_mode": self.offload_mode,
+            "expert_quant": self.expert_quant,
             "resident_expert_layers": self.resident_expert_layers,
             "resident_expert_layer_indices": self._resident_expert_layer_indices(),
+            "cached_experts_per_layer": self.cached_experts_per_layer,
             "vision_enabled": self.config.vision_config is not None,
             "cache_device": str(self.device_context.migration_policy.execution_device),
             "preprocess_device": str(self.device_context.migration_policy.preprocess_device),
