@@ -13,6 +13,7 @@ htmlcov/
 
 # Build and packaging artifacts
 build/
+.build/
 dist/
 *.egg-info/
 pip-wheel-metadata/
@@ -44,3 +45,5 @@ models/
 # OS files
 .DS_Store
 Thumbs.db
+
+download_models.py
