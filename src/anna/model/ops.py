@@ -9,10 +9,14 @@ from anna.model.config import Qwen3TextConfig
 
 class Qwen3DynamicCache:
     def __init__(self, config: Qwen3TextConfig):
+        self.config = config
         self.key_cache: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
         self.value_cache: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
         self.conv_states: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
         self.recurrent_states: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
+        self.layer_lengths: list[int] = [0 for _ in range(config.num_hidden_layers)]
+        self.seen_tokens = 0
+        self.block_size = max(1, int(config.cache_block_size))
         self.rope_deltas: torch.Tensor | None = None
 
     @property
@@ -20,19 +24,174 @@ class Qwen3DynamicCache:
         return any(state is not None for state in self.conv_states) or any(state is not None for state in self.recurrent_states)
 
     def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.key_cache[layer_idx] is None:
-            self.key_cache[layer_idx] = key_states
-            self.value_cache[layer_idx] = value_states
-        else:
-            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=2)
-            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=2)
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        current_length = self.layer_lengths[layer_idx]
+        append_length = int(key_states.shape[2])
+        required_length = current_length + append_length
+
+        key_cache = self._ensure_capacity(
+            cache=self.key_cache[layer_idx],
+            source=key_states,
+            current_length=current_length,
+            required_length=required_length,
+        )
+        value_cache = self._ensure_capacity(
+            cache=self.value_cache[layer_idx],
+            source=value_states,
+            current_length=current_length,
+            required_length=required_length,
+        )
+
+        key_cache[:, :, current_length:required_length, :].copy_(key_states)
+        value_cache[:, :, current_length:required_length, :].copy_(value_states)
+
+        self.key_cache[layer_idx] = key_cache
+        self.value_cache[layer_idx] = value_cache
+        self.layer_lengths[layer_idx] = required_length
+        self.seen_tokens = max(self.seen_tokens, required_length)
+
+        return key_cache[:, :, :required_length, :], value_cache[:, :, :required_length, :]
+
+    def _ensure_capacity(
+        self,
+        *,
+        cache: torch.Tensor | None,
+        source: torch.Tensor,
+        current_length: int,
+        required_length: int,
+    ) -> torch.Tensor:
+        if cache is None:
+            capacity = self._round_capacity(required_length)
+            shape = (*source.shape[:2], capacity, source.shape[3])
+            return source.new_empty(shape)
+
+        if required_length <= cache.shape[2]:
+            return cache
+
+        new_capacity = self._round_capacity(required_length)
+        expanded = cache.new_empty((*cache.shape[:2], new_capacity, cache.shape[3]))
+        if current_length > 0:
+            expanded[:, :, :current_length, :].copy_(cache[:, :, :current_length, :])
+        return expanded
+
+    def _round_capacity(self, required_length: int) -> int:
+        return max(self.block_size, ((required_length + self.block_size - 1) // self.block_size) * self.block_size)
 
     def get_seq_length(self) -> int:
-        for cached in self.key_cache:
-            if cached is not None and cached.numel() > 0:
-                return int(cached.shape[-2])
+        return self.seen_tokens
+
+    def get_batch_size(self) -> int:
+        for layer_idx in range(self.config.num_hidden_layers):
+            key_tensor = self.key_cache[layer_idx]
+            if key_tensor is not None:
+                return int(key_tensor.shape[0])
+        for state_group in (self.conv_states, self.recurrent_states):
+            for state in state_group:
+                if state is not None:
+                    return int(state.shape[0])
+        if self.rope_deltas is not None:
+            return int(self.rope_deltas.shape[0])
         return 0
+
+    def visible_key_cache(self, layer_idx: int) -> torch.Tensor | None:
+        tensor = self.key_cache[layer_idx]
+        if tensor is None:
+            return None
+        return tensor[:, :, : self.layer_lengths[layer_idx], :]
+
+    def visible_value_cache(self, layer_idx: int) -> torch.Tensor | None:
+        tensor = self.value_cache[layer_idx]
+        if tensor is None:
+            return None
+        return tensor[:, :, : self.layer_lengths[layer_idx], :]
+
+    @classmethod
+    def stack(cls, caches: list["Qwen3DynamicCache"], config: Qwen3TextConfig) -> "Qwen3DynamicCache":
+        if not caches:
+            return cls(config)
+
+        seq_lengths = {cache.get_seq_length() for cache in caches}
+        if len(seq_lengths) > 1:
+            raise ValueError(f"Cannot stack caches with mixed sequence lengths: {sorted(seq_lengths)}")
+
+        stacked = cls(config)
+        stacked.seen_tokens = caches[0].get_seq_length()
+        stacked.layer_lengths = list(caches[0].layer_lengths)
+        stacked.rope_deltas = None if caches[0].rope_deltas is None else torch.cat([cache.rope_deltas for cache in caches], dim=0)
+
+        for layer_idx in range(config.num_hidden_layers):
+            keys = [cache.visible_key_cache(layer_idx) for cache in caches]
+            if all(key is None for key in keys):
+                stacked.key_cache[layer_idx] = None
+                stacked.value_cache[layer_idx] = None
+            elif any(key is None for key in keys):
+                raise ValueError(f"Cannot stack partially initialized key/value caches at layer {layer_idx}")
+            else:
+                stacked.key_cache[layer_idx] = torch.cat(keys, dim=0)
+                stacked.value_cache[layer_idx] = torch.cat([cache.visible_value_cache(layer_idx) for cache in caches], dim=0)
+
+            conv_states = [cache.conv_states[layer_idx] for cache in caches]
+            if all(state is None for state in conv_states):
+                stacked.conv_states[layer_idx] = None
+            elif any(state is None for state in conv_states):
+                raise ValueError(f"Cannot stack partially initialized conv states at layer {layer_idx}")
+            else:
+                stacked.conv_states[layer_idx] = torch.cat(conv_states, dim=0)
+
+            recurrent_states = [cache.recurrent_states[layer_idx] for cache in caches]
+            if all(state is None for state in recurrent_states):
+                stacked.recurrent_states[layer_idx] = None
+            elif any(state is None for state in recurrent_states):
+                raise ValueError(f"Cannot stack partially initialized recurrent states at layer {layer_idx}")
+            else:
+                stacked.recurrent_states[layer_idx] = torch.cat(recurrent_states, dim=0)
+
+        return stacked
+
+    def split_batch(self) -> list["Qwen3DynamicCache"]:
+        batch_size = self.get_batch_size()
+        if batch_size <= 1:
+            return [self]
+
+        outputs = [Qwen3DynamicCache(self.config) for _ in range(batch_size)]
+        for cache in outputs:
+            cache.seen_tokens = self.seen_tokens
+            cache.layer_lengths = list(self.layer_lengths)
+
+        if self.rope_deltas is not None:
+            rope_chunks = self.rope_deltas.split(1, dim=0)
+            for idx, chunk in enumerate(rope_chunks):
+                outputs[idx].rope_deltas = chunk
+
+        for layer_idx in range(self.config.num_hidden_layers):
+            key_tensor = self.visible_key_cache(layer_idx)
+            value_tensor = self.visible_value_cache(layer_idx)
+            conv_state = self.conv_states[layer_idx]
+            recurrent_state = self.recurrent_states[layer_idx]
+            if key_tensor is not None:
+                key_chunks = key_tensor.split(1, dim=0)
+                value_chunks = value_tensor.split(1, dim=0) if value_tensor is not None else []
+                for idx, chunk in enumerate(key_chunks):
+                    outputs[idx].key_cache[layer_idx] = outputs[idx]._ensure_capacity(
+                        cache=None,
+                        source=chunk,
+                        current_length=0,
+                        required_length=self.layer_lengths[layer_idx],
+                    )
+                    outputs[idx].value_cache[layer_idx] = outputs[idx]._ensure_capacity(
+                        cache=None,
+                        source=value_chunks[idx],
+                        current_length=0,
+                        required_length=self.layer_lengths[layer_idx],
+                    )
+                    outputs[idx].key_cache[layer_idx][:, :, : self.layer_lengths[layer_idx], :].copy_(chunk)
+                    outputs[idx].value_cache[layer_idx][:, :, : self.layer_lengths[layer_idx], :].copy_(value_chunks[idx])
+            if conv_state is not None:
+                for idx, chunk in enumerate(conv_state.split(1, dim=0)):
+                    outputs[idx].conv_states[layer_idx] = chunk.clone()
+            if recurrent_state is not None:
+                for idx, chunk in enumerate(recurrent_state.split(1, dim=0)):
+                    outputs[idx].recurrent_states[layer_idx] = chunk.clone()
+        return outputs
 
     def to(
         self,
@@ -328,8 +487,10 @@ class Qwen3Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
         past_key_values: Qwen3DynamicCache | None = None,
     ) -> torch.Tensor:
+        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
         batch_size, seq_len, _ = hidden_states.shape
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -359,6 +520,9 @@ class Qwen3Attention(nn.Module):
         causal_mask = self._causal_mask(seq_len, key_states.shape[-2], past_len, hidden_states.device)
         if causal_mask is not None:
             attn_scores = attn_scores.masked_fill(causal_mask.view(1, 1, seq_len, -1), float("-inf"))
+        if attention_mask is not None and past_len == 0:
+            key_padding_mask = attention_mask[:, None, None, :].to(dtype=torch.bool)
+            attn_scores = attn_scores.masked_fill(~key_padding_mask, float("-inf"))
 
         attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
         attn_output = torch.matmul(attn_probs, value_states)
@@ -507,7 +671,12 @@ class Qwen3DecoderLayer(nn.Module):
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(hidden_states, cache_params=past_key_values, attention_mask=attention_mask)
         else:
-            hidden_states = self.self_attn(hidden_states, position_embeddings=position_embeddings, past_key_values=past_key_values)
+            hidden_states = self.self_attn(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+            )
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from anna.model.config import Qwen3TextConfig, RopeParameters
+from anna.model.ops import Qwen3DynamicCache
 from anna.model.qwen import Qwen3ForCausalLM
 
 
@@ -59,6 +60,58 @@ def test_qwen3_incremental_decode() -> None:
     assert second.logits.shape == (1, 1, 256)
     assert second.past_key_values is not None
     assert second.past_key_values.get_seq_length() == 7
+
+
+def test_qwen3_prefill_can_project_only_last_logit() -> None:
+    torch.manual_seed(0)
+    model = Qwen3ForCausalLM(_tiny_config())
+    input_ids = torch.randint(0, 256, (1, 6))
+    outputs = model(input_ids=input_ids, use_cache=True, logits_to_keep=1)
+    assert outputs.logits.shape == (1, 1, 256)
+    assert outputs.past_key_values is not None
+    assert outputs.past_key_values.get_seq_length() == 6
+
+
+def test_dynamic_cache_appends_without_reallocating_visible_prefix() -> None:
+    cache = Qwen3DynamicCache(_tiny_config())
+    key_a = torch.randn(1, 2, 3, 16)
+    value_a = torch.randn(1, 2, 3, 16)
+    key_b = torch.randn(1, 2, 2, 16)
+    value_b = torch.randn(1, 2, 2, 16)
+
+    combined_key_a, combined_value_a = cache.update(key_a, value_a, layer_idx=1)
+    combined_key_b, combined_value_b = cache.update(key_b, value_b, layer_idx=1)
+
+    assert combined_key_a.shape == (1, 2, 3, 16)
+    assert combined_value_a.shape == (1, 2, 3, 16)
+    assert combined_key_b.shape == (1, 2, 5, 16)
+    assert combined_value_b.shape == (1, 2, 5, 16)
+    assert torch.equal(combined_key_b[:, :, :3, :], key_a)
+    assert torch.equal(combined_value_b[:, :, :3, :], value_a)
+    assert torch.equal(combined_key_b[:, :, 3:, :], key_b)
+    assert torch.equal(combined_value_b[:, :, 3:, :], value_b)
+    assert cache.get_seq_length() == 5
+
+
+def test_dynamic_cache_stack_and_split_round_trips_batches() -> None:
+    config = _tiny_config()
+    cache_a = Qwen3DynamicCache(config)
+    cache_b = Qwen3DynamicCache(config)
+    key_a = torch.randn(1, 2, 3, 16)
+    value_a = torch.randn(1, 2, 3, 16)
+    key_b = torch.randn(1, 2, 3, 16)
+    value_b = torch.randn(1, 2, 3, 16)
+    cache_a.update(key_a, value_a, layer_idx=1)
+    cache_b.update(key_b, value_b, layer_idx=1)
+
+    stacked = Qwen3DynamicCache.stack([cache_a, cache_b], config)
+    split = stacked.split_batch()
+
+    assert len(split) == 2
+    assert torch.equal(split[0].visible_key_cache(1), key_a)
+    assert torch.equal(split[0].visible_value_cache(1), value_a)
+    assert torch.equal(split[1].visible_key_cache(1), key_b)
+    assert torch.equal(split[1].visible_value_cache(1), value_b)
 
 
 def test_qwen3_allows_out_of_range_padding_idx_for_tiny_configs() -> None:

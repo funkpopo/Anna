@@ -114,6 +114,7 @@ class Qwen3TextConfig:
     eos_token_id: int = 248044
     pad_token_id: int = 248044
     dtype: str = "bfloat16"
+    cache_block_size: int = 32
     layer_types: list[str] = field(default_factory=list)
     full_attention_interval: int = 4
     rope_parameters: RopeParameters = field(default_factory=RopeParameters)
@@ -154,6 +155,7 @@ class Qwen3TextConfig:
             eos_token_id=int(text_config.get("eos_token_id", 248044)),
             pad_token_id=int(text_config.get("pad_token_id", text_config.get("eos_token_id", 248044))),
             dtype=str(text_config.get("dtype", text_config.get("torch_dtype", "bfloat16"))),
+            cache_block_size=int(text_config.get("cache_block_size", 32)),
             layer_types=layer_types,
             full_attention_interval=interval,
             rope_parameters=RopeParameters.from_dict(text_config.get("rope_parameters")),

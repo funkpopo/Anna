@@ -42,6 +42,7 @@
 - 用户手动准备模型文件，本项目不提供模型下载逻辑。
 - CPU 仅用于必要的图片/视频预处理；prefill 与 decode 的模型执行优先走 `xpu`。
 - 多模态首轮 prefill 会把文本、图像、视频张量迁移到执行设备；后续 decode 只发送新 token，缓存留在执行设备。
+- 纯文本请求支持服务端连续批处理：同长度 prefill 合批、decode 按当前序列长度分桶。
 - 运行前会按请求规模预估显存占用；显存预算不足时会提前拒绝请求，避免把 XPU 顶死。
 - 运行期如果遇到 `OOM / device lost / out of resources`，会尝试清理 runtime cache 并返回可控错误。
 
@@ -50,7 +51,7 @@
 - 已在 `conda env anna` 中安装 `torch 2.11.0+xpu`，并完成 `pytest`、真实模型加载、文本生成、图片生成、视频生成与 API 烟测。
 - 尚未在 Intel Arc A770 上完成系统化性能与稳定性验证。
 - FP8 / AWQ / AWQ-4bit 虽已接入装载路径，但仍需真实官方模型做数值校验。
-- 当前默认单请求、单 batch，尚未做连续批处理与调度层。
+- 多模态请求当前仍走独占生成路径，未接入连续批处理。
 
 ## 目录
 
@@ -122,3 +123,4 @@ anna-bench --model-dir /path/to/model --device xpu --dtype bf16 --prompt "你好
 
 - 使用官方 FP8 / AWQ 变体校验量化权重布局。
 - 在 Arc A770 上做 profiling，定位热点算子，再决定是否补写自定义 XPU 算子。
+- 把文本连续批处理从同长度分桶推进到更自由的块式 cache / paged attention 形态。
