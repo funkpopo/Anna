@@ -118,6 +118,25 @@ class Qwen3TextConfig:
     layer_types: list[str] = field(default_factory=list)
     full_attention_interval: int = 4
     rope_parameters: RopeParameters = field(default_factory=RopeParameters)
+    decoder_sparse_step: int = 1
+    moe_intermediate_size: int = 0
+    shared_expert_intermediate_size: int = 0
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    norm_topk_prob: bool = True
+    router_aux_loss_coef: float = 0.001
+    mlp_only_layers: list[int] = field(default_factory=list)
+
+    @property
+    def is_moe_model(self) -> bool:
+        return self.num_experts > 0 and self.num_experts_per_tok > 0
+
+    def uses_sparse_moe(self, layer_idx: int) -> bool:
+        if not self.is_moe_model:
+            return False
+        if layer_idx in self.mlp_only_layers:
+            return False
+        return (layer_idx + 1) % max(1, self.decoder_sparse_step) == 0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Qwen3TextConfig":
@@ -125,6 +144,15 @@ class Qwen3TextConfig:
         interval = int(text_config.get("full_attention_interval", 4))
         layer_types = list(text_config.get("layer_types", []))
         num_hidden_layers = int(text_config.get("num_hidden_layers", 24))
+        moe_intermediate_size = int(text_config.get("moe_intermediate_size", text_config.get("intermediate_size", 3584)))
+        shared_expert_intermediate_size = int(
+            text_config.get(
+                "shared_expert_intermediate_size",
+                text_config.get("intermediate_size", moe_intermediate_size),
+            )
+        )
+        intermediate_size = int(text_config.get("intermediate_size", shared_expert_intermediate_size))
+        num_experts = int(text_config.get("num_experts", 0))
         if not layer_types:
             layer_types = [
                 "linear_attention" if (layer_idx + 1) % interval else "full_attention"
@@ -134,7 +162,7 @@ class Qwen3TextConfig:
         return cls(
             model_type=text_config.get("model_type", "qwen3_5_text"),
             hidden_size=int(text_config["hidden_size"]),
-            intermediate_size=int(text_config["intermediate_size"]),
+            intermediate_size=intermediate_size,
             num_hidden_layers=num_hidden_layers,
             num_attention_heads=int(text_config["num_attention_heads"]),
             num_key_value_heads=int(text_config.get("num_key_value_heads", text_config["num_attention_heads"])),
@@ -159,6 +187,14 @@ class Qwen3TextConfig:
             layer_types=layer_types,
             full_attention_interval=interval,
             rope_parameters=RopeParameters.from_dict(text_config.get("rope_parameters")),
+            decoder_sparse_step=int(text_config.get("decoder_sparse_step", 1)),
+            moe_intermediate_size=moe_intermediate_size,
+            shared_expert_intermediate_size=shared_expert_intermediate_size,
+            num_experts=num_experts,
+            num_experts_per_tok=int(text_config.get("num_experts_per_tok", 8 if num_experts > 0 else 0)),
+            norm_topk_prob=bool(text_config.get("norm_topk_prob", num_experts > 0)),
+            router_aux_loss_coef=float(text_config.get("router_aux_loss_coef", 0.001)),
+            mlp_only_layers=list(text_config.get("mlp_only_layers", [])),
         )
 
 

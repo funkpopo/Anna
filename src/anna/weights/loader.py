@@ -50,10 +50,19 @@ def build_model(
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[Qwen3ForConditionalGeneration, int]:
-    model = Qwen3ForConditionalGeneration(config)
-    model.to(device=device, dtype=dtype)
+    default_dtype = torch.get_default_dtype()
+    build_dtype = dtype if dtype in {torch.float16, torch.bfloat16, torch.float32} else torch.float32
+    try:
+        torch.set_default_dtype(build_dtype)
+        with torch.device("meta"):
+            model = Qwen3ForConditionalGeneration(config)
+    finally:
+        torch.set_default_dtype(default_dtype)
+
     quantized_specs = replace_linear_modules(model, config.quantization_config, compute_dtype=dtype)
-    model.to(device=device)
+    if not hasattr(model, "to_empty"):
+        raise RuntimeError("The current torch build does not support nn.Module.to_empty, which is required for low-memory model loading.")
+    model.to_empty(device=device)
     return model, len(quantized_specs)
 
 
