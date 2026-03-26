@@ -81,22 +81,34 @@ def main() -> None:
     messages = _build_messages(settings)
     latencies: list[float] = []
     completion_tokens: list[int] = []
+    prefill_latencies: list[float] = []
+    decode_latencies: list[float] = []
+    decode_tokens_per_second: list[float] = []
+    end_to_end_tokens_per_second: list[float] = []
 
     for _ in range(max(settings.warmup, 0)):
         if settings.image is None and settings.video is None:
-            engine.generate_text(settings.prompt, config=generation)
+            engine.profile_text(settings.prompt, config=generation)
         else:
-            engine.generate_chat(messages, config=generation)
+            engine.profile_chat(messages, config=generation)
 
     for _ in range(max(settings.runs, 1)):
         start = time.perf_counter()
         if settings.image is None and settings.video is None:
-            result = engine.generate_text(settings.prompt, config=generation)
+            result = engine.profile_text(settings.prompt, config=generation)
         else:
-            result = engine.generate_chat(messages, config=generation)
+            result = engine.profile_chat(messages, config=generation)
         latency = time.perf_counter() - start
         latencies.append(latency)
         completion_tokens.append(result.completion_tokens)
+        if result.prefill_seconds is not None:
+            prefill_latencies.append(result.prefill_seconds)
+        if result.decode_seconds is not None:
+            decode_latencies.append(result.decode_seconds)
+        if result.decode_tokens_per_second is not None:
+            decode_tokens_per_second.append(result.decode_tokens_per_second)
+        if result.end_to_end_tokens_per_second is not None:
+            end_to_end_tokens_per_second.append(result.end_to_end_tokens_per_second)
 
     avg_latency = statistics.mean(latencies)
     avg_tokens = statistics.mean(completion_tokens)
@@ -112,6 +124,14 @@ def main() -> None:
     print(f"max_latency_seconds={max(latencies):.4f}")
     print(f"avg_completion_tokens={avg_tokens:.2f}")
     print(f"avg_tokens_per_second={tokens_per_second:.2f}")
+    if prefill_latencies:
+        print(f"avg_prefill_seconds={statistics.mean(prefill_latencies):.4f}")
+    if decode_latencies:
+        print(f"avg_decode_seconds={statistics.mean(decode_latencies):.4f}")
+    if decode_tokens_per_second:
+        print(f"avg_decode_tokens_per_second={statistics.mean(decode_tokens_per_second):.2f}")
+    if end_to_end_tokens_per_second:
+        print(f"avg_end_to_end_tokens_per_second={statistics.mean(end_to_end_tokens_per_second):.2f}")
 
 
 if __name__ == "__main__":

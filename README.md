@@ -73,19 +73,33 @@
    - `tokenizer.json`
    - `tokenizer_config.json`
    - `model.safetensors` 或分片 safetensors
-4. 启动服务：
+4. 启动服务。当前统一使用 Anna 自己的参数命名：
 
 ```bash
-anna-serve --model-dir /path/to/model --device xpu --dtype bf16
+anna-serve /path/to/model --device xpu --dtype bf16
 ```
 
-如果要显式指定对外暴露的模型名称：
+Windows 示例：
 
 ```bash
-anna-serve --model-dir D:\Projects\Anna\models\Qwen\Qwen3___5-2B --model-name qwen3.5 --device xpu --dtype bf16
+anna-serve D:\Projects\Anna\models\Qwen\Qwen3___5-2B --device xpu --dtype bf16
 ```
 
-如果不指定 `--model-name`，默认模型名就是 `--model-dir` 的完整路径。
+显式指定对外暴露的模型名、API key、上下文长度、显存预算和调度参数：
+
+```bash
+anna-serve D:\Projects\Anna\models\Qwen\Qwen3___5-2B ^
+  --model-name qwen3.5 ^
+  --device xpu ^
+  --dtype bf16 ^
+  --api-key sk-anna-demo ^
+  --max-model-len 32768 ^
+  --gpu-memory-utilization 0.92 ^
+  --scheduler-max-batch-size 8 ^
+  --scheduler-max-batched-tokens 8192
+```
+
+如果不指定 `--model-name`，默认模型名仍然是 `--model-dir` 的完整路径。
 
 5. 命令行文本生成：
 
@@ -105,7 +119,19 @@ anna-generate --model-dir D:\Projects\Anna\models\Qwen\Qwen3___5-2B --model-name
 anna-bench --model-dir /path/to/model --device xpu --dtype bf16 --prompt "你好，请介绍一下你自己。" --runs 5
 ```
 
-7. 聊天接口思维开关：
+7. 如果服务启用了 `--api-key`，所有 `/v1/*` 路由都需要携带以下任一请求头，`/healthz` 不受影响：
+
+```bash
+Authorization: Bearer sk-anna-demo
+```
+
+或：
+
+```bash
+X-API-Key: sk-anna-demo
+```
+
+8. 聊天接口思维开关：
 
 ```json
 {
@@ -119,6 +145,28 @@ anna-bench --model-dir /path/to/model --device xpu --dtype bf16 --prompt "你好
 ```
 
 当 `enable_thinking=true` 时，返回体中的 `message` 和流式 `delta` 会包含独立的 `reasoning_content` 字段；当 `enable_thinking=false` 时，会通过 Qwen3.5 的 closed-think prompt 关闭思维模式，仅返回最终内容。
+
+## 服务启动参数
+
+- `MODEL` / `--model-dir`: 本地 Hugging Face 风格模型目录。位置参数和显式参数二选一即可。
+- `--model-name`: 对外暴露的模型 ID。
+- `--scheduler-max-batch-size`: 文本连续批处理中的最大并发请求数。
+- `--scheduler-max-batched-tokens`: Anna 调度器自己的近似 token batching 上限。prefill 会按该限制拆分同长度请求，decode 会按每步每请求 1 token 近似限流。
+- `--max-model-len`: 服务级上下文上限。该值不能超过模型自身 `max_position_embeddings`。
+- `--gpu-memory-utilization`: 映射到 XPU 内存保护阈值，用于提前拒绝高风险请求，避免把 Arc 显存直接顶死。
+
+## 错误反馈
+
+- 鉴权失败会返回 OpenAI 风格错误对象，区分 `missing_api_key` 和 `invalid_api_key`。
+- 请求体校验失败会统一返回 `invalid_request_error`，并尽量带出具体参数名。
+- 如果请求的 `model` 不在当前服务暴露的模型列表中，会返回 `model_not_found`，而不是静默回退到默认模型。
+- `context_length_exceeded`、显存保护拒绝和 XPU 运行时错误都会保留结构化错误码，便于调用方重试或降载。
+
+## 兼容边界
+
+- `--scheduler-max-batched-tokens` 目前实现的是 Anna 调度器自己的近似 batching 上限，不是完整的分块 prefill 语义。
+- 文本超长单请求如果会超过 `--scheduler-max-batched-tokens`，会自动绕过 scheduler 走直连生成，而不是被这个限批参数误伤。
+- 多模态请求当前仍走独占生成路径，尚未接入基于 `--scheduler-max-batched-tokens` 的连续批处理。
 
 ## 下一步
 

@@ -1,0 +1,451 @@
+#include <torch/extension.h>
+
+#include <ATen/ops/_weight_int4pack_mm_with_scales_and_zeros.h>
+#include <ATen/native/mkldnn/xpu/detail/LRUCache.h>
+
+#include <c10/xpu/XPUStream.h>
+#include <oneapi/dnnl/dnnl.hpp>
+#include <oneapi/dnnl/dnnl_sycl.hpp>
+
+#include <cstddef>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+namespace anna_onednn {
+
+dnnl::memory::data_type to_dnnl_dtype(c10::ScalarType dtype) {
+    switch (dtype) {
+        case c10::ScalarType::Float:
+            return dnnl::memory::data_type::f32;
+        case c10::ScalarType::Half:
+            return dnnl::memory::data_type::f16;
+        case c10::ScalarType::BFloat16:
+            return dnnl::memory::data_type::bf16;
+        default:
+            TORCH_CHECK(false, "Unsupported dtype for Anna oneDNN linear: ", dtype);
+    }
+}
+
+bool has_value(std::string_view value) {
+    return !value.empty() && value != "none";
+}
+
+dnnl::algorithm to_activation_algorithm(
+    std::string_view activation,
+    std::string_view algorithm) {
+    if (activation == "relu") {
+        return dnnl::algorithm::eltwise_relu;
+    }
+    if (activation == "swish") {
+        return dnnl::algorithm::eltwise_swish;
+    }
+    if (activation == "gelu") {
+        return algorithm == "tanh" ? dnnl::algorithm::eltwise_gelu_tanh
+                                   : dnnl::algorithm::eltwise_gelu_erf;
+    }
+    TORCH_CHECK(false, "Unsupported activation for Anna oneDNN linear: ", activation);
+}
+
+dnnl::algorithm to_binary_algorithm(std::string_view binary) {
+    if (binary == "add" || binary == "sum") {
+        return dnnl::algorithm::binary_add;
+    }
+    if (binary == "mul") {
+        return dnnl::algorithm::binary_mul;
+    }
+    TORCH_CHECK(false, "Unsupported binary op for Anna oneDNN linear: ", binary);
+}
+
+std::size_t hash_combine(std::size_t seed, std::size_t value) {
+    return seed ^ (value + 0x9e3779b9 + (seed << 6) + (seed >> 2));
+}
+
+struct PrimitiveKey {
+    int64_t m = 0;
+    int64_t n = 0;
+    int64_t k = 0;
+    c10::ScalarType dtype = c10::ScalarType::Undefined;
+    bool has_bias = false;
+    bool has_other = false;
+    std::string activation;
+    std::string algorithm;
+    std::string binary;
+
+    bool operator==(const PrimitiveKey& other) const {
+        return m == other.m && n == other.n && k == other.k &&
+            dtype == other.dtype && has_bias == other.has_bias &&
+            has_other == other.has_other && activation == other.activation &&
+            algorithm == other.algorithm && binary == other.binary;
+    }
+};
+
+} // namespace anna_onednn
+
+namespace std {
+
+template <>
+struct hash<anna_onednn::PrimitiveKey> {
+    std::size_t operator()(const anna_onednn::PrimitiveKey& key) const noexcept {
+        std::size_t seed = 0;
+        seed = anna_onednn::hash_combine(seed, std::hash<int64_t>{}(key.m));
+        seed = anna_onednn::hash_combine(seed, std::hash<int64_t>{}(key.n));
+        seed = anna_onednn::hash_combine(seed, std::hash<int64_t>{}(key.k));
+        seed = anna_onednn::hash_combine(seed, std::hash<int>{}(static_cast<int>(key.dtype)));
+        seed = anna_onednn::hash_combine(seed, std::hash<bool>{}(key.has_bias));
+        seed = anna_onednn::hash_combine(seed, std::hash<bool>{}(key.has_other));
+        seed = anna_onednn::hash_combine(seed, std::hash<std::string>{}(key.activation));
+        seed = anna_onednn::hash_combine(seed, std::hash<std::string>{}(key.algorithm));
+        seed = anna_onednn::hash_combine(seed, std::hash<std::string>{}(key.binary));
+        return seed;
+    }
+};
+
+} // namespace std
+
+namespace anna_onednn {
+
+struct PrimitiveBundle {
+    dnnl::memory::desc src_md;
+    dnnl::memory::desc weight_md;
+    dnnl::memory::desc dst_md;
+    dnnl::memory::desc bias_md;
+    dnnl::memory::desc other_md;
+    dnnl::matmul primitive;
+    bool has_other = false;
+    int binary_post_op_index = -1;
+};
+
+PrimitiveBundle make_primitive(
+    const dnnl::engine& engine,
+    const PrimitiveKey& key) {
+    PrimitiveBundle bundle;
+    const auto dtype = to_dnnl_dtype(key.dtype);
+    bundle.src_md = dnnl::memory::desc({key.m, key.k}, dtype, {key.k, 1});
+    bundle.weight_md = dnnl::memory::desc({key.k, key.n}, dtype, {1, key.k});
+    bundle.dst_md = dnnl::memory::desc({key.m, key.n}, dtype, {key.n, 1});
+    bundle.bias_md = dnnl::memory::desc({1, key.n}, dtype, {key.n, 1});
+    bundle.other_md = dnnl::memory::desc({key.m, key.n}, dtype, {key.n, 1});
+
+    dnnl::primitive_attr attr;
+    dnnl::post_ops post_ops;
+
+    if (key.has_other) {
+        bundle.has_other = true;
+        bundle.binary_post_op_index = static_cast<int>(post_ops.len());
+        post_ops.append_binary(to_binary_algorithm(key.binary), bundle.other_md);
+    }
+    if (has_value(key.activation)) {
+        post_ops.append_eltwise(
+            to_activation_algorithm(key.activation, key.algorithm),
+            key.activation == "swish" ? 1.0f : 0.0f,
+            0.0f);
+    }
+    attr.set_post_ops(post_ops);
+
+    dnnl::matmul::primitive_desc primitive_desc = key.has_bias
+        ? dnnl::matmul::primitive_desc(
+              engine,
+              bundle.src_md,
+              bundle.weight_md,
+              bundle.bias_md,
+              bundle.dst_md,
+              attr)
+        : dnnl::matmul::primitive_desc(
+              engine,
+              bundle.src_md,
+              bundle.weight_md,
+              bundle.dst_md,
+              attr);
+    bundle.primitive = dnnl::matmul(primitive_desc);
+    return bundle;
+}
+
+class StreamPrimitiveCache {
+  public:
+    explicit StreamPrimitiveCache(std::size_t capacity) : cache_(capacity) {}
+
+    std::shared_ptr<PrimitiveBundle> get_or_create(
+        const PrimitiveKey& key,
+        const dnnl::engine& engine) {
+        auto iter = cache_.find(key);
+        if (iter != cache_.end()) {
+            return iter->second;
+        }
+        auto bundle = std::make_shared<PrimitiveBundle>(make_primitive(engine, key));
+        return cache_.insert({key, bundle}).first->second;
+    }
+
+  private:
+    at::native::onednn::lru_cache<PrimitiveKey, std::shared_ptr<PrimitiveBundle>> cache_;
+};
+
+class StreamExecutionContext {
+  public:
+    StreamExecutionContext(c10::xpu::XPUStream xpu_stream, std::size_t capacity)
+        : cache_(capacity) {
+        auto queue = xpu_stream.queue();
+        engine_ = std::make_shared<dnnl::engine>(
+            dnnl::sycl_interop::make_engine(queue.get_device(), queue.get_context()));
+        stream_ = std::make_shared<dnnl::stream>(dnnl::sycl_interop::make_stream(*engine_, queue));
+    }
+
+    std::shared_ptr<PrimitiveBundle> get_or_create(
+        const PrimitiveKey& key) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return cache_.get_or_create(key, *engine_);
+    }
+
+    dnnl::engine& engine() {
+        return *engine_;
+    }
+
+    dnnl::stream& stream() {
+        return *stream_;
+    }
+
+  private:
+    std::mutex mutex_;
+    std::shared_ptr<dnnl::engine> engine_;
+    std::shared_ptr<dnnl::stream> stream_;
+    StreamPrimitiveCache cache_;
+};
+
+class PrimitiveCacheManager {
+  public:
+    static PrimitiveCacheManager& Instance() {
+        static PrimitiveCacheManager instance;
+        return instance;
+    }
+
+    std::shared_ptr<StreamExecutionContext> get_stream_context(
+        c10::DeviceIndex device_index,
+        c10::xpu::XPUStream xpu_stream) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        ensure_device_capacity(device_index);
+        auto& stream_contexts = stream_context_pool_[device_index];
+        auto stream_it = stream_contexts.find(xpu_stream);
+        if (stream_it == stream_contexts.end()) {
+            stream_it = stream_contexts
+                            .emplace(
+                                xpu_stream,
+                                std::make_shared<StreamExecutionContext>(
+                                    xpu_stream,
+                                    kPrimitiveCacheCapacity))
+                            .first;
+        }
+        return stream_it->second;
+    }
+
+  private:
+    static constexpr std::size_t kPrimitiveCacheCapacity = 256;
+
+    void ensure_device_capacity(c10::DeviceIndex device_index) {
+        if (device_index >= static_cast<c10::DeviceIndex>(stream_context_pool_.size())) {
+            stream_context_pool_.resize(device_index + 1);
+        }
+    }
+
+    std::mutex mutex_;
+    std::vector<std::unordered_map<c10::xpu::XPUStream, std::shared_ptr<StreamExecutionContext>>> stream_context_pool_;
+};
+
+} // namespace anna_onednn
+
+torch::Tensor anna_onednn_linear_pointwise(
+    torch::Tensor x,
+    torch::Tensor weight,
+    c10::optional<torch::Tensor> bias_opt,
+    const std::string& activation,
+    const std::string& algorithm,
+    c10::optional<torch::Tensor> other_opt,
+    const std::string& binary) {
+    TORCH_CHECK(x.device().is_xpu(), "Anna oneDNN linear expects XPU input.");
+    TORCH_CHECK(weight.device().is_xpu(), "Anna oneDNN linear expects XPU weight.");
+    TORCH_CHECK(x.dim() == 2, "Anna oneDNN linear expects 2D input.");
+    TORCH_CHECK(weight.dim() == 2, "Anna oneDNN linear expects 2D weight.");
+    TORCH_CHECK(
+        x.scalar_type() == weight.scalar_type(),
+        "Anna oneDNN linear requires matching input and weight dtype.");
+
+    auto x_contig = x.contiguous();
+    auto weight_contig = weight.contiguous();
+
+    torch::Tensor bias;
+    const bool has_bias = bias_opt.has_value() && bias_opt.value().defined();
+    if (has_bias) {
+        bias = bias_opt.value().contiguous();
+        TORCH_CHECK(bias.device().is_xpu(), "Anna oneDNN linear expects XPU bias.");
+        TORCH_CHECK(
+            bias.scalar_type() == x_contig.scalar_type(),
+            "Anna oneDNN linear requires matching bias dtype.");
+        TORCH_CHECK(bias.dim() == 1, "Anna oneDNN linear expects 1D bias.");
+    }
+
+    torch::Tensor other;
+    const bool has_binary = anna_onednn::has_value(binary);
+    if (has_binary) {
+        TORCH_CHECK(
+            other_opt.has_value() && other_opt.value().defined(),
+            "Anna oneDNN linear binary op requires `other`.");
+        other = other_opt.value().contiguous();
+        TORCH_CHECK(other.device().is_xpu(), "Anna oneDNN linear expects XPU `other` tensor.");
+        TORCH_CHECK(
+            other.scalar_type() == x_contig.scalar_type(),
+            "Anna oneDNN linear requires matching `other` dtype.");
+        TORCH_CHECK(other.dim() == 2, "Anna oneDNN linear expects 2D `other` tensor.");
+    }
+
+    const auto m = static_cast<int64_t>(x_contig.size(0));
+    const auto k = static_cast<int64_t>(x_contig.size(1));
+    const auto n = static_cast<int64_t>(weight_contig.size(0));
+    TORCH_CHECK(weight_contig.size(1) == k, "Anna oneDNN linear weight shape mismatch.");
+    if (has_bias) {
+        TORCH_CHECK(bias.size(0) == n, "Anna oneDNN linear bias shape mismatch.");
+    }
+    if (has_binary) {
+        TORCH_CHECK(
+            other.size(0) == m && other.size(1) == n,
+            "Anna oneDNN linear binary tensor shape mismatch.");
+    }
+
+    const auto device_index = x_contig.device().index();
+    auto xpu_stream = c10::xpu::getCurrentXPUStream(device_index);
+    auto stream_context =
+        anna_onednn::PrimitiveCacheManager::Instance().get_stream_context(
+            device_index,
+            xpu_stream);
+    auto& engine = stream_context->engine();
+    auto& stream = stream_context->stream();
+
+    anna_onednn::PrimitiveKey key;
+    key.m = m;
+    key.n = n;
+    key.k = k;
+    key.dtype = x_contig.scalar_type();
+    key.has_bias = has_bias;
+    key.has_other = has_binary;
+    key.activation = activation;
+    key.algorithm = algorithm;
+    key.binary = binary;
+    auto bundle = stream_context->get_or_create(key);
+
+    auto output = torch::empty({m, n}, x_contig.options());
+    auto src_mem = dnnl::sycl_interop::make_memory(
+        bundle->src_md,
+        engine,
+        dnnl::sycl_interop::memory_kind::usm,
+        x_contig.data_ptr());
+    auto weight_mem = dnnl::sycl_interop::make_memory(
+        bundle->weight_md,
+        engine,
+        dnnl::sycl_interop::memory_kind::usm,
+        weight_contig.data_ptr());
+    auto output_mem = dnnl::sycl_interop::make_memory(
+        bundle->dst_md,
+        engine,
+        dnnl::sycl_interop::memory_kind::usm,
+        output.data_ptr());
+
+    std::unordered_map<int, dnnl::memory> args{
+        {DNNL_ARG_SRC, src_mem},
+        {DNNL_ARG_WEIGHTS, weight_mem},
+        {DNNL_ARG_DST, output_mem},
+    };
+
+    dnnl::memory bias_mem;
+    if (has_bias) {
+        bias_mem = dnnl::sycl_interop::make_memory(
+            bundle->bias_md,
+            engine,
+            dnnl::sycl_interop::memory_kind::usm,
+            bias.data_ptr());
+        args.insert({DNNL_ARG_BIAS, bias_mem});
+    }
+
+    dnnl::memory other_mem;
+    if (bundle->has_other) {
+        other_mem = dnnl::sycl_interop::make_memory(
+            bundle->other_md,
+            engine,
+            dnnl::sycl_interop::memory_kind::usm,
+            other.data_ptr());
+        args.insert({
+            DNNL_ARG_ATTR_MULTIPLE_POST_OP(bundle->binary_post_op_index) | DNNL_ARG_SRC_1,
+            other_mem,
+        });
+    }
+
+    dnnl::sycl_interop::execute(bundle->primitive, stream, args);
+    return output;
+}
+
+torch::Tensor anna_onednn_linear_int4_weight_only(
+    torch::Tensor x,
+    torch::Tensor packed_weight,
+    torch::Tensor scale,
+    torch::Tensor zero,
+    int64_t group_size) {
+    TORCH_CHECK(x.device().is_xpu(), "Anna oneDNN int4 linear expects XPU input.");
+    TORCH_CHECK(
+        packed_weight.device().is_xpu(),
+        "Anna oneDNN int4 linear expects XPU packed weight.");
+    TORCH_CHECK(scale.device().is_xpu(), "Anna oneDNN int4 linear expects XPU scale.");
+    TORCH_CHECK(zero.device().is_xpu(), "Anna oneDNN int4 linear expects XPU zero.");
+    TORCH_CHECK(x.dim() == 2, "Anna oneDNN int4 linear expects 2D input.");
+    TORCH_CHECK(
+        packed_weight.dim() == 2,
+        "Anna oneDNN int4 linear expects 2D packed weight.");
+    TORCH_CHECK(scale.dim() == 2, "Anna oneDNN int4 linear expects 2D scale.");
+    TORCH_CHECK(zero.dim() == 2, "Anna oneDNN int4 linear expects 2D zero.");
+    TORCH_CHECK(
+        x.scalar_type() == scale.scalar_type(),
+        "Anna oneDNN int4 linear requires matching input/scale dtype.");
+    TORCH_CHECK(
+        x.scalar_type() == c10::ScalarType::Float ||
+            x.scalar_type() == c10::ScalarType::Half ||
+            x.scalar_type() == c10::ScalarType::BFloat16,
+        "Anna oneDNN int4 linear expects f32/f16/bf16 input.");
+    TORCH_CHECK(
+        packed_weight.scalar_type() == c10::ScalarType::Int,
+        "Anna oneDNN int4 linear expects int32 packed weight.");
+    TORCH_CHECK(
+        zero.scalar_type() == c10::ScalarType::Char,
+        "Anna oneDNN int4 linear expects int8 zero point.");
+    TORCH_CHECK(
+        group_size > 1 && group_size % 32 == 0,
+        "Anna oneDNN int4 linear expects group_size to be a multiple of 32.");
+
+    auto x_contig = x.contiguous();
+    auto packed_weight_contig = packed_weight.contiguous();
+    auto scale_contig = scale.contiguous();
+    auto zero_contig = zero.contiguous();
+
+    const auto k = static_cast<int64_t>(x_contig.size(1));
+    TORCH_CHECK(k % 8 == 0, "Anna oneDNN int4 linear expects K to be a multiple of 8.");
+    TORCH_CHECK(
+        packed_weight_contig.size(1) * 8 == k,
+        "Anna oneDNN int4 linear packed weight shape mismatch.");
+    TORCH_CHECK(
+        k % group_size == 0,
+        "Anna oneDNN int4 linear expects K to be divisible by group_size.");
+
+    const auto n = static_cast<int64_t>(packed_weight_contig.size(0));
+    const auto groups = static_cast<int64_t>(k / group_size);
+    TORCH_CHECK(
+        scale_contig.size(0) == groups && scale_contig.size(1) == n,
+        "Anna oneDNN int4 linear scale shape mismatch.");
+    TORCH_CHECK(
+        zero_contig.sizes() == scale_contig.sizes(),
+        "Anna oneDNN int4 linear zero shape mismatch.");
+
+    return at::_weight_int4pack_mm_with_scales_and_zeros(
+        x_contig,
+        packed_weight_contig,
+        group_size,
+        scale_contig,
+        zero_contig);
+}

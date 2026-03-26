@@ -3,7 +3,13 @@ from __future__ import annotations
 import torch
 
 from anna.model.config import Qwen3TextConfig, RopeParameters
-from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
+from anna.model.ops import (
+    Qwen3DynamicCache,
+    Qwen3PageAllocator,
+    torch_causal_conv1d_update,
+    torch_causal_conv1d_update_one_token,
+    torch_recurrent_gated_delta_rule_one_token,
+)
 from anna.model.qwen import Qwen3ForCausalLM
 
 
@@ -129,6 +135,62 @@ def test_dynamic_cache_release_reuses_freed_pages() -> None:
     cache_b.update(key, value, layer_idx=1)
 
     assert cache_b.page_tables[1][0] == first_page_ids
+
+
+def test_single_token_conv_update_matches_depthwise_conv() -> None:
+    torch.manual_seed(0)
+    hidden_states = torch.randn(2, 6, 1, dtype=torch.bfloat16)
+    conv_state = torch.randn(2, 6, 4, dtype=torch.bfloat16)
+    weight = torch.randn(6, 4, dtype=torch.bfloat16)
+    bias = torch.randn(6, dtype=torch.bfloat16)
+
+    expected_state = conv_state.clone()
+    actual_state = conv_state.clone()
+    expected = torch_causal_conv1d_update(hidden_states, expected_state, weight, bias)
+    actual = torch_causal_conv1d_update_one_token(hidden_states, actual_state, weight, bias)
+
+    assert torch.allclose(actual, expected, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(actual_state, expected_state, atol=1e-2, rtol=1e-2)
+
+
+def test_single_token_recurrent_rule_matches_manual_update() -> None:
+    torch.manual_seed(0)
+    query = torch.randn(2, 1, 4, 8, dtype=torch.bfloat16)
+    key = torch.randn(2, 1, 4, 8, dtype=torch.bfloat16)
+    value = torch.randn(2, 1, 4, 6, dtype=torch.bfloat16)
+    g = torch.randn(2, 1, 4, dtype=torch.float32)
+    beta = torch.sigmoid(torch.randn(2, 1, 4, dtype=torch.bfloat16))
+    initial_state = torch.randn(2, 4, 8, 6, dtype=torch.float32)
+
+    actual_out, actual_state = torch_recurrent_gated_delta_rule_one_token(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+
+    q_t = query[:, 0]
+    q_t = q_t * torch.rsqrt((q_t * q_t).sum(dim=-1, keepdim=True) + 1e-6)
+    q_t = q_t.float()
+    q_t = q_t * (q_t.shape[-1] ** -0.5)
+    k_t = key[:, 0]
+    k_t = k_t * torch.rsqrt((k_t * k_t).sum(dim=-1, keepdim=True) + 1e-6)
+    k_t = k_t.float()
+    v_t = value[:, 0].float()
+    beta_t = beta[:, 0].float().unsqueeze(-1)
+    g_t = g[:, 0].float().exp().unsqueeze(-1).unsqueeze(-1)
+    expected_state = initial_state * g_t
+    kv_mem = torch.matmul(k_t.unsqueeze(-2), expected_state).squeeze(-2)
+    delta = (v_t - kv_mem) * beta_t
+    expected_state = expected_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+    expected_out = torch.matmul(q_t.unsqueeze(-2), expected_state).squeeze(-2).unsqueeze(1).to(dtype=query.dtype)
+
+    assert actual_state is not None
+    assert torch.allclose(actual_out, expected_out, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(actual_state, expected_state, atol=1e-4, rtol=1e-4)
 
 
 def test_qwen3_allows_out_of_range_padding_idx_for_tiny_configs() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
@@ -9,6 +10,7 @@ from typing import Any, Iterator
 import torch
 
 from anna.mm.processor import PreparedInputs, Qwen3MultimodalProcessor
+from anna.model.linear_backend import onednn_linear_status
 from anna.model.qwen import Qwen3ForConditionalGeneration
 from anna.model.ops import Qwen3PageAllocator
 from anna.runtime.device import DeviceContext
@@ -114,11 +116,13 @@ class AnnaEngineError(RuntimeError):
         status_code: int = 400,
         error_type: str = "invalid_request_error",
         code: str | None = None,
+        param: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.error_type = error_type
         self.code = code
+        self.param = param
 
 
 @dataclass(slots=True)
@@ -145,6 +149,37 @@ class TextGenerationResult:
     prompt_tokens: int
     completion_tokens: int
     reasoning_text: str | None = None
+    prefill_seconds: float | None = None
+    decode_seconds: float | None = None
+    decode_tokens_per_second: float | None = None
+    end_to_end_tokens_per_second: float | None = None
+
+
+@dataclass(slots=True)
+class TokenGenerationRun:
+    completion_ids: list[int]
+    finish_reason: str
+    prompt_tokens: int
+    completion_tokens: int
+    prefill_seconds: float | None = None
+    decode_seconds: float | None = None
+
+    @property
+    def decode_tokens_per_second(self) -> float | None:
+        if self.decode_seconds is None or self.decode_seconds <= 0 or self.completion_tokens <= 0:
+            return None
+        return self.completion_tokens / self.decode_seconds
+
+    @property
+    def end_to_end_tokens_per_second(self) -> float | None:
+        total = 0.0
+        if self.prefill_seconds is not None:
+            total += self.prefill_seconds
+        if self.decode_seconds is not None:
+            total += self.decode_seconds
+        if total <= 0 or self.completion_tokens <= 0:
+            return None
+        return self.completion_tokens / total
 
 
 class AnnaEngine:
@@ -157,6 +192,7 @@ class AnnaEngine:
         model_id: str,
         device_context: DeviceContext,
         quantized_replacements: int = 0,
+        max_model_len: int | None = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -165,6 +201,7 @@ class AnnaEngine:
         self.device_context = device_context
         self.config = model.config
         self.quantized_replacements = quantized_replacements
+        self.max_model_len = max_model_len
         self.cache_allocator = Qwen3PageAllocator(self.config.text_config)
         self._attach_cache_allocator()
         self.execution_lock = threading.Lock()
@@ -178,14 +215,27 @@ class AnnaEngine:
         model_id: str | None = None,
         device: str = "auto",
         dtype: str = "auto",
+        max_model_len: int | None = None,
+        gpu_memory_utilization: float = 0.9,
     ) -> "AnnaEngine":
         model_path = Path(model_dir)
         config = load_model_config(model_path)
+        if max_model_len is not None:
+            if max_model_len <= 0:
+                raise ValueError("Configured max_model_len must be greater than 0.")
+            if max_model_len > config.text_config.max_position_embeddings:
+                raise ValueError(
+                    "Configured max_model_len "
+                    f"{max_model_len} exceeds the model context limit {config.text_config.max_position_embeddings}."
+                )
+        if not 0.0 < gpu_memory_utilization <= 1.0:
+            raise ValueError("gpu_memory_utilization must be within (0, 1].")
         device_context = DeviceContext.resolve(
             device=device,
             dtype=dtype,
             model_dtype=config.text_config.dtype,
         )
+        device_context.safety_policy.max_estimated_usage_ratio = gpu_memory_utilization
         try:
             model, quantized_replacements = build_model(
                 config,
@@ -225,6 +275,7 @@ class AnnaEngine:
             model_id=resolved_model_id,
             device_context=device_context,
             quantized_replacements=quantized_replacements,
+            max_model_len=max_model_len,
         )
 
     def list_models(self) -> list[str]:
@@ -240,6 +291,12 @@ class AnnaEngine:
     def set_scheduler(self, scheduler: object | None) -> None:
         self.scheduler = scheduler
 
+    def _effective_max_model_len(self) -> int:
+        configured = getattr(self, "max_model_len", None)
+        if configured is not None:
+            return configured
+        return self.config.text_config.max_position_embeddings
+
     def health(self) -> dict[str, Any]:
         quant_method = self.config.quantization_config.quant_method or "dense"
         memory_info = self.device_context.get_memory_info()
@@ -253,7 +310,10 @@ class AnnaEngine:
             "float8_available": self.device_context.float8_available,
             "quantization": quant_method,
             "quantized_replacements": self.quantized_replacements,
+            "onednn_linear": onednn_linear_status(),
             "vision_enabled": self.config.vision_config is not None,
+            "max_model_len": self._effective_max_model_len(),
+            "gpu_memory_utilization": self.device_context.safety_policy.max_estimated_usage_ratio,
             "cache_device": str(self.device_context.migration_policy.execution_device),
             "preprocess_device": str(self.device_context.migration_policy.preprocess_device),
             "memory": None
@@ -269,6 +329,10 @@ class AnnaEngine:
     def generate_text(self, prompt: str, *, config: GenerationConfig) -> TextGenerationResult:
         prepared = self.processor.encode_text(prompt)
         return self._generate(prepared, config=config)
+
+    def profile_text(self, prompt: str, *, config: GenerationConfig) -> TextGenerationResult:
+        prepared = self.processor.encode_text(prompt)
+        return self._generate_profiled(prepared, config=config)
 
     def stream_text(self, prompt: str, *, config: GenerationConfig) -> Iterator[StreamEvent]:
         prepared = self.processor.encode_text(prompt)
@@ -290,6 +354,32 @@ class AnnaEngine:
             finish_reason=raw.finish_reason,
             prompt_tokens=raw.prompt_tokens,
             completion_tokens=raw.completion_tokens,
+            prefill_seconds=raw.prefill_seconds,
+            decode_seconds=raw.decode_seconds,
+            decode_tokens_per_second=raw.decode_tokens_per_second,
+            end_to_end_tokens_per_second=raw.end_to_end_tokens_per_second,
+        )
+
+    def profile_chat(
+        self,
+        messages: list[object],
+        *,
+        config: GenerationConfig,
+        enable_thinking: bool = False,
+    ) -> TextGenerationResult:
+        prepared = self._prepare_messages(messages, enable_thinking=enable_thinking)
+        raw = self._generate_profiled(prepared, config=config)
+        reasoning_text, content_text = self._split_chat_output(raw.text, enable_thinking=enable_thinking)
+        return TextGenerationResult(
+            text=content_text,
+            reasoning_text=reasoning_text,
+            finish_reason=raw.finish_reason,
+            prompt_tokens=raw.prompt_tokens,
+            completion_tokens=raw.completion_tokens,
+            prefill_seconds=raw.prefill_seconds,
+            decode_seconds=raw.decode_seconds,
+            decode_tokens_per_second=raw.decode_tokens_per_second,
+            end_to_end_tokens_per_second=raw.end_to_end_tokens_per_second,
         )
 
     def stream_chat(
@@ -333,6 +423,7 @@ class AnnaEngine:
             self.scheduler is not None
             and prepared.pixel_values is None
             and prepared.pixel_values_videos is None
+            and getattr(self.scheduler, "can_schedule", lambda prepared: True)(prepared)
         )
 
     def _validate_generation_request(
@@ -347,9 +438,11 @@ class AnnaEngine:
             raise AnnaEngineError("Prompt produced zero tokens.")
 
         max_total = prompt_length + config.max_new_tokens
-        if max_total > self.config.text_config.max_position_embeddings:
+        context_limit = self._effective_max_model_len()
+        if max_total > context_limit:
+            limit_label = "configured context limit" if getattr(self, "max_model_len", None) is not None else "model context limit"
             raise AnnaEngineError(
-                f"Requested sequence length {max_total} exceeds model context limit {self.config.text_config.max_position_embeddings}.",
+                f"Requested sequence length {max_total} exceeds {limit_label} {context_limit}.",
                 status_code=400,
                 code="context_length_exceeded",
             )
@@ -508,9 +601,24 @@ class AnnaEngine:
             return self.scheduler.generate(prepared, config=config)
         return self._generate_direct(prepared, config=config)
 
-    def _generate_direct(self, prepared: PreparedInputs, *, config: GenerationConfig) -> TextGenerationResult:
+    def _generate_profiled(self, prepared: PreparedInputs, *, config: GenerationConfig) -> TextGenerationResult:
+        if self._can_use_scheduler(prepared):
+            return self.scheduler.generate(prepared, config=config)
+        return self._generate_direct(prepared, config=config, collect_timing=True)
+
+    def _generate_direct(
+        self,
+        prepared: PreparedInputs,
+        *,
+        config: GenerationConfig,
+        collect_timing: bool = False,
+    ) -> TextGenerationResult:
         if not config.stop_strings:
-            return self._generate_without_streaming_overhead(prepared, config=config)
+            return self._generate_without_streaming_overhead(
+                prepared,
+                config=config,
+                collect_timing=collect_timing,
+            )
 
         text_parts: list[str] = []
         finish_reason = "length"
@@ -539,18 +647,24 @@ class AnnaEngine:
         prepared: PreparedInputs,
         *,
         config: GenerationConfig,
+        collect_timing: bool = False,
     ) -> TextGenerationResult:
-        completion_ids, finish_reason, prompt_tokens, completion_tokens = self._generate_token_ids(
+        run = self._generate_token_ids(
             prepared,
             config=config,
+            collect_timing=collect_timing,
         )
-        text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
+        text = self.tokenizer.decode(run.completion_ids, skip_special_tokens=False)
         return TextGenerationResult(
             text=text,
             reasoning_text=None,
-            finish_reason=finish_reason,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
+            finish_reason=run.finish_reason,
+            prompt_tokens=run.prompt_tokens,
+            completion_tokens=run.completion_tokens,
+            prefill_seconds=run.prefill_seconds,
+            decode_seconds=run.decode_seconds,
+            decode_tokens_per_second=run.decode_tokens_per_second,
+            end_to_end_tokens_per_second=run.end_to_end_tokens_per_second,
         )
 
     def _stream(self, prepared: PreparedInputs, *, config: GenerationConfig) -> Iterator[StreamEvent]:
@@ -629,7 +743,9 @@ class AnnaEngine:
         self,
         prepared: PreparedInputs,
         config: GenerationConfig,
-    ) -> tuple[list[int], str, int, int]:
+        *,
+        collect_timing: bool = False,
+    ) -> TokenGenerationRun:
         prompt_ids, prompt_length = self._validate_generation_request(prepared, config=config)
         prepared = self._move_prepared_for_generation(prepared, config=config)
 
@@ -639,6 +755,8 @@ class AnnaEngine:
             prompt_ids,
             config.repetition_penalty,
         )
+        prefill_seconds = 0.0 if collect_timing else None
+        decode_seconds = 0.0 if collect_timing else None
 
         input_ids = prepared.input_ids
         attention_mask = prepared.attention_mask
@@ -651,6 +769,7 @@ class AnnaEngine:
 
         try:
             for step_idx in range(config.max_new_tokens):
+                step_start = time.perf_counter() if collect_timing else 0.0
                 try:
                     with self.execution_lock:
                         outputs = self.model(
@@ -676,11 +795,25 @@ class AnnaEngine:
                     )
                     token_id = int(next_token.item())
                     past_key_values = outputs.past_key_values
+                    if collect_timing:
+                        self.device_context.synchronize()
+                        elapsed = time.perf_counter() - step_start
+                        if step_idx == 0:
+                            prefill_seconds = (prefill_seconds or 0.0) + elapsed
+                        else:
+                            decode_seconds = (decode_seconds or 0.0) + elapsed
                 except RuntimeError as exc:
                     raise self._handle_runtime_failure(exc) from exc
 
                 if token_id in stop_token_ids:
-                    return completion_ids, "stop", prompt_length, len(completion_ids)
+                    return TokenGenerationRun(
+                        completion_ids=completion_ids,
+                        finish_reason="stop",
+                        prompt_tokens=prompt_length,
+                        completion_tokens=len(completion_ids),
+                        prefill_seconds=prefill_seconds,
+                        decode_seconds=decode_seconds,
+                    )
 
                 completion_ids.append(token_id)
                 repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
@@ -700,7 +833,14 @@ class AnnaEngine:
                 if step_idx + 1 >= config.max_new_tokens:
                     break
 
-            return completion_ids, "length", prompt_length, len(completion_ids)
+            return TokenGenerationRun(
+                completion_ids=completion_ids,
+                finish_reason="length",
+                prompt_tokens=prompt_length,
+                completion_tokens=len(completion_ids),
+                prefill_seconds=prefill_seconds,
+                decode_seconds=decode_seconds,
+            )
         finally:
             if past_key_values is not None:
                 past_key_values.release()

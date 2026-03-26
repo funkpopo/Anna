@@ -11,6 +11,10 @@ class ServeSettings:
     device: str = "auto"
     dtype: str = "auto"
     scheduler_max_batch_size: int = 4
+    scheduler_max_batched_tokens: int | None = None
+    max_model_len: int | None = None
+    gpu_memory_utilization: float = 0.9
+    api_key: str | None = None
     scheduler_batch_wait_ms: float = 2.0
     host: str = "127.0.0.1"
     port: int = 8000

@@ -13,9 +13,27 @@ htmlcov/
 
 # Build and packaging artifacts
 build/
+.build/
+.build*/
 dist/
 *.egg-info/
 pip-wheel-metadata/
+build.ninja
+.ninja_deps
+.ninja_log
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+cmake-build-*/
+compile_commands.json
+*.obj
+*.o
+*.lib
+*.a
+*.exp
+*.ilk
+*.pdb
+*.dll
 
 # Virtual environments
 .venv/
@@ -44,3 +62,6 @@ models/
 # OS files
 .DS_Store
 Thumbs.db
+
+# test scripts
+download_models.py

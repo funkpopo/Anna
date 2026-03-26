@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from anna.runtime.engine import AnnaEngine, GenerationConfig, ThinkingStreamParser
+from anna.runtime.engine import AnnaEngine, GenerationConfig, ThinkingStreamParser, TokenGenerationRun
 from anna.runtime.streaming import IncrementalTextAssembler
 
 
@@ -104,7 +104,14 @@ def test_generate_without_streaming_overhead_decodes_once() -> None:
 
     engine = object.__new__(AnnaEngine)
     engine.tokenizer = DummyTokenizer()
-    engine._generate_token_ids = lambda prepared, config: ([3, 4, 5], "stop", 7, 3)
+    engine._generate_token_ids = lambda prepared, config, collect_timing=False: TokenGenerationRun(
+        completion_ids=[3, 4, 5],
+        finish_reason="stop",
+        prompt_tokens=7,
+        completion_tokens=3,
+        prefill_seconds=0.12 if collect_timing else None,
+        decode_seconds=0.34 if collect_timing else None,
+    )
 
     result = engine._generate_without_streaming_overhead(object(), config=GenerationConfig())
 
@@ -112,6 +119,34 @@ def test_generate_without_streaming_overhead_decodes_once() -> None:
     assert result.finish_reason == "stop"
     assert result.prompt_tokens == 7
     assert result.completion_tokens == 3
+
+
+def test_generate_without_streaming_overhead_preserves_profile_metrics() -> None:
+    class DummyTokenizer:
+        def decode(self, token_ids: list[int], *, skip_special_tokens: bool = False) -> str:
+            return "done"
+
+    engine = object.__new__(AnnaEngine)
+    engine.tokenizer = DummyTokenizer()
+    engine._generate_token_ids = lambda prepared, config, collect_timing=False: TokenGenerationRun(
+        completion_ids=[1, 2],
+        finish_reason="length",
+        prompt_tokens=5,
+        completion_tokens=2,
+        prefill_seconds=0.5 if collect_timing else None,
+        decode_seconds=0.25 if collect_timing else None,
+    )
+
+    result = engine._generate_without_streaming_overhead(
+        object(),
+        config=GenerationConfig(),
+        collect_timing=True,
+    )
+
+    assert result.prefill_seconds == 0.5
+    assert result.decode_seconds == 0.25
+    assert result.decode_tokens_per_second == 8.0
+    assert result.end_to_end_tokens_per_second == 2 / 0.75
 
 
 def test_incremental_text_assembler_handles_unstable_unicode_suffix() -> None:
