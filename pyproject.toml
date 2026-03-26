@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anna"
+version = "0.1.0"
+description = "From-scratch Qwen3.5 inference service for Intel Arc with an OpenAI-compatible API."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.116,<1.0",
+    "imageio>=2.37,<3.0",
+    "imageio-ffmpeg>=0.6,<1.0",
+    "numpy>=2.3,<3.0",
+    "pillow>=11.3,<12.0",
+    "pydantic>=2.11,<3.0",
+    "safetensors>=0.6,<1.0",
+    "tokenizers>=0.22,<1.0",
+    "torch>=2.7",
+    "typing-extensions>=4.14,<5.0",
+    "uvicorn[standard]>=0.35,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1.0",
+    "pytest>=8.4,<9.0",
+]
+
+[project.scripts]
+anna-serve = "anna.cli.serve:main"
+anna-generate = "anna.cli.generate:main"
+anna-bench = "anna.cli.bench:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
