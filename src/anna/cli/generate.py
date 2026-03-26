@@ -15,6 +15,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
+    parser.add_argument("--offload-mode", choices=("auto", "none", "experts"), default="auto")
+    parser.add_argument(
+        "--resident-expert-layers",
+        type=int,
+        default=0,
+        help="Keep the first N sparse MoE layers fully resident on the execution device.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
@@ -34,6 +41,8 @@ def main() -> None:
         model_id=model_name,
         device=args.device,
         dtype=args.dtype,
+        offload_mode=args.offload_mode,
+        resident_expert_layers=args.resident_expert_layers,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
@@ -47,6 +56,8 @@ def main() -> None:
         model_id=settings.model_id,
         device=settings.device,
         dtype=settings.dtype,
+        offload_mode=settings.offload_mode,
+        resident_expert_layers=settings.resident_expert_layers,
     )
     result = engine.generate_text(
         settings.prompt,

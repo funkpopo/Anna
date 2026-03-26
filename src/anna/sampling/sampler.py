@@ -12,6 +12,8 @@ def apply_repetition_penalty(
         return logits
 
     output = logits.clone()
+    if generated_ids.device != output.device:
+        generated_ids = generated_ids.to(device=output.device)
     unique_ids = torch.unique(generated_ids)
     values = output.index_select(0, unique_ids)
     adjusted = torch.where(values < 0, values * penalty, values / penalty)

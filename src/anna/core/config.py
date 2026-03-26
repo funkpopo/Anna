@@ -10,6 +10,8 @@ class ServeSettings:
     model_id: str | None = None
     device: str = "auto"
     dtype: str = "auto"
+    offload_mode: str = "auto"
+    resident_expert_layers: int = 0
     scheduler_max_batch_size: int = 4
     scheduler_batch_wait_ms: float = 2.0
     host: str = "127.0.0.1"
@@ -24,6 +26,8 @@ class GenerateSettings:
     model_id: str | None = None
     device: str = "auto"
     dtype: str = "auto"
+    offload_mode: str = "auto"
+    resident_expert_layers: int = 0
     max_new_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.95
@@ -40,6 +44,8 @@ class BenchmarkSettings:
     video: str | None = None
     device: str = "auto"
     dtype: str = "auto"
+    offload_mode: str = "auto"
+    resident_expert_layers: int = 0
     max_new_tokens: int = 64
     temperature: float = 0.0
     top_p: float = 1.0

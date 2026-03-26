@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import copy
+from collections import OrderedDict
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from anna.model.config import Qwen3TextConfig
+
+
+def _module_device(module: nn.Module) -> torch.device:
+    for parameter in module.parameters():
+        return parameter.device
+    for buffer in module.buffers():
+        return buffer.device
+    return torch.device("cpu")
 
 
 class Qwen3PagedLayerAllocator:
@@ -853,6 +864,11 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
+        self.offload_experts = False
+        self.resident_experts = False
+        self.execution_device: torch.device | None = None
+        self.cached_experts_per_layer: int = max(self.top_k, 8)
+        self._expert_cache: OrderedDict[int, Qwen3MLP] = OrderedDict()
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList(
             [Qwen3MLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
@@ -860,7 +876,39 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.shared_expert = Qwen3MLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
 
+    def configure_runtime(
+        self,
+        execution_device: torch.device,
+        *,
+        offload_experts: bool,
+        resident_experts: bool = False,
+    ) -> None:
+        self.execution_device = execution_device
+        self.resident_experts = resident_experts
+        self.offload_experts = offload_experts and not resident_experts
+        self._expert_cache.clear()
+
+        expert_device = execution_device if resident_experts or not offload_experts else torch.device("cpu")
+        for expert in self.experts:
+            expert.to(expert_device)
+
+    def _get_cached_expert(self, expert_idx: int) -> Qwen3MLP | None:
+        if not self.offload_experts or self.execution_device is None or self.cached_experts_per_layer <= 0:
+            return None
+        cached = self._expert_cache.get(expert_idx)
+        if cached is not None:
+            self._expert_cache.move_to_end(expert_idx)
+            return cached
+
+        source = self.experts[expert_idx]
+        cached = copy.deepcopy(source).to(self.execution_device)
+        if len(self._expert_cache) >= self.cached_experts_per_layer:
+            self._expert_cache.popitem(last=False)
+        self._expert_cache[expert_idx] = cached
+        return cached
+
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        execution_device = hidden_states.device
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_dim)
         router_logits = self.gate(hidden_states)
@@ -874,18 +922,43 @@ class Qwen3SparseMoeBlock(nn.Module):
         final_hidden_states = hidden_states.new_zeros((batch_size * sequence_length, hidden_dim))
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
         hit_experts = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero(as_tuple=False).flatten()
+        gpu_candidates: set[int] = set()
+        if self.offload_experts and self.execution_device is not None and hit_experts.numel() > 0:
+            usage = expert_mask.sum(dim=(-1, -2))
+            gpu_count = min(int(hit_experts.numel()), self.cached_experts_per_layer)
+            if gpu_count > 0:
+                _, candidate_idx = torch.topk(usage, k=gpu_count)
+                gpu_candidates = {int(idx) for idx in candidate_idx.tolist() if int(usage[idx].item()) > 0}
 
         for expert_idx in hit_experts.tolist():
             expert_layer = self.experts[expert_idx]
+            if expert_idx in gpu_candidates:
+                cached = self._get_cached_expert(expert_idx)
+                if cached is not None:
+                    expert_layer = cached
             route_idx, token_idx = torch.where(expert_mask[expert_idx])
             if token_idx.numel() == 0:
                 continue
+            expert_device = _module_device(expert_layer)
             current_state = hidden_states.index_select(0, token_idx)
-            current_hidden_states = expert_layer(current_state) * routing_weights[token_idx, route_idx, None]
+            current_routing_weights = routing_weights[token_idx, route_idx, None]
+            if current_state.device != expert_device:
+                current_state = current_state.to(device=expert_device)
+            if current_routing_weights.device != expert_device:
+                current_routing_weights = current_routing_weights.to(device=expert_device)
+            current_hidden_states = expert_layer(current_state) * current_routing_weights
+            if current_hidden_states.device != execution_device:
+                current_hidden_states = current_hidden_states.to(device=execution_device, dtype=hidden_states.dtype)
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(dtype=hidden_states.dtype))
 
-        shared_expert_output = self.shared_expert(hidden_states)
-        shared_expert_output = torch.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+        shared_expert_device = _module_device(self.shared_expert)
+        shared_gate_device = _module_device(self.shared_expert_gate)
+        shared_input = hidden_states if hidden_states.device == shared_expert_device else hidden_states.to(device=shared_expert_device)
+        gate_input = hidden_states if hidden_states.device == shared_gate_device else hidden_states.to(device=shared_gate_device)
+        shared_expert_output = self.shared_expert(shared_input)
+        shared_expert_output = torch.sigmoid(self.shared_expert_gate(gate_input).to(device=shared_expert_output.device)) * shared_expert_output
+        if shared_expert_output.device != execution_device:
+            shared_expert_output = shared_expert_output.to(device=execution_device, dtype=hidden_states.dtype)
         final_hidden_states = final_hidden_states + shared_expert_output
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim), router_logits
 

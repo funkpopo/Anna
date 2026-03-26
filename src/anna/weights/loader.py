@@ -44,6 +44,18 @@ def _iter_weight_files(model_dir: Path) -> list[Path]:
     return files
 
 
+def estimate_model_weight_bytes(model_dir: str | Path) -> int:
+    model_path = Path(model_dir)
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        index_data = json.loads(index_path.read_text(encoding="utf-8"))
+        metadata = index_data.get("metadata", {})
+        total_size = metadata.get("total_size")
+        if total_size is not None:
+            return int(total_size)
+    return sum(weight_file.stat().st_size for weight_file in _iter_weight_files(model_path))
+
+
 def build_model(
     config: Qwen3Config,
     *,

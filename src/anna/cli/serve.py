@@ -18,6 +18,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-name", default=None, help="Model name exposed through the API.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
+    parser.add_argument("--offload-mode", choices=("auto", "none", "experts"), default="auto")
+    parser.add_argument(
+        "--resident-expert-layers",
+        type=int,
+        default=0,
+        help="Keep the first N sparse MoE layers fully resident on the execution device.",
+    )
     parser.add_argument("--scheduler-max-batch-size", type=int, default=4)
     parser.add_argument("--scheduler-batch-wait-ms", type=float, default=2.0)
     parser.add_argument("--host", default="127.0.0.1")
@@ -35,6 +42,8 @@ def main() -> None:
         model_id=model_name,
         device=args.device,
         dtype=args.dtype,
+        offload_mode=args.offload_mode,
+        resident_expert_layers=args.resident_expert_layers,
         scheduler_max_batch_size=args.scheduler_max_batch_size,
         scheduler_batch_wait_ms=args.scheduler_batch_wait_ms,
         host=args.host,
@@ -48,6 +57,8 @@ def main() -> None:
         model_id=settings.model_id,
         device=settings.device,
         dtype=settings.dtype,
+        offload_mode=settings.offload_mode,
+        resident_expert_layers=settings.resident_expert_layers,
     )
     scheduler = AnnaScheduler(
         engine,
