@@ -1,0 +1,303 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterator
+
+import torch
+
+from anna.mm.processor import PreparedInputs, Qwen3MultimodalProcessor
+from anna.model.qwen import Qwen3ForConditionalGeneration
+from anna.runtime.device import DeviceContext
+from anna.sampling.sampler import sample_next_token
+from anna.weights.loader import build_model, load_model_config, load_model_weights
+from anna.weights.tokenizer import QwenTokenizer
+
+logger = logging.getLogger(__name__)
+
+
+class AnnaEngineError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 400,
+        error_type: str = "invalid_request_error",
+        code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_type = error_type
+        self.code = code
+
+
+@dataclass(slots=True)
+class GenerationConfig:
+    max_new_tokens: int = 256
+    temperature: float = 0.7
+    top_p: float = 0.95
+    top_k: int = 50
+    repetition_penalty: float = 1.0
+    stop_strings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class StreamEvent:
+    text: str
+    finish_reason: str | None = None
+
+
+@dataclass(slots=True)
+class TextGenerationResult:
+    text: str
+    finish_reason: str
+    prompt_tokens: int
+    completion_tokens: int
+
+
+class AnnaEngine:
+    def __init__(
+        self,
+        *,
+        model: Qwen3ForConditionalGeneration,
+        tokenizer: QwenTokenizer,
+        processor: Qwen3MultimodalProcessor,
+        model_id: str,
+        device_context: DeviceContext,
+        quantized_replacements: int = 0,
+    ) -> None:
+        self.model = model
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.default_model_id = model_id
+        self.device_context = device_context
+        self.config = model.config
+        self.quantized_replacements = quantized_replacements
+
+    @classmethod
+    def from_model_dir(
+        cls,
+        model_dir: str | Path,
+        *,
+        model_id: str | None = None,
+        device: str = "auto",
+        dtype: str = "auto",
+    ) -> "AnnaEngine":
+        model_path = Path(model_dir)
+        config = load_model_config(model_path)
+        device_context = DeviceContext.resolve(
+            device=device,
+            dtype=dtype,
+            model_dtype=config.text_config.dtype,
+        )
+        model, quantized_replacements = build_model(
+            config,
+            device=device_context.device,
+            dtype=device_context.dtype,
+        )
+        report = load_model_weights(model, model_path)
+        report.quantized_replacements = quantized_replacements
+        model.eval()
+
+        tokenizer = QwenTokenizer.from_model_dir(model_path)
+        processor = Qwen3MultimodalProcessor(config, tokenizer)
+        resolved_model_id = model_id or model_path.name
+
+        logger.info(
+            "Loaded model %s on %s (compute=%s, requested=%s); tensors loaded=%s skipped=%s quantized=%s",
+            resolved_model_id,
+            device_context.device,
+            device_context.dtype,
+            device_context.reported_dtype,
+            report.loaded,
+            report.skipped,
+            report.quantized_replacements,
+        )
+
+        return cls(
+            model=model,
+            tokenizer=tokenizer,
+            processor=processor,
+            model_id=resolved_model_id,
+            device_context=device_context,
+            quantized_replacements=quantized_replacements,
+        )
+
+    def list_models(self) -> list[str]:
+        return [self.default_model_id]
+
+    def health(self) -> dict[str, Any]:
+        quant_method = self.config.quantization_config.quant_method or "dense"
+        return {
+            "status": "ok",
+            "model": self.default_model_id,
+            "device": str(self.device_context.device),
+            "compute_dtype": str(self.device_context.dtype),
+            "requested_dtype": self.device_context.requested_dtype,
+            "reported_dtype": self.device_context.reported_dtype,
+            "float8_available": self.device_context.float8_available,
+            "quantization": quant_method,
+            "quantized_replacements": self.quantized_replacements,
+            "vision_enabled": self.config.vision_config is not None,
+            "cache_device": str(self.device_context.migration_policy.execution_device),
+            "preprocess_device": str(self.device_context.migration_policy.preprocess_device),
+        }
+
+    def generate_text(self, prompt: str, *, config: GenerationConfig) -> TextGenerationResult:
+        prepared = self.processor.encode_text(prompt)
+        return self._generate(prepared, config=config)
+
+    def stream_text(self, prompt: str, *, config: GenerationConfig) -> Iterator[StreamEvent]:
+        prepared = self.processor.encode_text(prompt)
+        yield from self._stream(prepared, config=config)
+
+    def generate_chat(self, messages: list[object], *, config: GenerationConfig) -> TextGenerationResult:
+        prepared = self._prepare_messages(messages)
+        return self._generate(prepared, config=config)
+
+    def stream_chat(self, messages: list[object], *, config: GenerationConfig) -> Iterator[StreamEvent]:
+        prepared = self._prepare_messages(messages)
+        yield from self._stream(prepared, config=config)
+
+    def _prepare_messages(self, messages: list[object]) -> PreparedInputs:
+        try:
+            return self.processor.prepare_messages(messages)
+        except FileNotFoundError as exc:
+            raise AnnaEngineError(str(exc), status_code=400, code="invalid_media_reference") from exc
+        except ValueError as exc:
+            raise AnnaEngineError(str(exc), status_code=400) from exc
+        except RuntimeError as exc:
+            raise AnnaEngineError(str(exc), status_code=500, error_type="server_error") from exc
+
+    def _generate(self, prepared: PreparedInputs, *, config: GenerationConfig) -> TextGenerationResult:
+        text_parts: list[str] = []
+        finish_reason = "length"
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        for delta, finished, reason, prompt_count, completion_count in self._iter_generation(prepared, config):
+            if delta:
+                text_parts.append(delta)
+            prompt_tokens = prompt_count
+            completion_tokens = completion_count
+            if finished:
+                finish_reason = reason or "stop"
+                break
+
+        return TextGenerationResult(
+            text="".join(text_parts),
+            finish_reason=finish_reason,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+    def _stream(self, prepared: PreparedInputs, *, config: GenerationConfig) -> Iterator[StreamEvent]:
+        for delta, finished, reason, _, _ in self._iter_generation(prepared, config):
+            if delta:
+                yield StreamEvent(text=delta, finish_reason=None)
+            if finished:
+                yield StreamEvent(text="", finish_reason=reason or "stop")
+                return
+
+    def _trim_stop_strings(self, text: str, stop_strings: list[str]) -> tuple[str, bool]:
+        if not stop_strings:
+            return text, False
+        indexes = [text.find(stop) for stop in stop_strings if stop and stop in text]
+        if not indexes:
+            return text, False
+        trim_at = min(indexes)
+        return text[:trim_at], True
+
+    @torch.inference_mode()
+    def _iter_generation(
+        self,
+        prepared: PreparedInputs,
+        config: GenerationConfig,
+    ) -> Iterator[tuple[str, bool, str | None, int, int]]:
+        prompt_ids = prepared.input_ids[0].tolist()
+        prompt_length = int(prepared.input_ids.shape[1])
+        if prompt_length == 0:
+            raise AnnaEngineError("Prompt produced zero tokens.")
+
+        max_total = prompt_length + config.max_new_tokens
+        if max_total > self.config.text_config.max_position_embeddings:
+            raise AnnaEngineError(
+                f"Requested sequence length {max_total} exceeds model context limit {self.config.text_config.max_position_embeddings}.",
+                status_code=400,
+                code="context_length_exceeded",
+            )
+
+        prepared = self.device_context.move_prepared_inputs(prepared)
+        completion_ids: list[int] = []
+        decoded_text = ""
+        stop_token_ids = set(self.tokenizer.eos_token_ids)
+
+        input_ids = prepared.input_ids
+        attention_mask = prepared.attention_mask
+        mm_token_type_ids = prepared.mm_token_type_ids
+        pixel_values = prepared.pixel_values
+        image_grid_thw = prepared.image_grid_thw
+        pixel_values_videos = prepared.pixel_values_videos
+        video_grid_thw = prepared.video_grid_thw
+        past_key_values = None
+
+        for step_idx in range(config.max_new_tokens):
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
+                use_cache=True,
+            )
+            logits = outputs.logits[0, -1]
+            history_ids = prompt_ids + completion_ids
+            history_tensor = (
+                self.device_context.move_token_ids(torch.tensor(history_ids, dtype=torch.long))
+                if history_ids
+                else None
+            )
+            next_token = sample_next_token(
+                logits,
+                generated_ids=history_tensor,
+                temperature=config.temperature,
+                top_p=config.top_p,
+                top_k=config.top_k,
+                repetition_penalty=config.repetition_penalty,
+            )
+            token_id = int(next_token.item())
+            past_key_values = self.device_context.move_cache(outputs.past_key_values)
+
+            if token_id in stop_token_ids:
+                yield "", True, "stop", prompt_length, len(completion_ids)
+                return
+
+            completion_ids.append(token_id)
+            new_decoded = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
+            trimmed_text, hit_stop_string = self._trim_stop_strings(new_decoded, config.stop_strings)
+            delta = trimmed_text[len(decoded_text) :] if trimmed_text.startswith(decoded_text) else trimmed_text
+            decoded_text = trimmed_text
+
+            input_ids = next_token.view(1, 1)
+            attention_mask = None
+            mm_token_type_ids = None
+            pixel_values = None
+            image_grid_thw = None
+            pixel_values_videos = None
+            video_grid_thw = None
+
+            if delta:
+                yield delta, False, None, prompt_length, len(completion_ids)
+
+            if hit_stop_string:
+                yield "", True, "stop", prompt_length, len(completion_ids)
+                return
+
+            if step_idx + 1 >= config.max_new_tokens:
+                break
+
+        yield "", True, "length", prompt_length, len(completion_ids)
