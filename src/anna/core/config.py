@@ -28,8 +28,10 @@ class ServeSettings:
     device: str = "auto"
     dtype: str = "auto"
     offload_mode: str = "auto"
+    expert_quant: str = "auto"
     resident_expert_layers: int | None = None
     resident_expert_layer_indices: tuple[int, ...] | None = None
+    cached_experts_per_layer: int | None = None
     scheduler_max_batch_size: int = 4
     scheduler_batch_wait_ms: float = 2.0
     host: str = "127.0.0.1"
@@ -45,8 +47,10 @@ class GenerateSettings:
     device: str = "auto"
     dtype: str = "auto"
     offload_mode: str = "auto"
+    expert_quant: str = "auto"
     resident_expert_layers: int | None = None
     resident_expert_layer_indices: tuple[int, ...] | None = None
+    cached_experts_per_layer: int | None = None
     max_new_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.95
@@ -64,8 +68,10 @@ class BenchmarkSettings:
     device: str = "auto"
     dtype: str = "auto"
     offload_mode: str = "auto"
+    expert_quant: str = "auto"
     resident_expert_layers: int | None = None
     resident_expert_layer_indices: tuple[int, ...] | None = None
+    cached_experts_per_layer: int | None = None
     max_new_tokens: int = 64
     temperature: float = 0.0
     top_p: float = 1.0

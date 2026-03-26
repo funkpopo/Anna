@@ -21,6 +21,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--offload-mode", choices=("auto", "none", "experts"), default="auto")
     parser.add_argument(
+        "--expert-quant",
+        choices=("auto", "none", "int4"),
+        default="auto",
+        help="Quantization used for expert weights executed on XPU. 'auto' enables int4 for experts offload on XPU.",
+    )
+    parser.add_argument(
         "--resident-expert-layers",
         type=int,
         default=None,
@@ -30,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--resident-expert-layer-indices",
         default=None,
         help="Comma-separated 0-based decoder layer indices to keep fully resident on the execution device. Overrides --resident-expert-layers.",
+    )
+    parser.add_argument(
+        "--cached-experts-per-layer",
+        type=int,
+        default=None,
+        help="Max number of offloaded experts to keep cached on XPU per sparse MoE layer. Omit to auto-estimate; set 0 to disable.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -67,8 +79,10 @@ def main() -> None:
         device=args.device,
         dtype=args.dtype,
         offload_mode=args.offload_mode,
+        expert_quant=args.expert_quant,
         resident_expert_layers=args.resident_expert_layers,
         resident_expert_layer_indices=parse_resident_expert_layer_indices(args.resident_expert_layer_indices),
+        cached_experts_per_layer=args.cached_experts_per_layer,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
@@ -85,8 +99,10 @@ def main() -> None:
         device=settings.device,
         dtype=settings.dtype,
         offload_mode=settings.offload_mode,
+        expert_quant=settings.expert_quant,
         resident_expert_layers=settings.resident_expert_layers,
         resident_expert_layer_indices=settings.resident_expert_layer_indices,
+        cached_experts_per_layer=settings.cached_experts_per_layer,
     )
     generation = GenerationConfig(
         max_new_tokens=settings.max_new_tokens,
@@ -125,8 +141,10 @@ def main() -> None:
     print(f"device={engine.device_context.device}")
     print(f"compute_dtype={engine.device_context.dtype}")
     print(f"offload_mode={engine.offload_mode}")
+    print(f"expert_quant={engine.expert_quant}")
     print(f"resident_expert_layers={engine.resident_expert_layers}")
     print(f"resident_expert_layer_indices={','.join(str(idx) for idx in engine.resident_expert_layer_indices)}")
+    print(f"cached_experts_per_layer={engine.cached_experts_per_layer}")
     print(f"runs={len(latencies)}")
     print(f"avg_latency_seconds={avg_latency:.4f}")
     print(f"min_latency_seconds={min(latencies):.4f}")

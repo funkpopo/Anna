@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from anna.model.config import QuantizationConfig
-from anna.model.quantization import AWQLinear, FP8Linear, replace_linear_modules
+from anna.model.quantization import AWQLinear, FP8Linear, XPUInt4Linear, convert_module_linears_to_xpu_int4, replace_linear_modules
 
 
 class _TinyQuantNet(nn.Module):
@@ -53,3 +53,33 @@ def test_replace_linear_modules_awq_respects_skip_list() -> None:
     assert isinstance(model.proj, nn.Linear)
     assert isinstance(model.block[0], AWQLinear)
     assert isinstance(model.block[2], AWQLinear)
+
+
+def test_convert_module_linears_to_xpu_int4_replaces_supported_linears() -> None:
+    model = _TinyQuantNet()
+    converted = convert_module_linears_to_xpu_int4(model, group_size=32, device=torch.device("cpu"))
+
+    assert converted == 3
+    assert isinstance(model.proj, XPUInt4Linear)
+    assert isinstance(model.block[0], XPUInt4Linear)
+    assert isinstance(model.block[2], XPUInt4Linear)
+
+
+def test_xpu_int4_linear_cpu_fallback_matches_dense_linear_closely() -> None:
+    linear = nn.Linear(32, 16, bias=False)
+    with torch.no_grad():
+        linear.weight.copy_(torch.linspace(-1.0, 1.0, steps=16 * 32).reshape(16, 32))
+
+    quantized = XPUInt4Linear.from_linear(
+        linear,
+        group_size=32,
+        compute_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+    inputs = torch.randn(4, 32, dtype=torch.bfloat16)
+
+    reference = linear(inputs.to(dtype=torch.float32)).to(dtype=torch.bfloat16)
+    actual = quantized(inputs)
+    max_error = (actual.to(dtype=torch.float32) - reference.to(dtype=torch.float32)).abs().max().item()
+
+    assert max_error < 0.35
