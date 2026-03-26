@@ -13,19 +13,31 @@ def _float8_dtype():
     return getattr(torch, "float8_e4m3fn", None)
 
 
-def _empty_parameter(shape: tuple[int, ...], dtype: torch.dtype | None = None) -> nn.Parameter:
+def _empty_parameter(
+    shape: tuple[int, ...],
+    dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | None = None,
+) -> nn.Parameter:
     dtype = dtype or torch.float32
-    return nn.Parameter(torch.empty(*shape, dtype=dtype), requires_grad=False)
+    return nn.Parameter(torch.empty(*shape, dtype=dtype, device=device), requires_grad=False)
 
 
 class DenseLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        *,
+        device: torch.device | str | None = None,
+    ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = _empty_parameter((out_features, in_features))
+        self.weight = _empty_parameter((out_features, in_features), device=device)
         if bias:
-            self.bias = _empty_parameter((out_features,))
+            self.bias = _empty_parameter((out_features,), device=device)
         else:
             self.register_parameter("bias", None)
 
@@ -42,6 +54,7 @@ class FP8Linear(nn.Module):
         block_size: tuple[int, int] | None = None,
         bias: bool = False,
         compute_dtype: torch.dtype = torch.bfloat16,
+        device: torch.device | str | None = None,
     ):
         super().__init__()
         self.in_features = in_features
@@ -49,18 +62,18 @@ class FP8Linear(nn.Module):
         self.block_size = block_size
         self.compute_dtype = compute_dtype
         fp8_dtype = _float8_dtype() or torch.float16
-        self.weight = _empty_parameter((out_features, in_features), dtype=fp8_dtype)
+        self.weight = _empty_parameter((out_features, in_features), dtype=fp8_dtype, device=device)
         if block_size is None:
-            self.weight_scale_inv = nn.Parameter(torch.ones((), dtype=torch.float32), requires_grad=False)
+            self.weight_scale_inv = nn.Parameter(torch.ones((), dtype=torch.float32, device=device), requires_grad=False)
         else:
             scale_out = (out_features + block_size[0] - 1) // block_size[0]
             scale_in = (in_features + block_size[1] - 1) // block_size[1]
             self.weight_scale_inv = nn.Parameter(
-                torch.ones((scale_out, scale_in), dtype=torch.float32),
+                torch.ones((scale_out, scale_in), dtype=torch.float32, device=device),
                 requires_grad=False,
             )
         if bias:
-            self.bias = _empty_parameter((out_features,), dtype=compute_dtype)
+            self.bias = _empty_parameter((out_features,), dtype=compute_dtype, device=device)
         else:
             self.register_parameter("bias", None)
 
@@ -101,6 +114,7 @@ class AWQLinear(nn.Module):
         zero_point: bool = True,
         bias: bool = False,
         compute_dtype: torch.dtype = torch.float16,
+        device: torch.device | str | None = None,
     ):
         super().__init__()
         if bits != 4:
@@ -113,11 +127,11 @@ class AWQLinear(nn.Module):
         self.compute_dtype = compute_dtype
 
         self.register_parameter("weight", None)
-        self.register_buffer("qweight", torch.empty(0, dtype=torch.int32), persistent=True)
-        self.register_buffer("qzeros", torch.empty(0, dtype=torch.int32), persistent=True)
-        self.register_buffer("scales", torch.empty(0, dtype=torch.float16), persistent=True)
+        self.register_buffer("qweight", torch.empty(0, dtype=torch.int32, device=device), persistent=True)
+        self.register_buffer("qzeros", torch.empty(0, dtype=torch.int32, device=device), persistent=True)
+        self.register_buffer("scales", torch.empty(0, dtype=torch.float16, device=device), persistent=True)
         if bias:
-            self.bias = _empty_parameter((out_features,), dtype=compute_dtype)
+            self.bias = _empty_parameter((out_features,), dtype=compute_dtype, device=device)
         else:
             self.register_parameter("bias", None)
 
@@ -222,6 +236,7 @@ def replace_linear_modules(
             continue
         if _should_skip(module_name, quantization_config):
             continue
+        module_device = module.weight.device
 
         if quant_method == "fp8":
             replacement = FP8Linear(
@@ -230,6 +245,7 @@ def replace_linear_modules(
                 block_size=quantization_config.weight_block_size,
                 bias=module.bias is not None,
                 compute_dtype=compute_dtype,
+                device=module_device,
             )
         elif quant_method == "awq":
             replacement = AWQLinear(
@@ -240,6 +256,7 @@ def replace_linear_modules(
                 zero_point=quantization_config.zero_point,
                 bias=module.bias is not None,
                 compute_dtype=compute_dtype,
+                device=module_device,
             )
         else:
             continue
