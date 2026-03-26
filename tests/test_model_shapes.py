@@ -5,6 +5,7 @@ import torch
 from anna.model.config import Qwen3TextConfig, RopeParameters
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.model.qwen import Qwen3ForCausalLM
+from anna.runtime.engine import AnnaEngine
 
 
 def _tiny_config() -> Qwen3TextConfig:
@@ -186,3 +187,42 @@ def test_qwen3_runtime_can_pin_first_sparse_moe_layers() -> None:
     assert sparse_layers[0].offload_experts is False
     assert all(layer.resident_experts is False for layer in sparse_layers[1:])
     assert all(layer.offload_experts is True for layer in sparse_layers[1:])
+
+
+def test_qwen3_runtime_can_pin_sparse_moe_layers_by_decoder_index() -> None:
+    model = Qwen3ForCausalLM(_tiny_moe_config())
+
+    model.configure_runtime(
+        torch.device("cpu"),
+        offload_experts=True,
+        resident_expert_layer_indices=(1,),
+    )
+
+    resident_layer_indices = [
+        layer_idx
+        for layer_idx, layer in enumerate(model.model.layers)
+        if isinstance(layer.mlp, Qwen3SparseMoeBlock) and layer.mlp.resident_experts
+    ]
+    assert resident_layer_indices == [1]
+
+
+def test_engine_resolves_explicit_resident_expert_indices() -> None:
+    resolved = AnnaEngine._resolve_resident_expert_layer_indices(
+        requested_layers=None,
+        requested_indices=(2, 0, 2),
+        config=type("ConfigBox", (), {"text_config": _tiny_moe_config()})(),
+        resolved_offload_mode="experts",
+    )
+
+    assert resolved == (0, 2)
+
+
+def test_engine_leaves_resident_expert_indices_for_auto_estimation_when_unspecified() -> None:
+    resolved = AnnaEngine._resolve_resident_expert_layer_indices(
+        requested_layers=None,
+        requested_indices=None,
+        config=type("ConfigBox", (), {"text_config": _tiny_moe_config()})(),
+        resolved_offload_mode="experts",
+    )
+
+    assert resolved is None
