@@ -91,8 +91,12 @@
   - OOM / device lost / out of resources 自动清理缓存并返回可控错误
 - [x] 文本服务端连续批处理基础版
   - 同 prompt 长度 prefill 合批
-  - decode 按当前序列长度分桶
+  - decode mixed-length batching
   - 后台调度线程持续接单
+- [x] full attention paged KV cache 基础版
+  - per-request block table
+  - shared page allocator
+  - 页级回收与复用
 - [ ] 增加基础 profiling
 - [ ] 定位 Arc 上的瓶颈算子
 - [ ] 如有必要，补写自定义融合算子或权重预打包逻辑
@@ -112,7 +116,7 @@
 - [ ] 使用真实官方 FP8 权重做端到端前向验证
 - [ ] 使用真实官方 AWQ / AWQ-4bit 权重做端到端前向验证
 - [ ] 针对 Arc A770 调整量化 kernel 和数据布局
-- [ ] 把当前块式 cache 增长推进到更接近 paged cache 的页级回收与重用
+- [ ] 把当前 paged KV cache 的 Python gather 推进到更接近 paged attention 的低开销实现
 
 ## Phase 8: 端到端联调
 - [x] CLI 文本生成功能
@@ -133,5 +137,5 @@
 ## 当前限制
 - [x] 当前环境已在 `conda env anna` 中安装 `torch 2.11.0+xpu` 与项目依赖，可执行真实前向与 pytest。
 - [ ] FP8 与 AWQ 当前为项目内自实现装载/反量化路径，尚未完成真实模型数值校验。
-- [ ] 连续批处理当前仅覆盖纯文本请求；多模态仍走独占路径。
+- [ ] 连续批处理与 paged KV cache 当前仅覆盖纯文本请求；多模态仍走独占路径。
 - [ ] 尚未加入自定义 XPU 融合算子或 kernel。

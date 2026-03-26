@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from anna.model.config import Qwen3TextConfig, RopeParameters
-from anna.model.ops import Qwen3DynamicCache
+from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
 from anna.model.qwen import Qwen3ForCausalLM
 
 
@@ -79,8 +79,8 @@ def test_dynamic_cache_appends_without_reallocating_visible_prefix() -> None:
     key_b = torch.randn(1, 2, 2, 16)
     value_b = torch.randn(1, 2, 2, 16)
 
-    combined_key_a, combined_value_a = cache.update(key_a, value_a, layer_idx=1)
-    combined_key_b, combined_value_b = cache.update(key_b, value_b, layer_idx=1)
+    combined_key_a, combined_value_a, _ = cache.update(key_a, value_a, layer_idx=1)
+    combined_key_b, combined_value_b, _ = cache.update(key_b, value_b, layer_idx=1)
 
     assert combined_key_a.shape == (1, 2, 3, 16)
     assert combined_value_a.shape == (1, 2, 3, 16)
@@ -95,8 +95,9 @@ def test_dynamic_cache_appends_without_reallocating_visible_prefix() -> None:
 
 def test_dynamic_cache_stack_and_split_round_trips_batches() -> None:
     config = _tiny_config()
-    cache_a = Qwen3DynamicCache(config)
-    cache_b = Qwen3DynamicCache(config)
+    allocator = Qwen3PageAllocator(config)
+    cache_a = Qwen3DynamicCache(config, allocator=allocator)
+    cache_b = Qwen3DynamicCache(config, allocator=allocator)
     key_a = torch.randn(1, 2, 3, 16)
     value_a = torch.randn(1, 2, 3, 16)
     key_b = torch.randn(1, 2, 3, 16)
@@ -112,6 +113,22 @@ def test_dynamic_cache_stack_and_split_round_trips_batches() -> None:
     assert torch.equal(split[0].visible_value_cache(1), value_a)
     assert torch.equal(split[1].visible_key_cache(1), key_b)
     assert torch.equal(split[1].visible_value_cache(1), value_b)
+
+
+def test_dynamic_cache_release_reuses_freed_pages() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config)
+    cache_a = Qwen3DynamicCache(config, allocator=allocator)
+    cache_b = Qwen3DynamicCache(config, allocator=allocator)
+    key = torch.randn(1, 2, config.cache_block_size, 16)
+    value = torch.randn(1, 2, config.cache_block_size, 16)
+
+    cache_a.update(key, value, layer_idx=1)
+    first_page_ids = list(cache_a.page_tables[1][0])
+    cache_a.release()
+    cache_b.update(key, value, layer_idx=1)
+
+    assert cache_b.page_tables[1][0] == first_page_ids
 
 
 def test_qwen3_allows_out_of_range_padding_idx_for_tiny_configs() -> None:
