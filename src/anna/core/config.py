@@ -28,6 +28,7 @@ class ServeSettings:
     device: str = "auto"
     dtype: str = "auto"
     default_max_completion_tokens: int | None = None
+    default_enable_thinking: bool = True
     reasoning_format: str = "deepseek"
     offload_mode: str = "auto"
     offload_vision: bool = False

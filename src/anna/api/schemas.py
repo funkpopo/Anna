@@ -20,10 +20,15 @@ class ChatMessage(BaseModel):
     tool_call_id: str | None = None
 
 
+class ChatTemplateKwargs(BaseModel):
+    enable_thinking: bool | None = None
+
+
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[ChatMessage]
     enable_thinking: bool | None = None
+    chat_template_kwargs: ChatTemplateKwargs | None = None
     reasoning_format: Literal["none", "deepseek"] | None = None
     max_tokens: int | None = Field(default=None, ge=1)
     max_completion_tokens: int | None = Field(default=None, ge=1)

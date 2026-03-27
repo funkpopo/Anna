@@ -188,6 +188,7 @@ class AnnaEngine:
         device_context: DeviceContext,
         quantized_replacements: int = 0,
         default_max_completion_tokens: int | None = None,
+        default_enable_thinking: bool = True,
         reasoning_format: ReasoningFormat | str = _DEFAULT_REASONING_FORMAT,
         offload_mode: str = "none",
         offload_vision: bool = False,
@@ -206,6 +207,7 @@ class AnnaEngine:
         self.default_max_completion_tokens = (
             None if default_max_completion_tokens is None else max(1, int(default_max_completion_tokens))
         )
+        self.default_enable_thinking = bool(default_enable_thinking)
         self.reasoning_format = normalize_reasoning_format(reasoning_format)
         self.offload_mode = offload_mode
         self.offload_vision = offload_vision
@@ -229,6 +231,7 @@ class AnnaEngine:
         dtype: str = "auto",
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
+        default_enable_thinking: bool = True,
         reasoning_format: ReasoningFormat | str = _DEFAULT_REASONING_FORMAT,
         offload_mode: str = "auto",
         offload_vision: bool = False,
@@ -371,12 +374,13 @@ class AnnaEngine:
             resolved_default_max_completion_tokens = max(1, int(resolved_default_max_completion_tokens))
 
         logger.info(
-            "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, reasoning_format=%s, offload=%s, offload_vision=%s, expert_quant=%s, weight_quant=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
+            "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, default_enable_thinking=%s, reasoning_format=%s, offload=%s, offload_vision=%s, expert_quant=%s, weight_quant=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
             resolved_model_id,
             device_context.device,
             device_context.dtype,
             device_context.reported_dtype,
             resolved_default_max_completion_tokens,
+            bool(default_enable_thinking),
             normalize_reasoning_format(reasoning_format),
             resolved_offload_mode,
             resolved_offload_vision,
@@ -399,6 +403,7 @@ class AnnaEngine:
             device_context=device_context,
             quantized_replacements=report.quantized_replacements,
             default_max_completion_tokens=resolved_default_max_completion_tokens,
+            default_enable_thinking=default_enable_thinking,
             reasoning_format=reasoning_format,
             offload_mode=resolved_offload_mode,
             offload_vision=resolved_offload_vision,
@@ -796,6 +801,7 @@ class AnnaEngine:
             "requested_dtype": self.device_context.requested_dtype,
             "reported_dtype": self.device_context.reported_dtype,
             "default_max_completion_tokens": self.default_max_completion_tokens,
+            "default_enable_thinking": self.default_enable_thinking,
             "reasoning_format": self.reasoning_format,
             "float8_available": self.device_context.float8_available,
             "quantization": quant_method,

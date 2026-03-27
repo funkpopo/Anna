@@ -36,12 +36,15 @@ class _CapturingEngine:
         self,
         *,
         default_max_completion_tokens: int | None = 768,
+        default_enable_thinking: bool = True,
         reasoning_format: str = "deepseek",
     ) -> None:
         self.default_max_completion_tokens = default_max_completion_tokens
+        self.default_enable_thinking = default_enable_thinking
         self.reasoning_format = reasoning_format
         self.last_chat_config = None
         self.last_completion_config = None
+        self.last_enable_thinking = None
         self.last_reasoning_format = None
 
     def health(self) -> dict[str, str]:
@@ -52,6 +55,7 @@ class _CapturingEngine:
 
     def generate_chat(self, _messages, *, config, enable_thinking: bool = False, reasoning_format: str | None = None):
         self.last_chat_config = config
+        self.last_enable_thinking = enable_thinking
         self.last_reasoning_format = reasoning_format
         return TextGenerationResult(
             text="ok",
@@ -123,6 +127,57 @@ def test_chat_completion_request_max_completion_tokens_overrides_engine_default(
     assert response.status_code == 200
     assert engine.last_chat_config is not None
     assert engine.last_chat_config.max_new_tokens == 64
+
+
+def test_chat_completion_uses_engine_default_enable_thinking_when_request_omits_it() -> None:
+    engine = _CapturingEngine(default_enable_thinking=False)
+    client = TestClient(create_app(engine))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert engine.last_enable_thinking is False
+
+
+def test_chat_completion_chat_template_kwargs_enable_thinking_overrides_engine_default() -> None:
+    engine = _CapturingEngine(default_enable_thinking=True)
+    client = TestClient(create_app(engine))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+
+    assert response.status_code == 200
+    assert engine.last_enable_thinking is False
+
+
+def test_chat_completion_top_level_enable_thinking_overrides_chat_template_kwargs() -> None:
+    engine = _CapturingEngine(default_enable_thinking=True)
+    client = TestClient(create_app(engine))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "enable_thinking": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+
+    assert response.status_code == 200
+    assert engine.last_enable_thinking is True
 
 
 def test_chat_completion_leaves_max_completion_tokens_unset_when_engine_default_is_none() -> None:

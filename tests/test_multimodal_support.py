@@ -204,7 +204,7 @@ def test_tokenizer_renders_native_multimodal_placeholders() -> None:
 
     assert "<|vision_start|><|image_pad|><|vision_end|>" in rendered
     assert "<|vision_start|><|video_pad|><|vision_end|>" in rendered
-    assert rendered.endswith("<|im_start|>assistant\n<think>\n")
+    assert rendered.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
 
 
 def test_tokenizer_renders_open_think_prompt_when_enabled() -> None:

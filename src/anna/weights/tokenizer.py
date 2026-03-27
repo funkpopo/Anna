@@ -147,7 +147,10 @@ class QwenTokenizer:
             parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
 
         if add_generation_prompt:
-            # Keep the native open-think prompt so the raw <think>...</think> span
-            # is generated and can be handled entirely on the client side.
-            parts.append("<|im_start|>assistant\n<think>\n")
+            if enable_thinking:
+                parts.append("<|im_start|>assistant\n<think>\n")
+            else:
+                # Match the Qwen3 chat template behavior for non-thinking mode:
+                # pre-close an empty think block so generation starts directly in answer mode.
+                parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
         return "".join(parts)
