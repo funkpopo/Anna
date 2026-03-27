@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi.testclient import TestClient
 
 from anna.api.app import create_app
-from anna.runtime.engine import AnnaEngineError, TextGenerationResult
+from anna.runtime.engine import AnnaEngineError, GenerationPerfStats, TextGenerationResult
 
 
 class _FailingStreamEngine:
@@ -349,3 +351,46 @@ def test_chat_completion_request_reasoning_format_overrides_engine_default() -> 
 
     assert response.status_code == 200
     assert engine.last_reasoning_format == "deepseek"
+
+
+def test_chat_completion_logs_prefill_and_decode_metrics(caplog) -> None:
+    class _ProfilingEngine(_CapturingEngine):
+        def generate_chat(self, _messages, *, config, enable_thinking: bool = False, reasoning_format: str | None = None):
+            self.last_chat_config = config
+            self.last_enable_thinking = enable_thinking
+            self.last_reasoning_format = reasoning_format
+            return TextGenerationResult(
+                text="ok",
+                reasoning_text=None,
+                finish_reason="stop",
+                prompt_tokens=50,
+                completion_tokens=5,
+                perf=GenerationPerfStats(
+                    total_seconds=0.5,
+                    prefill_seconds=0.25,
+                    ttft_seconds=0.25,
+                    decode_seconds=0.25,
+                    prompt_tokens=50,
+                    completion_tokens=5,
+                    prefill_tokens_per_second=200.0,
+                    decode_tokens=4,
+                    decode_tokens_per_second=16.0,
+                    total_tokens_per_second=10.0,
+                ),
+            )
+
+    client = TestClient(create_app(_ProfilingEngine()))
+
+    with caplog.at_level(logging.INFO, logger="anna.api.routes"):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "fake-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 200
+    log_lines = [record.message for record in caplog.records if record.name == "anna.api.routes"]
+    assert any("prefill_seconds=0.250" in line for line in log_lines)
+    assert any("decode_tokens_per_second=16.00" in line for line in log_lines)

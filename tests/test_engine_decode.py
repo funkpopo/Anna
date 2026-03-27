@@ -107,7 +107,7 @@ def test_generate_without_streaming_overhead_decodes_once() -> None:
 
     engine = object.__new__(AnnaEngine)
     engine.tokenizer = DummyTokenizer()
-    engine._generate_token_ids = lambda prepared, config: ([3, 4, 5], "stop", 7, 3)
+    engine._generate_token_ids = lambda prepared, config: ([3, 4, 5], "stop", 7, 3, None)
 
     result = engine._generate_without_streaming_overhead(object(), config=GenerationConfig())
 

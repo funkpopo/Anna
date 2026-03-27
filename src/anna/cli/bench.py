@@ -146,6 +146,11 @@ def main() -> None:
     messages = _build_messages(settings)
     latencies: list[float] = []
     completion_tokens: list[int] = []
+    prefill_seconds: list[float] = []
+    prefill_tokens_per_second: list[float] = []
+    ttft_seconds: list[float] = []
+    decode_tokens_per_second: list[float] = []
+    total_tokens_per_second: list[float] = []
 
     for _ in range(max(settings.warmup, 0)):
         if settings.image is None and settings.video is None:
@@ -162,6 +167,12 @@ def main() -> None:
         latency = time.perf_counter() - start
         latencies.append(latency)
         completion_tokens.append(result.completion_tokens)
+        if result.perf is not None:
+            prefill_seconds.append(result.perf.prefill_seconds)
+            prefill_tokens_per_second.append(result.perf.prefill_tokens_per_second)
+            ttft_seconds.append(result.perf.ttft_seconds)
+            decode_tokens_per_second.append(result.perf.decode_tokens_per_second)
+            total_tokens_per_second.append(result.perf.total_tokens_per_second)
 
     avg_latency = statistics.mean(latencies)
     avg_tokens = statistics.mean(completion_tokens)
@@ -184,6 +195,12 @@ def main() -> None:
     print(f"max_latency_seconds={max(latencies):.4f}")
     print(f"avg_completion_tokens={avg_tokens:.2f}")
     print(f"avg_tokens_per_second={tokens_per_second:.2f}")
+    if prefill_seconds:
+        print(f"avg_prefill_seconds={statistics.mean(prefill_seconds):.4f}")
+        print(f"avg_ttft_seconds={statistics.mean(ttft_seconds):.4f}")
+        print(f"avg_prefill_tokens_per_second={statistics.mean(prefill_tokens_per_second):.2f}")
+        print(f"avg_decode_tokens_per_second={statistics.mean(decode_tokens_per_second):.2f}")
+        print(f"avg_total_tokens_per_second={statistics.mean(total_tokens_per_second):.2f}")
 
 
 if __name__ == "__main__":
