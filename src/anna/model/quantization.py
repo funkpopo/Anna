@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import os
 from dataclasses import dataclass
 
 import torch
@@ -129,10 +131,14 @@ class AWQLinear(nn.Module):
         self.register_buffer("qweight", torch.empty(0, dtype=torch.int32, device=device), persistent=True)
         self.register_buffer("qzeros", torch.empty(0, dtype=torch.int32, device=device), persistent=True)
         self.register_buffer("scales", torch.empty(0, dtype=torch.float16, device=device), persistent=True)
+        self.register_buffer("_xpu_qweight", torch.empty(0, dtype=torch.int32, device=device), persistent=False)
+        self.register_buffer("_xpu_qscale", torch.empty(0, dtype=torch.float32, device=device), persistent=False)
+        self.register_buffer("_xpu_qzeros", torch.empty(0, dtype=torch.int8, device=device), persistent=False)
         if bias:
             self.bias = _empty_parameter((out_features,), dtype=compute_dtype, device=device)
         else:
             self.register_parameter("bias", None)
+        self._xpu_padded_in_features = 0
 
     @staticmethod
     def _unpack_int4(packed: torch.Tensor) -> torch.Tensor:
@@ -176,9 +182,162 @@ class AWQLinear(nn.Module):
             f"Unsupported AWQ packed weight shape {tuple(self.qweight.shape)} for target {(self.out_features, self.in_features)}"
         )
 
+    @staticmethod
+    def _pack_int4_rows(values: torch.Tensor) -> torch.Tensor:
+        if values.ndim != 2:
+            raise ValueError(f"Expected a 2D int4 matrix, got shape {tuple(values.shape)}")
+        if values.shape[1] % 8 != 0:
+            raise ValueError(f"Int4 row packing requires the last dimension to be divisible by 8, got {values.shape[1]}")
+        reshaped = values.to(torch.int32).reshape(values.shape[0], values.shape[1] // 8, 8)
+        shifts = (torch.arange(8, dtype=torch.int32, device=values.device).view(1, 1, 8) * 4)
+        return torch.bitwise_left_shift(reshaped & 0xF, shifts).sum(dim=-1, dtype=torch.int32).contiguous()
+
+    @staticmethod
+    def _expand_group_values(
+        group_values: torch.Tensor,
+        *,
+        group_size: int,
+    ) -> torch.Tensor:
+        return (
+            group_values.transpose(0, 1)
+            .to(torch.int32)
+            .unsqueeze(-1)
+            .expand(-1, -1, group_size)
+            .reshape(group_values.shape[1], group_values.shape[0] * group_size)
+            .contiguous()
+        )
+
+    def _collapse_group_zeros(self, zeros_by_column: torch.Tensor, group_count: int) -> torch.Tensor:
+        if zeros_by_column.shape != (self.out_features, self.in_features):
+            raise ValueError(
+                f"Expected per-column AWQ zero-points with shape {(self.out_features, self.in_features)}, "
+                f"got {tuple(zeros_by_column.shape)}"
+            )
+        group_zeros = torch.empty((group_count, self.out_features), dtype=torch.int8, device=zeros_by_column.device)
+        for group_idx in range(group_count):
+            start = group_idx * self.group_size
+            end = min(start + self.group_size, self.in_features)
+            if end <= start:
+                raise ValueError(f"Invalid AWQ zero-point group bounds: start={start}, end={end}")
+            current = zeros_by_column[:, start:end].to(torch.int32)
+            reference = current[:, :1]
+            if not torch.equal(current, reference.expand_as(current)):
+                raise ValueError(
+                    "AWQ zero-point layout is not group-constant and cannot be collapsed into the XPU int4 layout."
+                )
+            group_zeros[group_idx].copy_(reference.squeeze(1).to(torch.int8))
+        return group_zeros
+
+    def _build_xpu_fast_path_state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        if self.qweight.numel() == 0:
+            raise RuntimeError("AWQLinear has no quantized weight payload.")
+        if self.group_size <= 0 or self.group_size % 32 != 0:
+            raise ValueError("AWQLinear XPU fast path requires group_size to be a positive multiple of 32.")
+
+        padded_in_features = XPUInt4Linear._padded_in_features(self.in_features, self.group_size)
+        group_count = padded_in_features // self.group_size
+        scales = self.scales.detach().to(device="cpu", dtype=torch.float32)
+        if scales.ndim != 2 or scales.shape[0] < group_count or scales.shape[1] < self.out_features:
+            raise ValueError(
+                f"Unsupported AWQ scale layout {tuple(scales.shape)} for target "
+                f"group_count={group_count}, out_features={self.out_features}"
+            )
+
+        weight_int = self._unpack_int4(self.qweight.detach().to(device="cpu"))
+        zeros_int = self._unpack_int4(self.qzeros.detach().to(device="cpu")) if self.qzeros.numel() else None
+
+        if weight_int.shape[0] == self.in_features and weight_int.shape[1] >= self.out_features:
+            weight_matrix = weight_int[: self.in_features, : self.out_features].transpose(0, 1).contiguous().to(torch.int32)
+            if zeros_int is None:
+                group_zeros = torch.full((group_count, self.out_features), 8, dtype=torch.int8)
+            elif zeros_int.shape[0] >= group_count and zeros_int.shape[1] >= self.out_features:
+                group_zeros = zeros_int[:group_count, : self.out_features].contiguous().to(torch.int8)
+            else:
+                raise ValueError(
+                    f"Unsupported AWQ zero-point layout {tuple(zeros_int.shape)} for qweight layout {tuple(self.qweight.shape)}"
+                )
+        elif weight_int.shape[0] == self.out_features and weight_int.shape[1] >= self.in_features:
+            weight_matrix = weight_int[: self.out_features, : self.in_features].contiguous().to(torch.int32)
+            if zeros_int is None:
+                group_zeros = torch.full((group_count, self.out_features), 8, dtype=torch.int8)
+            elif zeros_int.shape[0] >= group_count and zeros_int.shape[1] >= self.out_features:
+                group_zeros = zeros_int[:group_count, : self.out_features].contiguous().to(torch.int8)
+            elif zeros_int.shape[0] == self.out_features and zeros_int.shape[1] >= self.in_features:
+                group_zeros = self._collapse_group_zeros(
+                    zeros_int[: self.out_features, : self.in_features].contiguous(),
+                    group_count,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported AWQ zero-point layout {tuple(zeros_int.shape)} for qweight layout {tuple(self.qweight.shape)}"
+                )
+        else:
+            raise ValueError(
+                f"Unsupported AWQ packed weight shape {tuple(self.qweight.shape)} for target {(self.out_features, self.in_features)}"
+            )
+
+        padded_weight = self._expand_group_values(group_zeros, group_size=self.group_size)
+        padded_weight[:, : self.in_features] = weight_matrix
+        packed_weight = self._pack_int4_rows(padded_weight)
+        packed_scales = scales[:group_count, : self.out_features].contiguous().to(torch.float32)
+        return packed_weight, packed_scales, group_zeros.contiguous().to(torch.int8), padded_in_features
+
+    def _can_use_xpu_fast_path(self, x: torch.Tensor) -> bool:
+        return (
+            not _env_flag_is_true("ANNA_DISABLE_XPU_AWQ_FASTPATH")
+            and self.weight is None
+            and x.device.type == "xpu"
+            and self.qweight.numel() > 0
+        )
+
+    def _prepare_xpu_fast_path(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        if (
+            self._xpu_qweight.numel() > 0
+            and self._xpu_qweight.device == device
+            and self._xpu_qscale.device == device
+            and self._xpu_qzeros.device == device
+            and self._xpu_padded_in_features > 0
+        ):
+            return self._xpu_qweight, self._xpu_qscale, self._xpu_qzeros, self._xpu_padded_in_features
+
+        packed_weight, packed_scales, packed_zeros, padded_in_features = self._build_xpu_fast_path_state()
+        self._xpu_qweight = packed_weight.to(device=device)
+        self._xpu_qscale = packed_scales.to(device=device)
+        self._xpu_qzeros = packed_zeros.to(device=device)
+        self._xpu_padded_in_features = padded_in_features
+        return self._xpu_qweight, self._xpu_qscale, self._xpu_qzeros, self._xpu_padded_in_features
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.weight is not None:
             weight = self.weight.to(dtype=self.compute_dtype)
+        elif self._can_use_xpu_fast_path(x):
+            original_shape = x.shape[:-1]
+            x_2d = x.reshape(-1, x.shape[-1])
+            packed_weight, packed_scales, packed_zeros, padded_in_features = self._prepare_xpu_fast_path(x_2d.device)
+            if x_2d.shape[-1] > padded_in_features:
+                raise ValueError(
+                    f"AWQLinear input features {x_2d.shape[-1]} exceed the prepared int4 fast-path width {padded_in_features}."
+                )
+            if x_2d.shape[-1] < padded_in_features:
+                x_padded = torch.zeros(
+                    (x_2d.shape[0], padded_in_features),
+                    dtype=self.compute_dtype,
+                    device=x_2d.device,
+                )
+                x_padded[:, : x_2d.shape[-1]] = x_2d.to(dtype=self.compute_dtype)
+            else:
+                x_padded = x_2d.to(dtype=self.compute_dtype)
+
+            output = torch.ops.aten._weight_int4pack_mm_with_scales_and_zeros(
+                x_padded,
+                packed_weight,
+                self.group_size,
+                packed_scales,
+                packed_zeros,
+            )
+            if self.bias is not None:
+                output = output + self.bias.to(device=output.device, dtype=output.dtype)
+            return output.reshape(*original_shape, self.out_features).to(dtype=x.dtype)
         else:
             weight = self._dequantize_awq().to(dtype=self.compute_dtype)
         bias = None if self.bias is None else self.bias.to(dtype=self.compute_dtype)
@@ -388,6 +547,11 @@ def estimate_xpu_int4_linear_bytes(
     zero_bytes = group_count * out_features * torch.tensor([], dtype=torch.int8).element_size()
     bias_bytes = out_features * torch.tensor([], dtype=compute_dtype).element_size() if has_bias else 0
     return packed_weight_bytes + scale_bytes + zero_bytes + bias_bytes
+
+
+def _env_flag_is_true(name: str) -> bool:
+    value = os.getenv(name)
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def estimate_module_xpu_int4_bytes(

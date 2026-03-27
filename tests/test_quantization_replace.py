@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from anna.model.config import QuantizationConfig
@@ -16,6 +18,29 @@ class _TinyQuantNet(nn.Module):
             nn.ReLU(),
             nn.Linear(16, 8, bias=False),
         )
+
+
+def _pack_int4_matrix(values: torch.Tensor) -> torch.Tensor:
+    reshaped = values.to(torch.int32).reshape(values.shape[0], values.shape[1] // 8, 8)
+    shifts = (torch.arange(8, dtype=torch.int32).view(1, 1, 8) * 4)
+    return torch.bitwise_left_shift(reshaped & 0xF, shifts).sum(dim=-1, dtype=torch.int32)
+
+
+def _dequantize_xpu_int4_state(
+    packed_weight: torch.Tensor,
+    qscale: torch.Tensor,
+    qzeros: torch.Tensor,
+    *,
+    in_features: int,
+    group_size: int,
+) -> torch.Tensor:
+    shifts = (torch.arange(8, dtype=torch.int32).view(1, 1, 8) * 4)
+    unpacked = torch.bitwise_right_shift(packed_weight.unsqueeze(-1).to(torch.int32), shifts) & 0xF
+    unpacked = unpacked.reshape(packed_weight.shape[0], packed_weight.shape[1] * 8)[:, :in_features].to(torch.float32)
+    group_ids = torch.arange(in_features, dtype=torch.long) // group_size
+    scales = qscale[group_ids].transpose(0, 1).to(torch.float32)
+    zeros = qzeros[group_ids].transpose(0, 1).to(torch.float32)
+    return (unpacked - zeros) * scales
 
 
 def test_replace_linear_modules_fp8() -> None:
@@ -86,3 +111,72 @@ def test_xpu_int4_linear_cpu_fallback_matches_dense_linear_closely() -> None:
 
     assert max_error < 0.15
     assert mean_error < 0.05
+
+
+def test_awq_linear_builds_cached_xpu_pack_state_without_redequantizing_each_forward() -> None:
+    layer = AWQLinear(
+        48,
+        8,
+        group_size=32,
+        zero_point=True,
+        compute_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+    weight_int = (torch.arange(48 * 8, dtype=torch.int32).reshape(48, 8) % 11) + 2
+    zero_points = torch.tensor(
+        [
+            [8, 7, 9, 6, 8, 10, 7, 8],
+            [7, 8, 9, 8, 6, 7, 8, 9],
+        ],
+        dtype=torch.int32,
+    )
+    scales = torch.linspace(0.125, 1.0, steps=16, dtype=torch.float32).reshape(2, 8)
+
+    layer.qweight = _pack_int4_matrix(weight_int)
+    layer.qzeros = _pack_int4_matrix(zero_points)
+    layer.scales = scales.to(torch.float16)
+
+    packed_weight, packed_scales, packed_zeros, padded_in_features = layer._build_xpu_fast_path_state()
+    reference = layer._dequantize_awq()
+    actual = _dequantize_xpu_int4_state(
+        packed_weight,
+        packed_scales,
+        packed_zeros,
+        in_features=layer.in_features,
+        group_size=layer.group_size,
+    )
+
+    assert padded_in_features == 64
+    assert packed_weight.shape == (8, 8)
+    assert packed_scales.shape == (2, 8)
+    assert packed_zeros.shape == (2, 8)
+    assert torch.allclose(actual, reference, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.skipif(not hasattr(torch, "xpu") or not torch.xpu.is_available(), reason="requires torch.xpu")
+def test_awq_linear_xpu_fast_path_matches_dequantized_reference() -> None:
+    layer = AWQLinear(
+        32,
+        8,
+        group_size=32,
+        zero_point=True,
+        compute_dtype=torch.bfloat16,
+        device=torch.device("xpu"),
+    )
+    weight_int = (torch.arange(32 * 8, dtype=torch.int32).reshape(32, 8) % 13) + 1
+    zero_points = torch.tensor([[8, 7, 9, 6, 8, 10, 7, 8]], dtype=torch.int32)
+    scales = torch.linspace(0.125, 1.0, steps=8, dtype=torch.float32).reshape(1, 8)
+
+    layer.qweight = _pack_int4_matrix(weight_int).to(device="xpu")
+    layer.qzeros = _pack_int4_matrix(zero_points).to(device="xpu")
+    layer.scales = scales.to(dtype=torch.float16, device="xpu")
+
+    inputs = torch.randn(4, 32, device="xpu", dtype=torch.bfloat16)
+    actual = layer(inputs)
+    reference = F.linear(
+        inputs.to(dtype=torch.bfloat16),
+        layer._dequantize_awq().to(device="xpu", dtype=torch.bfloat16),
+        None,
+    ).to(dtype=inputs.dtype)
+
+    assert torch.allclose(actual, reference, atol=5e-2, rtol=5e-2)

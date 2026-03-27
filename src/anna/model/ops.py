@@ -9,6 +9,7 @@ from torch import nn
 
 from anna.model.config import Qwen3TextConfig
 from anna.model.quantization import convert_module_linears_to_xpu_int4
+from anna.model.xpu_fusion import apply_linear_pointwise
 
 
 def _module_device(module: nn.Module) -> torch.device:
@@ -856,14 +857,14 @@ class Qwen3Attention(nn.Module):
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         query_states, gate = torch.chunk(
-            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
+            apply_linear_pointwise(self.q_proj, hidden_states).view(*input_shape, -1, self.head_dim * 2),
             2,
             dim=-1,
         )
         gate = gate.reshape(*input_shape, -1)
         query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_norm(apply_linear_pointwise(self.k_proj, hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = apply_linear_pointwise(self.v_proj, hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -904,7 +905,7 @@ class Qwen3Attention(nn.Module):
             attn_output = torch.matmul(attn_probs, value_states)
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
-        return self.o_proj(attn_output)
+        return apply_linear_pointwise(self.o_proj, attn_output)
 
 
 class Qwen3GatedDeltaNet(nn.Module):
@@ -949,10 +950,10 @@ class Qwen3GatedDeltaNet(nn.Module):
         conv_state = None if cache_params is None else cache_params.conv_states[self.layer_idx]
         recurrent_state = None if cache_params is None else cache_params.recurrent_states[self.layer_idx]
 
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        mixed_qkv = apply_linear_pointwise(self.in_proj_qkv, hidden_states).transpose(1, 2)
+        z = apply_linear_pointwise(self.in_proj_z, hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
+        b = apply_linear_pointwise(self.in_proj_b, hidden_states)
+        a = apply_linear_pointwise(self.in_proj_a, hidden_states)
 
         if use_precomputed_states and conv_state is not None:
             mixed_qkv = torch_causal_conv1d_update(
@@ -1007,7 +1008,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z).reshape(batch_size, seq_len, -1)
-        return self.out_proj(core_attn_out)
+        return apply_linear_pointwise(self.out_proj, core_attn_out)
 
 
 class Qwen3MLP(nn.Module):
@@ -1018,8 +1019,15 @@ class Qwen3MLP(nn.Module):
         self.up_proj = nn.Linear(config.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, config.hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        gate = apply_linear_pointwise(self.gate_proj, x, activation="silu")
+        up = apply_linear_pointwise(self.up_proj, x)
+        return apply_linear_pointwise(self.down_proj, gate * up, residual=residual)
 
 
 class Qwen3SparseMoeBlock(nn.Module):
@@ -1194,6 +1202,8 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        if isinstance(self.mlp, Qwen3MLP):
+            return self.mlp(hidden_states, residual=residual)
         hidden_states = self.mlp(hidden_states)
         if isinstance(hidden_states, tuple):
             hidden_states, _ = hidden_states
