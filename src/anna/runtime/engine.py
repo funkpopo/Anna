@@ -847,11 +847,17 @@ class AnnaEngine:
         return indices
 
     def generate_text(self, prompt: str, *, config: GenerationConfig) -> TextGenerationResult:
-        prepared = self.processor.encode_text(prompt)
+        prepared = self.processor.encode_text(
+            prompt,
+            tensor_device=self.device_context.device,
+        )
         return self._generate(prepared, config=config)
 
     def stream_text(self, prompt: str, *, config: GenerationConfig) -> Iterator[StreamEvent]:
-        prepared = self.processor.encode_text(prompt)
+        prepared = self.processor.encode_text(
+            prompt,
+            tensor_device=self.device_context.device,
+        )
         yield from self._stream(prepared, config=config)
 
     def generate_chat(
@@ -913,7 +919,12 @@ class AnnaEngine:
 
     def _prepare_messages(self, messages: list[object], *, enable_thinking: bool = True) -> PreparedInputs:
         try:
-            return self.processor.prepare_messages(messages, enable_thinking=enable_thinking)
+            return self.processor.prepare_messages(
+                messages,
+                enable_thinking=enable_thinking,
+                tensor_device=self.device_context.device,
+                tensor_dtype=self.device_context.dtype,
+            )
         except FileNotFoundError as exc:
             raise AnnaEngineError(str(exc), status_code=400, code="invalid_media_reference") from exc
         except ValueError as exc:
@@ -926,6 +937,45 @@ class AnnaEngine:
             self.scheduler is not None
             and prepared.pixel_values is None
             and prepared.pixel_values_videos is None
+        )
+
+    @staticmethod
+    def _has_multimodal_inputs(prepared: PreparedInputs) -> bool:
+        return prepared.pixel_values is not None or prepared.pixel_values_videos is not None
+
+    def _forward_generation_model(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: object | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | None = None,
+    ):
+        if pixel_values is None and pixel_values_videos is None and hasattr(self.model, "forward_text_only"):
+            return self.model.forward_text_only(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                logits_to_keep=logits_to_keep,
+            )
+        return self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
+            use_cache=use_cache,
+            logits_to_keep=logits_to_keep,
         )
 
     def _validate_generation_request(
@@ -1305,7 +1355,9 @@ class AnnaEngine:
         unique_ids = list(dict.fromkeys(prompt_ids))
         if not unique_ids:
             return None, set()
-        history_tensor = self.device_context.move_token_ids(torch.tensor(unique_ids, dtype=torch.long))
+        history_tensor = self.device_context.move_token_ids(
+            torch.tensor(unique_ids, dtype=torch.long, device=self.device_context.device)
+        )
         return history_tensor, set(unique_ids)
 
     def _append_repetition_penalty_token(
@@ -1359,7 +1411,7 @@ class AnnaEngine:
             for step_idx in range(config.max_new_tokens):
                 try:
                     with self.execution_lock:
-                        outputs = self.model(
+                        outputs = self._forward_generation_model(
                             input_ids=input_ids,
                             attention_mask=attention_mask,
                             past_key_values=past_key_values,
@@ -1443,7 +1495,7 @@ class AnnaEngine:
             for step_idx in range(config.max_new_tokens):
                 try:
                     with self.execution_lock:
-                        outputs = self.model(
+                        outputs = self._forward_generation_model(
                             input_ids=input_ids,
                             attention_mask=attention_mask,
                             past_key_values=past_key_values,

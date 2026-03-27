@@ -84,6 +84,8 @@ class _FakeModel:
         self.cache_allocator = Qwen3PageAllocator(config.text_config)
         self.prefill_batch_sizes: list[int] = []
         self.decode_batch_sizes: list[int] = []
+        self.text_prefill_batch_sizes: list[int] = []
+        self.text_decode_batch_sizes: list[int] = []
         self.model = _FakePrefillRunner(self)
         self.lm_head = _FakeLMHead(self)
 
@@ -113,6 +115,45 @@ class _FakeModel:
             {
                 "logits": logits,
                 "past_key_values": past_key_values if past_key_values is not None else self._make_cache(batch_size=batch_size, seq_len=1),
+            },
+        )()
+
+    def forward_text_only(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Qwen3DynamicCache | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | None = None,
+    ):
+        del attention_mask, use_cache, logits_to_keep
+        batch_size = input_ids.shape[0]
+        if past_key_values is None:
+            seq_len = input_ids.shape[1]
+            self.text_prefill_batch_sizes.append(batch_size)
+            logits = torch.full((batch_size, 1, self.config.text_config.vocab_size), -1000.0)
+            planned = [1, 2]
+            for idx in range(batch_size):
+                logits[idx, 0, planned[idx]] = 1000.0
+            return type(
+                "TextPrefillOutput",
+                (),
+                {
+                    "logits": logits,
+                    "past_key_values": self._make_cache(batch_size=batch_size, seq_len=seq_len),
+                },
+            )()
+
+        self.text_decode_batch_sizes.append(batch_size)
+        logits = torch.full((batch_size, 1, self.config.text_config.vocab_size), -1000.0)
+        logits[:, 0, 9] = 1000.0
+        return type(
+            "TextDecodeOutput",
+            (),
+            {
+                "logits": logits,
+                "past_key_values": past_key_values,
             },
         )()
 
@@ -169,8 +210,10 @@ def test_scheduler_batches_same_length_requests() -> None:
         assert request_b.result is not None
         assert request_a.result.text == "A"
         assert request_b.result.text == "B"
-        assert fake_model.prefill_batch_sizes == [2]
-        assert fake_model.decode_batch_sizes == [2]
+        assert fake_model.text_prefill_batch_sizes == [2]
+        assert fake_model.text_decode_batch_sizes == [2]
+        assert fake_model.prefill_batch_sizes == []
+        assert fake_model.decode_batch_sizes == []
     finally:
         scheduler.shutdown()
 
@@ -221,7 +264,9 @@ def test_scheduler_batches_mixed_length_requests_during_decode() -> None:
         assert request_b.done.wait(timeout=2.0)
         assert request_a.error is None
         assert request_b.error is None
-        assert fake_model.prefill_batch_sizes == [1, 1]
-        assert fake_model.decode_batch_sizes == [2]
+        assert fake_model.text_prefill_batch_sizes == [1, 1]
+        assert fake_model.text_decode_batch_sizes == [2]
+        assert fake_model.prefill_batch_sizes == []
+        assert fake_model.decode_batch_sizes == []
     finally:
         scheduler.shutdown()
