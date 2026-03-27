@@ -206,4 +206,4 @@ anna-bench --model-dir /path/to/model --device xpu --dtype bf16 --prompt "你好
 ---
 🙏 致谢
 
-感谢 linuxdo 社区的交流、分享与反馈
+感谢 [linuxdo](https://linux.do/) 社区的交流、分享与反馈
