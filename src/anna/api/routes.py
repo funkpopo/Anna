@@ -47,8 +47,16 @@ def _default_reasoning_format(engine: object) -> ReasoningFormat:
     return normalize_reasoning_format(value)
 
 
-def _enable_thinking(value: bool | None) -> bool:
-    return value is not False
+def _default_enable_thinking(engine: object) -> bool:
+    return getattr(engine, "default_enable_thinking", True) is not False
+
+
+def _resolve_enable_thinking(engine: object, payload: ChatCompletionRequest) -> bool:
+    if payload.enable_thinking is not None:
+        return payload.enable_thinking
+    if payload.chat_template_kwargs is not None and payload.chat_template_kwargs.enable_thinking is not None:
+        return payload.chat_template_kwargs.enable_thinking
+    return _default_enable_thinking(engine)
 
 
 def _resolve_reasoning_format(engine: object, payload: ChatCompletionRequest) -> ReasoningFormat:
@@ -326,6 +334,7 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
     response_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     model_id = payload.model or engine.default_model_id
+    enable_thinking = _resolve_enable_thinking(engine, payload)
     reasoning_format = _resolve_reasoning_format(engine, payload)
 
     try:
@@ -333,7 +342,7 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
             events = engine.stream_chat(
                 payload.messages,
                 config=config,
-                enable_thinking=_enable_thinking(payload.enable_thinking),
+                enable_thinking=enable_thinking,
                 reasoning_format=reasoning_format,
             )
             return StreamingResponse(
@@ -349,7 +358,7 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
         result = engine.generate_chat(
             payload.messages,
             config=config,
-            enable_thinking=_enable_thinking(payload.enable_thinking),
+            enable_thinking=enable_thinking,
             reasoning_format=reasoning_format,
         )
     except AnnaEngineError as exc:

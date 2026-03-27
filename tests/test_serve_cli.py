@@ -31,6 +31,7 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
         [
             "--model-dir",
             "model",
+            "--disable-thinking",
             "--max-completion-tokens",
             "1024",
             "--reasoning-format",
@@ -49,6 +50,7 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
         ]
     )
 
+    assert args.default_enable_thinking is False
     assert args.max_completion_tokens == 1024
     assert args.reasoning_format == "deepseek"
     assert args.offload_vision is True

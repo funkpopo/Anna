@@ -99,6 +99,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-name", default=None, help="Model name exposed through the API.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
+    thinking_group = parser.add_mutually_exclusive_group()
+    thinking_group.add_argument(
+        "--enable-thinking",
+        dest="default_enable_thinking",
+        action="store_true",
+        default=True,
+        help="Enable thinking by default for chat requests that omit enable_thinking/chat_template_kwargs.enable_thinking.",
+    )
+    thinking_group.add_argument(
+        "--disable-thinking",
+        dest="default_enable_thinking",
+        action="store_false",
+        help="Disable thinking by default for chat requests that omit enable_thinking/chat_template_kwargs.enable_thinking.",
+    )
     parser.add_argument(
         "--max-completion-tokens",
         type=_positive_int,
@@ -193,6 +207,7 @@ def main() -> None:
         device=args.device,
         dtype=args.dtype,
         default_max_completion_tokens=args.max_completion_tokens,
+        default_enable_thinking=args.default_enable_thinking,
         reasoning_format=args.reasoning_format,
         offload_mode=args.offload_mode,
         offload_vision=args.offload_vision,
@@ -220,6 +235,7 @@ def main() -> None:
         dtype=settings.dtype,
         safety_policy=_build_safety_policy(settings),
         default_max_completion_tokens=settings.default_max_completion_tokens,
+        default_enable_thinking=settings.default_enable_thinking,
         reasoning_format=settings.reasoning_format,
         offload_mode=settings.offload_mode,
         offload_vision=settings.offload_vision,

@@ -117,7 +117,7 @@ def test_generate_without_streaming_overhead_decodes_once() -> None:
     assert result.completion_tokens == 3
 
 
-def test_generate_chat_preserves_raw_think_tags() -> None:
+def test_generate_chat_keeps_raw_think_tags_when_reasoning_format_is_none() -> None:
     engine = object.__new__(AnnaEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
     engine._generate = MethodType(
@@ -138,7 +138,7 @@ def test_generate_chat_preserves_raw_think_tags() -> None:
     )
 
     assert result.text == "先分析问题。\n</think>\n\n最终答案。"
-    assert result.reasoning_text == "先分析问题。"
+    assert result.reasoning_text is None
 
 
 def test_generate_chat_projects_reasoning_into_deepseek_format() -> None:
