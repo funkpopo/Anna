@@ -202,3 +202,8 @@ anna-bench --model-dir /path/to/model --device xpu --dtype bf16 --prompt "你好
 - 更完整的 Arc A770 性能与稳定性基准
 - 量化模型的更广覆盖与校验
 - 多模态调度与运行时开销优化
+
+---
+🙏 致谢
+
+感谢 [linuxdo](https://linux.do/) 社区的交流、分享与反馈
