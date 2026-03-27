@@ -76,10 +76,13 @@ def test_xpu_int4_linear_cpu_fallback_matches_dense_linear_closely() -> None:
         compute_dtype=torch.bfloat16,
         device=torch.device("cpu"),
     )
-    inputs = torch.randn(4, 32, dtype=torch.bfloat16)
+    inputs = torch.linspace(-1.0, 1.0, steps=4 * 32, dtype=torch.float32).reshape(4, 32).to(dtype=torch.bfloat16)
 
     reference = linear(inputs.to(dtype=torch.float32)).to(dtype=torch.bfloat16)
     actual = quantized(inputs)
-    max_error = (actual.to(dtype=torch.float32) - reference.to(dtype=torch.float32)).abs().max().item()
+    error = (actual.to(dtype=torch.float32) - reference.to(dtype=torch.float32)).abs()
+    max_error = error.max().item()
+    mean_error = error.mean().item()
 
-    assert max_error < 0.35
+    assert max_error < 0.15
+    assert mean_error < 0.05

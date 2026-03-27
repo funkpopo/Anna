@@ -21,8 +21,6 @@ from anna.runtime.engine import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-_CHAT_STREAM_FLUSH_BOUNDARIES = frozenset(".!?;\u3002\uff01\uff1f\uff1b")
-_CHAT_STREAM_MAX_BUFFER_CHARS = 64
 
 
 def _engine(request: Request):
@@ -199,24 +197,6 @@ def _sse_error_frame(exc: AnnaEngineError) -> str:
     return f"event: error\ndata: {json.dumps(_error_payload_from_exception(exc), ensure_ascii=False)}\n\n"
 
 
-def _should_flush_chat_delta(*, content: str, reasoning: str, finish_reason: str | None) -> bool:
-    if finish_reason is not None:
-        return True
-    if "</think>" in content:
-        return True
-    candidate = reasoning or content
-    if not candidate:
-        return False
-    if len(candidate) >= _CHAT_STREAM_MAX_BUFFER_CHARS:
-        return True
-    if "\n\n" in candidate:
-        return True
-    tail = candidate[-1]
-    if tail == "." and len(candidate) >= 2 and candidate[-2].isdigit():
-        return False
-    return tail in _CHAT_STREAM_FLUSH_BOUNDARIES
-
-
 def _chat_chunk_payload(
     *,
     response_id: str,
@@ -262,52 +242,19 @@ def _stream_sse_chat(
     }
     yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
 
-    pending_content = ""
-    pending_reasoning = ""
-
-    def _flush_pending(*, finish_reason: str | None) -> str | None:
-        nonlocal pending_content, pending_reasoning
-        if not pending_content and not pending_reasoning and finish_reason is None:
-            return None
-        payload = _chat_chunk_payload(
-            response_id=response_id,
-            created=created,
-            model=model,
-            content=pending_content,
-            reasoning=pending_reasoning,
-            finish_reason=finish_reason,
-        )
-        pending_content = ""
-        pending_reasoning = ""
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
     try:
         for event in events:
-            incoming_reasoning = event.reasoning_text or ""
-            incoming_content = event.text or ""
-
-            if pending_reasoning and incoming_content and not incoming_reasoning:
-                frame = _flush_pending(finish_reason=None)
-                if frame is not None:
-                    yield frame
-            if pending_content and incoming_reasoning and not incoming_content:
-                frame = _flush_pending(finish_reason=None)
-                if frame is not None:
-                    yield frame
-
-            if incoming_reasoning:
-                pending_reasoning += incoming_reasoning
-            if incoming_content:
-                pending_content += incoming_content
-            if not _should_flush_chat_delta(
-                content=pending_content,
-                reasoning=pending_reasoning,
-                finish_reason=event.finish_reason,
-            ):
+            if not event.text and not event.reasoning_text and event.finish_reason is None:
                 continue
-            frame = _flush_pending(finish_reason=event.finish_reason)
-            if frame is not None:
-                yield frame
+            payload = _chat_chunk_payload(
+                response_id=response_id,
+                created=created,
+                model=model,
+                content=event.text or "",
+                reasoning=event.reasoning_text or "",
+                finish_reason=event.finish_reason,
+            )
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
     except AnnaEngineError as exc:
         yield _sse_error_frame(exc)
     except Exception:  # pragma: no cover - defensive fallback
@@ -320,11 +267,6 @@ def _stream_sse_chat(
                 code="streaming_failed",
             )
         )
-
-    if pending_content or pending_reasoning:
-        frame = _flush_pending(finish_reason=None)
-        if frame is not None:
-            yield frame
 
     yield "data: [DONE]\n\n"
 
