@@ -608,8 +608,12 @@ class Qwen3Model(nn.Module):
                 position_ids = position_ids.masked_fill(attention_mask == 0, 0)
                 position_ids = position_ids.view(1, batch_size, -1).repeat(3, 1, 1).to(inputs_embeds.device)
             else:
-                position_ids = torch.arange(past_key_values_length, past_key_values_length + seq_length)
-                position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1).to(inputs_embeds.device)
+                position_ids = torch.arange(
+                    past_key_values_length,
+                    past_key_values_length + seq_length,
+                    device=inputs_embeds.device,
+                )
+                position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1)
             delta = rope_deltas.repeat_interleave(batch_size // rope_deltas.shape[0], dim=0)
             position_ids = position_ids + delta.to(device=inputs_embeds.device)
         else:
@@ -782,6 +786,34 @@ class Qwen3ForConditionalGeneration(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
+
+    def forward_text_only(
+        self,
+        *,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Qwen3DynamicCache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | None = None,
+    ) -> CausalLMOutput:
+        outputs = self.model.language_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+        )
+        hidden_states = outputs.last_hidden_state
+        if logits_to_keep is not None and logits_to_keep > 0:
+            hidden_states = hidden_states[:, -logits_to_keep:, :]
+        lm_head_device = self.lm_head.weight.device
+        if hidden_states.device != lm_head_device:
+            hidden_states = hidden_states.to(device=lm_head_device)
+        logits = self.lm_head(hidden_states)
+        return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)
 
     def forward(
         self,

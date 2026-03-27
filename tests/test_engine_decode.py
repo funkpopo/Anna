@@ -299,6 +299,79 @@ def test_generate_chat_keeps_incomplete_think_block_inline_when_reasoning_format
     assert result.finish_reason == "length"
 
 
+def test_forward_generation_model_uses_text_fast_path_for_text_only_requests() -> None:
+    class _FakeModel:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def forward_text_only(self, **_kwargs):
+            self.calls.append("text")
+            return object()
+
+        def __call__(self, **_kwargs):
+            self.calls.append("full")
+            return object()
+
+    engine = object.__new__(AnnaEngine)
+    engine.model = _FakeModel()
+
+    prepared = type(
+        "Prepared",
+        (),
+        {
+            "pixel_values": None,
+            "pixel_values_videos": None,
+        },
+    )()
+
+    engine._forward_generation_model(
+        input_ids=object(),
+        attention_mask=None,
+        past_key_values=None,
+        pixel_values=prepared.pixel_values,
+        pixel_values_videos=prepared.pixel_values_videos,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        mm_token_type_ids=None,
+        use_cache=True,
+        logits_to_keep=1,
+    )
+
+    assert engine.model.calls == ["text"]
+
+
+def test_forward_generation_model_keeps_full_path_for_multimodal_requests() -> None:
+    class _FakeModel:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def forward_text_only(self, **_kwargs):
+            self.calls.append("text")
+            return object()
+
+        def __call__(self, **_kwargs):
+            self.calls.append("full")
+            return object()
+
+    engine = object.__new__(AnnaEngine)
+    engine.model = _FakeModel()
+
+    engine._forward_generation_model(
+        input_ids=object(),
+        attention_mask=None,
+        past_key_values=None,
+        pixel_values=object(),
+        pixel_values_videos=None,
+        image_grid_thw=object(),
+        video_grid_thw=None,
+        mm_token_type_ids=object(),
+        use_cache=True,
+        logits_to_keep=1,
+    )
+
+    assert engine.model.calls == ["full"]
+
+
 def test_incremental_text_assembler_handles_unstable_unicode_suffix() -> None:
     class DummyTokenizer:
         mapping = {

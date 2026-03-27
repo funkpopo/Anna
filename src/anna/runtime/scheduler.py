@@ -159,14 +159,12 @@ class AnnaScheduler:
 
         try:
             with self.engine.execution_lock:
-                outputs = self.engine.model.model(
+                outputs = self.engine._forward_generation_model(
                     input_ids=batched.input_ids,
                     attention_mask=batched.attention_mask,
-                    mm_token_type_ids=batched.mm_token_type_ids,
                     use_cache=True,
+                    logits_to_keep=1,
                 )
-                last_hidden = outputs.last_hidden_state[:, -1, :]
-                logits = self.engine.model.lm_head(last_hidden)
         except RuntimeError as exc:
             raise self.engine._handle_runtime_failure(exc) from exc
 
@@ -176,7 +174,7 @@ class AnnaScheduler:
         for row_idx, request in enumerate(requests):
             request.past_key_values = split_caches[row_idx]
             next_token = sample_next_token(
-                logits[row_idx],
+                outputs.logits[row_idx, -1],
                 generated_ids=request.repetition_history,
                 temperature=request.config.temperature,
                 top_p=request.config.top_p,
@@ -218,7 +216,7 @@ class AnnaScheduler:
 
         try:
             with self.engine.execution_lock:
-                outputs = self.engine.model(
+                outputs = self.engine._forward_generation_model(
                     input_ids=input_ids,
                     past_key_values=batch_cache,
                     use_cache=True,
@@ -270,9 +268,10 @@ class AnnaScheduler:
         max_prompt_length = max(request.prompt_length for request in requests)
         text_config = self.engine.config.text_config
         pad_token_id = text_config.pad_token_id if 0 <= text_config.pad_token_id < text_config.vocab_size else 0
-        input_ids = torch.full((len(requests), max_prompt_length), pad_token_id, dtype=torch.long)
-        attention_mask = torch.zeros((len(requests), max_prompt_length), dtype=torch.long)
-        mm_token_type_ids = torch.zeros((len(requests), max_prompt_length), dtype=torch.int32)
+        input_device = requests[0].prepared.input_ids.device
+        input_ids = torch.full((len(requests), max_prompt_length), pad_token_id, dtype=torch.long, device=input_device)
+        attention_mask = torch.zeros((len(requests), max_prompt_length), dtype=torch.long, device=input_device)
+        mm_token_type_ids = torch.zeros((len(requests), max_prompt_length), dtype=torch.int32, device=input_device)
 
         for batch_idx, request in enumerate(requests):
             length = request.prompt_length

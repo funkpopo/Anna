@@ -21,13 +21,78 @@
 - Intel GPU 运行环境（如 Arc A770）与 `torch+xpu`
 - 本地可用模型目录（项目不负责下载模型文件）
 
+## 安装与项目配置
+
+### 1) 克隆项目
+
+```bash
+git clone <your-repo-url>
+cd Anna
+```
+
+### 2) 创建并激活虚拟环境
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -U pip
+```
+
+Linux/macOS:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+```
+
+### 3) 安装项目
+
+仅运行服务：
+
+```bash
+pip install -e .
+```
+
+需要本地开发/测试（含 `pytest`、`httpx`）：
+
+```bash
+pip install -e ".[dev]"
+```
+
+### 4) 安装 `xpu` 版 PyTorch
+
+本项目要求使用带 Intel `xpu` 支持的 PyTorch。请按你当前系统与驱动版本，从官方渠道安装对应构建，然后执行：
+
+```bash
+python -c "import torch; print(torch.__version__); print(torch.xpu.is_available())"
+```
+
+当输出中 `torch.xpu.is_available()` 为 `True` 时，表示运行环境可用。
+
+### 5) （可选）配置环境变量
+
+你可以在本机设置默认模型目录，减少命令输入：
+
+Windows PowerShell:
+
+```powershell
+$env:ANNA_MODEL_DIR="D:\path\to\your\model"
+```
+
+Linux/macOS:
+
+```bash
+export ANNA_MODEL_DIR="/path/to/your/model"
+```
+
+> `Anna` 本身不下载模型文件，需你提前准备本地模型目录。
+
 ## 快速开始
 
-### 1) 安装依赖
-
-先创建并激活你的 Python 环境，然后安装项目依赖与 `xpu` 版 `torch`。
-
-### 2) 准备模型目录
+### 1) 准备模型目录
 
 模型目录至少应包含：
 
@@ -36,7 +101,7 @@
 - `tokenizer_config.json`
 - `model.safetensors`（或分片 `safetensors`）
 
-### 3) 启动服务
+### 2) 启动服务
 
 ```bash
 anna-serve --model-dir /path/to/model --device xpu --dtype bf16

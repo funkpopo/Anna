@@ -53,18 +53,25 @@ class Qwen3MultimodalProcessor:
         self.tokenizer = tokenizer
         self.preprocessor = config.preprocessor_config
 
-    def encode_text(self, prompt: str) -> PreparedInputs:
-        input_ids = torch.tensor([self.tokenizer.encode(prompt)], dtype=torch.long)
-        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-        mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int32)
-        return PreparedInputs(
+    def encode_text(
+        self,
+        prompt: str,
+        *,
+        tensor_device: torch.device | str | None = None,
+    ) -> PreparedInputs:
+        return self._build_prepared_inputs(
             prompt=prompt,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            mm_token_type_ids=mm_token_type_ids,
+            tensor_device=tensor_device,
         )
 
-    def prepare_messages(self, messages: list[Any], *, enable_thinking: bool = True) -> PreparedInputs:
+    def prepare_messages(
+        self,
+        messages: list[Any],
+        *,
+        enable_thinking: bool = True,
+        tensor_device: torch.device | str | None = None,
+        tensor_dtype: torch.dtype | None = None,
+    ) -> PreparedInputs:
         prompt = self.tokenizer.render_messages(
             messages,
             add_generation_prompt=True,
@@ -88,7 +95,52 @@ class Qwen3MultimodalProcessor:
             pixel_values_videos, video_grid_thw = self.preprocess_videos(video_frames)
             prompt = self._expand_video_placeholders(prompt, video_grid_thw, video_fps)
 
-        input_ids = torch.tensor([self.tokenizer.encode(prompt)], dtype=torch.long)
+        return self._build_prepared_inputs(
+            prompt=prompt,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            tensor_device=tensor_device,
+            tensor_dtype=tensor_dtype,
+        )
+
+    @staticmethod
+    def _resolve_tensor_device(tensor_device: torch.device | str | None) -> torch.device | None:
+        if tensor_device is None:
+            return None
+        return tensor_device if isinstance(tensor_device, torch.device) else torch.device(tensor_device)
+
+    @staticmethod
+    def _move_tensor(
+        tensor: torch.Tensor | None,
+        *,
+        device: torch.device | None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor | None:
+        if tensor is None or device is None:
+            return tensor
+        if tensor.device == device and (dtype is None or tensor.dtype == dtype):
+            return tensor
+        kwargs: dict[str, object] = {"device": device, "non_blocking": True}
+        if dtype is not None:
+            kwargs["dtype"] = dtype
+        return tensor.to(**kwargs)
+
+    def _build_prepared_inputs(
+        self,
+        *,
+        prompt: str,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        tensor_device: torch.device | str | None = None,
+        tensor_dtype: torch.dtype | None = None,
+    ) -> PreparedInputs:
+        resolved_device = self._resolve_tensor_device(tensor_device)
+        tensor_kwargs = {} if resolved_device is None else {"device": resolved_device}
+        input_ids = torch.tensor([self.tokenizer.encode(prompt)], dtype=torch.long, **tensor_kwargs)
         attention_mask = torch.ones_like(input_ids, dtype=torch.long)
         mm_token_type_ids = self._create_mm_token_type_ids(input_ids)
         return PreparedInputs(
@@ -96,10 +148,10 @@ class Qwen3MultimodalProcessor:
             input_ids=input_ids,
             attention_mask=attention_mask,
             mm_token_type_ids=mm_token_type_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
+            pixel_values=self._move_tensor(pixel_values, device=resolved_device, dtype=tensor_dtype),
+            image_grid_thw=self._move_tensor(image_grid_thw, device=resolved_device, dtype=torch.long),
+            pixel_values_videos=self._move_tensor(pixel_values_videos, device=resolved_device, dtype=tensor_dtype),
+            video_grid_thw=self._move_tensor(video_grid_thw, device=resolved_device, dtype=torch.long),
         )
 
     def _collect_media(self, messages: list[Any], part_type: str) -> list[Any]:
