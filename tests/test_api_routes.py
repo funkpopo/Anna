@@ -249,7 +249,7 @@ def test_chat_completion_response_includes_cors_header_for_browser_requests() ->
     assert response.headers["access-control-allow-origin"] == "*"
 
 
-def test_streaming_chat_coalesces_fragmented_reasoning_deltas() -> None:
+def test_streaming_chat_emits_fragmented_reasoning_deltas_immediately() -> None:
     class _ChunkedStreamEngine:
         default_model_id = "fake-model"
         default_max_completion_tokens = None
@@ -280,8 +280,10 @@ def test_streaming_chat_coalesces_fragmented_reasoning_deltas() -> None:
     )
 
     assert response.status_code == 200
-    assert response.text.count('"reasoning_content"') == 1
-    assert '"reasoning_content": "用户要求我写。"' in response.text
+    assert response.text.count('"reasoning_content"') == 3
+    assert '"reasoning_content": "用户"' in response.text
+    assert '"reasoning_content": "要求"' in response.text
+    assert '"reasoning_content": "我写。"' in response.text
     assert '"content": "用户要求我写。"' not in response.text
 
 
@@ -318,6 +320,41 @@ def test_streaming_chat_flushes_reasoning_before_content_switch() -> None:
     assert '"reasoning_content": "先分析"' in response.text
     assert '"content": "最终答案。"' in response.text
     assert '"reasoning_content": "先分析", "content": "最终答案。"' not in response.text
+
+
+def test_streaming_chat_emits_content_deltas_immediately() -> None:
+    class _ChunkedStreamEngine:
+        default_model_id = "fake-model"
+        default_max_completion_tokens = None
+        reasoning_format = "deepseek"
+
+        def health(self) -> dict[str, str]:
+            return {"status": "ok"}
+
+        def list_models(self) -> list[str]:
+            return [self.default_model_id]
+
+        def stream_chat(self, *_args, **_kwargs):
+            from anna.runtime.engine import StreamEvent
+
+            yield StreamEvent(text="夏天", reasoning_text=None, finish_reason=None)
+            yield StreamEvent(text="到了。", reasoning_text=None, finish_reason="stop")
+
+    client = TestClient(create_app(_ChunkedStreamEngine()))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.text.count('"content"') == 2
+    assert '"content": "夏天"' in response.text
+    assert '"content": "到了。"' in response.text
 
 
 def test_chat_completion_uses_engine_default_reasoning_format_when_request_omits_it() -> None:

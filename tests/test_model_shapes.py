@@ -1,12 +1,30 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 
 from anna.model.quantization import XPUInt4Linear
 from anna.model.config import Qwen3TextConfig, RopeParameters
-from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
+from anna.model.ops import (
+    Qwen3DynamicCache,
+    Qwen3PageAllocator,
+    Qwen3SparseMoeBlock,
+    torch_causal_conv1d_update,
+    torch_recurrent_gated_delta_rule,
+)
 from anna.model.qwen import Qwen3ForCausalLM
 from anna.runtime.engine import AnnaEngine
+
+
+@contextmanager
+def _temporary_torch_seed(seed: int):
+    previous_state = torch.random.get_rng_state()
+    torch.manual_seed(seed)
+    try:
+        yield
+    finally:
+        torch.random.set_rng_state(previous_state)
 
 
 def _tiny_config() -> Qwen3TextConfig:
@@ -74,36 +92,36 @@ def _tiny_moe_config() -> Qwen3TextConfig:
 
 
 def test_qwen3_forward_shapes() -> None:
-    torch.manual_seed(0)
-    model = Qwen3ForCausalLM(_tiny_config())
-    input_ids = torch.randint(0, 256, (1, 6))
-    outputs = model(input_ids=input_ids, use_cache=True)
+    with _temporary_torch_seed(0):
+        model = Qwen3ForCausalLM(_tiny_config())
+        input_ids = torch.randint(0, 256, (1, 6))
+        outputs = model(input_ids=input_ids, use_cache=True)
     assert outputs.logits.shape == (1, 6, 256)
     assert outputs.past_key_values is not None
     assert outputs.past_key_values.get_seq_length() == 6
 
 
 def test_qwen3_incremental_decode() -> None:
-    torch.manual_seed(0)
-    model = Qwen3ForCausalLM(_tiny_config())
-    prompt_ids = torch.randint(0, 256, (1, 6))
-    first = model(input_ids=prompt_ids, use_cache=True)
-    next_token = torch.randint(0, 256, (1, 1))
-    second = model(
-        input_ids=next_token,
-        past_key_values=first.past_key_values,
-        use_cache=True,
-    )
+    with _temporary_torch_seed(0):
+        model = Qwen3ForCausalLM(_tiny_config())
+        prompt_ids = torch.randint(0, 256, (1, 6))
+        first = model(input_ids=prompt_ids, use_cache=True)
+        next_token = torch.randint(0, 256, (1, 1))
+        second = model(
+            input_ids=next_token,
+            past_key_values=first.past_key_values,
+            use_cache=True,
+        )
     assert second.logits.shape == (1, 1, 256)
     assert second.past_key_values is not None
     assert second.past_key_values.get_seq_length() == 7
 
 
 def test_qwen3_prefill_can_project_only_last_logit() -> None:
-    torch.manual_seed(0)
-    model = Qwen3ForCausalLM(_tiny_config())
-    input_ids = torch.randint(0, 256, (1, 6))
-    outputs = model(input_ids=input_ids, use_cache=True, logits_to_keep=1)
+    with _temporary_torch_seed(0):
+        model = Qwen3ForCausalLM(_tiny_config())
+        input_ids = torch.randint(0, 256, (1, 6))
+        outputs = model(input_ids=input_ids, use_cache=True, logits_to_keep=1)
     assert outputs.logits.shape == (1, 1, 256)
     assert outputs.past_key_values is not None
     assert outputs.past_key_values.get_seq_length() == 6
@@ -170,6 +188,75 @@ def test_dynamic_cache_release_reuses_freed_pages() -> None:
     cache_b.update(key, value, layer_idx=1)
 
     assert cache_b.page_tables[1][0] == first_page_ids
+
+
+def test_recurrent_gated_delta_rule_single_token_fast_path_matches_general_path() -> None:
+    with _temporary_torch_seed(0):
+        query = torch.randn(2, 1, 3, 4)
+        key = torch.randn(2, 1, 3, 4)
+        value = torch.randn(2, 1, 3, 5)
+        g = torch.randn(2, 1, 3)
+        beta = torch.sigmoid(torch.randn(2, 1, 3))
+        initial_state = torch.randn(2, 3, 4, 5)
+
+    output, final_state = torch_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+
+    initial_dtype = query.dtype
+    q = query.transpose(1, 2).contiguous().to(torch.float32)
+    k = key.transpose(1, 2).contiguous().to(torch.float32)
+    v = value.transpose(1, 2).contiguous().to(torch.float32)
+    b = beta.transpose(1, 2).contiguous().to(torch.float32)
+    gg = g.transpose(1, 2).contiguous().to(torch.float32)
+    q = q * torch.rsqrt((q * q).sum(dim=-1, keepdim=True) + 1e-6)
+    k = k * torch.rsqrt((k * k).sum(dim=-1, keepdim=True) + 1e-6)
+    q = q * (q.shape[-1] ** -0.5)
+
+    state = initial_state.to(torch.float32)
+    g_t = gg[:, :, 0].exp().unsqueeze(-1).unsqueeze(-1)
+    beta_t = b[:, :, 0].unsqueeze(-1)
+    state = state * g_t
+    kv_mem = (state * k[:, :, 0].unsqueeze(-1)).sum(dim=-2)
+    delta = (v[:, :, 0] - kv_mem) * beta_t
+    state = state + k[:, :, 0].unsqueeze(-1) * delta.unsqueeze(-2)
+    expected = (state * q[:, :, 0].unsqueeze(-1)).sum(dim=-2).unsqueeze(1).to(initial_dtype)
+
+    assert torch.allclose(output, expected, atol=1e-5, rtol=1e-4)
+    assert final_state is not None
+    assert torch.allclose(final_state, state, atol=1e-5, rtol=1e-4)
+
+
+def test_causal_conv1d_update_single_token_fast_path_matches_grouped_conv() -> None:
+    with _temporary_torch_seed(0):
+        hidden_states = torch.randn(2, 6, 1)
+        conv_state = torch.randn(2, 6, 4)
+        weight = torch.randn(6, 4)
+        bias = torch.randn(6)
+
+    fast_state = conv_state.clone()
+    fast = torch_causal_conv1d_update(hidden_states, fast_state, weight, bias)
+
+    baseline_state = conv_state.clone()
+    hidden_states_new = torch.cat([baseline_state, hidden_states], dim=-1).to(dtype=weight.dtype)
+    baseline_state.copy_(hidden_states_new[:, :, -baseline_state.shape[-1] :])
+    expected = torch.nn.functional.conv1d(
+        hidden_states_new,
+        weight.unsqueeze(1),
+        bias=bias,
+        padding=0,
+        groups=hidden_states.shape[1],
+    )
+    expected = torch.nn.functional.silu(expected[:, :, -1:]).to(dtype=hidden_states.dtype)
+
+    assert torch.allclose(fast, expected, atol=1e-5, rtol=1e-4)
+    assert torch.allclose(fast_state, baseline_state, atol=1e-5, rtol=1e-4)
 
 
 def test_qwen3_allows_out_of_range_padding_idx_for_tiny_configs() -> None:

@@ -665,8 +665,17 @@ def torch_causal_conv1d_update(
 ) -> torch.Tensor:
     _, hidden_size, seq_len = hidden_states.shape
     state_len = conv_state.shape[-1]
-    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(dtype=weight.dtype)
+    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1)
+    if hidden_states_new.dtype != weight.dtype:
+        hidden_states_new = hidden_states_new.to(dtype=weight.dtype)
     conv_state.copy_(hidden_states_new[:, :, -state_len:])
+    if seq_len == 1:
+        window = hidden_states_new[:, :, -weight.shape[-1] :]
+        out = (window * weight.unsqueeze(0)).sum(dim=-1)
+        if bias is not None:
+            out = out + bias.unsqueeze(0)
+        out = F.silu(out).unsqueeze(-1)
+        return out.to(dtype=hidden_states.dtype)
     out = F.conv1d(hidden_states_new, weight.unsqueeze(1), bias=bias, padding=0, groups=hidden_size)
     out = F.silu(out[:, :, -seq_len:])
     return out.to(dtype=hidden_states.dtype)
@@ -767,12 +776,28 @@ def torch_recurrent_gated_delta_rule(
     batch_size, num_heads, sequence_length, key_head_dim = key.shape
     value_head_dim = value.shape[-1]
     query = query * (query.shape[-1] ** -0.5)
-    core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, value_head_dim, device=value.device, dtype=value.dtype)
     last_recurrent_state = (
         torch.zeros(batch_size, num_heads, key_head_dim, value_head_dim, device=value.device, dtype=value.dtype)
         if initial_state is None
         else initial_state.to(dtype=value.dtype)
     )
+
+    if sequence_length == 1:
+        q_t = query[:, :, 0]
+        k_t = key[:, :, 0]
+        v_t = value[:, :, 0]
+        g_t = g[:, :, 0].exp().unsqueeze(-1).unsqueeze(-1)
+        beta_t = beta[:, :, 0].unsqueeze(-1)
+        last_recurrent_state = last_recurrent_state * g_t
+        kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
+        delta = (v_t - kv_mem) * beta_t
+        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        core_attn_out = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2).unsqueeze(2)
+        if not output_final_state:
+            last_recurrent_state = None
+        return core_attn_out.transpose(1, 2).contiguous().to(dtype=initial_dtype), last_recurrent_state
+
+    core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, value_head_dim, device=value.device, dtype=value.dtype)
 
     for i in range(sequence_length):
         q_t = query[:, :, i]
@@ -849,24 +874,34 @@ class Qwen3Attention(nn.Module):
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-        # XPU SDPA produced corrupted long-form decode outputs when fed the
-        # strided visible-cache mirror slices. Keep the explicit path here.
-        attn_scores = torch.matmul(query_states, key_states.transpose(-1, -2)) * self.scaling
-        visible_lengths = past_lengths + seq_len
+        if past_key_values is None and attention_mask is None:
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                dropout_p=0.0,
+                is_causal=seq_len > 1,
+            )
+        else:
+            # XPU SDPA produced corrupted long-form decode outputs when fed
+            # the visible-cache mirror. Keep decode on the explicit path.
+            attn_scores = torch.matmul(query_states, key_states.transpose(-1, -2)) * self.scaling
+            if not (batch_size == 1 and seq_len == 1 and attention_mask is None and past_key_values is not None):
+                visible_lengths = past_lengths + seq_len
 
-        causal_mask = self._causal_mask(seq_len, key_states.shape[-2], past_lengths, hidden_states.device)
-        if causal_mask is not None:
-            attn_scores = attn_scores.masked_fill(causal_mask.unsqueeze(1), float("-inf"))
+                causal_mask = self._causal_mask(seq_len, key_states.shape[-2], past_lengths, hidden_states.device)
+                if causal_mask is not None:
+                    attn_scores = attn_scores.masked_fill(causal_mask.unsqueeze(1), float("-inf"))
 
-        key_positions = torch.arange(key_states.shape[-2], device=hidden_states.device)[None, :]
-        visible_mask = key_positions < visible_lengths[:, None]
-        attn_scores = attn_scores.masked_fill(~visible_mask[:, None, None, :], float("-inf"))
-        if attention_mask is not None and past_key_values is None:
-            key_padding_mask = attention_mask[:, None, None, :].to(dtype=torch.bool)
-            attn_scores = attn_scores.masked_fill(~key_padding_mask, float("-inf"))
+                key_positions = torch.arange(key_states.shape[-2], device=hidden_states.device)[None, :]
+                visible_mask = key_positions < visible_lengths[:, None]
+                attn_scores = attn_scores.masked_fill(~visible_mask[:, None, None, :], float("-inf"))
+                if attention_mask is not None and past_key_values is None:
+                    key_padding_mask = attention_mask[:, None, None, :].to(dtype=torch.bool)
+                    attn_scores = attn_scores.masked_fill(~key_padding_mask, float("-inf"))
 
-        attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
-        attn_output = torch.matmul(attn_probs, value_states)
+            attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
+            attn_output = torch.matmul(attn_probs, value_states)
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)
