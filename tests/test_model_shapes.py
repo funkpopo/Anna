@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from anna.model.quantization import XPUInt4Linear
 from anna.model.config import Qwen3TextConfig, RopeParameters
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.model.qwen import Qwen3ForCausalLM
@@ -229,3 +230,20 @@ def test_engine_leaves_resident_expert_indices_for_auto_estimation_when_unspecif
     )
 
     assert resolved is None
+
+
+def test_engine_runtime_weight_quantization_converts_dense_text_linears() -> None:
+    model = Qwen3ForCausalLM(_tiny_config())
+    before_bytes = AnnaEngine._module_nbytes(model.model)
+
+    replacements = AnnaEngine._apply_runtime_weight_quantization(
+        model=model,
+        device=torch.device("cpu"),
+        compute_dtype=torch.bfloat16,
+    )
+    after_bytes = AnnaEngine._module_nbytes(model.model)
+
+    assert replacements > 0
+    assert after_bytes < before_bytes
+    assert isinstance(model.model.layers[0].linear_attn.in_proj_qkv, XPUInt4Linear)
+    assert isinstance(model.lm_head, torch.nn.Linear)

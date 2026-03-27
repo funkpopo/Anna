@@ -130,7 +130,7 @@ class AnnaScheduler:
 
     def _prefill_batch(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest]:
         for request in requests:
-            request.prompt_ids, request.prompt_length = self.engine._validate_generation_request(
+            request.prompt_ids, request.prompt_length, request.config = self.engine._validate_generation_request(
                 request.prepared,
                 config=request.config,
             )

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from anna.mm.processor import PreparedInputs
-from anna.model.config import Qwen3TextConfig, RopeParameters
+from anna.model.config import QuantizationConfig, Qwen3TextConfig, RopeParameters
 from anna.model.quantization import estimate_module_xpu_int4_bytes
 from anna.model.qwen import Qwen3ForCausalLM
 from anna.runtime.device import DeviceMemoryInfo, RuntimeSafetyPolicy
@@ -58,6 +58,83 @@ def test_guard_generation_memory_rejects_oversized_request() -> None:
         assert exc.code == "estimated_device_oom"
     else:  # pragma: no cover - defensive
         raise AssertionError("Expected memory guard to reject the oversized request.")
+
+
+def test_validate_generation_request_uses_remaining_context_when_no_memory_info_is_available() -> None:
+    engine = object.__new__(AnnaEngine)
+    engine.config = SimpleNamespace(
+        text_config=SimpleNamespace(
+            max_position_embeddings=32,
+        )
+    )
+    engine.device_context = SimpleNamespace(get_memory_info=lambda: None)
+
+    prepared = PreparedInputs(
+        prompt="test",
+        input_ids=torch.ones((1, 8), dtype=torch.long),
+        attention_mask=torch.ones((1, 8), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 8), dtype=torch.int32),
+    )
+
+    prompt_ids, prompt_length, resolved = engine._validate_generation_request(
+        prepared,
+        config=GenerationConfig(),
+    )
+
+    assert len(prompt_ids) == 8
+    assert prompt_length == 8
+    assert resolved.max_new_tokens == 24
+
+
+def test_validate_generation_request_auto_resolves_memory_bounded_limit() -> None:
+    engine = object.__new__(AnnaEngine)
+    engine.config = SimpleNamespace(
+        text_config=SimpleNamespace(
+            hidden_size=4096,
+            num_hidden_layers=32,
+            num_key_value_heads=8,
+            head_dim=128,
+            linear_num_key_heads=8,
+            linear_key_head_dim=128,
+            linear_num_value_heads=8,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+            layer_types=["full_attention"] * 16 + ["linear_attention"] * 16,
+            max_position_embeddings=8192,
+        )
+    )
+    engine.device_context = SimpleNamespace(
+        dtype=torch.bfloat16,
+        safety_policy=RuntimeSafetyPolicy(
+            min_free_bytes=128 << 20,
+            reserve_margin_bytes=64 << 20,
+            max_estimated_usage_ratio=0.9,
+            generation_memory_safety_factor=2.0,
+        ),
+        element_size=lambda dtype=None: 2,
+        get_memory_info=lambda: DeviceMemoryInfo(
+            free_bytes=1536 << 20,
+            total_bytes=2048 << 20,
+            allocated_bytes=0,
+            reserved_bytes=0,
+        ),
+    )
+
+    prepared = PreparedInputs(
+        prompt="test",
+        input_ids=torch.ones((1, 1024), dtype=torch.long),
+        attention_mask=torch.ones((1, 1024), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 1024), dtype=torch.int32),
+    )
+
+    _, prompt_length, resolved = engine._validate_generation_request(
+        prepared,
+        config=GenerationConfig(),
+    )
+
+    assert prompt_length == 1024
+    assert resolved.max_new_tokens is not None
+    assert 1 <= resolved.max_new_tokens < (8192 - prompt_length)
 
 
 def test_auto_resident_expert_estimation_uses_conservative_free_memory_budget() -> None:
@@ -151,7 +228,7 @@ def test_auto_resident_expert_estimation_accounts_for_int4_expert_storage() -> N
     model = Qwen3ForCausalLM(config)
     dense_layer_bytes = AnnaEngine._module_nbytes(model.model.layers[0].mlp.experts)
     int4_layer_bytes = estimate_module_xpu_int4_bytes(model.model.layers[0].mlp.experts)
-    fake_device_context = SimpleNamespace(
+    dense_device_context = SimpleNamespace(
         device=torch.device("xpu"),
         safety_policy=RuntimeSafetyPolicy(
             min_free_bytes=0,
@@ -167,15 +244,31 @@ def test_auto_resident_expert_estimation_accounts_for_int4_expert_storage() -> N
             reserved_bytes=0,
         ),
     )
+    int4_device_context = SimpleNamespace(
+        device=torch.device("xpu"),
+        safety_policy=RuntimeSafetyPolicy(
+            min_free_bytes=0,
+            reserve_margin_bytes=0,
+            max_estimated_usage_ratio=1.0,
+            generation_memory_safety_factor=2.0,
+        ),
+        synchronize=lambda: None,
+        get_memory_info=lambda: DeviceMemoryInfo(
+            free_bytes=(2304 << 20) + int4_layer_bytes * 3,
+            total_bytes=(2304 << 20) + int4_layer_bytes * 3 + 1024,
+            allocated_bytes=0,
+            reserved_bytes=0,
+        ),
+    )
 
     selected_dense = AnnaEngine._estimate_resident_expert_layer_indices(
         model=model,
-        device_context=fake_device_context,
+        device_context=dense_device_context,
         expert_quant="none",
     )
     selected_int4 = AnnaEngine._estimate_resident_expert_layer_indices(
         model=model,
-        device_context=fake_device_context,
+        device_context=int4_device_context,
         expert_quant="int4",
     )
 
@@ -226,7 +319,7 @@ def test_auto_cached_experts_per_layer_scales_with_available_xpu_budget() -> Non
     target_free_bytes = 768 << 20
     desired_cached = 3
     cache_budget_bytes = exemplar_expert_bytes * offloaded_layer_count * desired_cached
-    free_bytes = int(cache_budget_bytes / 0.65) + target_free_bytes
+    free_bytes = int((cache_budget_bytes + exemplar_expert_bytes * offloaded_layer_count) / 0.65) + target_free_bytes
 
     fake_device_context = SimpleNamespace(
         device=torch.device("xpu"),
@@ -248,3 +341,51 @@ def test_auto_cached_experts_per_layer_scales_with_available_xpu_budget() -> Non
 
     assert estimated >= desired_cached
     assert estimated <= config.num_experts
+
+
+def test_auto_weight_quantization_promotes_oversized_dense_xpu_models(monkeypatch) -> None:
+    config = SimpleNamespace(
+        text_config=Qwen3TextConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            vocab_size=256,
+            max_position_embeddings=128,
+            layer_types=["linear_attention", "full_attention", "linear_attention", "full_attention"],
+            rope_parameters=RopeParameters(
+                rope_type="default",
+                rope_theta=10000.0,
+                partial_rotary_factor=0.25,
+                mrope_section=(1, 1, 0),
+            ),
+        ),
+        quantization_config=QuantizationConfig(),
+        vision_config=None,
+    )
+    fake_device_context = SimpleNamespace(
+        device=torch.device("xpu"),
+        get_memory_info=lambda: DeviceMemoryInfo(
+            free_bytes=16 << 30,
+            total_bytes=16 << 30,
+            allocated_bytes=0,
+            reserved_bytes=0,
+        ),
+    )
+    monkeypatch.setattr("anna.runtime.engine.estimate_model_weight_bytes", lambda _model_path: 15 << 30)
+
+    resolved = AnnaEngine._resolve_weight_quant(
+        requested_quant="auto",
+        resolved_offload_mode="none",
+        model_path=SimpleNamespace(),
+        config=config,
+        device_context=fake_device_context,
+    )
+
+    assert resolved == "int4"

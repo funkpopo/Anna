@@ -262,6 +262,7 @@ class Qwen3Config:
     vision_config: Qwen3VisionConfig | None = None
     preprocessor_config: VisionPreprocessorConfig = field(default_factory=VisionPreprocessorConfig)
     quantization_config: QuantizationConfig = field(default_factory=QuantizationConfig)
+    default_max_completion_tokens: int | None = None
     tie_word_embeddings: bool = True
     image_token_id: int = 248056
     video_token_id: int = 248057
@@ -274,13 +275,30 @@ class Qwen3Config:
         config_data: dict[str, Any],
         *,
         preprocessor_data: dict[str, Any] | None = None,
+        generation_config_data: dict[str, Any] | None = None,
     ) -> "Qwen3Config":
+        text_config_data = config_data.get("text_config", {})
+        default_max_completion_tokens_value = _first_non_null(
+            config_data.get("max_completion_tokens"),
+            config_data.get("max_new_tokens"),
+            config_data.get("max_tokens"),
+            generation_config_data.get("max_completion_tokens") if generation_config_data else None,
+            generation_config_data.get("max_new_tokens") if generation_config_data else None,
+            generation_config_data.get("max_tokens") if generation_config_data else None,
+            text_config_data.get("max_completion_tokens"),
+            text_config_data.get("max_new_tokens"),
+            text_config_data.get("max_tokens"),
+        )
+        default_max_completion_tokens = (
+            None if default_max_completion_tokens_value is None else int(default_max_completion_tokens_value)
+        )
         return cls(
             model_type=config_data.get("model_type", "qwen3_5"),
             text_config=Qwen3TextConfig.from_dict(config_data),
             vision_config=Qwen3VisionConfig.from_dict(config_data.get("vision_config")),
             preprocessor_config=VisionPreprocessorConfig.from_dict(preprocessor_data),
             quantization_config=QuantizationConfig.from_dict(config_data.get("quantization_config")),
+            default_max_completion_tokens=default_max_completion_tokens,
             tie_word_embeddings=bool(_first_non_null(config_data.get("tie_word_embeddings"), True)),
             image_token_id=_int_from_candidates(config_data.get("image_token_id"), 248056),
             video_token_id=_int_from_candidates(config_data.get("video_token_id"), 248057),
@@ -296,4 +314,12 @@ class Qwen3Config:
         preprocessor_path = model_path / "preprocessor_config.json"
         if preprocessor_path.exists():
             preprocessor_data = json.loads(preprocessor_path.read_text(encoding="utf-8"))
-        return cls.from_dict(config_data, preprocessor_data=preprocessor_data)
+        generation_config_data = None
+        generation_config_path = model_path / "generation_config.json"
+        if generation_config_path.exists():
+            generation_config_data = json.loads(generation_config_path.read_text(encoding="utf-8"))
+        return cls.from_dict(
+            config_data,
+            preprocessor_data=preprocessor_data,
+            generation_config_data=generation_config_data,
+        )

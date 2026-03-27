@@ -20,6 +20,13 @@ def _non_negative_int(value: str) -> int:
     return parsed
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return parsed
+
+
 def _ratio(value: str) -> float:
     parsed = float(value)
     if not 0.0 < parsed <= 1.0:
@@ -72,18 +79,55 @@ def _build_safety_policy(settings: ServeSettings) -> RuntimeSafetyPolicy | None:
     )
 
 
+def _build_scheduler(engine: AnnaEngine, settings: ServeSettings) -> AnnaScheduler | None:
+    if settings.scheduler_max_batch_size <= 1:
+        engine.set_scheduler(None)
+        return None
+
+    scheduler = AnnaScheduler(
+        engine,
+        max_batch_size=settings.scheduler_max_batch_size,
+        batch_wait_ms=settings.scheduler_batch_wait_ms,
+    )
+    engine.set_scheduler(scheduler)
+    return scheduler
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Serve Anna with an OpenAI-compatible API.")
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--model-name", default=None, help="Model name exposed through the API.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
+    parser.add_argument(
+        "--max-completion-tokens",
+        type=_positive_int,
+        default=None,
+        help="Default completion token limit for API requests that omit max_completion_tokens/max_tokens. Defaults to the model config/generation_config value when present; otherwise Anna auto-estimates a safe per-request limit.",
+    )
+    parser.add_argument(
+        "--reasoning-format",
+        choices=("none", "deepseek"),
+        default="deepseek",
+        help="Reasoning output format for chat completions. 'none' keeps <think> tags in content only, 'deepseek' returns answer in content and reasoning in reasoning_content.",
+    )
     parser.add_argument("--offload-mode", choices=("auto", "none", "experts"), default="auto")
+    parser.add_argument(
+        "--offload-vision",
+        action="store_true",
+        help="Keep the vision tower on CPU even when the execution device is XPU. Useful for text-only serving on tight memory budgets.",
+    )
     parser.add_argument(
         "--expert-quant",
         choices=("auto", "none", "int4"),
         default="auto",
         help="Quantization used for expert weights executed on XPU. 'auto' enables int4 for experts offload on XPU.",
+    )
+    parser.add_argument(
+        "--weight-quant",
+        choices=("auto", "none", "int4"),
+        default="auto",
+        help="Quantization used for dense language-model linear weights executed on XPU. 'auto' enables int4 when the model is oversized for available XPU memory.",
     )
     parser.add_argument(
         "--resident-expert-layers",
@@ -126,7 +170,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Multiplier applied to estimated generation memory. Defaults to 2.0.",
     )
-    parser.add_argument("--scheduler-max-batch-size", type=int, default=4)
+    parser.add_argument(
+        "--scheduler-max-batch-size",
+        type=_positive_int,
+        default=1,
+        help="Enable continuous batching only when set above 1. Defaults to 1, which serves requests directly.",
+    )
     parser.add_argument("--scheduler-batch-wait-ms", type=float, default=2.0)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -143,8 +192,12 @@ def main() -> None:
         model_id=model_name,
         device=args.device,
         dtype=args.dtype,
+        default_max_completion_tokens=args.max_completion_tokens,
+        reasoning_format=args.reasoning_format,
         offload_mode=args.offload_mode,
+        offload_vision=args.offload_vision,
         expert_quant=args.expert_quant,
+        weight_quant=args.weight_quant,
         resident_expert_layers=args.resident_expert_layers,
         resident_expert_layer_indices=parse_resident_expert_layer_indices(args.resident_expert_layer_indices),
         cached_experts_per_layer=args.cached_experts_per_layer,
@@ -166,18 +219,17 @@ def main() -> None:
         device=settings.device,
         dtype=settings.dtype,
         safety_policy=_build_safety_policy(settings),
+        default_max_completion_tokens=settings.default_max_completion_tokens,
+        reasoning_format=settings.reasoning_format,
         offload_mode=settings.offload_mode,
+        offload_vision=settings.offload_vision,
         expert_quant=settings.expert_quant,
+        weight_quant=settings.weight_quant,
         resident_expert_layers=settings.resident_expert_layers,
         resident_expert_layer_indices=settings.resident_expert_layer_indices,
         cached_experts_per_layer=settings.cached_experts_per_layer,
     )
-    scheduler = AnnaScheduler(
-        engine,
-        max_batch_size=settings.scheduler_max_batch_size,
-        batch_wait_ms=settings.scheduler_batch_wait_ms,
-    )
-    engine.set_scheduler(scheduler)
+    scheduler = _build_scheduler(engine, settings)
     app = create_app(engine, scheduler=scheduler)
     uvicorn.run(app, host=settings.host, port=settings.port, log_level=settings.log_level)
 

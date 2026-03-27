@@ -84,6 +84,7 @@ def test_qwen3_config_keeps_multimodal_fields() -> None:
     config = Qwen3Config.from_dict(
         {
             "model_type": "qwen3_5_vl",
+            "max_completion_tokens": 1536,
             "text_config": {
                 "hidden_size": 64,
                 "intermediate_size": 128,
@@ -129,7 +130,32 @@ def test_qwen3_config_keeps_multimodal_fields() -> None:
     assert config.vision_config.temporal_patch_size == 2
     assert config.quantization_config.quant_method == "awq"
     assert config.quantization_config.bits == 4
+    assert config.default_max_completion_tokens == 1536
     assert config.preprocessor_config.merge_size == 2
+
+
+def test_qwen3_config_leaves_default_max_completion_tokens_unset_when_missing() -> None:
+    config = Qwen3Config.from_dict(
+        {
+            "model_type": "qwen3_5_vl",
+            "text_config": {
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_num_key_heads": 4,
+                "linear_num_value_heads": 4,
+                "vocab_size": 256,
+                "layer_types": ["linear_attention", "full_attention"],
+            },
+        }
+    )
+
+    assert config.default_max_completion_tokens is None
 
 
 def test_qwen3_config_uses_top_level_pad_token_when_text_config_value_is_null() -> None:
@@ -178,7 +204,7 @@ def test_tokenizer_renders_native_multimodal_placeholders() -> None:
 
     assert "<|vision_start|><|image_pad|><|vision_end|>" in rendered
     assert "<|vision_start|><|video_pad|><|vision_end|>" in rendered
-    assert rendered.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    assert rendered.endswith("<|im_start|>assistant\n<think>\n")
 
 
 def test_tokenizer_renders_open_think_prompt_when_enabled() -> None:
@@ -202,6 +228,24 @@ def test_tokenizer_renders_assistant_reasoning_history() -> None:
     )
 
     assert "<think>\n我先做加法。\n</think>\n\n答案是2。" in rendered
+
+
+def test_tokenizer_renders_raw_assistant_output_with_reasoning_content_without_duplication() -> None:
+    tokenizer = _tokenizer()
+    rendered = tokenizer.render_messages(
+        [
+            {"role": "user", "content": "夏天怎么样？"},
+            {
+                "role": "assistant",
+                "content": "先写夏天的氛围。</think>\n\n夏天有风，也有晚霞。",
+                "reasoning_content": "先写夏天的氛围。",
+            },
+        ],
+        add_generation_prompt=False,
+    )
+
+    assert "<think>\n先写夏天的氛围。\n</think>\n\n夏天有风，也有晚霞。" in rendered
+    assert rendered.count("先写夏天的氛围。") == 1
 
 
 def test_processor_expands_qwen3_native_placeholders() -> None:
