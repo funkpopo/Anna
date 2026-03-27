@@ -13,12 +13,16 @@ from anna.api.schemas import ChatCompletionRequest, CompletionRequest
 from anna.runtime.engine import (
     AnnaEngineError,
     GenerationConfig,
+    ReasoningFormat,
     StreamEvent,
     TextGenerationResult,
+    normalize_reasoning_format,
 )
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+_CHAT_STREAM_FLUSH_BOUNDARIES = frozenset(".!?;\u3002\uff01\uff1f\uff1b")
+_CHAT_STREAM_MAX_BUFFER_CHARS = 64
 
 
 def _engine(request: Request):
@@ -31,6 +35,24 @@ def _normalize_stop(stop: str | list[str] | None) -> list[str]:
     if isinstance(stop, str):
         return [stop]
     return stop
+
+
+def _default_max_completion_tokens(engine: object) -> int | None:
+    value = getattr(engine, "default_max_completion_tokens", None)
+    return None if value is None else max(1, int(value))
+
+
+def _default_reasoning_format(engine: object) -> ReasoningFormat:
+    value = getattr(engine, "reasoning_format", None)
+    return normalize_reasoning_format(value)
+
+
+def _enable_thinking(value: bool | None) -> bool:
+    return value is not False
+
+
+def _resolve_reasoning_format(engine: object, payload: ChatCompletionRequest) -> ReasoningFormat:
+    return normalize_reasoning_format(payload.reasoning_format) if payload.reasoning_format else _default_reasoning_format(engine)
 
 
 def _chat_response_payload(
@@ -104,6 +126,53 @@ def _sse_error_frame(exc: AnnaEngineError) -> str:
     return f"event: error\ndata: {json.dumps(_error_payload_from_exception(exc), ensure_ascii=False)}\n\n"
 
 
+def _should_flush_chat_delta(*, content: str, reasoning: str, finish_reason: str | None) -> bool:
+    if finish_reason is not None:
+        return True
+    if "</think>" in content:
+        return True
+    candidate = reasoning or content
+    if not candidate:
+        return False
+    if len(candidate) >= _CHAT_STREAM_MAX_BUFFER_CHARS:
+        return True
+    if "\n\n" in candidate:
+        return True
+    tail = candidate[-1]
+    if tail == "." and len(candidate) >= 2 and candidate[-2].isdigit():
+        return False
+    return tail in _CHAT_STREAM_FLUSH_BOUNDARIES
+
+
+def _chat_chunk_payload(
+    *,
+    response_id: str,
+    created: int,
+    model: str,
+    content: str,
+    reasoning: str,
+    finish_reason: str | None,
+) -> dict:
+    delta: dict[str, str] = {}
+    if reasoning:
+        delta["reasoning_content"] = reasoning
+    if content:
+        delta["content"] = content
+    return {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+
+
 def _stream_sse_chat(
     *,
     response_id: str,
@@ -120,27 +189,52 @@ def _stream_sse_chat(
     }
     yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
 
+    pending_content = ""
+    pending_reasoning = ""
+
+    def _flush_pending(*, finish_reason: str | None) -> str | None:
+        nonlocal pending_content, pending_reasoning
+        if not pending_content and not pending_reasoning and finish_reason is None:
+            return None
+        payload = _chat_chunk_payload(
+            response_id=response_id,
+            created=created,
+            model=model,
+            content=pending_content,
+            reasoning=pending_reasoning,
+            finish_reason=finish_reason,
+        )
+        pending_content = ""
+        pending_reasoning = ""
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
     try:
         for event in events:
-            delta: dict[str, str] = {}
-            if event.reasoning_text:
-                delta["reasoning_content"] = event.reasoning_text
-            if event.text:
-                delta["content"] = event.text
-            payload = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": delta,
-                        "finish_reason": event.finish_reason,
-                    }
-                ],
-            }
-            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            incoming_reasoning = event.reasoning_text or ""
+            incoming_content = event.text or ""
+
+            if pending_reasoning and incoming_content and not incoming_reasoning:
+                frame = _flush_pending(finish_reason=None)
+                if frame is not None:
+                    yield frame
+            if pending_content and incoming_reasoning and not incoming_content:
+                frame = _flush_pending(finish_reason=None)
+                if frame is not None:
+                    yield frame
+
+            if incoming_reasoning:
+                pending_reasoning += incoming_reasoning
+            if incoming_content:
+                pending_content += incoming_content
+            if not _should_flush_chat_delta(
+                content=pending_content,
+                reasoning=pending_reasoning,
+                finish_reason=event.finish_reason,
+            ):
+                continue
+            frame = _flush_pending(finish_reason=event.finish_reason)
+            if frame is not None:
+                yield frame
     except AnnaEngineError as exc:
         yield _sse_error_frame(exc)
     except Exception:  # pragma: no cover - defensive fallback
@@ -153,6 +247,11 @@ def _stream_sse_chat(
                 code="streaming_failed",
             )
         )
+
+    if pending_content or pending_reasoning:
+        frame = _flush_pending(finish_reason=None)
+        if frame is not None:
+            yield frame
 
     yield "data: [DONE]\n\n"
 
@@ -217,7 +316,7 @@ def list_models(request: Request) -> dict:
 def chat_completions(request: Request, payload: ChatCompletionRequest):
     engine = _engine(request)
     config = GenerationConfig(
-        max_new_tokens=payload.max_completion_tokens or payload.max_tokens or 256,
+        max_new_tokens=payload.max_completion_tokens or payload.max_tokens or _default_max_completion_tokens(engine),
         temperature=payload.temperature,
         top_p=payload.top_p,
         top_k=payload.top_k,
@@ -227,13 +326,15 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
     response_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     model_id = payload.model or engine.default_model_id
+    reasoning_format = _resolve_reasoning_format(engine, payload)
 
     try:
         if payload.stream:
             events = engine.stream_chat(
                 payload.messages,
                 config=config,
-                enable_thinking=bool(payload.enable_thinking),
+                enable_thinking=_enable_thinking(payload.enable_thinking),
+                reasoning_format=reasoning_format,
             )
             return StreamingResponse(
                 _stream_sse_chat(
@@ -248,7 +349,8 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
         result = engine.generate_chat(
             payload.messages,
             config=config,
-            enable_thinking=bool(payload.enable_thinking),
+            enable_thinking=_enable_thinking(payload.enable_thinking),
+            reasoning_format=reasoning_format,
         )
     except AnnaEngineError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -267,7 +369,7 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
 def completions(request: Request, payload: CompletionRequest):
     engine = _engine(request)
     config = GenerationConfig(
-        max_new_tokens=payload.max_tokens or 256,
+        max_new_tokens=payload.max_tokens or _default_max_completion_tokens(engine),
         temperature=payload.temperature,
         top_p=payload.top_p,
         top_k=payload.top_k,

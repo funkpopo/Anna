@@ -64,7 +64,7 @@ class Qwen3MultimodalProcessor:
             mm_token_type_ids=mm_token_type_ids,
         )
 
-    def prepare_messages(self, messages: list[Any], *, enable_thinking: bool = False) -> PreparedInputs:
+    def prepare_messages(self, messages: list[Any], *, enable_thinking: bool = True) -> PreparedInputs:
         prompt = self.tokenizer.render_messages(
             messages,
             add_generation_prompt=True,

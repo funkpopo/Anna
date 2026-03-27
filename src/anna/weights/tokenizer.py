@@ -66,15 +66,20 @@ class QwenTokenizer:
 
     @staticmethod
     def _split_reasoning_content(text: str) -> tuple[str | None, str]:
-        normalized = text.strip()
-        if not normalized.startswith("<think>"):
-            return None, text
+        normalized = text.lstrip()
+        explicit_open = normalized.startswith("<think>")
+        if explicit_open:
+            normalized = normalized.removeprefix("<think>").lstrip("\r\n")
         closing_tag = "</think>"
         closing_index = normalized.find(closing_tag)
-        if closing_index == -1:
-            return normalized.removeprefix("<think>").strip(), ""
-        reasoning = normalized[len("<think>") : closing_index].strip()
-        content = normalized[closing_index + len(closing_tag) :].lstrip()
+        if closing_index != -1:
+            reasoning = normalized[:closing_index].strip()
+            content = normalized[closing_index + len(closing_tag) :].lstrip("\r\n")
+            return reasoning or None, content
+        if not explicit_open:
+            return None, text
+        reasoning = normalized.strip()
+        content = ""
         return reasoning or None, content
 
     def _flatten_content(self, content: Any) -> str:
@@ -108,7 +113,7 @@ class QwenTokenizer:
         messages: list[Any],
         *,
         add_generation_prompt: bool = True,
-        enable_thinking: bool = False,
+        enable_thinking: bool = True,
     ) -> str:
         parts: list[str] = []
         for idx, message in enumerate(messages):
@@ -133,13 +138,16 @@ class QwenTokenizer:
                 if reasoning_content is None:
                     reasoning_content = parsed_reasoning
                     text = parsed_content.strip()
+                elif parsed_reasoning is not None:
+                    text = parsed_content.strip()
+                elif text.strip() == reasoning_content.strip():
+                    text = ""
                 if reasoning_content:
                     text = f"<think>\n{reasoning_content.strip()}\n</think>\n\n{text}"
             parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
 
         if add_generation_prompt:
-            if enable_thinking:
-                parts.append("<|im_start|>assistant\n<think>\n")
-            else:
-                parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+            # Keep the native open-think prompt so the raw <think>...</think> span
+            # is generated and can be handled entirely on the client side.
+            parts.append("<|im_start|>assistant\n<think>\n")
         return "".join(parts)

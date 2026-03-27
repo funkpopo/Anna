@@ -3,14 +3,14 @@ from __future__ import annotations
 import itertools
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal, cast
 
 import torch
 
 from anna.mm.processor import PreparedInputs, Qwen3MultimodalProcessor
-from anna.model.quantization import estimate_module_xpu_int4_bytes
+from anna.model.quantization import convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
 from anna.model.qwen import Qwen3ForConditionalGeneration
 from anna.model.ops import Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
@@ -20,6 +20,10 @@ from anna.weights.loader import build_model, estimate_model_weight_bytes, load_m
 from anna.weights.tokenizer import QwenTokenizer
 
 logger = logging.getLogger(__name__)
+
+ReasoningFormat = Literal["none", "deepseek"]
+_REASONING_FORMAT_VALUES = frozenset({"none", "deepseek"})
+_DEFAULT_REASONING_FORMAT: ReasoningFormat = "deepseek"
 
 
 def _common_prefix_length(left: str, right: str) -> int:
@@ -52,6 +56,16 @@ def _strip_unstable_replacement_suffix(text: str) -> str:
     return strip_unstable_replacement_suffix(text)
 
 
+def normalize_reasoning_format(value: str | None) -> ReasoningFormat:
+    if value is None:
+        return _DEFAULT_REASONING_FORMAT
+    normalized = value.strip().lower()
+    if normalized not in _REASONING_FORMAT_VALUES:
+        allowed = ", ".join(sorted(_REASONING_FORMAT_VALUES))
+        raise ValueError(f"Unsupported reasoning format: {value}. Expected one of: {allowed}.")
+    return cast(ReasoningFormat, normalized)
+
+
 class ThinkingStreamParser:
     CLOSE_TAG = "</think>"
 
@@ -64,7 +78,13 @@ class ThinkingStreamParser:
         if self.state != "reasoning":
             return []
         self.buffer = _strip_think_open_tag(self.buffer)
-        safe_length = max(0, len(self.buffer) - (len(self.CLOSE_TAG) - 1))
+        hold_back = 0
+        max_suffix = min(len(self.buffer), len(self.CLOSE_TAG) - 1)
+        for suffix_length in range(max_suffix, 0, -1):
+            if self.buffer.endswith(self.CLOSE_TAG[:suffix_length]):
+                hold_back = suffix_length
+                break
+        safe_length = max(0, len(self.buffer) - hold_back)
         if safe_length <= 0:
             return []
         reasoning = self.buffer[:safe_length]
@@ -76,13 +96,20 @@ class ThinkingStreamParser:
         self.buffer += text
 
         while True:
+            if self.state == "content":
+                stripped = self.buffer.lstrip()
+                if stripped.startswith("<think>"):
+                    self.buffer = stripped
+                    self.state = "reasoning"
+                    continue
+
             if self.state == "reasoning":
                 self.buffer = _strip_think_open_tag(self.buffer)
                 close_index = self.buffer.find(self.CLOSE_TAG)
                 if close_index == -1:
                     outputs.extend(self._emit_reasoning_prefix())
                     break
-                reasoning = self.buffer[:close_index]
+                reasoning = self.buffer[:close_index].rstrip("\r\n")
                 if reasoning:
                     outputs.append(("reasoning", reasoning))
                 self.buffer = self.buffer[close_index + len(self.CLOSE_TAG) :].lstrip("\r\n")
@@ -100,8 +127,9 @@ class ThinkingStreamParser:
         outputs: list[tuple[str, str]] = []
         if self.state == "reasoning":
             self.buffer = _strip_think_open_tag(self.buffer)
-            if self.buffer:
-                outputs.append(("reasoning", self.buffer))
+            reasoning = self.buffer.rstrip("\r\n")
+            if reasoning:
+                outputs.append(("reasoning", reasoning))
         elif self.buffer:
             outputs.append(("content", self.buffer))
         self.buffer = ""
@@ -125,7 +153,7 @@ class AnnaEngineError(RuntimeError):
 
 @dataclass(slots=True)
 class GenerationConfig:
-    max_new_tokens: int = 256
+    max_new_tokens: int | None = None
     temperature: float = 0.7
     top_p: float = 0.95
     top_k: int = 50
@@ -159,8 +187,12 @@ class AnnaEngine:
         model_id: str,
         device_context: DeviceContext,
         quantized_replacements: int = 0,
+        default_max_completion_tokens: int | None = None,
+        reasoning_format: ReasoningFormat | str = _DEFAULT_REASONING_FORMAT,
         offload_mode: str = "none",
+        offload_vision: bool = False,
         expert_quant: str = "none",
+        weight_quant: str = "none",
         resident_expert_layer_indices: tuple[int, ...] = (),
         cached_experts_per_layer: int = 0,
     ) -> None:
@@ -171,8 +203,14 @@ class AnnaEngine:
         self.device_context = device_context
         self.config = model.config
         self.quantized_replacements = quantized_replacements
+        self.default_max_completion_tokens = (
+            None if default_max_completion_tokens is None else max(1, int(default_max_completion_tokens))
+        )
+        self.reasoning_format = normalize_reasoning_format(reasoning_format)
         self.offload_mode = offload_mode
+        self.offload_vision = offload_vision
         self.expert_quant = expert_quant
+        self.weight_quant = weight_quant
         self.resident_expert_layer_indices = tuple(resident_expert_layer_indices)
         self.resident_expert_layers = len(self.resident_expert_layer_indices)
         self.cached_experts_per_layer = max(0, int(cached_experts_per_layer))
@@ -190,8 +228,12 @@ class AnnaEngine:
         device: str = "auto",
         dtype: str = "auto",
         safety_policy: RuntimeSafetyPolicy | None = None,
+        default_max_completion_tokens: int | None = None,
+        reasoning_format: ReasoningFormat | str = _DEFAULT_REASONING_FORMAT,
         offload_mode: str = "auto",
+        offload_vision: bool = False,
         expert_quant: str = "auto",
+        weight_quant: str = "auto",
         resident_expert_layers: int | None = None,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         cached_experts_per_layer: int | None = None,
@@ -211,9 +253,22 @@ class AnnaEngine:
             config=config,
             device_context=device_context,
         )
+        resolved_offload_vision = cls._resolve_offload_vision(
+            requested_offload_vision=offload_vision,
+            resolved_offload_mode=resolved_offload_mode,
+            config=config,
+            device_context=device_context,
+        )
         resolved_expert_quant = cls._resolve_expert_quant(
             requested_quant=expert_quant,
             resolved_offload_mode=resolved_offload_mode,
+            device_context=device_context,
+        )
+        resolved_weight_quant = cls._resolve_weight_quant(
+            requested_quant=weight_quant,
+            resolved_offload_mode=resolved_offload_mode,
+            model_path=model_path,
+            config=config,
             device_context=device_context,
         )
         resolved_resident_expert_layer_indices = cls._resolve_resident_expert_layer_indices(
@@ -226,15 +281,27 @@ class AnnaEngine:
             requested_cached_experts_per_layer=cached_experts_per_layer,
             resolved_offload_mode=resolved_offload_mode,
         )
-        model_device = torch.device("cpu") if resolved_offload_mode == "experts" else device_context.device
+        model_device = (
+            torch.device("cpu")
+            if resolved_offload_mode == "experts" or resolved_weight_quant == "int4"
+            else device_context.device
+        )
         try:
-            model, quantized_replacements = build_model(
+            model, model_quantized_replacements = build_model(
                 config,
                 device=model_device,
                 dtype=device_context.dtype,
             )
             report = load_model_weights(model, model_path)
-            report.quantized_replacements = quantized_replacements
+            runtime_weight_quantized_replacements = 0
+            if resolved_weight_quant == "int4":
+                runtime_weight_quantized_replacements = cls._apply_runtime_weight_quantization(
+                    model=model,
+                    device=device_context.device,
+                    compute_dtype=device_context.dtype,
+                )
+            total_quantized_replacements = model_quantized_replacements + runtime_weight_quantized_replacements
+            report.quantized_replacements = total_quantized_replacements
             auto_resident_indices = resolved_resident_expert_layer_indices is None
             auto_cached_experts_per_layer = resolved_cached_experts_per_layer is None
             initial_resident_expert_layer_indices = () if auto_resident_indices else resolved_resident_expert_layer_indices
@@ -243,7 +310,7 @@ class AnnaEngine:
             model.configure_runtime(
                 device_context.device,
                 offload_experts=resolved_offload_mode == "experts",
-                offload_vision=resolved_offload_mode == "experts",
+                offload_vision=resolved_offload_vision,
                 offload_token_io=False,
                 resident_expert_layers=0,
                 resident_expert_layer_indices=initial_resident_expert_layer_indices,
@@ -259,7 +326,7 @@ class AnnaEngine:
                 model.configure_runtime(
                     device_context.device,
                     offload_experts=resolved_offload_mode == "experts",
-                    offload_vision=resolved_offload_mode == "experts",
+                    offload_vision=resolved_offload_vision,
                     offload_token_io=False,
                     resident_expert_layers=0,
                     resident_expert_layer_indices=resolved_resident_expert_layer_indices,
@@ -275,7 +342,7 @@ class AnnaEngine:
                 model.configure_runtime(
                     device_context.device,
                     offload_experts=resolved_offload_mode == "experts",
-                    offload_vision=resolved_offload_mode == "experts",
+                    offload_vision=resolved_offload_vision,
                     offload_token_io=False,
                     resident_expert_layers=0,
                     resident_expert_layer_indices=resolved_resident_expert_layer_indices,
@@ -295,15 +362,26 @@ class AnnaEngine:
         tokenizer = QwenTokenizer.from_model_dir(model_path)
         processor = Qwen3MultimodalProcessor(config, tokenizer)
         resolved_model_id = model_id or model_path.name
+        resolved_default_max_completion_tokens = (
+            config.default_max_completion_tokens
+            if default_max_completion_tokens is None
+            else default_max_completion_tokens
+        )
+        if resolved_default_max_completion_tokens is not None:
+            resolved_default_max_completion_tokens = max(1, int(resolved_default_max_completion_tokens))
 
         logger.info(
-            "Loaded model %s on %s (compute=%s, requested=%s, offload=%s, expert_quant=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
+            "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, reasoning_format=%s, offload=%s, offload_vision=%s, expert_quant=%s, weight_quant=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
             resolved_model_id,
             device_context.device,
             device_context.dtype,
             device_context.reported_dtype,
+            resolved_default_max_completion_tokens,
+            normalize_reasoning_format(reasoning_format),
             resolved_offload_mode,
+            resolved_offload_vision,
             resolved_expert_quant,
+            resolved_weight_quant,
             len(resolved_resident_expert_layer_indices or ()),
             list(resolved_resident_expert_layer_indices or ()),
             resolved_cached_experts_per_layer,
@@ -319,9 +397,13 @@ class AnnaEngine:
             processor=processor,
             model_id=resolved_model_id,
             device_context=device_context,
-            quantized_replacements=quantized_replacements,
+            quantized_replacements=report.quantized_replacements,
+            default_max_completion_tokens=resolved_default_max_completion_tokens,
+            reasoning_format=reasoning_format,
             offload_mode=resolved_offload_mode,
+            offload_vision=resolved_offload_vision,
             expert_quant=resolved_expert_quant,
+            weight_quant=resolved_weight_quant,
             resident_expert_layer_indices=tuple(resolved_resident_expert_layer_indices or ()),
             cached_experts_per_layer=int(resolved_cached_experts_per_layer or 0),
         )
@@ -352,6 +434,20 @@ class AnnaEngine:
         return "none"
 
     @staticmethod
+    def _resolve_offload_vision(
+        *,
+        requested_offload_vision: bool,
+        resolved_offload_mode: str,
+        config: object,
+        device_context: DeviceContext,
+    ) -> bool:
+        if device_context.device.type != "xpu":
+            return False
+        if getattr(config, "vision_config", None) is None:
+            return False
+        return bool(requested_offload_vision or resolved_offload_mode == "experts")
+
+    @staticmethod
     def _resolve_expert_quant(
         *,
         requested_quant: str,
@@ -366,6 +462,60 @@ class AnnaEngine:
         if normalized == "auto":
             return "int4"
         return normalized
+
+    @staticmethod
+    def _resolve_weight_quant(
+        *,
+        requested_quant: str,
+        resolved_offload_mode: str,
+        model_path: Path,
+        config: object,
+        device_context: DeviceContext,
+    ) -> str:
+        normalized = requested_quant.lower()
+        if normalized not in {"auto", "none", "int4"}:
+            raise ValueError(f"Unsupported weight quant mode: {requested_quant}")
+        if device_context.device.type != "xpu":
+            return "none"
+        if resolved_offload_mode == "experts" or config.text_config.is_moe_model:
+            return "none"
+        if normalized != "auto":
+            return normalized
+        if getattr(config, "quantization_config", None) is not None and config.quantization_config.is_enabled:
+            return "none"
+
+        memory_info = device_context.get_memory_info()
+        if memory_info is None:
+            return "none"
+
+        weight_bytes = estimate_model_weight_bytes(model_path)
+        if weight_bytes > int(memory_info.total_bytes * 0.85):
+            return "int4"
+        return "none"
+
+    @classmethod
+    def _apply_runtime_weight_quantization(
+        cls,
+        *,
+        model: Qwen3ForConditionalGeneration,
+        device: torch.device,
+        compute_dtype: torch.dtype,
+    ) -> int:
+        text_model = cls._text_model(model)
+        if text_model is None:
+            return 0
+        replacements = convert_module_linears_to_xpu_int4(
+            text_model,
+            compute_dtype=compute_dtype,
+            device=device,
+        )
+        logger.info(
+            "Runtime dense text int4 quantization: replacements=%s device=%s compute_dtype=%s",
+            replacements,
+            device,
+            compute_dtype,
+        )
+        return replacements
 
     @staticmethod
     def _resolve_cached_experts_per_layer(
@@ -645,10 +795,14 @@ class AnnaEngine:
             "compute_dtype": str(self.device_context.dtype),
             "requested_dtype": self.device_context.requested_dtype,
             "reported_dtype": self.device_context.reported_dtype,
+            "default_max_completion_tokens": self.default_max_completion_tokens,
+            "reasoning_format": self.reasoning_format,
             "float8_available": self.device_context.float8_available,
             "quantization": quant_method,
+            "weight_quant": self.weight_quant,
             "quantized_replacements": self.quantized_replacements,
             "offload_mode": self.offload_mode,
+            "offload_vision": self.offload_vision,
             "expert_quant": self.expert_quant,
             "resident_expert_layers": self.resident_expert_layers,
             "resident_expert_layer_indices": self._resident_expert_layer_indices(),
@@ -699,13 +853,19 @@ class AnnaEngine:
         messages: list[object],
         *,
         config: GenerationConfig,
-        enable_thinking: bool = False,
+        enable_thinking: bool = True,
+        reasoning_format: ReasoningFormat | str | None = None,
     ) -> TextGenerationResult:
         prepared = self._prepare_messages(messages, enable_thinking=enable_thinking)
         raw = self._generate(prepared, config=config)
-        reasoning_text, content_text = self._split_chat_output(raw.text, enable_thinking=enable_thinking)
+        text, reasoning_text = self._project_chat_output(
+            raw_text=raw.text,
+            raw_reasoning_text=raw.reasoning_text,
+            enable_thinking=enable_thinking,
+            reasoning_format=reasoning_format,
+        )
         return TextGenerationResult(
-            text=content_text,
+            text=text,
             reasoning_text=reasoning_text,
             finish_reason=raw.finish_reason,
             prompt_tokens=raw.prompt_tokens,
@@ -717,28 +877,35 @@ class AnnaEngine:
         messages: list[object],
         *,
         config: GenerationConfig,
-        enable_thinking: bool = False,
+        enable_thinking: bool = True,
+        reasoning_format: ReasoningFormat | str | None = None,
     ) -> Iterator[StreamEvent]:
         prepared = self._prepare_messages(messages, enable_thinking=enable_thinking)
+        resolved_reasoning_format = self._resolve_reasoning_format(reasoning_format)
+        if resolved_reasoning_format == "none":
+            yield from self._stream(prepared, config=config)
+            return
+
         parser = ThinkingStreamParser(enable_thinking=enable_thinking)
-
         for event in self._stream(prepared, config=config):
-            if event.finish_reason is not None:
-                for kind, chunk in parser.flush():
-                    if kind == "reasoning":
-                        yield StreamEvent(text="", reasoning_text=chunk, finish_reason=None)
-                    else:
-                        yield StreamEvent(text=chunk, reasoning_text=None, finish_reason=None)
-                yield event
-                return
+            parsed_chunks = self._parse_chat_stream_event(parser, event)
+            if not parsed_chunks:
+                yield StreamEvent(
+                    text="",
+                    reasoning_text=event.reasoning_text,
+                    finish_reason=event.finish_reason,
+                )
+                continue
 
-            for kind, chunk in parser.feed(event.text):
-                if kind == "reasoning":
-                    yield StreamEvent(text="", reasoning_text=chunk, finish_reason=None)
-                else:
-                    yield StreamEvent(text=chunk, reasoning_text=None, finish_reason=None)
+            last_index = len(parsed_chunks) - 1
+            for index, (kind, chunk) in enumerate(parsed_chunks):
+                yield StreamEvent(
+                    text=chunk if kind == "content" else "",
+                    reasoning_text=chunk if kind == "reasoning" else None,
+                    finish_reason=event.finish_reason if index == last_index else None,
+                )
 
-    def _prepare_messages(self, messages: list[object], *, enable_thinking: bool) -> PreparedInputs:
+    def _prepare_messages(self, messages: list[object], *, enable_thinking: bool = True) -> PreparedInputs:
         try:
             return self.processor.prepare_messages(messages, enable_thinking=enable_thinking)
         except FileNotFoundError as exc:
@@ -760,20 +927,101 @@ class AnnaEngine:
         prepared: PreparedInputs,
         *,
         config: GenerationConfig,
-    ) -> tuple[list[int], int]:
+    ) -> tuple[list[int], int, GenerationConfig]:
         prompt_ids = prepared.input_ids[0].tolist()
         prompt_length = int(prepared.input_ids.shape[1])
         if prompt_length == 0:
             raise AnnaEngineError("Prompt produced zero tokens.")
 
-        max_total = prompt_length + config.max_new_tokens
-        if max_total > self.config.text_config.max_position_embeddings:
+        context_limit = self.config.text_config.max_position_embeddings
+        context_remaining = context_limit - prompt_length
+        if context_remaining <= 0:
             raise AnnaEngineError(
-                f"Requested sequence length {max_total} exceeds model context limit {self.config.text_config.max_position_embeddings}.",
+                f"Prompt length {prompt_length} already reaches the model context limit {context_limit}.",
                 status_code=400,
                 code="context_length_exceeded",
             )
-        return prompt_ids, prompt_length
+        if config.max_new_tokens is None:
+            resolved_max_new_tokens = self._resolve_auto_max_new_tokens(
+                prepared,
+                context_remaining=context_remaining,
+            )
+        else:
+            resolved_max_new_tokens = max(1, int(config.max_new_tokens))
+            max_total = prompt_length + resolved_max_new_tokens
+            if max_total > context_limit:
+                raise AnnaEngineError(
+                    f"Requested sequence length {max_total} exceeds model context limit {context_limit}.",
+                    status_code=400,
+                    code="context_length_exceeded",
+                )
+        return prompt_ids, prompt_length, replace(config, max_new_tokens=resolved_max_new_tokens)
+
+    def _resolve_auto_max_new_tokens(
+        self,
+        prepared: PreparedInputs,
+        *,
+        context_remaining: int,
+    ) -> int:
+        if context_remaining <= 0:
+            raise AnnaEngineError(
+                "No completion tokens remain within the model context window.",
+                status_code=400,
+                code="context_length_exceeded",
+            )
+
+        memory_info = self.device_context.get_memory_info()
+        if memory_info is None:
+            return context_remaining
+
+        policy = self.device_context.safety_policy
+        if memory_info.free_bytes < policy.min_free_bytes:
+            raise AnnaEngineError(
+                f"Insufficient free XPU memory before generation: free={_format_bytes(memory_info.free_bytes)}, "
+                f"required reserve={_format_bytes(policy.min_free_bytes)}. Reduce workload or restart the service.",
+                status_code=503,
+                error_type="server_error",
+                code="insufficient_device_memory",
+            )
+
+        available_budget = max(0, memory_info.free_bytes - policy.reserve_margin_bytes)
+        max_allowed = int(memory_info.total_bytes * policy.max_estimated_usage_ratio)
+        memory_budget = min(available_budget, max_allowed)
+        if memory_budget <= 0:
+            raise AnnaEngineError(
+                "No XPU memory budget remains for generation after applying safety margins.",
+                status_code=503,
+                error_type="server_error",
+                code="insufficient_device_memory",
+            )
+
+        probe = GenerationConfig(max_new_tokens=1)
+        low = 1
+        high = context_remaining
+        best = 0
+        while low <= high:
+            mid = (low + high) // 2
+            probe.max_new_tokens = mid
+            estimated_bytes = self._estimate_generation_memory_bytes(prepared, config=probe)
+            if estimated_bytes <= memory_budget:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        if best > 0:
+            return best
+
+        one_token_config = GenerationConfig(max_new_tokens=1)
+        estimated_bytes = self._estimate_generation_memory_bytes(prepared, config=one_token_config)
+        raise AnnaEngineError(
+            f"Request rejected by memory guard: estimated={_format_bytes(estimated_bytes)}, "
+            f"free={_format_bytes(memory_info.free_bytes)}, reserve={_format_bytes(policy.reserve_margin_bytes)}. "
+            "Reduce prompt length, image/video size, or max_completion_tokens.",
+            status_code=400,
+            error_type="invalid_request_error",
+            code="estimated_device_oom",
+        )
 
     def _move_prepared_for_generation(
         self,
@@ -897,30 +1145,60 @@ class AnnaEngine:
             code="runtime_execution_failed",
         )
 
+    def _resolve_reasoning_format(self, reasoning_format: ReasoningFormat | str | None) -> ReasoningFormat:
+        if reasoning_format is None:
+            return normalize_reasoning_format(getattr(self, "reasoning_format", None))
+        return normalize_reasoning_format(reasoning_format)
+
+    def _project_chat_output(
+        self,
+        *,
+        raw_text: str,
+        raw_reasoning_text: str | None,
+        enable_thinking: bool,
+        reasoning_format: ReasoningFormat | str | None,
+    ) -> tuple[str, str | None]:
+        resolved_reasoning_format = self._resolve_reasoning_format(reasoning_format)
+        if resolved_reasoning_format == "none":
+            return raw_text, None
+
+        parsed_reasoning, parsed_content = self._split_chat_output(
+            raw_text,
+            enable_thinking=enable_thinking,
+        )
+        reasoning_text = raw_reasoning_text if raw_reasoning_text is not None else parsed_reasoning
+        if reasoning_text is not None:
+            return parsed_content, reasoning_text
+        return raw_text, None
+
+    def _parse_chat_stream_event(
+        self,
+        parser: ThinkingStreamParser,
+        event: StreamEvent,
+    ) -> list[tuple[str, str]]:
+        outputs: list[tuple[str, str]] = []
+        if event.text:
+            outputs.extend(parser.feed(event.text))
+        if event.finish_reason is not None:
+            outputs.extend(parser.flush())
+        return outputs
+
     def _split_chat_output(self, raw_text: str, *, enable_thinking: bool) -> tuple[str | None, str]:
         normalized = raw_text
-        if normalized.startswith("<think>"):
+        explicit_open = normalized.startswith("<think>")
+        if explicit_open:
             normalized = normalized[len("<think>") :].lstrip("\r\n")
             enable_thinking = True
 
         closing_tag = "</think>"
-        if enable_thinking:
-            close_index = normalized.find(closing_tag)
-            if close_index == -1:
-                reasoning = normalized.strip()
-                return (reasoning or None), ""
+        close_index = normalized.find(closing_tag)
+        if close_index != -1:
             reasoning = normalized[:close_index].strip()
             content = normalized[close_index + len(closing_tag) :].lstrip("\r\n")
             return (reasoning or None), content
-
-        tagged_prefix = "<think>"
-        if tagged_prefix in normalized and closing_tag in normalized:
-            prefix_index = normalized.find(tagged_prefix)
-            close_index = normalized.find(closing_tag, prefix_index)
-            if prefix_index != -1 and close_index != -1:
-                reasoning = normalized[prefix_index + len(tagged_prefix) : close_index].strip()
-                content = normalized[close_index + len(closing_tag) :].lstrip("\r\n")
-                return (reasoning or None), content
+        if explicit_open or enable_thinking:
+            reasoning = normalized.strip()
+            return (reasoning or None), ""
         return None, raw_text
 
     def _generate(self, prepared: PreparedInputs, *, config: GenerationConfig) -> TextGenerationResult:
@@ -1052,7 +1330,7 @@ class AnnaEngine:
         prepared: PreparedInputs,
         config: GenerationConfig,
     ) -> tuple[list[int], str, int, int]:
-        prompt_ids, prompt_length = self._validate_generation_request(prepared, config=config)
+        prompt_ids, prompt_length, config = self._validate_generation_request(prepared, config=config)
         prepared = self._move_prepared_for_generation(prepared, config=config)
 
         completion_ids: list[int] = []
@@ -1133,7 +1411,7 @@ class AnnaEngine:
         prepared: PreparedInputs,
         config: GenerationConfig,
     ) -> Iterator[tuple[str, bool, str | None, int, int]]:
-        prompt_ids, prompt_length = self._validate_generation_request(prepared, config=config)
+        prompt_ids, prompt_length, config = self._validate_generation_request(prepared, config=config)
         prepared = self._move_prepared_for_generation(prepared, config=config)
         completion_ids: list[int] = []
         stop_token_ids = set(self.tokenizer.eos_token_ids)

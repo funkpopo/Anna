@@ -22,8 +22,7 @@
   - `/v1/chat/completions`
   - `/v1/completions`
   - SSE 流式输出
-  - `enable_thinking` 开关
-  - `reasoning_content` 输出
+  - 原样透传 `<think>...</think>` 输出
 - 采样
   - greedy
   - temperature
@@ -79,13 +78,33 @@
 anna-serve --model-dir /path/to/model --device xpu --dtype bf16
 ```
 
+如果要给所有未显式传 `max_completion_tokens` / `max_tokens` 的 API 请求设置默认 completion 上限，可以在启动命令中指定：
+
+```bash
+anna-serve --model-dir /path/to/model --device xpu --dtype bf16 --max-completion-tokens 2048
+```
+
 如果要显式指定对外暴露的模型名称：
 
 ```bash
 anna-serve --model-dir D:\Projects\Anna\models\Qwen\Qwen3___5-2B --model-name qwen3.5 --device xpu --dtype bf16
 ```
 
+对显存吃紧的 dense 多模态模型，可以启用运行时文本线性层 `int4` 量化；如果主要提供纯文本服务，还可以把视觉塔留在 CPU：
+
+```bash
+anna-serve --model-dir D:\Projects\Anna\models\Jackrong\Qwen3___5-9B-Claude-4___6-Opus-Reasoning-Distilled-v2 --model-name qwen3.5 --device xpu --dtype bf16 --weight-quant int4 --offload-vision
+```
+
 如果不指定 `--model-name`，默认模型名就是 `--model-dir` 的完整路径。
+
+服务端默认 completion 上限的解析顺序如下：
+
+1. 请求体里的 `max_completion_tokens`
+2. 请求体里的 `max_tokens`
+3. `anna-serve --max-completion-tokens`
+4. 模型 `config.json` 顶层的 `max_completion_tokens`（兼容 `max_new_tokens` / `max_tokens`）
+5. 回退到 `256`
 
 5. 命令行文本生成：
 
@@ -113,12 +132,11 @@ anna-bench --model-dir /path/to/model --device xpu --dtype bf16 --prompt "你好
   "messages": [
     {"role": "user", "content": "请解释一下什么是量化推理"}
   ],
-  "enable_thinking": true,
   "max_completion_tokens": 256
 }
 ```
 
-当 `enable_thinking=true` 时，返回体中的 `message` 和流式 `delta` 会包含独立的 `reasoning_content` 字段；当 `enable_thinking=false` 时，会通过 Qwen3.5 的 closed-think prompt 关闭思维模式，仅返回最终内容。
+聊天接口会默认保留模型原始的 `<think>...</think>` 文本，不在服务端裁剪、拆分或注入 closed-think prompt。客户端如果需要隐藏或单独渲染 reasoning，应自行解析返回的 `message.content` 或流式 `delta.content`。
 
 ## 下一步
 

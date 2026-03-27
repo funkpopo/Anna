@@ -24,6 +24,7 @@ class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[ChatMessage]
     enable_thinking: bool | None = None
+    reasoning_format: Literal["none", "deepseek"] | None = None
     max_tokens: int | None = Field(default=None, ge=1)
     max_completion_tokens: int | None = Field(default=None, ge=1)
     temperature: float = Field(default=0.7, ge=0.0)
