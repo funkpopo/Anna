@@ -29,6 +29,25 @@ def _engine(request: Request):
     return request.app.state.engine
 
 
+def _format_bytes(num_bytes: int | None) -> str:
+    if num_bytes is None:
+        return "n/a"
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{num_bytes} B"
+
+
+def _memory_snapshot(engine: object):
+    device_context = getattr(engine, "device_context", None)
+    if device_context is None or not hasattr(device_context, "get_memory_info"):
+        return None
+    return device_context.get_memory_info()
+
+
 def _normalize_stop(stop: str | list[str] | None) -> list[str]:
     if stop is None:
         return []
@@ -61,6 +80,52 @@ def _resolve_enable_thinking(engine: object, payload: ChatCompletionRequest) -> 
 
 def _resolve_reasoning_format(engine: object, payload: ChatCompletionRequest) -> ReasoningFormat:
     return normalize_reasoning_format(payload.reasoning_format) if payload.reasoning_format else _default_reasoning_format(engine)
+
+
+def _log_generation_result(
+    *,
+    route_name: str,
+    model: str,
+    result: TextGenerationResult,
+    elapsed_seconds: float,
+    memory_before,
+    memory_after,
+) -> None:
+    perf = result.perf
+    if perf is None:
+        total_tokens_per_second = 0.0 if elapsed_seconds <= 0 else result.completion_tokens / elapsed_seconds
+        logger.info(
+            "%s model=%s prompt_tokens=%s completion_tokens=%s total_seconds=%.3f total_tokens_per_second=%.2f xpu_free_before=%s xpu_free_after=%s",
+            route_name,
+            model,
+            result.prompt_tokens,
+            result.completion_tokens,
+            elapsed_seconds,
+            total_tokens_per_second,
+            _format_bytes(None if memory_before is None else memory_before.free_bytes),
+            _format_bytes(None if memory_after is None else memory_after.free_bytes),
+        )
+        return
+
+    logger.info(
+        "%s model=%s prompt_tokens=%s completion_tokens=%s prefill_seconds=%.3f prefill_tokens_per_second=%.2f ttft_seconds=%.3f decode_seconds=%.3f decode_tokens=%s decode_tokens_per_second=%.2f total_seconds=%.3f total_tokens_per_second=%.2f xpu_free_before=%s xpu_free_after=%s xpu_allocated_after=%s xpu_reserved_after=%s",
+        route_name,
+        model,
+        result.prompt_tokens,
+        result.completion_tokens,
+        perf.prefill_seconds,
+        perf.prefill_tokens_per_second,
+        perf.ttft_seconds,
+        perf.decode_seconds,
+        perf.decode_tokens,
+        perf.decode_tokens_per_second,
+        perf.total_seconds,
+        perf.total_tokens_per_second,
+        _format_bytes(None if memory_before is None else memory_before.free_bytes),
+        _format_bytes(None if memory_after is None else memory_after.free_bytes),
+        _format_bytes(None if memory_after is None else memory_after.allocated_bytes),
+        _format_bytes(None if memory_after is None else memory_after.reserved_bytes),
+    )
 
 
 def _chat_response_payload(
@@ -336,6 +401,8 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
     model_id = payload.model or engine.default_model_id
     enable_thinking = _resolve_enable_thinking(engine, payload)
     reasoning_format = _resolve_reasoning_format(engine, payload)
+    memory_before = _memory_snapshot(engine)
+    started_at = time.perf_counter()
 
     try:
         if payload.stream:
@@ -364,6 +431,15 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
     except AnnaEngineError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
+    _log_generation_result(
+        route_name="chat_completion",
+        model=model_id,
+        result=result,
+        elapsed_seconds=time.perf_counter() - started_at,
+        memory_before=memory_before,
+        memory_after=_memory_snapshot(engine),
+    )
+
     return JSONResponse(
         _chat_response_payload(
             response_id=response_id,
@@ -388,6 +464,8 @@ def completions(request: Request, payload: CompletionRequest):
     response_id = f"cmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     model_id = payload.model or engine.default_model_id
+    memory_before = _memory_snapshot(engine)
+    started_at = time.perf_counter()
 
     try:
         if payload.stream:
@@ -405,6 +483,15 @@ def completions(request: Request, payload: CompletionRequest):
         result = engine.generate_text(payload.prompt, config=config)
     except AnnaEngineError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    _log_generation_result(
+        route_name="completion",
+        model=model_id,
+        result=result,
+        elapsed_seconds=time.perf_counter() - started_at,
+        memory_before=memory_before,
+        memory_after=_memory_snapshot(engine),
+    )
 
     return JSONResponse(
         _completion_response_payload(

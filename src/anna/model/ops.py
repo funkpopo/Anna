@@ -101,6 +101,10 @@ class Qwen3PageAllocator:
         self.config = config
         self.block_size = max(1, int(config.cache_block_size))
         self.layers = [Qwen3PagedLayerAllocator(self.block_size) for _ in range(config.num_hidden_layers)]
+        self.full_attention_layer_indices = tuple(
+            layer_idx for layer_idx, layer_type in enumerate(config.layer_types) if layer_type == "full_attention"
+        )
+        self._full_attention_layer_index_set = set(self.full_attention_layer_indices)
 
     def allocate(
         self,
@@ -130,6 +134,9 @@ class Qwen3PageAllocator:
             layer.to(device=device, dtype=dtype)
         return self
 
+    def uses_contiguous_full_attention_mirror(self, layer_idx: int) -> bool:
+        return layer_idx in self._full_attention_layer_index_set
+
 
 class Qwen3DynamicCache:
     def __init__(
@@ -152,6 +159,9 @@ class Qwen3DynamicCache:
             [[] for _ in range(batch_size)]
             for _ in range(config.num_hidden_layers)
         ]
+        self.visible_key_caches: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
+        self.visible_value_caches: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
+        self.visible_cache_capacities: list[int] = [0 for _ in range(config.num_hidden_layers)]
         self.seen_tokens = 0
         self.rope_deltas: torch.Tensor | None = None
         self._released = False
@@ -167,6 +177,103 @@ class Qwen3DynamicCache:
             return
         if len(self.layer_lengths[0]) != batch_size:
             raise ValueError(f"Cache batch size mismatch: expected {len(self.layer_lengths[0])}, got {batch_size}")
+
+    def _uses_contiguous_full_attention_mirror(self, layer_idx: int) -> bool:
+        return self.allocator.uses_contiguous_full_attention_mirror(layer_idx)
+
+    def _next_visible_cache_capacity(self, layer_idx: int, required_length: int) -> int:
+        current_capacity = self.visible_cache_capacities[layer_idx]
+        if current_capacity >= required_length:
+            return current_capacity
+        growth_target = max(self.block_size, current_capacity * 2)
+        return max(required_length, growth_target)
+
+    def _ensure_visible_layer_buffers(
+        self,
+        layer_idx: int,
+        *,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        batch_size: int,
+        required_length: int,
+        previous_max_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key_buffer = self.visible_key_caches[layer_idx]
+        value_buffer = self.visible_value_caches[layer_idx]
+        required_capacity = self._next_visible_cache_capacity(layer_idx, required_length)
+        compatible = (
+            key_buffer is not None
+            and value_buffer is not None
+            and key_buffer.shape[0] == batch_size
+            and value_buffer.shape[0] == batch_size
+            and key_buffer.shape[1] == key_states.shape[1]
+            and value_buffer.shape[1] == value_states.shape[1]
+            and key_buffer.shape[3] == key_states.shape[3]
+            and value_buffer.shape[3] == value_states.shape[3]
+            and key_buffer.device == key_states.device
+            and value_buffer.device == value_states.device
+            and key_buffer.dtype == key_states.dtype
+            and value_buffer.dtype == value_states.dtype
+            and key_buffer.shape[2] >= required_capacity
+            and value_buffer.shape[2] >= required_capacity
+        )
+        if compatible:
+            return key_buffer, value_buffer
+
+        new_key_buffer = key_states.new_empty((batch_size, key_states.shape[1], required_capacity, key_states.shape[3]))
+        new_value_buffer = value_states.new_empty(
+            (batch_size, value_states.shape[1], required_capacity, value_states.shape[3])
+        )
+        can_copy_existing = (
+            key_buffer is not None
+            and value_buffer is not None
+            and key_buffer.shape[0] == batch_size
+            and value_buffer.shape[0] == batch_size
+            and key_buffer.shape[1] == key_states.shape[1]
+            and value_buffer.shape[1] == value_states.shape[1]
+            and key_buffer.shape[3] == key_states.shape[3]
+            and value_buffer.shape[3] == value_states.shape[3]
+            and key_buffer.device == key_states.device
+            and value_buffer.device == value_states.device
+            and key_buffer.dtype == key_states.dtype
+            and value_buffer.dtype == value_states.dtype
+        )
+        if can_copy_existing and previous_max_length > 0:
+            copy_length = min(previous_max_length, key_buffer.shape[2], value_buffer.shape[2])
+            new_key_buffer[:, :, :copy_length, :].copy_(key_buffer[:, :, :copy_length, :])
+            new_value_buffer[:, :, :copy_length, :].copy_(value_buffer[:, :, :copy_length, :])
+        self.visible_key_caches[layer_idx] = new_key_buffer
+        self.visible_value_caches[layer_idx] = new_value_buffer
+        self.visible_cache_capacities[layer_idx] = required_capacity
+        return new_key_buffer, new_value_buffer
+
+    def _update_visible_layer_cache(
+        self,
+        layer_idx: int,
+        *,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        past_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        visible_lengths = self.layer_lengths[layer_idx]
+        max_length = max(visible_lengths, default=0)
+        previous_max_length = int(past_lengths.max().item()) if past_lengths.numel() > 0 else 0
+        key_buffer, value_buffer = self._ensure_visible_layer_buffers(
+            layer_idx,
+            key_states=key_states,
+            value_states=value_states,
+            batch_size=key_states.shape[0],
+            required_length=max_length,
+            previous_max_length=previous_max_length,
+        )
+
+        for batch_idx, start_position in enumerate(past_lengths.tolist()):
+            append_length = key_states.shape[2]
+            end_position = start_position + append_length
+            key_buffer[batch_idx, :, start_position:end_position, :].copy_(key_states[batch_idx])
+            value_buffer[batch_idx, :, start_position:end_position, :].copy_(value_states[batch_idx])
+
+        return key_buffer[:, :, :max_length, :], value_buffer[:, :, :max_length, :]
 
     def update(
         self,
@@ -203,6 +310,14 @@ class Qwen3DynamicCache:
             self.layer_lengths[layer_idx][batch_idx] = required_length
 
         self.seen_tokens = max(self.get_seq_lengths().tolist(), default=0)
+        if self._uses_contiguous_full_attention_mirror(layer_idx):
+            mirrored_key, mirrored_value = self._update_visible_layer_cache(
+                layer_idx,
+                key_states=key_states,
+                value_states=value_states,
+                past_lengths=past_lengths,
+            )
+            return mirrored_key, mirrored_value, past_lengths
         gathered_key, gathered_value, _ = self._gather_layer_cache(layer_idx)
         return gathered_key, gathered_value, past_lengths
 
@@ -283,10 +398,16 @@ class Qwen3DynamicCache:
             empty_lengths = torch.zeros(0, dtype=torch.long)
             return None, None, empty_lengths
 
-        visible_lengths = torch.tensor(self.layer_lengths[layer_idx], dtype=torch.long)
+        key_buffer = self.visible_key_caches[layer_idx]
+        value_buffer = self.visible_value_caches[layer_idx]
+        visible_lengths_device = None if key_buffer is None else key_buffer.device
+        visible_lengths = torch.tensor(self.layer_lengths[layer_idx], dtype=torch.long, device=visible_lengths_device)
         max_length = int(visible_lengths.max().item()) if visible_lengths.numel() > 0 else 0
         if max_length <= 0:
             return None, None, visible_lengths
+
+        if key_buffer is not None and value_buffer is not None:
+            return key_buffer[:, :, :max_length, :], value_buffer[:, :, :max_length, :], visible_lengths
 
         layer = self.allocator.layers[layer_idx]
         if layer.key_pages is None or layer.value_pages is None:
@@ -392,6 +513,9 @@ class Qwen3DynamicCache:
                 self.layer_lengths[layer_idx][batch_idx] = 0
             self.conv_states[layer_idx] = None
             self.recurrent_states[layer_idx] = None
+            self.visible_key_caches[layer_idx] = None
+            self.visible_value_caches[layer_idx] = None
+            self.visible_cache_capacities[layer_idx] = 0
 
         self.seen_tokens = 0
         self.rope_deltas = None
@@ -415,6 +539,8 @@ class Qwen3DynamicCache:
 
         self.conv_states = [_move_tensor(tensor) for tensor in self.conv_states]
         self.recurrent_states = [_move_tensor(tensor) for tensor in self.recurrent_states]
+        self.visible_key_caches = [_move_tensor(tensor) for tensor in self.visible_key_caches]
+        self.visible_value_caches = [_move_tensor(tensor) for tensor in self.visible_value_caches]
         self.rope_deltas = _move_tensor(self.rope_deltas)
         self.allocator.to(device=device, dtype=dtype)
         return self
@@ -723,6 +849,8 @@ class Qwen3Attention(nn.Module):
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+        # XPU SDPA produced corrupted long-form decode outputs when fed the
+        # strided visible-cache mirror slices. Keep the explicit path here.
         attn_scores = torch.matmul(query_states, key_states.transpose(-1, -2)) * self.scaling
         visible_lengths = past_lengths + seq_len
 

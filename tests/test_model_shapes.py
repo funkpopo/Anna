@@ -117,12 +117,16 @@ def test_dynamic_cache_appends_without_reallocating_visible_prefix() -> None:
     value_b = torch.randn(1, 2, 2, 16)
 
     combined_key_a, combined_value_a, _ = cache.update(key_a, value_a, layer_idx=1)
+    key_storage_ptr = combined_key_a.untyped_storage().data_ptr()
+    value_storage_ptr = combined_value_a.untyped_storage().data_ptr()
     combined_key_b, combined_value_b, _ = cache.update(key_b, value_b, layer_idx=1)
 
     assert combined_key_a.shape == (1, 2, 3, 16)
     assert combined_value_a.shape == (1, 2, 3, 16)
     assert combined_key_b.shape == (1, 2, 5, 16)
     assert combined_value_b.shape == (1, 2, 5, 16)
+    assert combined_key_b.untyped_storage().data_ptr() == key_storage_ptr
+    assert combined_value_b.untyped_storage().data_ptr() == value_storage_ptr
     assert torch.equal(combined_key_b[:, :, :3, :], key_a)
     assert torch.equal(combined_value_b[:, :, :3, :], value_a)
     assert torch.equal(combined_key_b[:, :, 3:, :], key_b)

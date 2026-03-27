@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import logging
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator, Literal, cast
@@ -162,6 +163,20 @@ class GenerationConfig:
 
 
 @dataclass(slots=True)
+class GenerationPerfStats:
+    total_seconds: float
+    prefill_seconds: float
+    ttft_seconds: float
+    decode_seconds: float
+    prompt_tokens: int
+    completion_tokens: int
+    prefill_tokens_per_second: float
+    decode_tokens: int
+    decode_tokens_per_second: float
+    total_tokens_per_second: float
+
+
+@dataclass(slots=True)
 class StreamEvent:
     text: str
     reasoning_text: str | None = None
@@ -175,6 +190,7 @@ class TextGenerationResult:
     prompt_tokens: int
     completion_tokens: int
     reasoning_text: str | None = None
+    perf: GenerationPerfStats | None = None
 
 
 class AnnaEngine:
@@ -217,6 +233,7 @@ class AnnaEngine:
         self.resident_expert_layers = len(self.resident_expert_layer_indices)
         self.cached_experts_per_layer = max(0, int(cached_experts_per_layer))
         self.cache_allocator = Qwen3PageAllocator(self.config.text_config)
+        self.full_attention_cache_mirror = bool(self.cache_allocator.full_attention_layer_indices)
         self._attach_cache_allocator()
         self.execution_lock = threading.Lock()
         self.scheduler = None
@@ -374,7 +391,7 @@ class AnnaEngine:
             resolved_default_max_completion_tokens = max(1, int(resolved_default_max_completion_tokens))
 
         logger.info(
-            "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, default_enable_thinking=%s, reasoning_format=%s, offload=%s, offload_vision=%s, expert_quant=%s, weight_quant=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
+            "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, default_enable_thinking=%s, reasoning_format=%s, offload=%s, offload_vision=%s, expert_quant=%s, weight_quant=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, full_attention_cache_mirror=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
             resolved_model_id,
             device_context.device,
             device_context.dtype,
@@ -389,6 +406,7 @@ class AnnaEngine:
             len(resolved_resident_expert_layer_indices or ()),
             list(resolved_resident_expert_layer_indices or ()),
             resolved_cached_experts_per_layer,
+            bool(config.text_config.layer_types and "full_attention" in config.text_config.layer_types),
             model_device,
             report.loaded,
             report.skipped,
@@ -813,6 +831,7 @@ class AnnaEngine:
             "resident_expert_layers": self.resident_expert_layers,
             "resident_expert_layer_indices": self._resident_expert_layer_indices(),
             "cached_experts_per_layer": self.cached_experts_per_layer,
+            "full_attention_cache_mirror": self.full_attention_cache_mirror,
             "vision_enabled": self.config.vision_config is not None,
             "cache_device": str(self.device_context.migration_policy.execution_device),
             "preprocess_device": str(self.device_context.migration_policy.preprocess_device),
@@ -882,6 +901,7 @@ class AnnaEngine:
             finish_reason=raw.finish_reason,
             prompt_tokens=raw.prompt_tokens,
             completion_tokens=raw.completion_tokens,
+            perf=raw.perf,
         )
 
     def stream_chat(
@@ -957,6 +977,7 @@ class AnnaEngine:
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
     ):
+        attention_mask = self._prune_trivial_attention_mask(attention_mask)
         if pixel_values is None and pixel_values_videos is None and hasattr(self.model, "forward_text_only"):
             return self.model.forward_text_only(
                 input_ids=input_ids,
@@ -976,6 +997,46 @@ class AnnaEngine:
             mm_token_type_ids=mm_token_type_ids,
             use_cache=use_cache,
             logits_to_keep=logits_to_keep,
+        )
+
+    @staticmethod
+    def _prune_trivial_attention_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
+        if attention_mask is None or attention_mask.ndim != 2:
+            return attention_mask
+        if int(attention_mask.min().item()) > 0:
+            return None
+        return attention_mask
+
+    @staticmethod
+    def _tokens_per_second(token_count: int, elapsed_seconds: float) -> float:
+        if token_count <= 0 or elapsed_seconds <= 0:
+            return 0.0
+        return token_count / elapsed_seconds
+
+    def _build_generation_perf_stats(
+        self,
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_seconds: float,
+        prefill_seconds: float,
+        decode_seconds: float,
+    ) -> GenerationPerfStats:
+        prefill_seconds = max(0.0, prefill_seconds)
+        total_seconds = max(prefill_seconds, total_seconds)
+        decode_seconds = max(0.0, decode_seconds)
+        decode_tokens = max(0, completion_tokens - 1)
+        return GenerationPerfStats(
+            total_seconds=total_seconds,
+            prefill_seconds=prefill_seconds,
+            ttft_seconds=prefill_seconds,
+            decode_seconds=decode_seconds,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            prefill_tokens_per_second=self._tokens_per_second(prompt_tokens, prefill_seconds),
+            decode_tokens=decode_tokens,
+            decode_tokens_per_second=self._tokens_per_second(decode_tokens, decode_seconds),
+            total_tokens_per_second=self._tokens_per_second(completion_tokens, total_seconds),
         )
 
     def _validate_generation_request(
@@ -1128,6 +1189,9 @@ class AnnaEngine:
         if prepared.pixel_values_videos is not None:
             media_bytes += prepared.pixel_values_videos.numel() * bytes_per_elem
 
+        if getattr(self, "full_attention_cache_mirror", False):
+            kv_cache_bytes *= 2
+
         estimated = kv_cache_bytes + conv_cache_bytes + recurrent_bytes + hidden_working_bytes + media_bytes
         return int(estimated * self.device_context.safety_policy.generation_memory_safety_factor)
 
@@ -1270,12 +1334,15 @@ class AnnaEngine:
         finish_reason = "length"
         prompt_tokens = 0
         completion_tokens = 0
+        perf = None
 
-        for delta, finished, reason, prompt_count, completion_count in self._iter_generation(prepared, config):
+        for delta, finished, reason, prompt_count, completion_count, perf_stats in self._iter_generation(prepared, config):
             if delta:
                 text_parts.append(delta)
             prompt_tokens = prompt_count
             completion_tokens = completion_count
+            if perf_stats is not None:
+                perf = perf_stats
             if finished:
                 finish_reason = reason or "stop"
                 break
@@ -1286,6 +1353,7 @@ class AnnaEngine:
             finish_reason=finish_reason,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            perf=perf,
         )
 
     def _generate_without_streaming_overhead(
@@ -1294,7 +1362,7 @@ class AnnaEngine:
         *,
         config: GenerationConfig,
     ) -> TextGenerationResult:
-        completion_ids, finish_reason, prompt_tokens, completion_tokens = self._generate_token_ids(
+        completion_ids, finish_reason, prompt_tokens, completion_tokens, perf = self._generate_token_ids(
             prepared,
             config=config,
         )
@@ -1305,6 +1373,7 @@ class AnnaEngine:
             finish_reason=finish_reason,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            perf=perf,
         )
 
     def _stream(self, prepared: PreparedInputs, *, config: GenerationConfig) -> Iterator[StreamEvent]:
@@ -1314,7 +1383,7 @@ class AnnaEngine:
         yield from self._stream_direct(prepared, config=config)
 
     def _stream_direct(self, prepared: PreparedInputs, *, config: GenerationConfig) -> Iterator[StreamEvent]:
-        for delta, finished, reason, _, _ in self._iter_generation(prepared, config):
+        for delta, finished, reason, _, _, _ in self._iter_generation(prepared, config):
             if delta:
                 yield StreamEvent(text=delta, finish_reason=None)
             if finished:
@@ -1387,7 +1456,7 @@ class AnnaEngine:
         self,
         prepared: PreparedInputs,
         config: GenerationConfig,
-    ) -> tuple[list[int], str, int, int]:
+    ) -> tuple[list[int], str, int, int, GenerationPerfStats]:
         prompt_ids, prompt_length, config = self._validate_generation_request(prepared, config=config)
         prepared = self._move_prepared_for_generation(prepared, config=config)
 
@@ -1406,6 +1475,8 @@ class AnnaEngine:
         pixel_values_videos = prepared.pixel_values_videos
         video_grid_thw = prepared.video_grid_thw
         past_key_values = None
+        started_at = time.perf_counter()
+        first_token_at = None
 
         try:
             for step_idx in range(config.max_new_tokens):
@@ -1434,11 +1505,27 @@ class AnnaEngine:
                     )
                     token_id = int(next_token.item())
                     past_key_values = outputs.past_key_values
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
                 except RuntimeError as exc:
                     raise self._handle_runtime_failure(exc) from exc
 
                 if token_id in stop_token_ids:
-                    return completion_ids, "stop", prompt_length, len(completion_ids)
+                    total_seconds = time.perf_counter() - started_at
+                    prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
+                    return (
+                        completion_ids,
+                        "stop",
+                        prompt_length,
+                        len(completion_ids),
+                        self._build_generation_perf_stats(
+                            prompt_tokens=prompt_length,
+                            completion_tokens=len(completion_ids),
+                            total_seconds=total_seconds,
+                            prefill_seconds=prefill_seconds,
+                            decode_seconds=max(0.0, total_seconds - prefill_seconds),
+                        ),
+                    )
 
                 completion_ids.append(token_id)
                 repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
@@ -1458,7 +1545,21 @@ class AnnaEngine:
                 if step_idx + 1 >= config.max_new_tokens:
                     break
 
-            return completion_ids, "length", prompt_length, len(completion_ids)
+            total_seconds = time.perf_counter() - started_at
+            prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
+            return (
+                completion_ids,
+                "length",
+                prompt_length,
+                len(completion_ids),
+                self._build_generation_perf_stats(
+                    prompt_tokens=prompt_length,
+                    completion_tokens=len(completion_ids),
+                    total_seconds=total_seconds,
+                    prefill_seconds=prefill_seconds,
+                    decode_seconds=max(0.0, total_seconds - prefill_seconds),
+                ),
+            )
         finally:
             if past_key_values is not None:
                 past_key_values.release()
@@ -1468,7 +1569,7 @@ class AnnaEngine:
         self,
         prepared: PreparedInputs,
         config: GenerationConfig,
-    ) -> Iterator[tuple[str, bool, str | None, int, int]]:
+    ) -> Iterator[tuple[str, bool, str | None, int, int, GenerationPerfStats | None]]:
         prompt_ids, prompt_length, config = self._validate_generation_request(prepared, config=config)
         prepared = self._move_prepared_for_generation(prepared, config=config)
         completion_ids: list[int] = []
@@ -1490,6 +1591,8 @@ class AnnaEngine:
         pixel_values_videos = prepared.pixel_values_videos
         video_grid_thw = prepared.video_grid_thw
         past_key_values = None
+        started_at = time.perf_counter()
+        first_token_at = None
 
         try:
             for step_idx in range(config.max_new_tokens):
@@ -1518,14 +1621,31 @@ class AnnaEngine:
                     )
                     token_id = int(next_token.item())
                     past_key_values = outputs.past_key_values
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
                 except RuntimeError as exc:
                     raise self._handle_runtime_failure(exc) from exc
 
                 if token_id in stop_token_ids:
                     tail, _ = text_assembler.flush()
                     if tail:
-                        yield tail, False, None, prompt_length, len(completion_ids)
-                    yield "", True, "stop", prompt_length, len(completion_ids)
+                        yield tail, False, None, prompt_length, len(completion_ids), None
+                    total_seconds = time.perf_counter() - started_at
+                    prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
+                    yield (
+                        "",
+                        True,
+                        "stop",
+                        prompt_length,
+                        len(completion_ids),
+                        self._build_generation_perf_stats(
+                            prompt_tokens=prompt_length,
+                            completion_tokens=len(completion_ids),
+                            total_seconds=total_seconds,
+                            prefill_seconds=prefill_seconds,
+                            decode_seconds=max(0.0, total_seconds - prefill_seconds),
+                        ),
+                    )
                     return
 
                 completion_ids.append(token_id)
@@ -1545,10 +1665,25 @@ class AnnaEngine:
                 video_grid_thw = None
 
                 if delta:
-                    yield delta, False, None, prompt_length, len(completion_ids)
+                    yield delta, False, None, prompt_length, len(completion_ids), None
 
                 if hit_stop_string:
-                    yield "", True, "stop", prompt_length, len(completion_ids)
+                    total_seconds = time.perf_counter() - started_at
+                    prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
+                    yield (
+                        "",
+                        True,
+                        "stop",
+                        prompt_length,
+                        len(completion_ids),
+                        self._build_generation_perf_stats(
+                            prompt_tokens=prompt_length,
+                            completion_tokens=len(completion_ids),
+                            total_seconds=total_seconds,
+                            prefill_seconds=prefill_seconds,
+                            decode_seconds=max(0.0, total_seconds - prefill_seconds),
+                        ),
+                    )
                     return
 
                 if step_idx + 1 >= config.max_new_tokens:
@@ -1556,8 +1691,23 @@ class AnnaEngine:
 
             tail, _ = text_assembler.flush()
             if tail:
-                yield tail, False, None, prompt_length, len(completion_ids)
-            yield "", True, "length", prompt_length, len(completion_ids)
+                yield tail, False, None, prompt_length, len(completion_ids), None
+            total_seconds = time.perf_counter() - started_at
+            prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
+            yield (
+                "",
+                True,
+                "length",
+                prompt_length,
+                len(completion_ids),
+                self._build_generation_perf_stats(
+                    prompt_tokens=prompt_length,
+                    completion_tokens=len(completion_ids),
+                    total_seconds=total_seconds,
+                    prefill_seconds=prefill_seconds,
+                    decode_seconds=max(0.0, total_seconds - prefill_seconds),
+                ),
+            )
         finally:
             if past_key_values is not None:
                 past_key_values.release()
