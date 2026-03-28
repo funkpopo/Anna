@@ -4,6 +4,7 @@ import itertools
 import logging
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator, Literal, cast
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 ReasoningFormat = Literal["none", "deepseek"]
 _REASONING_FORMAT_VALUES = frozenset({"none", "deepseek"})
 _DEFAULT_REASONING_FORMAT: ReasoningFormat = "deepseek"
+_COMPILE_MODE_VALUES = frozenset({"none", "default", "reduce-overhead", "max-autotune"})
 
 
 def _common_prefix_length(left: str, right: str) -> int:
@@ -65,6 +67,40 @@ def normalize_reasoning_format(value: str | None) -> ReasoningFormat:
         allowed = ", ".join(sorted(_REASONING_FORMAT_VALUES))
         raise ValueError(f"Unsupported reasoning format: {value}. Expected one of: {allowed}.")
     return cast(ReasoningFormat, normalized)
+
+
+def normalize_compile_mode(value: str | None) -> str:
+    if value is None:
+        return "none"
+    normalized = value.strip().lower()
+    if normalized not in _COMPILE_MODE_VALUES:
+        allowed = ", ".join(sorted(_COMPILE_MODE_VALUES))
+        raise ValueError(f"Unsupported compile mode: {value}. Expected one of: {allowed}.")
+    return normalized
+
+
+@dataclass(slots=True)
+class EngineOptimizationConfig:
+    compile_mode: str = "none"
+    compile_fullgraph: bool = False
+    prefill_chunk_size: int = 0
+    prompt_cache_size: int = 0
+    profile_runtime: bool = False
+
+
+@dataclass(slots=True)
+class PromptCacheEntry:
+    logits: torch.Tensor
+    past_key_values: object
+    prompt_tokens: int
+
+
+@dataclass(slots=True)
+class PromptPrefillResult:
+    logits: torch.Tensor
+    past_key_values: object | None
+    prefill_seconds: float
+    prompt_cache_hit: bool = False
 
 
 class ThinkingStreamParser:
@@ -212,6 +248,7 @@ class AnnaEngine:
         weight_quant: str = "none",
         resident_expert_layer_indices: tuple[int, ...] = (),
         cached_experts_per_layer: int = 0,
+        optimization_config: EngineOptimizationConfig | None = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -232,11 +269,59 @@ class AnnaEngine:
         self.resident_expert_layer_indices = tuple(resident_expert_layer_indices)
         self.resident_expert_layers = len(self.resident_expert_layer_indices)
         self.cached_experts_per_layer = max(0, int(cached_experts_per_layer))
+        self.optimization_config = self._normalize_optimization_config(optimization_config)
         self.cache_allocator = Qwen3PageAllocator(self.config.text_config)
         self.full_attention_cache_mirror = bool(self.cache_allocator.full_attention_layer_indices)
         self._attach_cache_allocator()
         self.execution_lock = threading.Lock()
         self.scheduler = None
+        self._compiled_text_forward = None
+        self._prompt_cache: OrderedDict[tuple[int, ...], PromptCacheEntry] = OrderedDict()
+        self._apply_runtime_optimizations()
+
+    @staticmethod
+    def _normalize_optimization_config(config: EngineOptimizationConfig | None) -> EngineOptimizationConfig:
+        if config is None:
+            return EngineOptimizationConfig()
+        return EngineOptimizationConfig(
+            compile_mode=normalize_compile_mode(config.compile_mode),
+            compile_fullgraph=bool(config.compile_fullgraph),
+            prefill_chunk_size=max(0, int(config.prefill_chunk_size)),
+            prompt_cache_size=max(0, int(config.prompt_cache_size)),
+            profile_runtime=bool(config.profile_runtime),
+        )
+
+    def _apply_runtime_optimizations(self) -> None:
+        text_model = self._text_model(self.model)
+        if text_model is not None and hasattr(text_model, "layers"):
+            for layer in text_model.layers:
+                linear_attn = getattr(layer, "linear_attn", None)
+                if linear_attn is not None:
+                    linear_attn.profile_runtime = self.optimization_config.profile_runtime
+                mlp = getattr(layer, "mlp", None)
+                if isinstance(mlp, Qwen3SparseMoeBlock):
+                    mlp.profile_runtime = self.optimization_config.profile_runtime
+        self._maybe_compile_text_model()
+
+    def _maybe_compile_text_model(self) -> None:
+        self._compiled_text_forward = None
+        compile_mode = self.optimization_config.compile_mode
+        if compile_mode == "none" or not hasattr(torch, "compile") or not hasattr(self.model, "forward_text_only"):
+            return
+        try:
+            self._compiled_text_forward = torch.compile(
+                self.model.forward_text_only,
+                mode=compile_mode,
+                fullgraph=self.optimization_config.compile_fullgraph,
+            )
+            logger.info(
+                "Enabled torch.compile for text generation path: mode=%s fullgraph=%s",
+                compile_mode,
+                self.optimization_config.compile_fullgraph,
+            )
+        except Exception:
+            logger.exception("Failed to enable torch.compile for text generation path; falling back to eager mode.")
+            self._compiled_text_forward = None
 
     @classmethod
     def from_model_dir(
@@ -246,6 +331,11 @@ class AnnaEngine:
         model_id: str | None = None,
         device: str = "auto",
         dtype: str = "auto",
+        compile_mode: str = "none",
+        compile_fullgraph: bool = False,
+        prefill_chunk_size: int = 0,
+        prompt_cache_size: int = 0,
+        profile_runtime: bool = False,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
         default_enable_thinking: bool = True,
@@ -429,6 +519,13 @@ class AnnaEngine:
             weight_quant=resolved_weight_quant,
             resident_expert_layer_indices=tuple(resolved_resident_expert_layer_indices or ()),
             cached_experts_per_layer=int(resolved_cached_experts_per_layer or 0),
+            optimization_config=EngineOptimizationConfig(
+                compile_mode=compile_mode,
+                compile_fullgraph=compile_fullgraph,
+                prefill_chunk_size=prefill_chunk_size,
+                prompt_cache_size=prompt_cache_size,
+                profile_runtime=profile_runtime,
+            ),
         )
 
     @staticmethod
@@ -832,6 +929,15 @@ class AnnaEngine:
             "resident_expert_layer_indices": self._resident_expert_layer_indices(),
             "cached_experts_per_layer": self.cached_experts_per_layer,
             "full_attention_cache_mirror": self.full_attention_cache_mirror,
+            "runtime_optimizations": {
+                "compile_mode": self.optimization_config.compile_mode,
+                "compile_fullgraph": self.optimization_config.compile_fullgraph,
+                "compiled_text_forward": self._compiled_text_forward is not None,
+                "prefill_chunk_size": self.optimization_config.prefill_chunk_size,
+                "prompt_cache_size": self.optimization_config.prompt_cache_size,
+                "prompt_cache_entries": len(self._prompt_cache),
+                "profile_runtime": self.optimization_config.profile_runtime,
+            },
             "vision_enabled": self.config.vision_config is not None,
             "cache_device": str(self.device_context.migration_policy.execution_device),
             "preprocess_device": str(self.device_context.migration_policy.preprocess_device),
@@ -963,6 +1069,258 @@ class AnnaEngine:
     def _has_multimodal_inputs(prepared: PreparedInputs) -> bool:
         return prepared.pixel_values is not None or prepared.pixel_values_videos is not None
 
+    @staticmethod
+    def _profile_memory_stats_snapshot(memory_stats: dict[str, int | float] | None) -> dict[str, int | float] | None:
+        if not memory_stats:
+            return None
+        keys = (
+            "allocated_bytes.all.current",
+            "allocated_bytes.all.peak",
+            "reserved_bytes.all.current",
+            "reserved_bytes.all.peak",
+            "active_bytes.all.current",
+            "active_bytes.all.peak",
+            "num_alloc_retries",
+            "num_ooms",
+        )
+        snapshot = {key: memory_stats[key] for key in keys if key in memory_stats}
+        return snapshot or None
+
+    def _log_profiled_forward(
+        self,
+        *,
+        stage: str,
+        elapsed_seconds: float,
+        input_ids: torch.Tensor,
+        past_key_values: object | None,
+        memory_before: object | None,
+        memory_after: object | None,
+        stats_before: dict[str, int | float] | None,
+        stats_after: dict[str, int | float] | None,
+    ) -> None:
+        cache_length = getattr(past_key_values, "get_seq_length", None)
+        seen_tokens = cache_length() if callable(cache_length) else 0
+        logger.info(
+            "xpu_profile stage=%s input_tokens=%s cache_tokens=%s elapsed_seconds=%.6f free_before=%s free_after=%s stats_before=%s stats_after=%s",
+            stage,
+            int(input_ids.shape[-1]),
+            seen_tokens,
+            elapsed_seconds,
+            _format_bytes(memory_before.free_bytes) if memory_before is not None else "n/a",
+            _format_bytes(memory_after.free_bytes) if memory_after is not None else "n/a",
+            stats_before,
+            stats_after,
+        )
+
+    def _profiled_forward_generation_model(
+        self,
+        *,
+        stage: str,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: object | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | None = None,
+    ):
+        if not self.optimization_config.profile_runtime:
+            return self._forward_generation_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
+                use_cache=use_cache,
+                logits_to_keep=logits_to_keep,
+            )
+
+        self.device_context.synchronize()
+        memory_before = self.device_context.get_memory_info()
+        stats_before = self._profile_memory_stats_snapshot(self.device_context.get_memory_stats())
+        started_at = time.perf_counter()
+        outputs = self._forward_generation_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
+            use_cache=use_cache,
+            logits_to_keep=logits_to_keep,
+        )
+        self.device_context.synchronize()
+        elapsed_seconds = time.perf_counter() - started_at
+        memory_after = self.device_context.get_memory_info()
+        stats_after = self._profile_memory_stats_snapshot(self.device_context.get_memory_stats())
+        self._log_profiled_forward(
+            stage=stage,
+            elapsed_seconds=elapsed_seconds,
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            memory_before=memory_before,
+            memory_after=memory_after,
+            stats_before=stats_before,
+            stats_after=stats_after,
+        )
+        return outputs
+
+    def _prompt_cache_key(self, prepared: PreparedInputs) -> tuple[int, ...] | None:
+        if self.optimization_config.prompt_cache_size <= 0:
+            return None
+        if self._has_multimodal_inputs(prepared):
+            return None
+        return tuple(int(token_id) for token_id in prepared.input_ids[0].tolist())
+
+    def _evict_prompt_cache_entry(self, key: tuple[int, ...], entry: PromptCacheEntry) -> None:
+        release = getattr(entry.past_key_values, "release", None)
+        if callable(release):
+            release()
+        self._prompt_cache.pop(key, None)
+
+    def _clone_prompt_cache_entry(self, key: tuple[int, ...]) -> PromptPrefillResult | None:
+        entry = self._prompt_cache.get(key)
+        if entry is None:
+            return None
+        clone = getattr(entry.past_key_values, "clone", None)
+        if not callable(clone):
+            self._evict_prompt_cache_entry(key, entry)
+            return None
+        self._prompt_cache.move_to_end(key)
+        started_at = time.perf_counter()
+        try:
+            cached_past = clone()
+        except Exception:
+            logger.exception("Failed to clone prompt cache entry; evicting stale cache.")
+            self._evict_prompt_cache_entry(key, entry)
+            return None
+        return PromptPrefillResult(
+            logits=entry.logits.clone(),
+            past_key_values=cached_past,
+            prefill_seconds=time.perf_counter() - started_at,
+            prompt_cache_hit=True,
+        )
+
+    def _remember_prompt_cache_entry(
+        self,
+        *,
+        key: tuple[int, ...] | None,
+        logits: torch.Tensor,
+        past_key_values: object | None,
+        prompt_tokens: int,
+    ) -> None:
+        if key is None or past_key_values is None or self.optimization_config.prompt_cache_size <= 0:
+            return
+        clone = getattr(past_key_values, "clone", None)
+        if not callable(clone):
+            return
+        try:
+            cached_past = clone()
+        except Exception:
+            logger.exception("Failed to clone prompt cache state for reuse; skipping cache insert.")
+            return
+
+        existing = self._prompt_cache.pop(key, None)
+        if existing is not None:
+            release = getattr(existing.past_key_values, "release", None)
+            if callable(release):
+                release()
+
+        self._prompt_cache[key] = PromptCacheEntry(
+            logits=logits.detach().clone(),
+            past_key_values=cached_past,
+            prompt_tokens=prompt_tokens,
+        )
+
+        while len(self._prompt_cache) > self.optimization_config.prompt_cache_size:
+            stale_key, stale_entry = self._prompt_cache.popitem(last=False)
+            release = getattr(stale_entry.past_key_values, "release", None)
+            if callable(release):
+                release()
+
+    def _prefill_generation_prompt(self, prepared: PreparedInputs) -> PromptPrefillResult:
+        started_at = time.perf_counter()
+        cache_key = self._prompt_cache_key(prepared)
+        if cache_key is not None:
+            cached = self._clone_prompt_cache_entry(cache_key)
+            if cached is not None:
+                logger.info("Prompt cache hit: prompt_tokens=%s", int(prepared.input_ids.shape[1]))
+                return cached
+
+        input_ids = prepared.input_ids
+        attention_mask = prepared.attention_mask
+        mm_token_type_ids = prepared.mm_token_type_ids
+        pixel_values = prepared.pixel_values
+        image_grid_thw = prepared.image_grid_thw
+        pixel_values_videos = prepared.pixel_values_videos
+        video_grid_thw = prepared.video_grid_thw
+        past_key_values = None
+        outputs = None
+        chunk_size = self.optimization_config.prefill_chunk_size
+
+        if chunk_size > 0 and not self._has_multimodal_inputs(prepared) and int(input_ids.shape[1]) > chunk_size:
+            total_tokens = int(input_ids.shape[1])
+            for start_idx in range(0, total_tokens, chunk_size):
+                end_idx = min(total_tokens, start_idx + chunk_size)
+                outputs = self._profiled_forward_generation_model(
+                    stage=f"prefill[{start_idx}:{end_idx}]",
+                    input_ids=input_ids[:, start_idx:end_idx],
+                    attention_mask=attention_mask[:, :end_idx] if start_idx == 0 else None,
+                    past_key_values=past_key_values,
+                    pixel_values=pixel_values,
+                    pixel_values_videos=pixel_values_videos,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    mm_token_type_ids=mm_token_type_ids[:, start_idx:end_idx] if mm_token_type_ids is not None else None,
+                    use_cache=True,
+                    logits_to_keep=1,
+                )
+                past_key_values = outputs.past_key_values
+                pixel_values = None
+                image_grid_thw = None
+                pixel_values_videos = None
+                video_grid_thw = None
+        else:
+            outputs = self._profiled_forward_generation_model(
+                stage="prefill",
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            past_key_values = outputs.past_key_values
+
+        if outputs is None:
+            raise RuntimeError("Prompt prefill did not produce model outputs.")
+
+        logits = outputs.logits[0, -1]
+        self._remember_prompt_cache_entry(
+            key=cache_key,
+            logits=logits,
+            past_key_values=past_key_values,
+            prompt_tokens=int(prepared.input_ids.shape[1]),
+        )
+        return PromptPrefillResult(
+            logits=logits,
+            past_key_values=past_key_values,
+            prefill_seconds=time.perf_counter() - started_at,
+            prompt_cache_hit=False,
+        )
+
     def _forward_generation_model(
         self,
         *,
@@ -979,7 +1337,8 @@ class AnnaEngine:
     ):
         attention_mask = self._prune_trivial_attention_mask(attention_mask)
         if pixel_values is None and pixel_values_videos is None and hasattr(self.model, "forward_text_only"):
-            return self.model.forward_text_only(
+            forward_text_only = getattr(self, "_compiled_text_forward", None) or self.model.forward_text_only
+            return forward_text_only(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
@@ -1466,49 +1825,52 @@ class AnnaEngine:
             prompt_ids,
             config.repetition_penalty,
         )
-
-        input_ids = prepared.input_ids
-        attention_mask = prepared.attention_mask
-        mm_token_type_ids = prepared.mm_token_type_ids
-        pixel_values = prepared.pixel_values
-        image_grid_thw = prepared.image_grid_thw
-        pixel_values_videos = prepared.pixel_values_videos
-        video_grid_thw = prepared.video_grid_thw
-        past_key_values = None
         started_at = time.perf_counter()
         first_token_at = None
+        input_ids = None
+        past_key_values = None
 
         try:
+            try:
+                prefill = self._prefill_generation_prompt(prepared)
+            except RuntimeError as exc:
+                raise self._handle_runtime_failure(exc) from exc
+            past_key_values = prefill.past_key_values
+            current_logits = prefill.logits
+
             for step_idx in range(config.max_new_tokens):
-                try:
-                    with self.execution_lock:
-                        outputs = self._forward_generation_model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            past_key_values=past_key_values,
-                            pixel_values=pixel_values,
-                            pixel_values_videos=pixel_values_videos,
-                            image_grid_thw=image_grid_thw,
-                            video_grid_thw=video_grid_thw,
-                            mm_token_type_ids=mm_token_type_ids,
-                            use_cache=True,
-                            logits_to_keep=1,
-                        )
-                    logits = outputs.logits[0, -1]
-                    next_token = sample_next_token(
-                        logits,
-                        generated_ids=repetition_history,
-                        temperature=config.temperature,
-                        top_p=config.top_p,
-                        top_k=config.top_k,
-                        repetition_penalty=config.repetition_penalty,
-                    )
-                    token_id = int(next_token.item())
-                    past_key_values = outputs.past_key_values
-                    if first_token_at is None:
-                        first_token_at = time.perf_counter()
-                except RuntimeError as exc:
-                    raise self._handle_runtime_failure(exc) from exc
+                if step_idx > 0:
+                    try:
+                        with self.execution_lock:
+                            outputs = self._profiled_forward_generation_model(
+                                stage=f"decode[{step_idx}]",
+                                input_ids=input_ids,
+                                attention_mask=None,
+                                past_key_values=past_key_values,
+                                pixel_values=None,
+                                pixel_values_videos=None,
+                                image_grid_thw=None,
+                                video_grid_thw=None,
+                                mm_token_type_ids=None,
+                                use_cache=True,
+                                logits_to_keep=1,
+                            )
+                        current_logits = outputs.logits[0, -1]
+                        past_key_values = outputs.past_key_values
+                    except RuntimeError as exc:
+                        raise self._handle_runtime_failure(exc) from exc
+
+                next_token = sample_next_token(
+                    current_logits,
+                    generated_ids=repetition_history,
+                    temperature=config.temperature,
+                    top_p=config.top_p,
+                    top_k=config.top_k,
+                    repetition_penalty=config.repetition_penalty,
+                )
+                token_id = int(next_token.item())
+                if first_token_at is None:
+                    first_token_at = time.perf_counter()
 
                 if token_id in stop_token_ids:
                     total_seconds = time.perf_counter() - started_at
@@ -1535,12 +1897,6 @@ class AnnaEngine:
                 )
 
                 input_ids = next_token.view(1, 1)
-                attention_mask = None
-                mm_token_type_ids = None
-                pixel_values = None
-                image_grid_thw = None
-                pixel_values_videos = None
-                video_grid_thw = None
 
                 if step_idx + 1 >= config.max_new_tokens:
                     break
@@ -1583,48 +1939,52 @@ class AnnaEngine:
             stop_strings=config.stop_strings,
         )
 
-        input_ids = prepared.input_ids
-        attention_mask = prepared.attention_mask
-        mm_token_type_ids = prepared.mm_token_type_ids
-        pixel_values = prepared.pixel_values
-        image_grid_thw = prepared.image_grid_thw
-        pixel_values_videos = prepared.pixel_values_videos
-        video_grid_thw = prepared.video_grid_thw
-        past_key_values = None
         started_at = time.perf_counter()
         first_token_at = None
+        input_ids = None
+        past_key_values = None
 
         try:
+            try:
+                prefill = self._prefill_generation_prompt(prepared)
+            except RuntimeError as exc:
+                raise self._handle_runtime_failure(exc) from exc
+            past_key_values = prefill.past_key_values
+            current_logits = prefill.logits
+
             for step_idx in range(config.max_new_tokens):
-                try:
-                    with self.execution_lock:
-                        outputs = self._forward_generation_model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            past_key_values=past_key_values,
-                            pixel_values=pixel_values,
-                            pixel_values_videos=pixel_values_videos,
-                            image_grid_thw=image_grid_thw,
-                            video_grid_thw=video_grid_thw,
-                            mm_token_type_ids=mm_token_type_ids,
-                            use_cache=True,
-                            logits_to_keep=1,
-                        )
-                    logits = outputs.logits[0, -1]
-                    next_token = sample_next_token(
-                        logits,
-                        generated_ids=repetition_history,
-                        temperature=config.temperature,
-                        top_p=config.top_p,
-                        top_k=config.top_k,
-                        repetition_penalty=config.repetition_penalty,
-                    )
-                    token_id = int(next_token.item())
-                    past_key_values = outputs.past_key_values
-                    if first_token_at is None:
-                        first_token_at = time.perf_counter()
-                except RuntimeError as exc:
-                    raise self._handle_runtime_failure(exc) from exc
+                if step_idx > 0:
+                    try:
+                        with self.execution_lock:
+                            outputs = self._profiled_forward_generation_model(
+                                stage=f"decode[{step_idx}]",
+                                input_ids=input_ids,
+                                attention_mask=None,
+                                past_key_values=past_key_values,
+                                pixel_values=None,
+                                pixel_values_videos=None,
+                                image_grid_thw=None,
+                                video_grid_thw=None,
+                                mm_token_type_ids=None,
+                                use_cache=True,
+                                logits_to_keep=1,
+                            )
+                        current_logits = outputs.logits[0, -1]
+                        past_key_values = outputs.past_key_values
+                    except RuntimeError as exc:
+                        raise self._handle_runtime_failure(exc) from exc
+
+                next_token = sample_next_token(
+                    current_logits,
+                    generated_ids=repetition_history,
+                    temperature=config.temperature,
+                    top_p=config.top_p,
+                    top_k=config.top_k,
+                    repetition_penalty=config.repetition_penalty,
+                )
+                token_id = int(next_token.item())
+                if first_token_at is None:
+                    first_token_at = time.perf_counter()
 
                 if token_id in stop_token_ids:
                     tail, _ = text_assembler.flush()
@@ -1657,12 +2017,6 @@ class AnnaEngine:
                 delta, hit_stop_string = text_assembler.feed_token(token_id)
 
                 input_ids = next_token.view(1, 1)
-                attention_mask = None
-                mm_token_type_ids = None
-                pixel_values = None
-                image_grid_thw = None
-                pixel_values_videos = None
-                video_grid_thw = None
 
                 if delta:
                     yield delta, False, None, prompt_length, len(completion_ids), None

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
+import pytest
 import torch
 
+import anna.model.ops as model_ops
 from anna.model.quantization import XPUInt4Linear
 from anna.model.config import Qwen3TextConfig, RopeParameters
 from anna.model.ops import (
@@ -11,6 +13,7 @@ from anna.model.ops import (
     Qwen3PageAllocator,
     Qwen3SparseMoeBlock,
     torch_causal_conv1d_update,
+    torch_chunk_gated_delta_rule,
     torch_recurrent_gated_delta_rule,
 )
 from anna.model.qwen import Qwen3ForCausalLM
@@ -25,6 +28,56 @@ def _temporary_torch_seed(seed: int):
         yield
     finally:
         torch.random.set_rng_state(previous_state)
+
+
+def _stub_run_gated_delta_fused(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    z: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if initial_state is None:
+        core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=output_final_state,
+        )
+    else:
+        core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+        )
+
+    batch_size, seq_len, _, head_v_dim = value.shape
+    core_attn_out = core_attn_out.reshape(-1, head_v_dim)
+    z = z.reshape(-1, head_v_dim)
+    input_dtype = core_attn_out.dtype
+    hidden_states = core_attn_out.float()
+    hidden_states = hidden_states * torch.rsqrt(hidden_states.pow(2).mean(dim=-1, keepdim=True) + norm_eps)
+    hidden_states = norm_weight * hidden_states.to(dtype=input_dtype)
+    hidden_states = hidden_states * torch.nn.functional.silu(z.float())
+    return hidden_states.to(dtype=input_dtype).reshape(batch_size, seq_len, -1), last_recurrent_state
+
+
+@pytest.fixture(autouse=True)
+def _stub_gated_delta_fused(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(model_ops, "run_gated_delta_fused", _stub_run_gated_delta_fused)
 
 
 def _tiny_config() -> Qwen3TextConfig:
@@ -174,6 +227,21 @@ def test_dynamic_cache_stack_and_split_round_trips_batches() -> None:
     assert torch.equal(split[1].visible_value_cache(1), value_b)
 
 
+def test_dynamic_cache_clone_preserves_contents_with_distinct_page_tables() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config)
+    cache = Qwen3DynamicCache(config, allocator=allocator)
+    key = torch.randn(1, 2, 3, 16)
+    value = torch.randn(1, 2, 3, 16)
+    cache.update(key, value, layer_idx=1)
+
+    cloned = cache.clone()
+
+    assert torch.equal(cloned.visible_key_cache(1), key)
+    assert torch.equal(cloned.visible_value_cache(1), value)
+    assert cloned.page_tables[1][0] != cache.page_tables[1][0]
+
+
 def test_dynamic_cache_release_reuses_freed_pages() -> None:
     config = _tiny_config()
     allocator = Qwen3PageAllocator(config)
@@ -299,6 +367,24 @@ def test_qwen3_runtime_can_pin_sparse_moe_layers_by_decoder_index() -> None:
     assert resident_layer_indices == [1]
     offloaded_sparse_layers = [layer.mlp for layer in model.model.layers if isinstance(layer.mlp, Qwen3SparseMoeBlock) and layer.mlp.offload_experts]
     assert all(layer.cached_experts_per_layer == 3 for layer in offloaded_sparse_layers)
+
+
+def test_sparse_moe_cached_expert_materialization_copies_weights_without_aliasing_source() -> None:
+    block = Qwen3SparseMoeBlock(_tiny_moe_config())
+    block.configure_runtime(
+        torch.device("cpu"),
+        offload_experts=True,
+        cached_experts_per_layer=1,
+    )
+
+    source = block.experts[0]
+    cached = block._get_cached_expert(0)
+
+    assert cached is not None
+    assert cached is not source
+    for source_parameter, cached_parameter in zip(source.parameters(), cached.parameters()):
+        assert torch.equal(source_parameter, cached_parameter)
+        assert source_parameter.data_ptr() != cached_parameter.data_ptr()
 
 
 def test_engine_resolves_explicit_resident_expert_indices() -> None:
