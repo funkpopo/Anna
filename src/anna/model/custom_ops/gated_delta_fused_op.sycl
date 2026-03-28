@@ -1,0 +1,347 @@
+#include <ATen/ATen.h>
+#include <c10/core/DeviceType.h>
+#include <c10/util/BFloat16.h>
+#include <c10/util/Half.h>
+#include <c10/util/Optional.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/library.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <tuple>
+
+namespace anna {
+
+namespace {
+
+at::Tensor l2norm(const at::Tensor& x, double eps = 1e-6) {
+  auto squared = x * x;
+  return x * at::rsqrt(squared.sum(-1, true) + eps);
+}
+
+void validate_common_inputs(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& g_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& z_in,
+    const at::Tensor& norm_weight) {
+  TORCH_CHECK(query_in.dim() == 4, "query must be [batch, seq, heads, head_dim]");
+  TORCH_CHECK(key_in.dim() == 4, "key must be [batch, seq, heads, head_dim]");
+  TORCH_CHECK(value_in.dim() == 4, "value must be [batch, seq, heads, head_dim]");
+  TORCH_CHECK(g_in.dim() == 3, "g must be [batch, seq, heads]");
+  TORCH_CHECK(beta_in.dim() == 3, "beta must be [batch, seq, heads]");
+  TORCH_CHECK(z_in.dim() == 4, "z must be [batch, seq, heads, head_dim]");
+  TORCH_CHECK(norm_weight.dim() == 1, "norm_weight must be [head_dim]");
+
+  TORCH_CHECK(query_in.size(0) == key_in.size(0), "query/key batch size mismatch");
+  TORCH_CHECK(query_in.size(0) == value_in.size(0), "query/value batch size mismatch");
+  TORCH_CHECK(query_in.size(1) == key_in.size(1), "query/key sequence length mismatch");
+  TORCH_CHECK(query_in.size(1) == value_in.size(1), "query/value sequence length mismatch");
+  TORCH_CHECK(query_in.size(2) == key_in.size(2), "query/key head count mismatch");
+  TORCH_CHECK(query_in.size(2) == value_in.size(2), "query/value head count mismatch");
+  TORCH_CHECK(query_in.size(3) == key_in.size(3), "query/key head dim mismatch");
+
+  TORCH_CHECK(g_in.size(0) == query_in.size(0), "g batch size mismatch");
+  TORCH_CHECK(g_in.size(1) == query_in.size(1), "g sequence length mismatch");
+  TORCH_CHECK(g_in.size(2) == query_in.size(2), "g head count mismatch");
+  TORCH_CHECK(beta_in.sizes() == g_in.sizes(), "beta shape must match g");
+
+  TORCH_CHECK(z_in.size(0) == query_in.size(0), "z batch size mismatch");
+  TORCH_CHECK(z_in.size(1) == query_in.size(1), "z sequence length mismatch");
+  TORCH_CHECK(z_in.size(2) == query_in.size(2), "z head count mismatch");
+  TORCH_CHECK(z_in.size(3) == value_in.size(3), "z head dim must match value");
+  TORCH_CHECK(norm_weight.size(0) == value_in.size(3), "norm_weight head dim must match value");
+}
+
+void validate_xpu_inputs(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& g_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& z_in,
+    const at::Tensor& norm_weight,
+    const c10::optional<at::Tensor>& initial_state_opt) {
+  auto device = query_in.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "query must be an XPU tensor");
+  TORCH_CHECK(key_in.device() == device, "key must be on the same device as query");
+  TORCH_CHECK(value_in.device() == device, "value must be on the same device as query");
+  TORCH_CHECK(g_in.device() == device, "g must be on the same device as query");
+  TORCH_CHECK(beta_in.device() == device, "beta must be on the same device as query");
+  TORCH_CHECK(z_in.device() == device, "z must be on the same device as query");
+  TORCH_CHECK(norm_weight.device() == device, "norm_weight must be on the same device as query");
+  if (initial_state_opt.has_value() && initial_state_opt->defined()) {
+    TORCH_CHECK(initial_state_opt->device() == device, "initial_state must be on the same device as query");
+  }
+}
+
+int64_t next_power_of_two(int64_t value) {
+  int64_t result = 1;
+  while (result < value) {
+    result <<= 1;
+  }
+  return result;
+}
+
+template <typename scalar_t>
+inline float load_as_float(const scalar_t* ptr, int64_t idx) {
+  return static_cast<float>(ptr[idx]);
+}
+
+std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_meta(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& g_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& z_in,
+    const at::Tensor& norm_weight,
+    double /*norm_eps*/,
+    const c10::optional<at::Tensor>& initial_state_opt,
+    bool output_final_state) {
+  validate_common_inputs(query_in, key_in, value_in, g_in, beta_in, z_in, norm_weight);
+  if (initial_state_opt.has_value() && initial_state_opt->defined()) {
+    TORCH_CHECK(initial_state_opt->dim() == 4, "initial_state must be [batch, heads, key_head_dim, value_head_dim]");
+    TORCH_CHECK(initial_state_opt->size(0) == query_in.size(0), "initial_state batch size mismatch");
+    TORCH_CHECK(initial_state_opt->size(1) == query_in.size(2), "initial_state head count mismatch");
+    TORCH_CHECK(initial_state_opt->size(2) == query_in.size(3), "initial_state key head dim mismatch");
+    TORCH_CHECK(initial_state_opt->size(3) == value_in.size(3), "initial_state value head dim mismatch");
+  }
+
+  auto meta_options = query_in.options().device(c10::Device(c10::DeviceType::Meta));
+  auto output = at::empty(
+      {query_in.size(0), query_in.size(1), query_in.size(2) * value_in.size(3)},
+      meta_options);
+  if (!output_final_state) {
+    return {output, c10::nullopt};
+  }
+  auto final_state = at::empty(
+      {query_in.size(0), query_in.size(2), query_in.size(3), value_in.size(3)},
+      meta_options.dtype(at::kFloat));
+  return {output, final_state};
+}
+
+std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_xpu(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& g_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& z_in,
+    const at::Tensor& norm_weight,
+    double norm_eps,
+    const c10::optional<at::Tensor>& initial_state_opt,
+    bool output_final_state) {
+  validate_common_inputs(query_in, key_in, value_in, g_in, beta_in, z_in, norm_weight);
+  validate_xpu_inputs(query_in, key_in, value_in, g_in, beta_in, z_in, norm_weight, initial_state_opt);
+
+  if (initial_state_opt.has_value() && initial_state_opt->defined()) {
+    TORCH_CHECK(initial_state_opt->dim() == 4, "initial_state must be [batch, heads, key_head_dim, value_head_dim]");
+    TORCH_CHECK(initial_state_opt->size(0) == query_in.size(0), "initial_state batch size mismatch");
+    TORCH_CHECK(initial_state_opt->size(1) == query_in.size(2), "initial_state head count mismatch");
+    TORCH_CHECK(initial_state_opt->size(2) == query_in.size(3), "initial_state key head dim mismatch");
+    TORCH_CHECK(initial_state_opt->size(3) == value_in.size(3), "initial_state value head dim mismatch");
+  }
+
+  TORCH_CHECK(
+      query_in.scalar_type() == key_in.scalar_type() &&
+          query_in.scalar_type() == value_in.scalar_type() &&
+          query_in.scalar_type() == z_in.scalar_type() &&
+          query_in.scalar_type() == norm_weight.scalar_type(),
+      "query, key, value, z, and norm_weight must share the same dtype");
+
+  const auto initial_dtype = query_in.scalar_type();
+  TORCH_CHECK(
+      initial_dtype == at::kHalf || initial_dtype == at::kBFloat16 || initial_dtype == at::kFloat,
+      "gated_delta_fused XPU kernel supports float16, bfloat16, and float32 inputs");
+
+  auto query = query_in.contiguous();
+  auto key = key_in.contiguous();
+  auto value = value_in.contiguous();
+  auto beta = beta_in.to(at::kFloat).contiguous();
+  auto g = g_in.to(at::kFloat).contiguous();
+  auto z = z_in.contiguous();
+  auto norm = norm_weight.contiguous();
+
+  const auto batch_size = query.size(0);
+  const auto sequence_length = query.size(1);
+  const auto num_heads = query.size(2);
+  const auto key_head_dim = query.size(3);
+  const auto value_head_dim = value.size(3);
+  const auto output_feature_dim = num_heads * value_head_dim;
+
+  at::Tensor working_state;
+  if (initial_state_opt.has_value() && initial_state_opt->defined()) {
+    working_state = initial_state_opt->contiguous().to(at::kFloat).clone();
+  } else {
+    working_state = at::zeros(
+        {batch_size, num_heads, key_head_dim, value_head_dim},
+        value.options().dtype(at::kFloat));
+  }
+
+  auto output = at::empty(
+      {batch_size, sequence_length, output_feature_dim},
+      query.options());
+
+  auto stream = c10::xpu::getCurrentXPUStream(query_in.device().index());
+  const int64_t local_size = std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, value_head_dim)), 256);
+  const size_t group_count = static_cast<size_t>(batch_size * num_heads);
+
+  const float* beta_ptr = beta.const_data_ptr<float>();
+  const float* g_ptr = g.const_data_ptr<float>();
+  float* state_ptr = working_state.mutable_data_ptr<float>();
+  const float norm_eps_f = static_cast<float>(norm_eps);
+  const float l2_eps_f = 1e-6f;
+  const float query_scale_base = 1.0f / std::sqrt(static_cast<float>(key_head_dim));
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      initial_dtype,
+      "gated_delta_fused_xpu",
+      [&] {
+        const scalar_t* query_ptr = query.const_data_ptr<scalar_t>();
+        const scalar_t* key_ptr = key.const_data_ptr<scalar_t>();
+        const scalar_t* value_ptr = value.const_data_ptr<scalar_t>();
+        const scalar_t* z_ptr = z.const_data_ptr<scalar_t>();
+        const scalar_t* norm_ptr = norm.const_data_ptr<scalar_t>();
+        scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
+
+        stream.queue().submit([&](sycl::handler& cgh) {
+          sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
+          sycl::local_accessor<float, 1> normalized_query(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
+          sycl::local_accessor<float, 1> normalized_key(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
+          cgh.parallel_for(
+              sycl::nd_range<2>(
+                  sycl::range<2>(group_count, static_cast<size_t>(local_size)),
+                  sycl::range<2>(1, static_cast<size_t>(local_size))),
+              [=](sycl::nd_item<2> item) {
+                const int64_t bh = static_cast<int64_t>(item.get_group(0));
+                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+                const int64_t b = bh / num_heads;
+                const int64_t h = bh % num_heads;
+
+                const int64_t s_base = ((b * num_heads) + h) * key_head_dim * value_head_dim;
+
+                for (int64_t t = 0; t < sequence_length; ++t) {
+                  const int64_t scalar_index = ((b * sequence_length + t) * num_heads) + h;
+                  const float g_scale = sycl::exp(g_ptr[scalar_index]);
+                  const float beta_value = beta_ptr[scalar_index];
+                  const int64_t q_t_base = scalar_index * key_head_dim;
+                  const int64_t k_t_base = scalar_index * key_head_dim;
+                  const int64_t v_t_base = scalar_index * value_head_dim;
+                  const int64_t z_t_base = scalar_index * value_head_dim;
+
+                  if (lane == 0) {
+                    float query_sum_sq = 0.0f;
+                    float key_sum_sq = 0.0f;
+                    for (int64_t k_idx = 0; k_idx < key_head_dim; ++k_idx) {
+                      const float raw_query = load_as_float(query_ptr, q_t_base + k_idx);
+                      const float raw_key = load_as_float(key_ptr, k_t_base + k_idx);
+                      normalized_query[k_idx] = raw_query;
+                      normalized_key[k_idx] = raw_key;
+                      query_sum_sq += raw_query * raw_query;
+                      key_sum_sq += raw_key * raw_key;
+                    }
+
+                    const float query_scale = sycl::rsqrt(query_sum_sq + l2_eps_f) * query_scale_base;
+                    const float key_scale = sycl::rsqrt(key_sum_sq + l2_eps_f);
+                    for (int64_t k_idx = 0; k_idx < key_head_dim; ++k_idx) {
+                      normalized_query[k_idx] *= query_scale;
+                      normalized_key[k_idx] *= key_scale;
+                    }
+                  }
+                  item.barrier(sycl::access::fence_space::local_space);
+
+                  float local_sum_sq = 0.0f;
+                  for (int64_t v_idx = lane; v_idx < value_head_dim; v_idx += local_size) {
+                    float kv_mem = 0.0f;
+                    for (int64_t k_idx = 0; k_idx < key_head_dim; ++k_idx) {
+                      const int64_t state_index = s_base + k_idx * value_head_dim + v_idx;
+                      const float decayed = state_ptr[state_index] * g_scale;
+                      state_ptr[state_index] = decayed;
+                      kv_mem += decayed * normalized_key[k_idx];
+                    }
+
+                    const float value_item = load_as_float(value_ptr, v_t_base + v_idx);
+                    const float delta = (value_item - kv_mem) * beta_value;
+                    float out_value = 0.0f;
+                    for (int64_t k_idx = 0; k_idx < key_head_dim; ++k_idx) {
+                      const int64_t state_index = s_base + k_idx * value_head_dim + v_idx;
+                      const float updated = state_ptr[state_index] + normalized_key[k_idx] * delta;
+                      state_ptr[state_index] = updated;
+                      out_value += updated * normalized_query[k_idx];
+                    }
+
+                    const int64_t out_index = ((b * sequence_length + t) * output_feature_dim) + h * value_head_dim + v_idx;
+                    output_ptr[out_index] = static_cast<scalar_t>(out_value);
+                    local_sum_sq += out_value * out_value;
+                  }
+
+                  partial_sum[lane] = local_sum_sq;
+                  item.barrier(sycl::access::fence_space::local_space);
+
+                  for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
+                    if (lane < stride) {
+                      partial_sum[lane] += partial_sum[lane + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                  }
+
+                  const float inv_rms = sycl::rsqrt(partial_sum[0] / static_cast<float>(value_head_dim) + norm_eps_f);
+
+                  for (int64_t v_idx = lane; v_idx < value_head_dim; v_idx += local_size) {
+                    const int64_t out_index = ((b * sequence_length + t) * output_feature_dim) + h * value_head_dim + v_idx;
+                    const float z_value = load_as_float(z_ptr, z_t_base + v_idx);
+                    const float gate = z_value / (1.0f + sycl::exp(-z_value));
+                    const float norm_value = load_as_float(norm_ptr, v_idx);
+                    const float out_value = load_as_float(output_ptr, out_index) * inv_rms * norm_value * gate;
+                    output_ptr[out_index] = static_cast<scalar_t>(out_value);
+                  }
+                  item.barrier(sycl::access::fence_space::local_space);
+                }
+              });
+        });
+      });
+
+  if (!output_final_state) {
+    working_state.record_stream(stream);
+  }
+
+  if (!output_final_state) {
+    return {output, c10::nullopt};
+  }
+  return {output, working_state};
+}
+
+} // namespace
+
+} // namespace anna
+
+TORCH_LIBRARY(anna, m) {
+  m.def(
+      "gated_delta_fused("
+      "Tensor query, "
+      "Tensor key, "
+      "Tensor value, "
+      "Tensor g, "
+      "Tensor beta, "
+      "Tensor z, "
+      "Tensor norm_weight, "
+      "float norm_eps, "
+      "Tensor? initial_state=None, "
+      "bool output_final_state=False"
+      ") -> (Tensor, Tensor?)");
+}
+
+TORCH_LIBRARY_IMPL(anna, Meta, m) {
+  m.impl("gated_delta_fused", anna::gated_delta_fused_meta);
+}
+
+TORCH_LIBRARY_IMPL(anna, XPU, m) {
+  m.impl("gated_delta_fused", anna::gated_delta_fused_xpu);
+}

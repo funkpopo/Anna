@@ -17,6 +17,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Benchmark Anna on a local model directory.")
     parser.add_argument("--model-dir", required=True)
@@ -26,6 +33,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video", default=None, help="Optional local video path.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
+    parser.add_argument(
+        "--compile-mode",
+        choices=("none", "default", "reduce-overhead", "max-autotune"),
+        default="none",
+        help="Optional torch.compile mode for the text generation path.",
+    )
+    parser.add_argument(
+        "--compile-fullgraph",
+        action="store_true",
+        help="Request fullgraph capture for torch.compile when --compile-mode is enabled.",
+    )
+    parser.add_argument(
+        "--prefill-chunk-size",
+        type=_non_negative_int,
+        default=0,
+        help="Split long text-only prefills into token chunks. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--prompt-cache-size",
+        type=_non_negative_int,
+        default=0,
+        help="Keep up to N text-only prompt KV caches resident for exact prompt reuse. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--profile-runtime",
+        action="store_true",
+        help="Log synchronized XPU forward timings and memory stats for prefill/decode profiling.",
+    )
     parser.add_argument("--offload-mode", choices=("auto", "none", "experts"), default="auto")
     parser.add_argument(
         "--offload-vision",
@@ -101,6 +136,11 @@ def main() -> None:
         model_id=model_name,
         device=args.device,
         dtype=args.dtype,
+        compile_mode=args.compile_mode,
+        compile_fullgraph=args.compile_fullgraph,
+        prefill_chunk_size=args.prefill_chunk_size,
+        prompt_cache_size=args.prompt_cache_size,
+        profile_runtime=args.profile_runtime,
         offload_mode=args.offload_mode,
         offload_vision=args.offload_vision,
         expert_quant=args.expert_quant,
@@ -123,6 +163,11 @@ def main() -> None:
         model_id=settings.model_id,
         device=settings.device,
         dtype=settings.dtype,
+        compile_mode=settings.compile_mode,
+        compile_fullgraph=settings.compile_fullgraph,
+        prefill_chunk_size=settings.prefill_chunk_size,
+        prompt_cache_size=settings.prompt_cache_size,
+        profile_runtime=settings.profile_runtime,
         offload_mode=settings.offload_mode,
         offload_vision=settings.offload_vision,
         expert_quant=settings.expert_quant,
@@ -184,6 +229,11 @@ def main() -> None:
     print(f"compute_dtype={engine.device_context.dtype}")
     print(f"offload_mode={engine.offload_mode}")
     print(f"offload_vision={engine.offload_vision}")
+    print(f"compile_mode={engine.optimization_config.compile_mode}")
+    print(f"compile_fullgraph={engine.optimization_config.compile_fullgraph}")
+    print(f"prefill_chunk_size={engine.optimization_config.prefill_chunk_size}")
+    print(f"prompt_cache_size={engine.optimization_config.prompt_cache_size}")
+    print(f"profile_runtime={engine.optimization_config.profile_runtime}")
     print(f"expert_quant={engine.expert_quant}")
     print(f"weight_quant={engine.weight_quant}")
     print(f"resident_expert_layers={engine.resident_expert_layers}")

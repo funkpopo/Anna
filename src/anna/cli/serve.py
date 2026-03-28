@@ -99,6 +99,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-name", default=None, help="Model name exposed through the API.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
+    parser.add_argument(
+        "--compile-mode",
+        choices=("none", "default", "reduce-overhead", "max-autotune"),
+        default="none",
+        help="Optional torch.compile mode for the text generation path.",
+    )
+    parser.add_argument(
+        "--compile-fullgraph",
+        action="store_true",
+        help="Request fullgraph capture for torch.compile when --compile-mode is enabled.",
+    )
+    parser.add_argument(
+        "--prefill-chunk-size",
+        type=_non_negative_int,
+        default=0,
+        help="Split long text-only prefills into token chunks. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--prompt-cache-size",
+        type=_non_negative_int,
+        default=0,
+        help="Keep up to N text-only prompt KV caches resident for exact prompt reuse. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--profile-runtime",
+        action="store_true",
+        help="Log synchronized XPU forward timings and memory stats for prefill/decode profiling.",
+    )
     thinking_group = parser.add_mutually_exclusive_group()
     thinking_group.add_argument(
         "--enable-thinking",
@@ -206,6 +234,11 @@ def main() -> None:
         model_id=model_name,
         device=args.device,
         dtype=args.dtype,
+        compile_mode=args.compile_mode,
+        compile_fullgraph=args.compile_fullgraph,
+        prefill_chunk_size=args.prefill_chunk_size,
+        prompt_cache_size=args.prompt_cache_size,
+        profile_runtime=args.profile_runtime,
         default_max_completion_tokens=args.max_completion_tokens,
         default_enable_thinking=args.default_enable_thinking,
         reasoning_format=args.reasoning_format,
@@ -233,6 +266,11 @@ def main() -> None:
         model_id=settings.model_id,
         device=settings.device,
         dtype=settings.dtype,
+        compile_mode=settings.compile_mode,
+        compile_fullgraph=settings.compile_fullgraph,
+        prefill_chunk_size=settings.prefill_chunk_size,
+        prompt_cache_size=settings.prompt_cache_size,
+        profile_runtime=settings.profile_runtime,
         safety_policy=_build_safety_policy(settings),
         default_max_completion_tokens=settings.default_max_completion_tokens,
         default_enable_thinking=settings.default_enable_thinking,

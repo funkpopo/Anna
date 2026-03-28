@@ -27,6 +27,11 @@ class ServeSettings:
     model_id: str | None = None
     device: str = "auto"
     dtype: str = "auto"
+    compile_mode: str = "none"
+    compile_fullgraph: bool = False
+    prefill_chunk_size: int = 0
+    prompt_cache_size: int = 0
+    profile_runtime: bool = False
     default_max_completion_tokens: int | None = None
     default_enable_thinking: bool = True
     reasoning_format: str = "deepseek"
@@ -55,6 +60,11 @@ class GenerateSettings:
     model_id: str | None = None
     device: str = "auto"
     dtype: str = "auto"
+    compile_mode: str = "none"
+    compile_fullgraph: bool = False
+    prefill_chunk_size: int = 0
+    prompt_cache_size: int = 0
+    profile_runtime: bool = False
     offload_mode: str = "auto"
     offload_vision: bool = False
     expert_quant: str = "auto"
@@ -78,6 +88,11 @@ class BenchmarkSettings:
     video: str | None = None
     device: str = "auto"
     dtype: str = "auto"
+    compile_mode: str = "none"
+    compile_fullgraph: bool = False
+    prefill_chunk_size: int = 0
+    prompt_cache_size: int = 0
+    profile_runtime: bool = False
     offload_mode: str = "auto"
     offload_vision: bool = False
     expert_quant: str = "auto"
