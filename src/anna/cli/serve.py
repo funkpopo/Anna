@@ -110,6 +110,7 @@ def _build_metrics_logger(engine: AnnaEngine, settings: ServeSettings) -> AnnaSe
     return AnnaServiceMetricsLogger(
         engine.service_metrics_snapshot,
         interval_seconds=settings.metrics_log_interval_seconds,
+        activity_event=getattr(getattr(engine, "metrics", None), "activity_event", None),
     )
 
 
