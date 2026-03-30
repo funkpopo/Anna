@@ -1,51 +1,55 @@
 # Anna
 
-## 环境要求（本地开发和测试，未经Linux平台验证）
+[English](README.md) | [简体中文](README_zh.md)
 
-- Windows + Intel Arc 显卡
-- PyTorch `xpu`
+Anna is a from-scratch Qwen3.5 inference service for Intel Arc GPUs with an OpenAI-compatible API.
+
+## Requirements (local development and testing; not validated on Linux)
+
+- Windows + Intel Arc GPU
+- PyTorch with `xpu`
 - Intel oneAPI DPC++/C++
-- 可本地编译并加载 `anna_gated_delta_fused` 自定义算子
+- Ability to build and load the custom `anna_gated_delta_fused` operator locally
 
-如果你准备在 Arc A770 / A750 上跑本地 Qwen3.5，这个 README 就是按这条路径写的。
+If you want to run a local Qwen3.5 model on an Arc A770 or A750, this README is written for that path.
 
-## 分支特性
+## Main Features
 
-- OpenAI 兼容接口
+- OpenAI-compatible API
   - `GET /v1/models`
   - `POST /v1/chat/completions`
   - `POST /v1/completions`
-- 文本生成与流式输出
-- `xpu` 设备推理
-- 线性注意力 SYCL fused op
-- 启动时终端打印服务地址与可用路由
-- 运行时终端打印聚合指标
-  - 空闲时不会持续刷日志
+- Text generation and streaming responses
+- `xpu` inference
+- Linear-attention SYCL fused op
+- Service address and available routes printed on startup
+- Aggregated runtime metrics printed in the terminal
+  - Idle periods do not keep spamming logs
 
-## 推荐环境
+## Recommended Environment
 
-当前 `main` 分支默认按下面的环境准备：
+The current `main` branch is expected to run in an environment like this:
 
 - Windows 11
-- Python 3.11 或 3.12
+- Python 3.11 or 3.12
 - Intel Arc A770 / A750
-- 已正确安装 Intel GPU 驱动
-- 已正确安装带 `xpu` 的 PyTorch
+- Intel GPU driver installed correctly
+- PyTorch installed with `xpu` support
 - Intel oneAPI DPC++/C++ Compiler
 - Visual Studio 2022 Build Tools
 
-## 环境配置
+## Setup
 
-### 1. 克隆仓库（`main` 已包含 SYCL）
+### 1. Clone the repository (`main` already includes SYCL)
 
 ```powershell
 git clone -b main <your-repo-url> Anna
 cd Anna
 ```
 
-### 2. 创建 Conda 环境
+### 2. Create a Conda environment
 
-推荐使用 Miniforge/Conda 管理 Python 环境：
+Using Miniforge or Conda is recommended:
 
 ```powershell
 conda create -n anna python=3.12 -y
@@ -53,60 +57,54 @@ conda activate anna
 python -m pip install -U pip
 ```
 
-### 3. 安装 PyTorch
+### 3. Install PyTorch
 
-安装完成后先验证：
+After installation, verify it first:
 
 ```powershell
 python -c "import torch; print(torch.__version__); print(torch.xpu.is_available())"
 ```
 
-预期至少满足：
+The minimum expectation is:
 
-- 能正常 `import torch`
-- `torch.xpu.is_available()` 输出 `True`
+- `import torch` works
+- `torch.xpu.is_available()` prints `True`
 
-### 4. 安装项目本身
+### 4. Install the project itself
 
-仅运行：
+Runtime only:
 
 ```powershell
 pip install -e .
 ```
 
-开发和测试：
+Notes:
 
-```powershell
-pip install -e ".[dev]"
-```
+- `pip install -e .` only installs the Python package, it does not compile the SYCL fused op
+- After installation, you must still run `python tools\build_gated_delta_fused_op.py`
 
-注意：
+### 5. Prepare the compiler environment
 
-- `pip install -e .` 只会安装 Python 包，不会自动编译 SYCL fused op
-- 安装完成后必须继续执行下面的 `python tools\build_gated_delta_fused_op.py`
+The current build script defaults to these two paths:
 
-### 5. 准备编译器环境
+- oneAPI compiler: `D:\Intel\oneAPI\compiler\2025.3\bin\dpcpp.exe`
+- MSVC environment script: `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat`
 
-当前构建脚本默认使用下面两个路径：
+If your installation uses different paths, update those values in `tools/build_gated_delta_fused_op.py`.
 
-- oneAPI 编译器：`PATH:\Intel\oneAPI\compiler\2025.3\bin\dpcpp.exe`
-- MSVC 环境脚本：`C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat`
+### 6. Build the SYCL fused op
 
-如果你的安装路径不同，需要修改 `tools/build_gated_delta_fused_op.py` 里的这两个路径。
-
-### 6. 编译 SYCL fused op
-
-这是当前 `main` 分支在 Intel Arc `xpu` 环境下的必需步骤：
+This is a required step on the current `main` branch when running on Intel Arc with `xpu`:
 
 ```powershell
 python tools\build_gated_delta_fused_op.py
 ```
 
-成功后会在下面目录生成动态库：
+If the build succeeds, the dynamic library will be generated here:
 
 - `.build\anna_gated_delta_fused\anna_gated_delta_fused.pyd`
 
-终端通常会看到类似输出：
+The terminal usually prints output similar to:
 
 ```text
 Compiling Anna gated_delta_fused SYCL op...
@@ -114,44 +112,44 @@ library_path=D:\Projects\Anna\.build\anna_gated_delta_fused\anna_gated_delta_fus
 op_registered=True
 ```
 
-### 7. 可选验证
+### 7. Optional verification
 
 ```powershell
 pytest tests\test_fused_op_xpu.py -q
 ```
 
-如果只是做一次完整回归：
+For a full regression run:
 
 ```powershell
 pytest -q
 ```
 
-## 模型目录要求
+## Local Model Directory Requirements
 
-本地模型目录至少应包含：
+Your local model directory should contain at least:
 
 - `config.json`
 - `tokenizer.json`
 - `tokenizer_config.json`
-- `model.safetensors` 或分片 `*.safetensors`
+- `model.safetensors` or sharded `*.safetensors`
 
-例如：
+For example:
 
 ```text
 D:\Projects\Anna\models\Qwen\Qwen3___5-2B
 ```
 
-## 运行命令示例
+## Command Examples
 
-### 1. 启动服务
+### 1. Start the server
 
-最小示例：
+Minimal example:
 
 ```powershell
 anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16
 ```
 
-与你当前 `main` 分支/环境一致的示例：
+Example aligned with the current `main` branch and environment:
 
 ```powershell
 anna-serve `
@@ -165,7 +163,7 @@ anna-serve `
   --port 8000
 ```
 
-如果你不想看周期指标日志：
+If you do not want periodic metrics logs:
 
 ```powershell
 anna-serve `
@@ -176,15 +174,15 @@ anna-serve `
   --metrics-log-interval-seconds 0
 ```
 
-### 2. 启动后终端行为
+### 2. What the terminal prints on startup
 
-服务启动后会在终端打印：
+After the server starts, the terminal prints:
 
-- 服务地址
-- 当前可用路由
-- 运行时聚合指标
+- The service address
+- The currently available routes
+- Aggregated runtime metrics
 
-示例：
+Example:
 
 ```text
 INFO anna.cli.serve: Starting Anna server on http://127.0.0.1:8000
@@ -196,7 +194,7 @@ INFO anna.cli.serve: Route: /v1/chat/completions, Methods: POST
 INFO anna.cli.serve: Route: /v1/completions, Methods: POST
 ```
 
-### 3. 直接文本生成
+### 3. Generate text directly
 
 ```powershell
 anna-generate `
@@ -210,7 +208,7 @@ anna-generate `
   --max-new-tokens 32
 ```
 
-### 4. 基准测试
+### 4. Run a benchmark
 
 ```powershell
 anna-bench `
@@ -218,18 +216,18 @@ anna-bench `
   --model-name Qwen3.5-2B `
   --device xpu `
   --dtype bfloat16 `
-  --prompt "你好，请介绍一下你自己。" `
+  --prompt "Hello, please introduce yourself." `
   --runs 5
 ```
 
-## API 调用示例
+## API Examples
 
 ### Chat Completions
 
 ```powershell
 curl.exe http://127.0.0.1:8000/v1/chat/completions `
   -H "Content-Type: application/json" `
-  -d "{\"model\":\"Qwen3.5-2B\",\"messages\":[{\"role\":\"user\",\"content\":\"你好，介绍一下你自己。\"}],\"max_completion_tokens\":128}"
+  -d "{\"model\":\"Qwen3.5-2B\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello, please introduce yourself.\"}],\"max_completion_tokens\":128}"
 ```
 
 ### Completions
@@ -240,57 +238,57 @@ curl.exe http://127.0.0.1:8000/v1/completions `
   -d "{\"model\":\"Qwen3.5-2B\",\"prompt\":\"Hello\",\"max_tokens\":32}"
 ```
 
-### 查看模型列表
+### List models
 
 ```powershell
 curl.exe http://127.0.0.1:8000/v1/models
 ```
 
-### 健康检查
+### Health check
 
 ```powershell
 curl.exe http://127.0.0.1:8000/healthz
 ```
 
-## 常见问题
+## Troubleshooting
 
-### 1. `torch.xpu.is_available()` 是 `False`
+### 1. `torch.xpu.is_available()` returns `False`
 
-优先检查：
+Check these first:
 
-- PyTorch 版本是否真的支持 `xpu`
-- Intel GPU 驱动是否正确安装
-- 当前 Python 环境是否装错了 `cpu` 版 `torch`
+- Whether your PyTorch build really supports `xpu`
+- Whether the Intel GPU driver is installed correctly
+- Whether you accidentally installed a CPU-only `torch` in the current environment
 
-### 2. fused op 编译失败
+### 2. The fused op build fails
 
-优先检查：
+Check these first:
 
-- `dpcpp.exe` 路径是否正确
-- `vcvars64.bat` 路径是否正确
-- oneAPI 与 MSVC 是否都已安装
-- 当前激活环境里的 `torch` 是否包含头文件和 `torch_xpu` 相关库
+- Whether the `dpcpp.exe` path is correct
+- Whether the `vcvars64.bat` path is correct
+- Whether both oneAPI and MSVC are installed
+- Whether the active environment's `torch` includes the required headers and `torch_xpu` related libraries
 
-### 3. 服务能启动，但生成时报 fused-op 相关错误
+### 3. The server starts, but generation fails with fused-op related errors
 
-先重建一次自定义算子：
+Rebuild the custom operator once:
 
 ```powershell
 python tools\build_gated_delta_fused_op.py
 ```
 
-然后重启服务。
+Then restart the server.
 
-### 4. 指标日志不想显示
+### 4. I do not want the metrics logs
 
-可以直接关闭：
+Disable them directly:
 
 ```powershell
 anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16 --metrics-log-interval-seconds 0
 ```
 
-## 开发建议
+## Development Notes
 
-- 改了 SYCL 源码后，先重新执行 `python tools\build_gated_delta_fused_op.py`
-- 再执行 `pytest tests\test_fused_op_xpu.py -q`
-- 最后再重启 `anna-serve`
+- After changing the SYCL source, rerun `python tools\build_gated_delta_fused_op.py`
+- Then run `pytest tests\test_fused_op_xpu.py -q`
+- Restart `anna-serve` after that
