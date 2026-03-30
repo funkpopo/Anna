@@ -18,6 +18,17 @@ dist/
 *.egg-info/
 pip-wheel-metadata/
 
+# Native/SYCL build artifacts
+*.obj
+*.o
+*.exp
+*.lib
+*.ilk
+*.pdb
+*.idb
+*.iobj
+*.ipdb
+
 # Virtual environments
 .venv/
 venv/
@@ -33,6 +44,7 @@ ENV/
 # IDE/editor files
 .idea/
 .vscode/
+.vs/
 *.swp
 *.swo
 
