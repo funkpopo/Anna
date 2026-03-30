@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
-from anna.cli.serve import _build_safety_policy, _build_scheduler, build_parser
+from anna.api.app import create_app
+from anna.cli.serve import _build_metrics_logger, _build_safety_policy, _build_scheduler, _log_available_routes, build_parser
 from anna.core.config import ServeSettings
+from anna.runtime.service_metrics import AnnaServiceMetricsLogger
 
 
 def test_build_safety_policy_uses_custom_serve_overrides() -> None:
@@ -47,6 +50,8 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "0.95",
             "--generation-memory-safety-factor",
             "1.25",
+            "--metrics-log-interval-seconds",
+            "3.5",
         ]
     )
 
@@ -59,6 +64,7 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.reserve_memory_mib == 128
     assert args.max_estimated_usage_ratio == 0.95
     assert args.generation_memory_safety_factor == 1.25
+    assert args.metrics_log_interval_seconds == 3.5
 
 
 def test_serve_parser_defaults_to_direct_generation() -> None:
@@ -67,6 +73,7 @@ def test_serve_parser_defaults_to_direct_generation() -> None:
     args = parser.parse_args(["--model-dir", "model"])
 
     assert args.scheduler_max_batch_size == 1
+    assert args.metrics_log_interval_seconds == 10.0
 
 
 class _FakeEngine:
@@ -85,3 +92,36 @@ def test_build_scheduler_skips_continuous_batching_when_disabled() -> None:
 
     assert scheduler is None
     assert engine.scheduler is None
+
+
+def test_build_metrics_logger_can_be_disabled() -> None:
+    engine = _FakeEngine()
+    engine.service_metrics_snapshot = lambda: None  # type: ignore[assignment]
+    settings = ServeSettings(model_dir=Path("dummy"), metrics_log_interval_seconds=0.0)
+
+    metrics_logger = _build_metrics_logger(engine, settings)
+
+    assert metrics_logger is None
+
+
+def test_build_metrics_logger_uses_engine_snapshot_provider() -> None:
+    engine = _FakeEngine()
+    engine.service_metrics_snapshot = lambda: None  # type: ignore[assignment]
+    settings = ServeSettings(model_dir=Path("dummy"), metrics_log_interval_seconds=5.0)
+
+    metrics_logger = _build_metrics_logger(engine, settings)
+
+    assert isinstance(metrics_logger, AnnaServiceMetricsLogger)
+    assert metrics_logger.interval_seconds == 5.0
+
+
+def test_log_available_routes_reports_server_address_and_paths(caplog) -> None:
+    app = create_app(_FakeEngine())
+
+    with caplog.at_level(logging.INFO):
+        _log_available_routes(app, host="127.0.0.1", port=8000)
+
+    assert "Starting Anna server on http://127.0.0.1:8000" in caplog.text
+    assert "Available routes are:" in caplog.text
+    assert "Route: /healthz, Methods: GET" in caplog.text
+    assert "Route: /v1/chat/completions, Methods: POST" in caplog.text

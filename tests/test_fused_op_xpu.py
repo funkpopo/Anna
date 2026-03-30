@@ -18,7 +18,7 @@ def test_gated_delta_fused_xpu_matches_reference() -> None:
     g = torch.randn(2, 3, 4, device=device, dtype=torch.float32)
     beta = torch.sigmoid(torch.randn(2, 3, 4, device=device, dtype=torch.float16))
     z = torch.randn(2, 3, 4, 8, device=device, dtype=torch.float16)
-    norm_weight = torch.randn(8, device=device, dtype=torch.float16)
+    norm_weight = torch.randn(8, device=device, dtype=torch.float32)
     initial_state = torch.randn(2, 4, 8, 8, device=device, dtype=torch.float32)
 
     output, final_state = torch.ops.anna.gated_delta_fused(

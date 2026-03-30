@@ -55,6 +55,7 @@ void validate_common_inputs(
   TORCH_CHECK(z_in.size(2) == query_in.size(2), "z head count mismatch");
   TORCH_CHECK(z_in.size(3) == value_in.size(3), "z head dim must match value");
   TORCH_CHECK(norm_weight.size(0) == value_in.size(3), "norm_weight head dim must match value");
+  TORCH_CHECK(at::isFloatingType(norm_weight.scalar_type()), "norm_weight must be a floating-point tensor");
 }
 
 void validate_xpu_inputs(
@@ -150,9 +151,8 @@ std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_xpu(
   TORCH_CHECK(
       query_in.scalar_type() == key_in.scalar_type() &&
           query_in.scalar_type() == value_in.scalar_type() &&
-          query_in.scalar_type() == z_in.scalar_type() &&
-          query_in.scalar_type() == norm_weight.scalar_type(),
-      "query, key, value, z, and norm_weight must share the same dtype");
+          query_in.scalar_type() == z_in.scalar_type(),
+      "query, key, value, and z must share the same dtype");
 
   const auto initial_dtype = query_in.scalar_type();
   TORCH_CHECK(
@@ -165,7 +165,7 @@ std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_xpu(
   auto beta = beta_in.to(at::kFloat).contiguous();
   auto g = g_in.to(at::kFloat).contiguous();
   auto z = z_in.contiguous();
-  auto norm = norm_weight.contiguous();
+  auto norm = norm_weight.to(at::kFloat).contiguous();
 
   const auto batch_size = query.size(0);
   const auto sequence_length = query.size(1);
@@ -208,7 +208,7 @@ std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_xpu(
         const scalar_t* key_ptr = key.const_data_ptr<scalar_t>();
         const scalar_t* value_ptr = value.const_data_ptr<scalar_t>();
         const scalar_t* z_ptr = z.const_data_ptr<scalar_t>();
-        const scalar_t* norm_ptr = norm.const_data_ptr<scalar_t>();
+        const float* norm_ptr = norm.const_data_ptr<float>();
         scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
 
         stream.queue().submit([&](sycl::handler& cgh) {

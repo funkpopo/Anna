@@ -16,6 +16,7 @@ from anna.model.quantization import convert_module_linears_to_xpu_int4, estimate
 from anna.model.qwen import Qwen3ForConditionalGeneration
 from anna.model.ops import Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
+from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
 from anna.sampling.sampler import sample_next_token
 from anna.weights.loader import build_model, estimate_model_weight_bytes, load_model_config, load_model_weights
@@ -277,6 +278,7 @@ class AnnaEngine:
         self.scheduler = None
         self._compiled_text_forward = None
         self._prompt_cache: OrderedDict[tuple[int, ...], PromptCacheEntry] = OrderedDict()
+        self.metrics = AnnaServiceMetrics()
         self._apply_runtime_optimizations()
 
     @staticmethod
@@ -905,9 +907,34 @@ class AnnaEngine:
     def set_scheduler(self, scheduler: object | None) -> None:
         self.scheduler = scheduler
 
+    def _kv_cache_page_counts(self) -> tuple[int, int]:
+        used_pages = 0
+        total_pages = 0
+        for layer in getattr(self.cache_allocator, "layers", ()):
+            key_pages = getattr(layer, "key_pages", None)
+            if key_pages is None:
+                continue
+            capacity = int(key_pages.shape[0])
+            free_pages = len(getattr(layer, "free_pages", ()))
+            used_pages += max(0, min(capacity, capacity - free_pages))
+            total_pages += capacity
+        return used_pages, total_pages
+
+    def service_metrics_snapshot(self) -> ServiceMetricsSnapshot:
+        metrics = getattr(self, "metrics", None)
+        snapshot = metrics.snapshot() if metrics is not None else ServiceMetricsSnapshot(timestamp=time.perf_counter())
+        used_pages, total_pages = self._kv_cache_page_counts()
+        return replace(
+            snapshot,
+            kv_cache_used_pages=used_pages,
+            kv_cache_total_pages=total_pages,
+            prompt_cache_entries=len(getattr(self, "_prompt_cache", {})),
+        )
+
     def health(self) -> dict[str, Any]:
         quant_method = self.config.quantization_config.quant_method or "dense"
         memory_info = self.device_context.get_memory_info()
+        service_metrics = self.service_metrics_snapshot()
         return {
             "status": "ok",
             "model": self.default_model_id,
@@ -954,6 +981,20 @@ class AnnaEngine:
                 "total_bytes": memory_info.total_bytes,
                 "allocated_bytes": memory_info.allocated_bytes,
                 "reserved_bytes": memory_info.reserved_bytes,
+            },
+            "service_metrics": {
+                "requests_started_total": service_metrics.requests_started_total,
+                "requests_completed_total": service_metrics.requests_completed_total,
+                "requests_failed_total": service_metrics.requests_failed_total,
+                "prompt_tokens_total": service_metrics.prompt_tokens_total,
+                "generation_tokens_total": service_metrics.generation_tokens_total,
+                "prompt_cache_queries_total": service_metrics.prompt_cache_queries_total,
+                "prompt_cache_hits_total": service_metrics.prompt_cache_hits_total,
+                "prompt_cache_entries": service_metrics.prompt_cache_entries,
+                "running_requests": service_metrics.running_requests,
+                "waiting_requests": service_metrics.waiting_requests,
+                "kv_cache_used_pages": service_metrics.kv_cache_used_pages,
+                "kv_cache_total_pages": service_metrics.kv_cache_total_pages,
             },
         }
 
@@ -1248,11 +1289,17 @@ class AnnaEngine:
 
     def _prefill_generation_prompt(self, prepared: PreparedInputs) -> PromptPrefillResult:
         started_at = time.perf_counter()
+        prompt_tokens = int(prepared.input_ids.shape[1])
+        metrics = getattr(self, "metrics", None)
         cache_key = self._prompt_cache_key(prepared)
         if cache_key is not None:
             cached = self._clone_prompt_cache_entry(cache_key)
+            if metrics is not None:
+                metrics.record_prompt_cache_lookup(hit=cached is not None)
             if cached is not None:
                 logger.info("Prompt cache hit: prompt_tokens=%s", int(prepared.input_ids.shape[1]))
+                if metrics is not None:
+                    metrics.record_prompt_tokens(prompt_tokens)
                 return cached
 
         input_ids = prepared.input_ids
@@ -1314,6 +1361,8 @@ class AnnaEngine:
             past_key_values=past_key_values,
             prompt_tokens=int(prepared.input_ids.shape[1]),
         )
+        if metrics is not None:
+            metrics.record_prompt_tokens(prompt_tokens)
         return PromptPrefillResult(
             logits=logits,
             past_key_values=past_key_values,
@@ -1683,7 +1732,17 @@ class AnnaEngine:
     def _generate(self, prepared: PreparedInputs, *, config: GenerationConfig) -> TextGenerationResult:
         if self._can_use_scheduler(prepared):
             return self.scheduler.generate(prepared, config=config)
-        return self._generate_direct(prepared, config=config)
+        metrics = getattr(self, "metrics", None)
+        if metrics is not None:
+            metrics.record_request_submitted(waiting=False)
+        success = False
+        try:
+            result = self._generate_direct(prepared, config=config)
+            success = True
+            return result
+        finally:
+            if metrics is not None:
+                metrics.record_request_finished(success=success)
 
     def _generate_direct(self, prepared: PreparedInputs, *, config: GenerationConfig) -> TextGenerationResult:
         if not config.stop_strings:
@@ -1739,7 +1798,16 @@ class AnnaEngine:
         if self._can_use_scheduler(prepared):
             yield from self.scheduler.stream(prepared, config=config)
             return
-        yield from self._stream_direct(prepared, config=config)
+        metrics = getattr(self, "metrics", None)
+        if metrics is not None:
+            metrics.record_request_submitted(waiting=False)
+        success = False
+        try:
+            yield from self._stream_direct(prepared, config=config)
+            success = True
+        finally:
+            if metrics is not None:
+                metrics.record_request_finished(success=success)
 
     def _stream_direct(self, prepared: PreparedInputs, *, config: GenerationConfig) -> Iterator[StreamEvent]:
         for delta, finished, reason, _, _, _ in self._iter_generation(prepared, config):
@@ -1890,6 +1958,9 @@ class AnnaEngine:
                     )
 
                 completion_ids.append(token_id)
+                metrics = getattr(self, "metrics", None)
+                if metrics is not None:
+                    metrics.record_generation_tokens(1)
                 repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
                     history_tensor=repetition_history,
                     history_ids=repetition_history_ids,
@@ -2009,6 +2080,9 @@ class AnnaEngine:
                     return
 
                 completion_ids.append(token_id)
+                metrics = getattr(self, "metrics", None)
+                if metrics is not None:
+                    metrics.record_generation_tokens(1)
                 repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
                     history_tensor=repetition_history,
                     history_ids=repetition_history_ids,
