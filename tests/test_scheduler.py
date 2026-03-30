@@ -214,6 +214,14 @@ def test_scheduler_batches_same_length_requests() -> None:
         assert fake_model.text_decode_batch_sizes == [2]
         assert fake_model.prefill_batch_sizes == []
         assert fake_model.decode_batch_sizes == []
+        snapshot = engine.service_metrics_snapshot()
+        assert snapshot.requests_started_total == 2
+        assert snapshot.requests_completed_total == 2
+        assert snapshot.requests_failed_total == 0
+        assert snapshot.prompt_tokens_total == 4
+        assert snapshot.generation_tokens_total == 2
+        assert snapshot.running_requests == 0
+        assert snapshot.waiting_requests == 0
     finally:
         scheduler.shutdown()
 
@@ -268,5 +276,13 @@ def test_scheduler_batches_mixed_length_requests_during_decode() -> None:
         assert fake_model.text_decode_batch_sizes == [2]
         assert fake_model.prefill_batch_sizes == []
         assert fake_model.decode_batch_sizes == []
+        snapshot = engine.service_metrics_snapshot()
+        assert snapshot.requests_started_total == 2
+        assert snapshot.requests_completed_total == 2
+        assert snapshot.requests_failed_total == 0
+        assert snapshot.prompt_tokens_total == 5
+        assert snapshot.generation_tokens_total == 2
+        assert snapshot.running_requests == 0
+        assert snapshot.waiting_requests == 0
     finally:
         scheduler.shutdown()

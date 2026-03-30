@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-from types import MethodType
+from collections import OrderedDict
+from types import MethodType, SimpleNamespace
 
+import torch
+
+from anna.mm.processor import PreparedInputs
 from anna.runtime.engine import AnnaEngine, GenerationConfig, ThinkingStreamParser
-from anna.runtime.engine import StreamEvent, TextGenerationResult
+from anna.runtime.engine import EngineOptimizationConfig, StreamEvent, TextGenerationResult
 from anna.runtime.streaming import IncrementalTextAssembler
 
 
@@ -340,6 +344,41 @@ def test_forward_generation_model_uses_text_fast_path_for_text_only_requests() -
     assert engine.model.calls == ["text"]
 
 
+def test_forward_generation_model_prefers_compiled_text_fast_path_when_available() -> None:
+    class _FakeModel:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def forward_text_only(self, **_kwargs):
+            self.calls.append("text")
+            return object()
+
+        def __call__(self, **_kwargs):
+            self.calls.append("full")
+            return object()
+
+    engine = object.__new__(AnnaEngine)
+    engine.model = _FakeModel()
+    compiled_calls: list[str] = []
+    engine._compiled_text_forward = lambda **_kwargs: compiled_calls.append("compiled") or object()
+
+    engine._forward_generation_model(
+        input_ids=object(),
+        attention_mask=None,
+        past_key_values=None,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        mm_token_type_ids=None,
+        use_cache=True,
+        logits_to_keep=1,
+    )
+
+    assert compiled_calls == ["compiled"]
+    assert engine.model.calls == []
+
+
 def test_forward_generation_model_keeps_full_path_for_multimodal_requests() -> None:
     class _FakeModel:
         def __init__(self) -> None:
@@ -370,6 +409,82 @@ def test_forward_generation_model_keeps_full_path_for_multimodal_requests() -> N
     )
 
     assert engine.model.calls == ["full"]
+
+
+def test_prefill_generation_chunks_long_text_prompts() -> None:
+    engine = object.__new__(AnnaEngine)
+    engine.optimization_config = EngineOptimizationConfig(prefill_chunk_size=3)
+    engine._prompt_cache = OrderedDict()
+    engine._compiled_text_forward = None
+    calls: list[tuple[torch.Tensor, torch.Tensor | None, object | None]] = []
+
+    def _fake_forward(self, **kwargs):
+        calls.append((kwargs["input_ids"].clone(), kwargs["attention_mask"], kwargs["past_key_values"]))
+        return SimpleNamespace(
+            logits=torch.tensor([[[float(kwargs["input_ids"][0, -1].item())]]]),
+            past_key_values=SimpleNamespace(tag=f"cache-{len(calls)}"),
+        )
+
+    engine._forward_generation_model = MethodType(_fake_forward, engine)
+
+    prepared = PreparedInputs(
+        prompt="chunk me",
+        input_ids=torch.tensor([[1, 2, 3, 4, 5, 6, 7]], dtype=torch.long),
+        attention_mask=torch.ones((1, 7), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 7), dtype=torch.int32),
+    )
+
+    result = engine._prefill_generation_prompt(prepared)
+
+    assert [chunk.tolist() for chunk, _, _ in calls] == [[[1, 2, 3]], [[4, 5, 6]], [[7]]]
+    assert calls[0][1] is not None
+    assert calls[1][1] is None
+    assert calls[2][1] is None
+    assert result.logits.item() == 7.0
+    assert result.prompt_cache_hit is False
+
+
+def test_prefill_generation_reuses_prompt_cache_for_exact_prompt_matches() -> None:
+    class _FakeCache:
+        def __init__(self, label: str) -> None:
+            self.label = label
+            self.released = False
+
+        def clone(self):
+            return _FakeCache(self.label)
+
+        def release(self) -> None:
+            self.released = True
+
+    engine = object.__new__(AnnaEngine)
+    engine.optimization_config = EngineOptimizationConfig(prompt_cache_size=1)
+    engine._prompt_cache = OrderedDict()
+    engine._compiled_text_forward = None
+    forward_calls: list[int] = []
+
+    def _fake_forward(self, **_kwargs):
+        forward_calls.append(1)
+        return SimpleNamespace(
+            logits=torch.tensor([[[11.0]]]),
+            past_key_values=_FakeCache("prefill"),
+        )
+
+    engine._forward_generation_model = MethodType(_fake_forward, engine)
+
+    prepared = PreparedInputs(
+        prompt="cache me",
+        input_ids=torch.tensor([[11, 12, 13]], dtype=torch.long),
+        attention_mask=torch.ones((1, 3), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 3), dtype=torch.int32),
+    )
+
+    first = engine._prefill_generation_prompt(prepared)
+    second = engine._prefill_generation_prompt(prepared)
+
+    assert len(forward_calls) == 1
+    assert first.prompt_cache_hit is False
+    assert second.prompt_cache_hit is True
+    assert second.logits.item() == 11.0
 
 
 def test_incremental_text_assembler_handles_unstable_unicode_suffix() -> None:

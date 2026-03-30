@@ -1,209 +1,303 @@
-# Anna
+# Anna (SYCL Branch)
 
-`Anna` 是一个可本地部署的 Qwen3.5 推理服务，目标场景是 Intel Arc A770 / A750（`xpu`），并提供 OpenAI 兼容接口，方便你直接接入现有客户端或 SDK。
+`sycl` 分支面向 Intel Arc `xpu` 推理路径，包含一个用 DPC++/SYCL 构建的自定义 fused op，用来加速 Qwen3 线性注意力中的 gated-delta 计算。
 
-## 你可以用它做什么
+当前分支的重点不是“通用跨平台安装”，而是：
 
-- 本地加载 Hugging Face 风格模型目录（`safetensors` 单文件或分片）
-- 提供 OpenAI 兼容 API：
+- Windows + Intel Arc 显卡
+- PyTorch `xpu`
+- Intel oneAPI DPC++/C++
+- 可本地编译并加载 `anna_gated_delta_fused` 自定义算子
+
+如果你准备在 Arc A770 / A750 上跑本地 Qwen3.5，这个 README 就是按这条路径写的。
+
+## 分支特性
+
+- OpenAI 兼容接口
   - `GET /v1/models`
   - `POST /v1/chat/completions`
   - `POST /v1/completions`
-- 支持 SSE 流式输出
-- 支持文本与多模态（图像/视频）输入路径
-- 支持常见采样参数：`temperature`、`top_k`、`top_p`、`repetition_penalty`
-- 支持 BF16/FP16 推理，以及 FP8/AWQ/AWQ-4bit 装载路径
+- 文本生成与流式输出
+- `xpu` 设备推理
+- 线性注意力 SYCL fused op
+- 启动时终端打印服务地址与可用路由
+- 运行时终端打印聚合指标
+  - 空闲时不会持续刷日志
 
-## 适用环境
+## 推荐环境
 
-- Windows（推荐）或 Linux
-- Python 3.11+
-- Intel GPU 运行环境（如 Arc A770）与 `torch+xpu`
-- 本地可用模型目录（项目不负责下载模型文件）
+当前分支默认按下面的环境准备：
 
-## 安装与项目配置
+- Windows 11
+- Python 3.11 或 3.12
+- Intel Arc A770 / A750
+- 已正确安装 Intel GPU 驱动
+- 已正确安装带 `xpu` 的 PyTorch
+- Intel oneAPI DPC++/C++ Compiler
+- Visual Studio 2022 Build Tools
 
-### 1) 克隆项目
+## 环境配置
 
-```bash
-git clone <your-repo-url>
-cd Anna
-```
-
-### 2) 创建并激活虚拟环境
-
-Windows PowerShell:
+### 1. 克隆并切到 `sycl` 分支
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+git clone <your-repo-url> Anna
+cd Anna
+git checkout sycl
+```
+
+### 2. 创建 Conda 环境
+
+推荐使用 Miniforge/Conda 管理 Python 环境：
+
+```powershell
+conda create -n anna python=3.12 -y
+conda activate anna
 python -m pip install -U pip
 ```
 
-Linux/macOS:
+### 3. 安装 PyTorch
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -U pip
-```
+安装完成后先验证：
 
-### 3) 安装项目
-
-仅运行服务：
-
-```bash
-pip install -e .
-```
-
-需要本地开发/测试（含 `pytest`、`httpx`）：
-
-```bash
-pip install -e ".[dev]"
-```
-
-### 4) 安装 `xpu` 版 PyTorch
-
-本项目要求使用带 Intel `xpu` 支持的 PyTorch。请按你当前系统与驱动版本，从官方渠道安装对应构建，然后执行：
-
-```bash
+```powershell
 python -c "import torch; print(torch.__version__); print(torch.xpu.is_available())"
 ```
 
-当输出中 `torch.xpu.is_available()` 为 `True` 时，表示运行环境可用。
+预期至少满足：
 
-### 5) （可选）配置环境变量
+- 能正常 `import torch`
+- `torch.xpu.is_available()` 输出 `True`
 
-你可以在本机设置默认模型目录，减少命令输入：
+### 4. 安装项目本身
 
-Windows PowerShell:
+仅运行：
 
 ```powershell
-$env:ANNA_MODEL_DIR="D:\path\to\your\model"
+pip install -e .
 ```
 
-Linux/macOS:
+开发和测试：
 
-```bash
-export ANNA_MODEL_DIR="/path/to/your/model"
+```powershell
+pip install -e ".[dev]"
 ```
 
-> `Anna` 本身不下载模型文件，需你提前准备本地模型目录。
+### 5. 准备编译器环境
 
-## 快速开始
+当前构建脚本默认使用下面两个路径：
 
-### 1) 准备模型目录
+- oneAPI 编译器：`D:\Intel\oneAPI\compiler\2025.3\bin\dpcpp.exe`
+- MSVC 环境脚本：`C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat`
 
-模型目录至少应包含：
+如果你的安装路径不同，需要修改 [tools/build_gated_delta_fused_op.py](/D:/Projects/Anna/tools/build_gated_delta_fused_op.py) 里的这两个路径。
+
+### 6. 编译 SYCL fused op
+
+```powershell
+python tools\build_gated_delta_fused_op.py
+```
+
+成功后会在下面目录生成动态库：
+
+- `.build\anna_gated_delta_fused\anna_gated_delta_fused.pyd`
+
+终端通常会看到类似输出：
+
+```text
+Compiling Anna gated_delta_fused SYCL op...
+library_path=D:\Projects\Anna\.build\anna_gated_delta_fused\anna_gated_delta_fused.pyd
+op_registered=True
+```
+
+### 7. 可选验证
+
+```powershell
+pytest tests\test_fused_op_xpu.py -q
+```
+
+如果只是做一次完整回归：
+
+```powershell
+pytest -q
+```
+
+## 模型目录要求
+
+本地模型目录至少应包含：
 
 - `config.json`
 - `tokenizer.json`
 - `tokenizer_config.json`
-- `model.safetensors`（或分片 `safetensors`）
+- `model.safetensors` 或分片 `*.safetensors`
 
-### 2) 启动服务
+例如：
 
-```bash
-anna-serve --model-dir /path/to/model --device xpu --dtype bf16
+```text
+D:\Projects\Anna\models\Qwen\Qwen3___5-2B
 ```
 
-可选参数示例：
+## 运行命令示例
 
-```bash
-anna-serve --model-dir /path/to/model --model-name qwen3.5 --device xpu --dtype bf16 --max-completion-tokens 2048
+### 1. 启动服务
+
+最小示例：
+
+```powershell
+anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16
 ```
 
-显存紧张时，可启用文本线性层 `int4` 量化，并把视觉塔放到 CPU：
+与你当前分支/环境一致的示例：
 
-```bash
-anna-serve --model-dir /path/to/model --model-name qwen3.5 --device xpu --dtype bf16 --weight-quant int4 --offload-vision
+```powershell
+anna-serve `
+  --model-dir D:\Projects\Anna\models\Qwen\Qwen3___5-2B `
+  --model-name Qwen3.5-2B `
+  --device xpu `
+  --dtype bfloat16 `
+  --offload-mode none `
+  --weight-quant none `
+  --host 127.0.0.1 `
+  --port 8000
 ```
 
-默认启用思维链
+如果你不想看周期指标日志：
 
-```bash
-anna-serve --model-dir /path/to/model --model-name qwen3.5 --device xpu --dtype bf16 --weight-quant int4 --offload-vision --disable-thinking --min-free-memory-mib 256 --reserve-memory-mib 128 --max-estimated-usage-ratio 0.95 --generation-memory-safety-factor 1.25
+```powershell
+anna-serve `
+  --model-dir D:\Projects\Anna\models\Qwen\Qwen3___5-2B `
+  --model-name Qwen3.5-2B `
+  --device xpu `
+  --dtype bfloat16 `
+  --metrics-log-interval-seconds 0
 ```
 
-禁用思维链
+### 2. 启动后终端行为
 
-```bash
-anna-serve --model-dir /path/to/model --model-name qwen3.5 --device xpu --dtype bf16 --weight-quant int4 --offload-vision --disable-thinking --reasoning-format deepseek --min-free-memory-mib 256 --reserve-memory-mib 128 --max-estimated-usage-ratio 0.95 --generation-memory-safety-factor 1.25
+服务启动后会在终端打印：
+
+- 服务地址
+- 当前可用路由
+- 运行时聚合指标
+
+示例：
+
+```text
+INFO anna.cli.serve: Starting Anna server on http://127.0.0.1:8000
+INFO anna.cli.serve: Available routes are:
+INFO anna.cli.serve: Route: /openapi.json, Methods: HEAD, GET
+INFO anna.cli.serve: Route: /healthz, Methods: GET
+INFO anna.cli.serve: Route: /v1/models, Methods: GET
+INFO anna.cli.serve: Route: /v1/chat/completions, Methods: POST
+INFO anna.cli.serve: Route: /v1/completions, Methods: POST
+```
+
+### 3. 直接文本生成
+
+```powershell
+anna-generate `
+  --model-dir D:\Projects\Anna\models\Qwen\Qwen3___5-2B `
+  --model-name Qwen3.5-2B `
+  --device xpu `
+  --dtype bfloat16 `
+  --offload-mode none `
+  --weight-quant none `
+  --prompt "Hello" `
+  --max-new-tokens 32
+```
+
+### 4. 基准测试
+
+```powershell
+anna-bench `
+  --model-dir D:\Projects\Anna\models\Qwen\Qwen3___5-2B `
+  --model-name Qwen3.5-2B `
+  --device xpu `
+  --dtype bfloat16 `
+  --prompt "你好，请介绍一下你自己。" `
+  --runs 5
 ```
 
 ## API 调用示例
 
 ### Chat Completions
 
-```bash
-curl -X POST http://127.0.0.1:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.5",
-    "messages": [{"role":"user","content":"你好，介绍一下你自己。"}],
-    "max_completion_tokens": 256
-  }'
+```powershell
+curl.exe http://127.0.0.1:8000/v1/chat/completions `
+  -H "Content-Type: application/json" `
+  -d "{\"model\":\"Qwen3.5-2B\",\"messages\":[{\"role\":\"user\",\"content\":\"你好，介绍一下你自己。\"}],\"max_completion_tokens\":128}"
 ```
 
-### 流式输出
+### Completions
 
-在请求体中设置 `"stream": true` 即可使用 SSE 流式返回。
-
-## CLI 用法
-
-### 文本生成
-
-```bash
-anna-generate --model-dir /path/to/model --device xpu --dtype bf16 --prompt "你好，介绍一下你自己。"
+```powershell
+curl.exe http://127.0.0.1:8000/v1/completions `
+  -H "Content-Type: application/json" `
+  -d "{\"model\":\"Qwen3.5-2B\",\"prompt\":\"Hello\",\"max_tokens\":32}"
 ```
 
-### 基准测试
+### 查看模型列表
 
-```bash
-anna-bench --model-dir /path/to/model --device xpu --dtype bf16 --prompt "你好，请介绍一下你自己。" --runs 5
+```powershell
+curl.exe http://127.0.0.1:8000/v1/models
 ```
 
-## 关键行为说明
+### 健康检查
 
-- 如果不传 `--model-name`，服务对外暴露的模型名默认是 `--model-dir` 的完整路径。
-- 服务端默认 completion 上限优先级：
-  1. 请求体 `max_completion_tokens`
-  2. 请求体 `max_tokens`
-  3. 启动参数 `--max-completion-tokens`
-  4. 模型配置中的 `max_completion_tokens`（兼容 `max_new_tokens` / `max_tokens`）
-  5. 回退到 `256`
-- 聊天接口默认会保留模型原始 `<think>...</think>` 内容；若你不希望前端展示，需要在客户端侧自行过滤或拆分渲染。
-
-## 当前状态
-
-- 已完成基础可用性验证：模型加载、文本生成、多模态路径、API 烟测。
-- 仍在持续完善 Arc A770 的系统化性能与稳定性验证。
-- FP8/AWQ/AWQ-4bit 路径已接入，仍建议结合目标模型做充分数值校验。
+```powershell
+curl.exe http://127.0.0.1:8000/healthz
+```
 
 ## 常见问题
 
-### 为什么服务起不来或推理不走 xpu？
+### 1. `torch.xpu.is_available()` 是 `False`
 
-请优先检查：
+优先检查：
 
-- `torch` 是否为带 `xpu` 支持的构建
-- 驱动与运行时是否与当前 `torch` 版本兼容
-- 启动参数是否显式传入 `--device xpu`
+- PyTorch 版本是否真的支持 `xpu`
+- Intel GPU 驱动是否正确安装
+- 当前 Python 环境是否装错了 `cpu` 版 `torch`
 
-### 显存不足怎么办？
+### 2. fused op 编译失败
 
-- 降低 `max_completion_tokens`
-- 使用更小模型或量化模型
-- 尝试 `--weight-quant int4`
-- 文本为主的场景可加 `--offload-vision`
+优先检查：
 
-## 路线图
+- `dpcpp.exe` 路径是否正确
+- `vcvars64.bat` 路径是否正确
+- oneAPI 与 MSVC 是否都已安装
+- 当前激活环境里的 `torch` 是否包含头文件和 `torch_xpu` 相关库
 
-- 更完整的 Arc A770 性能与稳定性基准
-- 量化模型的更广覆盖与校验
-- 多模态调度与运行时开销优化
+### 3. 服务能启动，但生成时报 fused-op 相关错误
 
----
-🙏 致谢
+先重建一次自定义算子：
 
-感谢 [linuxdo](https://linux.do/) 社区的交流、分享与反馈
+```powershell
+python tools\build_gated_delta_fused_op.py
+```
+
+然后重启服务。
+
+### 4. 指标日志不想显示
+
+可以直接关闭：
+
+```powershell
+anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16 --metrics-log-interval-seconds 0
+```
+
+## 开发建议
+
+- 改了 SYCL 源码后，先重新执行 `python tools\build_gated_delta_fused_op.py`
+- 再执行 `pytest tests\test_fused_op_xpu.py -q`
+- 最后再重启 `anna-serve`
+
+## 当前分支定位
+
+`sycl` 分支适合做下面几类工作：
+
+- Intel Arc `xpu` 推理调试
+- 自定义 SYCL fused op 开发
+- Windows + oneAPI 本地部署
+- 运行时/调度/缓存行为验证
+
+如果你要的是“最通用、最少本地编译依赖”的部署方式，这个分支不是首选；它更偏底层调优和 Arc/XPU 实验分支。

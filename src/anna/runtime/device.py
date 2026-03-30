@@ -239,6 +239,22 @@ class DeviceContext:
             reserved_bytes=reserved_bytes,
         )
 
+    def get_memory_stats(self) -> dict[str, int | float] | None:
+        if self.device.type != "xpu":
+            return None
+        xpu = _xpu_module()
+        if xpu is None or not hasattr(xpu, "memory_stats"):
+            return None
+
+        memory_stats = getattr(xpu, "memory_stats")
+        try:
+            stats = memory_stats(self.device)
+        except TypeError:
+            stats = memory_stats()
+        if not isinstance(stats, dict):
+            return None
+        return stats
+
     @staticmethod
     def classify_runtime_error(exc: BaseException) -> str:
         message = str(exc).lower()

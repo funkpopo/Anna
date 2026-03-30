@@ -84,6 +84,9 @@ class AnnaScheduler:
 
     def _submit(self, prepared: PreparedInputs, *, config: "GenerationConfig", stream: bool) -> SchedulerRequest:
         request = SchedulerRequest(prepared=prepared, config=config, stream=stream)
+        metrics = getattr(self.engine, "metrics", None)
+        if metrics is not None:
+            metrics.record_request_submitted(waiting=True)
         with self._condition:
             self._pending.append(request)
             self._condition.notify()
@@ -129,6 +132,9 @@ class AnnaScheduler:
             active = next_active
 
     def _prefill_batch(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest]:
+        metrics = getattr(self.engine, "metrics", None)
+        if metrics is not None:
+            metrics.record_requests_started_from_queue(len(requests))
         for request in requests:
             request.prompt_ids, request.prompt_length, request.config = self.engine._validate_generation_request(
                 request.prepared,
@@ -168,6 +174,9 @@ class AnnaScheduler:
         except RuntimeError as exc:
             raise self.engine._handle_runtime_failure(exc) from exc
 
+        metrics = getattr(self.engine, "metrics", None)
+        if metrics is not None:
+            metrics.record_prompt_tokens(sum(request.prompt_length for request in requests))
         split_caches = outputs.past_key_values.split_batch() if outputs.past_key_values is not None else [None] * len(requests)
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
         active: list[SchedulerRequest] = []
@@ -187,6 +196,8 @@ class AnnaScheduler:
                 continue
 
             request.completion_ids.append(token_id)
+            if metrics is not None:
+                metrics.record_generation_tokens(1)
             request.repetition_history, request.repetition_history_ids = self.engine._append_repetition_penalty_token(
                 history_tensor=request.repetition_history,
                 history_ids=request.repetition_history_ids,
@@ -228,6 +239,7 @@ class AnnaScheduler:
         split_caches = outputs.past_key_values.split_batch() if outputs.past_key_values is not None else [None] * len(requests)
         next_active: list[SchedulerRequest] = []
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
+        metrics = getattr(self.engine, "metrics", None)
         for row_idx, request in enumerate(requests):
             request.past_key_values = split_caches[row_idx]
             next_token = sample_next_token(
@@ -244,6 +256,8 @@ class AnnaScheduler:
                 continue
 
             request.completion_ids.append(token_id)
+            if metrics is not None:
+                metrics.record_generation_tokens(1)
             request.repetition_history, request.repetition_history_ids = self.engine._append_repetition_penalty_token(
                 history_tensor=request.repetition_history,
                 history_ids=request.repetition_history_ids,
@@ -319,6 +333,7 @@ class AnnaScheduler:
             request.events.put(StreamEvent(text=text, finish_reason=None))
 
     def _finish_request(self, request: SchedulerRequest, *, finish_reason: str) -> None:
+        metrics = getattr(self.engine, "metrics", None)
         if request.assembler is not None:
             tail, _ = request.assembler.flush()
             if tail:
@@ -333,6 +348,8 @@ class AnnaScheduler:
             request.events.put(StreamEvent(text="", finish_reason=finish_reason))
             request.events.put(_DONE)
             request.done.set()
+            if metrics is not None:
+                metrics.record_request_finished(success=True)
             return
 
         from anna.runtime.engine import TextGenerationResult
@@ -344,6 +361,8 @@ class AnnaScheduler:
             completion_tokens=len(request.completion_ids),
         )
         request.done.set()
+        if metrics is not None:
+            metrics.record_request_finished(success=True)
 
     def _normalize_error(self, exc: Exception) -> "AnnaEngineError":
         from anna.runtime.engine import AnnaEngineError
@@ -362,6 +381,7 @@ class AnnaScheduler:
         from anna.runtime.engine import AnnaEngineError
 
         normalized = exc if isinstance(exc, AnnaEngineError) else self._normalize_error(exc)
+        metrics = getattr(self.engine, "metrics", None)
         request.error = normalized
         if request.past_key_values is not None:
             request.past_key_values.release()
@@ -370,3 +390,5 @@ class AnnaScheduler:
             request.events.put(normalized)
             request.events.put(_DONE)
         request.done.set()
+        if metrics is not None:
+            metrics.record_request_finished(success=False)

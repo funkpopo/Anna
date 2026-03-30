@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import logging
 
 import uvicorn
 
-from anna.api.app import create_app
+from anna.api.app import create_app, list_app_routes
 from anna.core.config import ServeSettings, parse_resident_expert_layer_indices
 from anna.core.logging import setup_logging
 from anna.core.model_path import resolve_model_dir, resolve_model_name
 from anna.runtime.device import RuntimeSafetyPolicy
 from anna.runtime.engine import AnnaEngine
+from anna.runtime.service_metrics import AnnaServiceMetricsLogger
 from anna.runtime.scheduler import AnnaScheduler
+
+logger = logging.getLogger(__name__)
 
 
 def _non_negative_int(value: str) -> int:
@@ -24,6 +28,13 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be > 0")
+    return parsed
+
+
+def _non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0.0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
     return parsed
 
 
@@ -93,12 +104,57 @@ def _build_scheduler(engine: AnnaEngine, settings: ServeSettings) -> AnnaSchedul
     return scheduler
 
 
+def _build_metrics_logger(engine: AnnaEngine, settings: ServeSettings) -> AnnaServiceMetricsLogger | None:
+    if settings.metrics_log_interval_seconds <= 0:
+        return None
+    return AnnaServiceMetricsLogger(
+        engine.service_metrics_snapshot,
+        interval_seconds=settings.metrics_log_interval_seconds,
+        activity_event=getattr(getattr(engine, "metrics", None), "activity_event", None),
+    )
+
+
+def _log_available_routes(app, *, host: str, port: int) -> None:
+    logger.info("Starting Anna server on http://%s:%s", host, port)
+    logger.info("Available routes are:")
+    for path, methods in list_app_routes(app):
+        logger.info("Route: %s, Methods: %s", path, methods)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Serve Anna with an OpenAI-compatible API.")
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--model-name", default=None, help="Model name exposed through the API.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
+    parser.add_argument(
+        "--compile-mode",
+        choices=("none", "default", "reduce-overhead", "max-autotune"),
+        default="none",
+        help="Optional torch.compile mode for the text generation path.",
+    )
+    parser.add_argument(
+        "--compile-fullgraph",
+        action="store_true",
+        help="Request fullgraph capture for torch.compile when --compile-mode is enabled.",
+    )
+    parser.add_argument(
+        "--prefill-chunk-size",
+        type=_non_negative_int,
+        default=0,
+        help="Split long text-only prefills into token chunks. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--prompt-cache-size",
+        type=_non_negative_int,
+        default=0,
+        help="Keep up to N text-only prompt KV caches resident for exact prompt reuse. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--profile-runtime",
+        action="store_true",
+        help="Log synchronized XPU forward timings and memory stats for prefill/decode profiling.",
+    )
     thinking_group = parser.add_mutually_exclusive_group()
     thinking_group.add_argument(
         "--enable-thinking",
@@ -191,6 +247,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable continuous batching only when set above 1. Defaults to 1, which serves requests directly.",
     )
     parser.add_argument("--scheduler-batch-wait-ms", type=float, default=2.0)
+    parser.add_argument(
+        "--metrics-log-interval-seconds",
+        type=_non_negative_float,
+        default=10.0,
+        help="Emit aggregated runtime metrics to the terminal every N seconds. Set 0 to disable.",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--log-level", default="info")
@@ -206,6 +268,11 @@ def main() -> None:
         model_id=model_name,
         device=args.device,
         dtype=args.dtype,
+        compile_mode=args.compile_mode,
+        compile_fullgraph=args.compile_fullgraph,
+        prefill_chunk_size=args.prefill_chunk_size,
+        prompt_cache_size=args.prompt_cache_size,
+        profile_runtime=args.profile_runtime,
         default_max_completion_tokens=args.max_completion_tokens,
         default_enable_thinking=args.default_enable_thinking,
         reasoning_format=args.reasoning_format,
@@ -222,6 +289,7 @@ def main() -> None:
         generation_memory_safety_factor=args.generation_memory_safety_factor,
         scheduler_max_batch_size=args.scheduler_max_batch_size,
         scheduler_batch_wait_ms=args.scheduler_batch_wait_ms,
+        metrics_log_interval_seconds=args.metrics_log_interval_seconds,
         host=args.host,
         port=args.port,
         log_level=args.log_level,
@@ -233,6 +301,11 @@ def main() -> None:
         model_id=settings.model_id,
         device=settings.device,
         dtype=settings.dtype,
+        compile_mode=settings.compile_mode,
+        compile_fullgraph=settings.compile_fullgraph,
+        prefill_chunk_size=settings.prefill_chunk_size,
+        prompt_cache_size=settings.prompt_cache_size,
+        profile_runtime=settings.profile_runtime,
         safety_policy=_build_safety_policy(settings),
         default_max_completion_tokens=settings.default_max_completion_tokens,
         default_enable_thinking=settings.default_enable_thinking,
@@ -246,8 +319,16 @@ def main() -> None:
         cached_experts_per_layer=settings.cached_experts_per_layer,
     )
     scheduler = _build_scheduler(engine, settings)
+    metrics_logger = _build_metrics_logger(engine, settings)
     app = create_app(engine, scheduler=scheduler)
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level=settings.log_level)
+    try:
+        _log_available_routes(app, host=settings.host, port=settings.port)
+        if metrics_logger is not None:
+            metrics_logger.start()
+        uvicorn.run(app, host=settings.host, port=settings.port, log_level=settings.log_level)
+    finally:
+        if metrics_logger is not None:
+            metrics_logger.shutdown()
 
 
 if __name__ == "__main__":
