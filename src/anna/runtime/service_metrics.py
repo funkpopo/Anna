@@ -35,6 +35,7 @@ class ServiceMetricsSnapshot:
 class AnnaServiceMetrics:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._activity_event = threading.Event()
         self._requests_started_total = 0
         self._requests_completed_total = 0
         self._requests_failed_total = 0
@@ -52,6 +53,7 @@ class AnnaServiceMetrics:
                 self._waiting_requests += 1
             else:
                 self._running_requests += 1
+        self._activity_event.set()
 
     def record_requests_started_from_queue(self, count: int) -> None:
         normalized = max(0, int(count))
@@ -60,6 +62,7 @@ class AnnaServiceMetrics:
         with self._lock:
             self._waiting_requests = max(0, self._waiting_requests - normalized)
             self._running_requests += normalized
+        self._activity_event.set()
 
     def record_request_finished(self, *, success: bool) -> None:
         with self._lock:
@@ -68,6 +71,7 @@ class AnnaServiceMetrics:
                 self._requests_completed_total += 1
             else:
                 self._requests_failed_total += 1
+        self._activity_event.set()
 
     def record_prompt_tokens(self, count: int) -> None:
         normalized = max(0, int(count))
@@ -75,6 +79,7 @@ class AnnaServiceMetrics:
             return
         with self._lock:
             self._prompt_tokens_total += normalized
+        self._activity_event.set()
 
     def record_generation_tokens(self, count: int) -> None:
         normalized = max(0, int(count))
@@ -82,12 +87,18 @@ class AnnaServiceMetrics:
             return
         with self._lock:
             self._generation_tokens_total += normalized
+        self._activity_event.set()
 
     def record_prompt_cache_lookup(self, *, hit: bool) -> None:
         with self._lock:
             self._prompt_cache_queries_total += 1
             if hit:
                 self._prompt_cache_hits_total += 1
+        self._activity_event.set()
+
+    @property
+    def activity_event(self) -> threading.Event:
+        return self._activity_event
 
     def snapshot(self) -> ServiceMetricsSnapshot:
         with self._lock:
@@ -111,9 +122,11 @@ class AnnaServiceMetricsLogger:
         snapshot_provider: Callable[[], ServiceMetricsSnapshot],
         *,
         interval_seconds: float = 10.0,
+        activity_event: threading.Event | None = None,
     ) -> None:
         self.snapshot_provider = snapshot_provider
         self.interval_seconds = max(0.0, float(interval_seconds))
+        self.activity_event = activity_event
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -128,6 +141,8 @@ class AnnaServiceMetricsLogger:
 
     def shutdown(self) -> None:
         self._stop_event.set()
+        if self.activity_event is not None:
+            self.activity_event.set()
         if self._thread is not None:
             self._thread.join(timeout=max(1.0, self.interval_seconds + 1.0))
             self._thread = None
@@ -152,9 +167,39 @@ class AnnaServiceMetricsLogger:
             f"Prompt cache hit rate: {prompt_cache_hit_rate:.1f}%"
         )
 
+    @staticmethod
+    def should_log_interval(previous: ServiceMetricsSnapshot, current: ServiceMetricsSnapshot) -> bool:
+        if current.running_requests > 0 or current.waiting_requests > 0:
+            return True
+        deltas = (
+            current.requests_started_total - previous.requests_started_total,
+            current.requests_completed_total - previous.requests_completed_total,
+            current.requests_failed_total - previous.requests_failed_total,
+            current.prompt_tokens_total - previous.prompt_tokens_total,
+            current.generation_tokens_total - previous.generation_tokens_total,
+            current.prompt_cache_queries_total - previous.prompt_cache_queries_total,
+            current.prompt_cache_hits_total - previous.prompt_cache_hits_total,
+            current.kv_cache_used_pages - previous.kv_cache_used_pages,
+            current.kv_cache_total_pages - previous.kv_cache_total_pages,
+            current.prompt_cache_entries - previous.prompt_cache_entries,
+        )
+        return any(delta != 0 for delta in deltas)
+
+    @staticmethod
+    def _is_idle(snapshot: ServiceMetricsSnapshot) -> bool:
+        return snapshot.running_requests <= 0 and snapshot.waiting_requests <= 0
+
     def _run_loop(self) -> None:
         previous = self.snapshot_provider()
-        while not self._stop_event.wait(self.interval_seconds):
+        while not self._stop_event.is_set():
+            if self.activity_event is not None and self._is_idle(previous):
+                self.activity_event.wait()
+                if self._stop_event.is_set():
+                    return
+                self.activity_event.clear()
+            if self._stop_event.wait(self.interval_seconds):
+                return
             current = self.snapshot_provider()
-            logger.info(self.format_interval(previous, current))
+            if self.should_log_interval(previous, current):
+                logger.info(self.format_interval(previous, current))
             previous = current

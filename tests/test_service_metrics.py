@@ -5,6 +5,7 @@ from anna.runtime.service_metrics import AnnaServiceMetrics, AnnaServiceMetricsL
 
 def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     metrics = AnnaServiceMetrics()
+    assert metrics.activity_event.is_set() is False
 
     metrics.record_request_submitted(waiting=True)
     metrics.record_request_submitted(waiting=False)
@@ -27,6 +28,7 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     assert snapshot.prompt_cache_hits_total == 1
     assert snapshot.running_requests == 0
     assert snapshot.waiting_requests == 0
+    assert metrics.activity_event.is_set() is True
 
 
 def test_service_metrics_logger_formats_interval_rates() -> None:
@@ -57,3 +59,24 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
     assert "Waiting: 1 reqs" in line
     assert "GPU KV cache usage: 50.0% (6/12 pages)" in line
     assert "Prompt cache hit rate: 75.0%" in line
+
+
+def test_service_metrics_logger_skips_idle_intervals_without_changes() -> None:
+    previous = ServiceMetricsSnapshot(timestamp=10.0, kv_cache_total_pages=128)
+    current = ServiceMetricsSnapshot(timestamp=20.0, kv_cache_total_pages=128)
+
+    assert AnnaServiceMetricsLogger.should_log_interval(previous, current) is False
+
+
+def test_service_metrics_logger_logs_idle_interval_after_completed_work() -> None:
+    previous = ServiceMetricsSnapshot(timestamp=10.0)
+    current = ServiceMetricsSnapshot(
+        timestamp=20.0,
+        requests_started_total=1,
+        requests_completed_total=1,
+        prompt_tokens_total=32,
+        generation_tokens_total=8,
+        kv_cache_total_pages=128,
+    )
+
+    assert AnnaServiceMetricsLogger.should_log_interval(previous, current) is True

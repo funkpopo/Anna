@@ -6,7 +6,7 @@ from pathlib import Path
 from anna.api.app import create_app
 from anna.cli.serve import _build_metrics_logger, _build_safety_policy, _build_scheduler, _log_available_routes, build_parser
 from anna.core.config import ServeSettings
-from anna.runtime.service_metrics import AnnaServiceMetricsLogger
+from anna.runtime.service_metrics import AnnaServiceMetrics, AnnaServiceMetricsLogger
 
 
 def test_build_safety_policy_uses_custom_serve_overrides() -> None:
@@ -107,12 +107,14 @@ def test_build_metrics_logger_can_be_disabled() -> None:
 def test_build_metrics_logger_uses_engine_snapshot_provider() -> None:
     engine = _FakeEngine()
     engine.service_metrics_snapshot = lambda: None  # type: ignore[assignment]
+    engine.metrics = AnnaServiceMetrics()
     settings = ServeSettings(model_dir=Path("dummy"), metrics_log_interval_seconds=5.0)
 
     metrics_logger = _build_metrics_logger(engine, settings)
 
     assert isinstance(metrics_logger, AnnaServiceMetricsLogger)
     assert metrics_logger.interval_seconds == 5.0
+    assert metrics_logger.activity_event is engine.metrics.activity_event
 
 
 def test_log_available_routes_reports_server_address_and_paths(caplog) -> None:
