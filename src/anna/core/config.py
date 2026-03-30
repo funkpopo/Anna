@@ -48,6 +48,7 @@ class ServeSettings:
     generation_memory_safety_factor: float | None = None
     scheduler_max_batch_size: int = 1
     scheduler_batch_wait_ms: float = 2.0
+    metrics_log_interval_seconds: float = 10.0
     host: str = "127.0.0.1"
     port: int = 8000
     log_level: str = "info"

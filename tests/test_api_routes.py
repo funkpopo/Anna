@@ -4,7 +4,7 @@ import logging
 
 from fastapi.testclient import TestClient
 
-from anna.api.app import create_app
+from anna.api.app import create_app, list_app_routes
 from anna.runtime.engine import AnnaEngineError, GenerationPerfStats, TextGenerationResult
 
 
@@ -76,6 +76,16 @@ class _CapturingEngine:
             prompt_tokens=1,
             completion_tokens=1,
         )
+
+
+def test_list_app_routes_includes_openapi_and_completion_endpoints() -> None:
+    routes = list_app_routes(create_app(_CapturingEngine()))
+
+    assert ("/openapi.json", "HEAD, GET") in routes
+    assert ("/docs", "HEAD, GET") in routes
+    assert ("/healthz", "GET") in routes
+    assert ("/v1/chat/completions", "POST") in routes
+    assert ("/v1/completions", "POST") in routes
 
 def test_streaming_chat_returns_sse_error_frame_for_engine_failures() -> None:
     client = TestClient(create_app(_FailingStreamEngine()))
