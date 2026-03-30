@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import copy
+import logging
+import time
 from collections import OrderedDict
 
 import torch
@@ -8,7 +9,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from anna.model.config import Qwen3TextConfig
+from anna.model.fused_ops import run_gated_delta_fused
 from anna.model.quantization import convert_module_linears_to_xpu_int4
+
+logger = logging.getLogger(__name__)
 
 
 def _module_device(module: nn.Module) -> torch.device:
@@ -17,6 +21,15 @@ def _module_device(module: nn.Module) -> torch.device:
     for buffer in module.buffers():
         return buffer.device
     return torch.device("cpu")
+
+
+def _module_dtype(module: nn.Module) -> torch.dtype:
+    for parameter in module.parameters():
+        return parameter.dtype
+    for buffer in module.buffers():
+        if buffer.is_floating_point():
+            return buffer.dtype
+    return torch.float32
 
 
 class Qwen3PagedLayerAllocator:
@@ -501,6 +514,49 @@ class Qwen3DynamicCache:
                     outputs[idx].recurrent_states[layer_idx] = chunk.clone()
         return outputs
 
+    def clone(self) -> "Qwen3DynamicCache":
+        batch_size = self.get_batch_size()
+        cloned = Qwen3DynamicCache(self.config, allocator=self.allocator, batch_size=batch_size)
+        for layer_idx in range(self.config.num_hidden_layers):
+            cloned.layer_lengths[layer_idx] = list(self.layer_lengths[layer_idx])
+            cloned.visible_cache_capacities[layer_idx] = self.visible_cache_capacities[layer_idx]
+
+        cloned.seen_tokens = self.seen_tokens
+        if self.rope_deltas is not None:
+            cloned.rope_deltas = self.rope_deltas.clone()
+
+        for layer_idx in range(self.config.num_hidden_layers):
+            if self.conv_states[layer_idx] is not None:
+                cloned.conv_states[layer_idx] = self.conv_states[layer_idx].clone()
+            if self.recurrent_states[layer_idx] is not None:
+                cloned.recurrent_states[layer_idx] = self.recurrent_states[layer_idx].clone()
+            if self.visible_key_caches[layer_idx] is not None:
+                cloned.visible_key_caches[layer_idx] = self.visible_key_caches[layer_idx].clone()
+            if self.visible_value_caches[layer_idx] is not None:
+                cloned.visible_value_caches[layer_idx] = self.visible_value_caches[layer_idx].clone()
+
+            layer = self.allocator.layers[layer_idx]
+            if layer.key_pages is None or layer.value_pages is None:
+                continue
+
+            key_template = layer.key_pages[:1]
+            value_template = layer.value_pages[:1]
+            for batch_idx, page_ids in enumerate(self.page_tables[layer_idx]):
+                if not page_ids:
+                    continue
+                new_page_ids = self.allocator.allocate(
+                    layer_idx,
+                    len(page_ids),
+                    key_template=key_template,
+                    value_template=value_template,
+                )
+                for old_page_id, new_page_id in zip(page_ids, new_page_ids):
+                    layer.key_pages[new_page_id].copy_(layer.key_pages[old_page_id])
+                    layer.value_pages[new_page_id].copy_(layer.value_pages[old_page_id])
+                cloned.page_tables[layer_idx][batch_idx] = list(new_page_ids)
+
+        return cloned
+
     def release(self) -> None:
         if self._released:
             return
@@ -918,6 +974,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_idx = layer_idx
+        self.profile_runtime = False
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = nn.Conv1d(
@@ -979,34 +1036,23 @@ class Qwen3GatedDeltaNet(nn.Module):
             repeat_factor = self.num_v_heads // self.num_k_heads
             query = query.repeat_interleave(repeat_factor, dim=2)
             key = key.repeat_interleave(repeat_factor, dim=2)
-
-        if not use_precomputed_states:
-            core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=cache_params is not None,
-            )
-        else:
-            core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=cache_params is not None,
-            )
+        output_final_state = cache_params is not None
+        core_attn_out, last_recurrent_state = run_gated_delta_fused(
+            query=query,
+            key=key,
+            value=value,
+            g=g,
+            beta=beta,
+            z=z,
+            norm_weight=self.norm.weight,
+            norm_eps=self.norm.eps,
+            initial_state=recurrent_state if use_precomputed_states else None,
+            output_final_state=output_final_state,
+        )
 
         if cache_params is not None:
             cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
 
-        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-        z = z.reshape(-1, self.head_v_dim)
-        core_attn_out = self.norm(core_attn_out, z).reshape(batch_size, seq_len, -1)
         return self.out_proj(core_attn_out)
 
 
@@ -1025,6 +1071,8 @@ class Qwen3MLP(nn.Module):
 class Qwen3SparseMoeBlock(nn.Module):
     def __init__(self, config: Qwen3TextConfig):
         super().__init__()
+        self._config = config
+        self._expert_intermediate_size = config.moe_intermediate_size
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
@@ -1034,6 +1082,8 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.expert_quant: str = "none"
         self.expert_quant_group_size: int = 128
         self.cached_experts_per_layer: int = max(self.top_k, 8)
+        self.profile_runtime = False
+        self.host_experts_pinned = False
         self._expert_cache: OrderedDict[int, Qwen3MLP] = OrderedDict()
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList(
@@ -1060,6 +1110,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         if cached_experts_per_layer is not None:
             self.cached_experts_per_layer = max(0, min(int(cached_experts_per_layer), self.num_experts))
         self._expert_cache.clear()
+        self.host_experts_pinned = False
 
         if resident_experts and self._should_use_xpu_int4():
             for expert in self.experts:
@@ -1072,6 +1123,8 @@ class Qwen3SparseMoeBlock(nn.Module):
             expert_device = execution_device if resident_experts or not offload_experts else torch.device("cpu")
             for expert in self.experts:
                 expert.to(expert_device)
+                if self.offload_experts and expert_device.type == "cpu":
+                    self.host_experts_pinned = self._pin_module_host_memory(expert) or self.host_experts_pinned
 
     def _should_use_xpu_int4(self) -> bool:
         return (
@@ -1079,6 +1132,89 @@ class Qwen3SparseMoeBlock(nn.Module):
             and self.execution_device.type == "xpu"
             and self.expert_quant == "int4"
         )
+
+    @staticmethod
+    def _pin_module_host_memory(module: nn.Module) -> bool:
+        pinned_any = False
+        try:
+            for child in module.modules():
+                for name, parameter in list(child._parameters.items()):
+                    if parameter is None or parameter.device.type != "cpu":
+                        continue
+                    child._parameters[name].data = parameter.detach().contiguous().pin_memory()
+                    pinned_any = True
+                for name, buffer in list(child._buffers.items()):
+                    if buffer is None or buffer.device.type != "cpu":
+                        continue
+                    child._buffers[name] = buffer.detach().contiguous().pin_memory()
+                    pinned_any = True
+        except RuntimeError:
+            logger.debug("Pinned host memory is unavailable for MoE expert staging.", exc_info=True)
+            return False
+        return pinned_any
+
+    def _new_expert_module(self) -> Qwen3MLP:
+        return Qwen3MLP(self._config, intermediate_size=self._expert_intermediate_size)
+
+    @staticmethod
+    def _copy_module_state_(
+        source: nn.Module,
+        target: nn.Module,
+        *,
+        non_blocking: bool,
+    ) -> None:
+        with torch.no_grad():
+            target_parameters = dict(target.named_parameters())
+            for name, source_parameter in source.named_parameters():
+                target_parameter = target_parameters[name]
+                copied = source_parameter.to(
+                    device=target_parameter.device,
+                    dtype=target_parameter.dtype,
+                    non_blocking=non_blocking,
+                )
+                target_parameter.copy_(copied)
+
+            target_buffers = dict(target.named_buffers())
+            for name, source_buffer in source.named_buffers():
+                target_buffer = target_buffers[name]
+                copied = source_buffer.to(
+                    device=target_buffer.device,
+                    dtype=target_buffer.dtype if source_buffer.is_floating_point() else source_buffer.dtype,
+                    non_blocking=non_blocking,
+                )
+                target_buffer.copy_(copied)
+
+    def _materialize_cached_expert(self, expert_idx: int) -> Qwen3MLP:
+        if self.execution_device is None:
+            raise RuntimeError("Cannot materialize cached expert without an execution device.")
+
+        source = self.experts[expert_idx]
+        started_at = time.perf_counter()
+        if self._should_use_xpu_int4():
+            cached = self._new_expert_module()
+            self._copy_module_state_(source, cached, non_blocking=False)
+            convert_module_linears_to_xpu_int4(
+                cached,
+                group_size=self.expert_quant_group_size,
+                device=self.execution_device,
+            )
+        else:
+            cached = self._new_expert_module().to(
+                device=self.execution_device,
+                dtype=_module_dtype(source),
+            )
+            self._copy_module_state_(source, cached, non_blocking=self.host_experts_pinned)
+
+        if self.profile_runtime and self.execution_device.type == "xpu" and hasattr(torch, "xpu"):
+            torch.xpu.synchronize()
+            logger.info(
+                "MoE expert staged to XPU: expert=%s quant=%s pinned_host=%s elapsed=%.4f",
+                expert_idx,
+                self.expert_quant,
+                self.host_experts_pinned,
+                time.perf_counter() - started_at,
+            )
+        return cached
 
     def _get_cached_expert(self, expert_idx: int) -> Qwen3MLP | None:
         if not self.offload_experts or self.execution_device is None or self.cached_experts_per_layer <= 0:
@@ -1088,18 +1224,9 @@ class Qwen3SparseMoeBlock(nn.Module):
             self._expert_cache.move_to_end(expert_idx)
             return cached
 
-        source = self.experts[expert_idx]
-        cached = copy.deepcopy(source)
-        if self._should_use_xpu_int4():
-            convert_module_linears_to_xpu_int4(
-                cached,
-                group_size=self.expert_quant_group_size,
-                device=self.execution_device,
-            )
-        else:
-            cached = cached.to(self.execution_device)
         if len(self._expert_cache) >= self.cached_experts_per_layer:
             self._expert_cache.popitem(last=False)
+        cached = self._materialize_cached_expert(expert_idx)
         self._expert_cache[expert_idx] = cached
         return cached
 
