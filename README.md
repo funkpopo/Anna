@@ -1,8 +1,6 @@
-# Anna (SYCL Branch)
+# Anna
 
-`sycl` 分支面向 Intel Arc `xpu` 推理路径，包含一个用 DPC++/SYCL 构建的自定义 fused op，用来加速 Qwen3 线性注意力中的 gated-delta 计算。
-
-当前分支的重点不是“通用跨平台安装”，而是：
+## 环境要求（本地开发和测试，未经Linux平台验证）
 
 - Windows + Intel Arc 显卡
 - PyTorch `xpu`
@@ -26,7 +24,7 @@
 
 ## 推荐环境
 
-当前分支默认按下面的环境准备：
+当前 `main` 分支默认按下面的环境准备：
 
 - Windows 11
 - Python 3.11 或 3.12
@@ -38,12 +36,11 @@
 
 ## 环境配置
 
-### 1. 克隆并切到 `sycl` 分支
+### 1. 克隆仓库（`main` 已包含 SYCL）
 
 ```powershell
-git clone <your-repo-url> Anna
+git clone -b main <your-repo-url> Anna
 cd Anna
-git checkout sycl
 ```
 
 ### 2. 创建 Conda 环境
@@ -83,16 +80,23 @@ pip install -e .
 pip install -e ".[dev]"
 ```
 
+注意：
+
+- `pip install -e .` 只会安装 Python 包，不会自动编译 SYCL fused op
+- 安装完成后必须继续执行下面的 `python tools\build_gated_delta_fused_op.py`
+
 ### 5. 准备编译器环境
 
 当前构建脚本默认使用下面两个路径：
 
-- oneAPI 编译器：`D:\Intel\oneAPI\compiler\2025.3\bin\dpcpp.exe`
+- oneAPI 编译器：`PATH:\Intel\oneAPI\compiler\2025.3\bin\dpcpp.exe`
 - MSVC 环境脚本：`C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat`
 
-如果你的安装路径不同，需要修改 [tools/build_gated_delta_fused_op.py](/D:/Projects/Anna/tools/build_gated_delta_fused_op.py) 里的这两个路径。
+如果你的安装路径不同，需要修改 `tools/build_gated_delta_fused_op.py` 里的这两个路径。
 
 ### 6. 编译 SYCL fused op
+
+这是当前 `main` 分支在 Intel Arc `xpu` 环境下的必需步骤：
 
 ```powershell
 python tools\build_gated_delta_fused_op.py
@@ -147,7 +151,7 @@ D:\Projects\Anna\models\Qwen\Qwen3___5-2B
 anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16
 ```
 
-与你当前分支/环境一致的示例：
+与你当前 `main` 分支/环境一致的示例：
 
 ```powershell
 anna-serve `
@@ -290,14 +294,3 @@ anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16 --metrics-
 - 改了 SYCL 源码后，先重新执行 `python tools\build_gated_delta_fused_op.py`
 - 再执行 `pytest tests\test_fused_op_xpu.py -q`
 - 最后再重启 `anna-serve`
-
-## 当前分支定位
-
-`sycl` 分支适合做下面几类工作：
-
-- Intel Arc `xpu` 推理调试
-- 自定义 SYCL fused op 开发
-- Windows + oneAPI 本地部署
-- 运行时/调度/缓存行为验证
-
-如果你要的是“最通用、最少本地编译依赖”的部署方式，这个分支不是首选；它更偏底层调优和 Arc/XPU 实验分支。
