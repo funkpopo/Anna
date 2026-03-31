@@ -284,6 +284,16 @@ class DeviceContext:
         if callable(synchronize):
             synchronize()
 
+    def release_unused_memory(self) -> None:
+        if self.device.type != "xpu":
+            return
+        xpu = _xpu_module()
+        if xpu is None:
+            return
+        empty_cache = getattr(xpu, "empty_cache", None)
+        if callable(empty_cache):
+            empty_cache()
+
     def synchronize(self) -> None:
         if self.device.type == "xpu":
             xpu = _xpu_module()

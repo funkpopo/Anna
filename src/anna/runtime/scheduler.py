@@ -181,9 +181,12 @@ class AnnaScheduler:
         configured_chunk_size = int(getattr(self.engine.optimization_config, "prefill_chunk_size", 0))
         outputs = None
         past_key_values = None
+        prompt_tokens_recorded = 0
+        metrics = getattr(self.engine, "metrics", None)
 
         try:
             if configured_chunk_size > 0 and prompt_length > configured_chunk_size:
+                past_key_values = self.engine._reserve_prefill_cache(batched)
                 for start_idx in range(0, prompt_length, configured_chunk_size):
                     end_idx = min(prompt_length, start_idx + configured_chunk_size)
                     chunk = PreparedInputs(
@@ -204,6 +207,11 @@ class AnnaScheduler:
                             logits_to_keep=1,
                         )
                     past_key_values = outputs.past_key_values
+                    if metrics is not None:
+                        chunk_tokens = (end_idx - start_idx) * len(requests)
+                        if chunk_tokens > 0:
+                            metrics.record_prompt_tokens(chunk_tokens)
+                            prompt_tokens_recorded += chunk_tokens
             else:
                 batched = self.engine.device_context.move_prepared_inputs(batched)
                 with self.engine.execution_lock:
@@ -215,6 +223,7 @@ class AnnaScheduler:
                         use_cache=True,
                         logits_to_keep=1,
                     )
+                    past_key_values = outputs.past_key_values
         except RuntimeError as exc:
             release = getattr(past_key_values, "release", None)
             if callable(release):
@@ -224,9 +233,9 @@ class AnnaScheduler:
         if outputs is None:
             raise RuntimeError("Scheduler prefill did not produce model outputs.")
 
-        metrics = getattr(self.engine, "metrics", None)
-        if metrics is not None:
-            metrics.record_prompt_tokens(sum(request.prompt_length for request in requests))
+        total_prompt_tokens = sum(request.prompt_length for request in requests)
+        if metrics is not None and prompt_tokens_recorded < total_prompt_tokens:
+            metrics.record_prompt_tokens(total_prompt_tokens - prompt_tokens_recorded)
         split_caches = outputs.past_key_values.split_batch() if outputs.past_key_values is not None else [None] * len(requests)
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
         active: list[SchedulerRequest] = []
@@ -405,6 +414,7 @@ class AnnaScheduler:
             request.done.set()
             if metrics is not None:
                 metrics.record_request_finished(success=True)
+            self.engine._trim_runtime_cache_if_idle()
             return
 
         from anna.runtime.engine import TextGenerationResult
@@ -419,6 +429,7 @@ class AnnaScheduler:
         request.done.set()
         if metrics is not None:
             metrics.record_request_finished(success=True)
+        self.engine._trim_runtime_cache_if_idle()
 
     def _build_perf_stats(self, request: SchedulerRequest):
         started_at = request.generation_started_at
@@ -477,3 +488,4 @@ class AnnaScheduler:
         request.done.set()
         if metrics is not None:
             metrics.record_request_finished(success=False)
+        self.engine._trim_runtime_cache_if_idle()

@@ -59,6 +59,44 @@ class Qwen3PagedLayerAllocator:
         for page_id in reversed(page_ids):
             self.free_pages.append(page_id)
 
+    def capacity(self) -> int:
+        if self.key_pages is None:
+            return 0
+        return int(self.key_pages.shape[0])
+
+    def used_pages(self) -> int:
+        capacity = self.capacity()
+        return max(0, min(capacity, capacity - len(self.free_pages)))
+
+    def ensure_capacity(
+        self,
+        required_pages: int,
+        *,
+        key_template: torch.Tensor,
+        value_template: torch.Tensor,
+    ) -> int:
+        normalized_required = max(0, int(required_pages))
+        current_capacity = self.capacity()
+        if normalized_required <= current_capacity:
+            return current_capacity
+        newly_added = self._grow(
+            normalized_required - current_capacity,
+            key_template=key_template,
+            value_template=value_template,
+        )
+        for page_id in reversed(newly_added):
+            self.free_pages.append(page_id)
+        return self.capacity()
+
+    def trim(self) -> int:
+        capacity = self.capacity()
+        if capacity <= 0 or self.used_pages() > 0:
+            return 0
+        self.key_pages = None
+        self.value_pages = None
+        self.free_pages.clear()
+        return capacity
+
     def _grow(
         self,
         num_pages: int,
@@ -137,6 +175,23 @@ class Qwen3PageAllocator:
         if page_ids:
             self.layers[layer_idx].free(page_ids)
 
+    def ensure_capacity(
+        self,
+        layer_idx: int,
+        required_pages: int,
+        *,
+        key_template: torch.Tensor,
+        value_template: torch.Tensor,
+    ) -> int:
+        return self.layers[layer_idx].ensure_capacity(
+            required_pages,
+            key_template=key_template,
+            value_template=value_template,
+        )
+
+    def trim(self) -> int:
+        return sum(layer.trim() for layer in self.layers)
+
     def to(
         self,
         *,
@@ -177,7 +232,11 @@ class Qwen3DynamicCache:
         self.visible_cache_capacities: list[int] = [0 for _ in range(config.num_hidden_layers)]
         self.seen_tokens = 0
         self.rope_deltas: torch.Tensor | None = None
+        self.reserved_seq_capacity = 0
         self._released = False
+
+    def reserve_sequence_capacity(self, seq_length: int) -> None:
+        self.reserved_seq_capacity = max(0, int(seq_length))
 
     @property
     def has_previous_state(self) -> bool:
@@ -213,7 +272,10 @@ class Qwen3DynamicCache:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         key_buffer = self.visible_key_caches[layer_idx]
         value_buffer = self.visible_value_caches[layer_idx]
-        required_capacity = self._next_visible_cache_capacity(layer_idx, required_length)
+        required_capacity = self._next_visible_cache_capacity(
+            layer_idx,
+            max(required_length, self.reserved_seq_capacity),
+        )
         compatible = (
             key_buffer is not None
             and value_buffer is not None
@@ -297,11 +359,21 @@ class Qwen3DynamicCache:
         batch_size, _, append_length, _ = key_states.shape
         self._ensure_batch_size(batch_size)
         past_lengths = torch.tensor(self.layer_lengths[layer_idx], device=key_states.device, dtype=torch.long)
+        reserved_length = max(append_length, self.reserved_seq_capacity)
+        required_blocks_hint = (reserved_length + self.block_size - 1) // self.block_size
+        if required_blocks_hint > 0:
+            self.allocator.ensure_capacity(
+                layer_idx,
+                required_blocks_hint * batch_size,
+                key_template=key_states,
+                value_template=value_states,
+            )
 
         for batch_idx in range(batch_size):
             current_length = self.layer_lengths[layer_idx][batch_idx]
             required_length = current_length + append_length
-            required_blocks = (required_length + self.block_size - 1) // self.block_size
+            reserved_required_length = max(required_length, self.reserved_seq_capacity)
+            required_blocks = (reserved_required_length + self.block_size - 1) // self.block_size
             page_table = self.page_tables[layer_idx][batch_idx]
             if len(page_table) < required_blocks:
                 page_table.extend(
@@ -465,6 +537,7 @@ class Qwen3DynamicCache:
             stacked.layer_lengths[layer_idx] = [row.layer_lengths[layer_idx][0] for row in rows]
         stacked.seen_tokens = max(stacked.get_seq_lengths().tolist(), default=0)
         stacked.rope_deltas = None if rows[0].rope_deltas is None else torch.cat([row.rope_deltas for row in rows], dim=0)
+        stacked.reserved_seq_capacity = max((row.reserved_seq_capacity for row in rows), default=0)
 
         for layer_idx in range(config.num_hidden_layers):
             stacked.page_tables[layer_idx] = [list(row.page_tables[layer_idx][0]) for row in rows]
@@ -497,6 +570,7 @@ class Qwen3DynamicCache:
             for layer_idx in range(self.config.num_hidden_layers):
                 cache.layer_lengths[layer_idx][0] = self.layer_lengths[layer_idx][batch_idx]
             cache.seen_tokens = cache.get_seq_length()
+            cache.reserved_seq_capacity = self.reserved_seq_capacity
 
         if self.rope_deltas is not None:
             rope_chunks = self.rope_deltas.split(1, dim=0)
@@ -522,6 +596,7 @@ class Qwen3DynamicCache:
             cloned.visible_cache_capacities[layer_idx] = self.visible_cache_capacities[layer_idx]
 
         cloned.seen_tokens = self.seen_tokens
+        cloned.reserved_seq_capacity = self.reserved_seq_capacity
         if self.rope_deltas is not None:
             cloned.rope_deltas = self.rope_deltas.clone()
 
@@ -575,6 +650,7 @@ class Qwen3DynamicCache:
 
         self.seen_tokens = 0
         self.rope_deltas = None
+        self.reserved_seq_capacity = 0
         self._released = True
 
     def to(
