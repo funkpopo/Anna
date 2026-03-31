@@ -273,6 +273,10 @@ class AnnaEngine:
         self.optimization_config = self._normalize_optimization_config(optimization_config)
         self.cache_allocator = Qwen3PageAllocator(self.config.text_config)
         self.full_attention_cache_mirror = bool(self.cache_allocator.full_attention_layer_indices)
+        self.optimization_config = replace(
+            self.optimization_config,
+            prefill_chunk_size=self._resolve_prefill_chunk_size(self.optimization_config.prefill_chunk_size),
+        )
         self._attach_cache_allocator()
         self.execution_lock = threading.Lock()
         self.scheduler = None
@@ -292,6 +296,58 @@ class AnnaEngine:
             prompt_cache_size=max(0, int(config.prompt_cache_size)),
             profile_runtime=bool(config.profile_runtime),
         )
+
+    def _resolve_prefill_chunk_size(self, requested_chunk_size: int) -> int:
+        if requested_chunk_size > 0:
+            return requested_chunk_size
+        device = getattr(self.device_context, "device", torch.device("cpu"))
+        if device.type != "xpu":
+            return 0
+
+        text_config = self.config.text_config
+        bytes_per_elem = self.device_context.element_size(self.device_context.dtype)
+        full_layers = sum(1 for layer_type in text_config.layer_types if layer_type == "full_attention")
+        linear_layers = max(0, int(text_config.num_hidden_layers) - full_layers)
+        per_token_kv_bytes = (
+            full_layers
+            * 2
+            * int(text_config.num_key_value_heads)
+            * int(text_config.head_dim)
+            * bytes_per_elem
+        )
+        if self.full_attention_cache_mirror:
+            per_token_kv_bytes *= 2
+        per_token_hidden_bytes = int(text_config.hidden_size) * bytes_per_elem * 8
+        per_token_linear_bytes = linear_layers * (
+            (
+                int(text_config.linear_num_key_heads) * int(text_config.linear_key_head_dim) * 2
+            )
+            + (
+                int(text_config.linear_num_value_heads) * int(text_config.linear_value_head_dim)
+            )
+        ) * bytes_per_elem
+        estimated_bytes_per_token = max(1, per_token_kv_bytes + per_token_hidden_bytes + per_token_linear_bytes)
+
+        memory_info = self.device_context.get_memory_info()
+        if memory_info is None:
+            target_chunk_budget = 96 << 20
+        else:
+            available_budget = max(
+                64 << 20,
+                min(memory_info.free_bytes // 8, 256 << 20),
+            )
+            target_chunk_budget = available_budget
+
+        auto_chunk = int(target_chunk_budget // estimated_bytes_per_token)
+        resolved = max(128, min(2048, auto_chunk))
+        logger.info(
+            "Enabled auto prefill chunking on %s: chunk_size=%s estimated_bytes_per_token=%s target_budget=%s",
+            self.device_context.device,
+            resolved,
+            _format_bytes(estimated_bytes_per_token),
+            _format_bytes(target_chunk_budget),
+        )
+        return resolved
 
     def _apply_runtime_optimizations(self) -> None:
         text_model = self._text_model(self.model)
@@ -599,8 +655,6 @@ class AnnaEngine:
             raise ValueError(f"Unsupported weight quant mode: {requested_quant}")
         if device_context.device.type != "xpu":
             return "none"
-        if resolved_offload_mode == "experts" or config.text_config.is_moe_model:
-            return "none"
         if normalized != "auto":
             return normalized
         if getattr(config, "quantization_config", None) is not None and config.quantization_config.is_enabled:
@@ -611,7 +665,8 @@ class AnnaEngine:
             return "none"
 
         weight_bytes = estimate_model_weight_bytes(model_path)
-        if weight_bytes > int(memory_info.total_bytes * 0.85):
+        usage_threshold = 0.70 if resolved_offload_mode == "experts" or config.text_config.is_moe_model else 0.85
+        if weight_bytes > int(memory_info.total_bytes * usage_threshold):
             return "int4"
         return "none"
 
@@ -623,16 +678,23 @@ class AnnaEngine:
         device: torch.device,
         compute_dtype: torch.dtype,
     ) -> int:
-        text_model = cls._text_model(model)
-        if text_model is None:
-            return 0
+        def _should_quantize(module_name: str, _module: torch.nn.Module) -> bool:
+            normalized = module_name.replace("\\", "/")
+            return (
+                ".visual." not in normalized
+                and not normalized.startswith("model.visual.")
+                and ".mlp.experts." not in normalized
+                and ".mlp._expert_cache." not in normalized
+            )
+
         replacements = convert_module_linears_to_xpu_int4(
-            text_model,
+            model,
             compute_dtype=compute_dtype,
             device=device,
+            include_predicate=_should_quantize,
         )
         logger.info(
-            "Runtime dense text int4 quantization: replacements=%s device=%s compute_dtype=%s",
+            "Runtime dense XPU int4 quantization: replacements=%s device=%s compute_dtype=%s",
             replacements,
             device,
             compute_dtype,
@@ -1015,14 +1077,14 @@ class AnnaEngine:
     def generate_text(self, prompt: str, *, config: GenerationConfig) -> TextGenerationResult:
         prepared = self.processor.encode_text(
             prompt,
-            tensor_device=self.device_context.device,
+            tensor_device=self._preprocess_device(),
         )
         return self._generate(prepared, config=config)
 
     def stream_text(self, prompt: str, *, config: GenerationConfig) -> Iterator[StreamEvent]:
         prepared = self.processor.encode_text(
             prompt,
-            tensor_device=self.device_context.device,
+            tensor_device=self._preprocess_device(),
         )
         yield from self._stream(prepared, config=config)
 
@@ -1089,7 +1151,7 @@ class AnnaEngine:
             return self.processor.prepare_messages(
                 messages,
                 enable_thinking=enable_thinking,
-                tensor_device=self.device_context.device,
+                tensor_device=self._preprocess_device(),
                 tensor_dtype=self.device_context.dtype,
             )
         except FileNotFoundError as exc:
@@ -1098,6 +1160,15 @@ class AnnaEngine:
             raise AnnaEngineError(str(exc), status_code=400) from exc
         except RuntimeError as exc:
             raise AnnaEngineError(str(exc), status_code=500, error_type="server_error") from exc
+
+    def _preprocess_device(self) -> torch.device:
+        migration_policy = getattr(self.device_context, "migration_policy", None)
+        preprocess_device = getattr(migration_policy, "preprocess_device", None)
+        if isinstance(preprocess_device, torch.device):
+            return preprocess_device
+        if preprocess_device is not None:
+            return torch.device(preprocess_device)
+        return self.device_context.device
 
     def _can_use_scheduler(self, prepared: PreparedInputs) -> bool:
         return (
@@ -1313,43 +1384,49 @@ class AnnaEngine:
         outputs = None
         chunk_size = self.optimization_config.prefill_chunk_size
 
-        if chunk_size > 0 and not self._has_multimodal_inputs(prepared) and int(input_ids.shape[1]) > chunk_size:
-            total_tokens = int(input_ids.shape[1])
-            for start_idx in range(0, total_tokens, chunk_size):
-                end_idx = min(total_tokens, start_idx + chunk_size)
+        try:
+            if chunk_size > 0 and not self._has_multimodal_inputs(prepared) and int(input_ids.shape[1]) > chunk_size:
+                total_tokens = int(input_ids.shape[1])
+                for start_idx in range(0, total_tokens, chunk_size):
+                    end_idx = min(total_tokens, start_idx + chunk_size)
+                    outputs = self._profiled_forward_generation_model(
+                        stage=f"prefill[{start_idx}:{end_idx}]",
+                        input_ids=input_ids[:, start_idx:end_idx],
+                        attention_mask=attention_mask[:, :end_idx] if start_idx == 0 else None,
+                        past_key_values=past_key_values,
+                        pixel_values=pixel_values,
+                        pixel_values_videos=pixel_values_videos,
+                        image_grid_thw=image_grid_thw,
+                        video_grid_thw=video_grid_thw,
+                        mm_token_type_ids=mm_token_type_ids[:, start_idx:end_idx] if mm_token_type_ids is not None else None,
+                        use_cache=True,
+                        logits_to_keep=1,
+                    )
+                    past_key_values = outputs.past_key_values
+                    pixel_values = None
+                    image_grid_thw = None
+                    pixel_values_videos = None
+                    video_grid_thw = None
+            else:
                 outputs = self._profiled_forward_generation_model(
-                    stage=f"prefill[{start_idx}:{end_idx}]",
-                    input_ids=input_ids[:, start_idx:end_idx],
-                    attention_mask=attention_mask[:, :end_idx] if start_idx == 0 else None,
-                    past_key_values=past_key_values,
+                    stage="prefill",
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=None,
                     pixel_values=pixel_values,
                     pixel_values_videos=pixel_values_videos,
                     image_grid_thw=image_grid_thw,
                     video_grid_thw=video_grid_thw,
-                    mm_token_type_ids=mm_token_type_ids[:, start_idx:end_idx] if mm_token_type_ids is not None else None,
+                    mm_token_type_ids=mm_token_type_ids,
                     use_cache=True,
                     logits_to_keep=1,
                 )
                 past_key_values = outputs.past_key_values
-                pixel_values = None
-                image_grid_thw = None
-                pixel_values_videos = None
-                video_grid_thw = None
-        else:
-            outputs = self._profiled_forward_generation_model(
-                stage="prefill",
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=None,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                mm_token_type_ids=mm_token_type_ids,
-                use_cache=True,
-                logits_to_keep=1,
-            )
-            past_key_values = outputs.past_key_values
+        except Exception:
+            release = getattr(past_key_values, "release", None)
+            if callable(release):
+                release()
+            raise
 
         if outputs is None:
             raise RuntimeError("Prompt prefill did not produce model outputs.")

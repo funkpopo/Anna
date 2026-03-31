@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -294,7 +295,8 @@ class XPUInt4Linear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
-        if x_2d.shape[-1] < self.padded_in_features:
+        uses_xpu_kernel = x_2d.device.type == "xpu" and self.qweight.device.type == "xpu"
+        if uses_xpu_kernel and x_2d.shape[-1] < self.padded_in_features:
             x_padded = torch.zeros(
                 (x_2d.shape[0], self.padded_in_features),
                 dtype=self.compute_dtype,
@@ -304,7 +306,7 @@ class XPUInt4Linear(nn.Module):
         else:
             x_padded = x_2d.to(dtype=self.compute_dtype)
 
-        if x_padded.device.type == "xpu" and self.qweight.device.type == "xpu":
+        if uses_xpu_kernel:
             output = torch.ops.aten._weight_int4pack_mm_with_scales_and_zeros(
                 x_padded,
                 self.qweight,
@@ -425,6 +427,7 @@ def convert_module_linears_to_xpu_int4(
     group_size: int = 128,
     compute_dtype: torch.dtype | None = None,
     device: torch.device | str = torch.device("xpu"),
+    include_predicate: Callable[[str, nn.Module], bool] | None = None,
 ) -> int:
     replacements: list[tuple[str, XPUInt4Linear]] = []
     for module_name, child in list(module.named_modules()):
@@ -433,6 +436,8 @@ def convert_module_linears_to_xpu_int4(
         if isinstance(child, XPUInt4Linear):
             continue
         if not isinstance(child, (FP8Linear, AWQLinear, DenseLinear, nn.Linear)):
+            continue
+        if include_predicate is not None and not include_predicate(module_name, child):
             continue
         replacements.append(
             (

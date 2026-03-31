@@ -389,3 +389,56 @@ def test_auto_weight_quantization_promotes_oversized_dense_xpu_models(monkeypatc
     )
 
     assert resolved == "int4"
+
+
+def test_auto_weight_quantization_can_promote_oversized_expert_offload_models(monkeypatch) -> None:
+    config = SimpleNamespace(
+        text_config=Qwen3TextConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            vocab_size=256,
+            max_position_embeddings=128,
+            layer_types=["linear_attention", "full_attention", "linear_attention", "full_attention"],
+            rope_parameters=RopeParameters(
+                rope_type="default",
+                rope_theta=10000.0,
+                partial_rotary_factor=0.25,
+                mrope_section=(1, 1, 0),
+            ),
+            decoder_sparse_step=1,
+            moe_intermediate_size=96,
+            shared_expert_intermediate_size=128,
+            num_experts=4,
+            num_experts_per_tok=2,
+        ),
+        quantization_config=QuantizationConfig(),
+        vision_config=None,
+    )
+    fake_device_context = SimpleNamespace(
+        device=torch.device("xpu"),
+        get_memory_info=lambda: DeviceMemoryInfo(
+            free_bytes=16 << 30,
+            total_bytes=16 << 30,
+            allocated_bytes=0,
+            reserved_bytes=0,
+        ),
+    )
+    monkeypatch.setattr("anna.runtime.engine.estimate_model_weight_bytes", lambda _model_path: 14 << 30)
+
+    resolved = AnnaEngine._resolve_weight_quant(
+        requested_quant="auto",
+        resolved_offload_mode="experts",
+        model_path=SimpleNamespace(),
+        config=config,
+        device_context=fake_device_context,
+    )
+
+    assert resolved == "int4"

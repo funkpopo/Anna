@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterator
@@ -38,6 +39,8 @@ class SchedulerRequest:
     error: "AnnaEngineError | None" = None
     done: threading.Event = field(default_factory=threading.Event)
     events: queue.Queue[object] = field(default_factory=queue.Queue)
+    generation_started_at: float | None = None
+    first_token_at: float | None = None
 
 
 class AnnaScheduler:
@@ -54,6 +57,7 @@ class AnnaScheduler:
         self._pending: deque[SchedulerRequest] = deque()
         self._condition = threading.Condition()
         self._stop = False
+        self._fatal_error: AnnaEngineError | None = None
         self._worker = threading.Thread(target=self._run_loop, name="anna-scheduler", daemon=True)
         self._worker.start()
 
@@ -83,6 +87,8 @@ class AnnaScheduler:
             yield item
 
     def _submit(self, prepared: PreparedInputs, *, config: "GenerationConfig", stream: bool) -> SchedulerRequest:
+        if self._fatal_error is not None:
+            raise self._fatal_error
         request = SchedulerRequest(prepared=prepared, config=config, stream=stream)
         metrics = getattr(self.engine, "metrics", None)
         if metrics is not None:
@@ -94,48 +100,58 @@ class AnnaScheduler:
 
     def _run_loop(self) -> None:
         active: list[SchedulerRequest] = []
-        while True:
+        try:
+            while True:
+                with self._condition:
+                    while not self._stop and not self._pending and not active:
+                        self._condition.wait()
+                    if self._stop and not self._pending and not active:
+                        return
+                    if not active and self._pending and self.batch_wait_seconds > 0:
+                        self._condition.wait(timeout=self.batch_wait_seconds)
+
+                    pending_batch: list[SchedulerRequest] = []
+                    while self._pending and len(pending_batch) < self.max_batch_size:
+                        pending_batch.append(self._pending.popleft())
+
+                if pending_batch:
+                    try:
+                        active.extend(self._prefill_batch(pending_batch))
+                    except Exception as exc:  # pragma: no cover - worker-level best effort
+                        self._fail_requests(pending_batch, self._normalize_error(exc))
+
+                if not active:
+                    continue
+
+                next_active: list[SchedulerRequest] = []
+                ready = [request for request in active if request.past_key_values is not None]
+                for request in active:
+                    if request.past_key_values is None:
+                        self._fail_request(request, RuntimeError("Missing decode cache for active request."))
+
+                for chunk_start in range(0, len(ready), self.max_batch_size):
+                    chunk = ready[chunk_start : chunk_start + self.max_batch_size]
+                    try:
+                        next_active.extend(self._decode_batch(chunk))
+                    except Exception as exc:  # pragma: no cover - worker-level best effort
+                        self._fail_requests(chunk, self._normalize_error(exc))
+
+                active = next_active
+        except BaseException as exc:  # pragma: no cover - catastrophic worker failure
+            pending: list[SchedulerRequest] = []
             with self._condition:
-                while not self._stop and not self._pending and not active:
-                    self._condition.wait()
-                if self._stop and not self._pending and not active:
-                    return
-                if not active and self._pending and self.batch_wait_seconds > 0:
-                    self._condition.wait(timeout=self.batch_wait_seconds)
-
-                pending_batch: list[SchedulerRequest] = []
-                while self._pending and len(pending_batch) < self.max_batch_size:
-                    pending_batch.append(self._pending.popleft())
-
-            if pending_batch:
-                try:
-                    active.extend(self._prefill_batch(pending_batch))
-                except Exception as exc:  # pragma: no cover - worker-level best effort
-                    self._fail_requests(pending_batch, self._normalize_error(exc))
-
-            if not active:
-                continue
-
-            next_active: list[SchedulerRequest] = []
-            ready = [request for request in active if request.past_key_values is not None]
-            for request in active:
-                if request.past_key_values is None:
-                    self._fail_request(request, RuntimeError("Missing decode cache for active request."))
-
-            for chunk_start in range(0, len(ready), self.max_batch_size):
-                chunk = ready[chunk_start : chunk_start + self.max_batch_size]
-                try:
-                    next_active.extend(self._decode_batch(chunk))
-                except Exception as exc:  # pragma: no cover - worker-level best effort
-                    self._fail_requests(chunk, self._normalize_error(exc))
-
-            active = next_active
+                while self._pending:
+                    pending.append(self._pending.popleft())
+            fatal = self._normalize_worker_crash(exc)
+            self._fatal_error = fatal
+            self._fail_requests(active + pending, fatal)
 
     def _prefill_batch(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest]:
         metrics = getattr(self.engine, "metrics", None)
         if metrics is not None:
             metrics.record_requests_started_from_queue(len(requests))
         for request in requests:
+            request.generation_started_at = time.perf_counter()
             request.prompt_ids, request.prompt_length, request.config = self.engine._validate_generation_request(
                 request.prepared,
                 config=request.config,
@@ -161,18 +177,52 @@ class AnnaScheduler:
     def _prefill_same_length_group(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest]:
         batched = self._batch_text_inputs(requests)
         self._guard_batch_memory(requests)
-        batched = self.engine.device_context.move_prepared_inputs(batched)
+        prompt_length = int(batched.input_ids.shape[1])
+        configured_chunk_size = int(getattr(self.engine.optimization_config, "prefill_chunk_size", 0))
+        outputs = None
+        past_key_values = None
 
         try:
-            with self.engine.execution_lock:
-                outputs = self.engine._forward_generation_model(
-                    input_ids=batched.input_ids,
-                    attention_mask=batched.attention_mask,
-                    use_cache=True,
-                    logits_to_keep=1,
-                )
+            if configured_chunk_size > 0 and prompt_length > configured_chunk_size:
+                for start_idx in range(0, prompt_length, configured_chunk_size):
+                    end_idx = min(prompt_length, start_idx + configured_chunk_size)
+                    chunk = PreparedInputs(
+                        prompt="",
+                        input_ids=batched.input_ids[:, start_idx:end_idx],
+                        attention_mask=batched.attention_mask[:, :end_idx] if start_idx == 0 else None,
+                        mm_token_type_ids=batched.mm_token_type_ids[:, start_idx:end_idx],
+                    )
+                    chunk = self.engine.device_context.move_prepared_inputs(chunk)
+                    with self.engine.execution_lock:
+                        outputs = self.engine._profiled_forward_generation_model(
+                            stage=f"scheduler_prefill[{start_idx}:{end_idx}]",
+                            input_ids=chunk.input_ids,
+                            attention_mask=chunk.attention_mask,
+                            past_key_values=past_key_values,
+                            mm_token_type_ids=chunk.mm_token_type_ids,
+                            use_cache=True,
+                            logits_to_keep=1,
+                        )
+                    past_key_values = outputs.past_key_values
+            else:
+                batched = self.engine.device_context.move_prepared_inputs(batched)
+                with self.engine.execution_lock:
+                    outputs = self.engine._profiled_forward_generation_model(
+                        stage="scheduler_prefill",
+                        input_ids=batched.input_ids,
+                        attention_mask=batched.attention_mask,
+                        mm_token_type_ids=batched.mm_token_type_ids,
+                        use_cache=True,
+                        logits_to_keep=1,
+                    )
         except RuntimeError as exc:
+            release = getattr(past_key_values, "release", None)
+            if callable(release):
+                release()
             raise self.engine._handle_runtime_failure(exc) from exc
+
+        if outputs is None:
+            raise RuntimeError("Scheduler prefill did not produce model outputs.")
 
         metrics = getattr(self.engine, "metrics", None)
         if metrics is not None:
@@ -191,6 +241,8 @@ class AnnaScheduler:
                 repetition_penalty=request.config.repetition_penalty,
             )
             token_id = int(next_token.item())
+            if request.first_token_at is None:
+                request.first_token_at = time.perf_counter()
             if token_id in stop_token_ids:
                 self._finish_request(request, finish_reason="stop")
                 continue
@@ -227,7 +279,8 @@ class AnnaScheduler:
 
         try:
             with self.engine.execution_lock:
-                outputs = self.engine._forward_generation_model(
+                outputs = self.engine._profiled_forward_generation_model(
+                    stage="scheduler_decode",
                     input_ids=input_ids,
                     past_key_values=batch_cache,
                     use_cache=True,
@@ -251,6 +304,8 @@ class AnnaScheduler:
                 repetition_penalty=request.config.repetition_penalty,
             )
             token_id = int(next_token.item())
+            if request.first_token_at is None:
+                request.first_token_at = time.perf_counter()
             if token_id in stop_token_ids:
                 self._finish_request(request, finish_reason="stop")
                 continue
@@ -359,10 +414,28 @@ class AnnaScheduler:
             finish_reason=finish_reason,
             prompt_tokens=request.prompt_length,
             completion_tokens=len(request.completion_ids),
+            perf=self._build_perf_stats(request),
         )
         request.done.set()
         if metrics is not None:
             metrics.record_request_finished(success=True)
+
+    def _build_perf_stats(self, request: SchedulerRequest):
+        started_at = request.generation_started_at
+        if started_at is None:
+            return None
+        finished_at = time.perf_counter()
+        first_token_at = request.first_token_at if request.first_token_at is not None else finished_at
+        total_seconds = max(0.0, finished_at - started_at)
+        prefill_seconds = max(0.0, first_token_at - started_at)
+        decode_seconds = max(0.0, finished_at - first_token_at)
+        return self.engine._build_generation_perf_stats(
+            prompt_tokens=request.prompt_length,
+            completion_tokens=len(request.completion_ids),
+            total_seconds=total_seconds,
+            prefill_seconds=prefill_seconds,
+            decode_seconds=decode_seconds,
+        )
 
     def _normalize_error(self, exc: Exception) -> "AnnaEngineError":
         from anna.runtime.engine import AnnaEngineError
@@ -372,6 +445,18 @@ class AnnaScheduler:
         if isinstance(exc, RuntimeError):
             return self.engine._handle_runtime_failure(exc)
         return AnnaEngineError(str(exc), status_code=500, error_type="server_error", code="scheduler_failed")
+
+    def _normalize_worker_crash(self, exc: BaseException) -> "AnnaEngineError":
+        from anna.runtime.engine import AnnaEngineError
+
+        if isinstance(exc, Exception):
+            return self._normalize_error(exc)
+        return AnnaEngineError(
+            f"Scheduler worker crashed: {exc}",
+            status_code=500,
+            error_type="server_error",
+            code="scheduler_worker_failed",
+        )
 
     def _fail_requests(self, requests: list[SchedulerRequest], exc: "AnnaEngineError") -> None:
         for request in requests:

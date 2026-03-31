@@ -411,16 +411,49 @@ def test_engine_leaves_resident_expert_indices_for_auto_estimation_when_unspecif
 
 def test_engine_runtime_weight_quantization_converts_dense_text_linears() -> None:
     model = Qwen3ForCausalLM(_tiny_config())
-    before_bytes = AnnaEngine._module_nbytes(model.model)
+    before_bytes = AnnaEngine._module_nbytes(model)
 
     replacements = AnnaEngine._apply_runtime_weight_quantization(
         model=model,
         device=torch.device("cpu"),
         compute_dtype=torch.bfloat16,
     )
-    after_bytes = AnnaEngine._module_nbytes(model.model)
+    after_bytes = AnnaEngine._module_nbytes(model)
 
     assert replacements > 0
     assert after_bytes < before_bytes
     assert isinstance(model.model.layers[0].linear_attn.in_proj_qkv, XPUInt4Linear)
-    assert isinstance(model.lm_head, torch.nn.Linear)
+    assert isinstance(model.lm_head, XPUInt4Linear)
+
+
+def test_engine_runtime_weight_quantization_skips_sparse_expert_modules() -> None:
+    model = Qwen3ForCausalLM(_tiny_moe_config())
+
+    AnnaEngine._apply_runtime_weight_quantization(
+        model=model,
+        device=torch.device("cpu"),
+        compute_dtype=torch.bfloat16,
+    )
+
+    assert isinstance(model.model.layers[0].mlp.shared_expert.gate_proj, XPUInt4Linear)
+    assert isinstance(model.model.layers[0].mlp.experts[0].gate_proj, torch.nn.Linear)
+    assert isinstance(model.lm_head, XPUInt4Linear)
+
+
+def test_runtime_weight_quantized_lm_head_preserves_forward_shapes() -> None:
+    model = Qwen3ForCausalLM(_tiny_config())
+    model.configure_runtime(torch.device("cpu"))
+    AnnaEngine._apply_runtime_weight_quantization(
+        model=model,
+        device=torch.device("cpu"),
+        compute_dtype=torch.bfloat16,
+    )
+
+    outputs = model(
+        input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
+        attention_mask=torch.ones((1, 3), dtype=torch.long),
+        use_cache=True,
+        logits_to_keep=1,
+    )
+
+    assert outputs.logits.shape == (1, 1, model.config.vocab_size)
