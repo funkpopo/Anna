@@ -742,7 +742,7 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
             hidden_states = hidden_states[:, -logits_to_keep:, :]
-        lm_head_device = self.lm_head.weight.device
+        lm_head_device = _module_device(self.lm_head)
         if hidden_states.device != lm_head_device:
             hidden_states = hidden_states.to(device=lm_head_device)
         logits = self.lm_head(hidden_states)
@@ -809,7 +809,7 @@ class Qwen3ForConditionalGeneration(nn.Module):
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
             hidden_states = hidden_states[:, -logits_to_keep:, :]
-        lm_head_device = self.lm_head.weight.device
+        lm_head_device = _module_device(self.lm_head)
         if hidden_states.device != lm_head_device:
             hidden_states = hidden_states.to(device=lm_head_device)
         logits = self.lm_head(hidden_states)
@@ -846,7 +846,7 @@ class Qwen3ForConditionalGeneration(nn.Module):
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
             hidden_states = hidden_states[:, -logits_to_keep:, :]
-        lm_head_device = self.lm_head.weight.device
+        lm_head_device = _module_device(self.lm_head)
         if hidden_states.device != lm_head_device:
             hidden_states = hidden_states.to(device=lm_head_device)
         logits = self.lm_head(hidden_states)

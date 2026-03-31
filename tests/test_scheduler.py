@@ -6,7 +6,7 @@ from anna.mm.processor import PreparedInputs
 from anna.model.config import Qwen3Config, Qwen3TextConfig
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
 from anna.runtime.device import RuntimeSafetyPolicy
-from anna.runtime.engine import AnnaEngine, GenerationConfig
+from anna.runtime.engine import AnnaEngine, EngineOptimizationConfig, GenerationConfig
 from anna.runtime.scheduler import AnnaScheduler
 
 
@@ -28,6 +28,7 @@ class _FakeTokenizer:
 
 class _FakeDeviceContext:
     def __init__(self) -> None:
+        self.device = torch.device("cpu")
         self.safety_policy = RuntimeSafetyPolicy()
 
     def get_memory_info(self):
@@ -86,6 +87,7 @@ class _FakeModel:
         self.decode_batch_sizes: list[int] = []
         self.text_prefill_batch_sizes: list[int] = []
         self.text_decode_batch_sizes: list[int] = []
+        self.text_prefill_chunk_lengths: list[int] = []
         self.model = _FakePrefillRunner(self)
         self.lm_head = _FakeLMHead(self)
 
@@ -129,9 +131,10 @@ class _FakeModel:
     ):
         del attention_mask, use_cache, logits_to_keep
         batch_size = input_ids.shape[0]
-        if past_key_values is None:
+        if past_key_values is None or input_ids.shape[1] > 1:
             seq_len = input_ids.shape[1]
             self.text_prefill_batch_sizes.append(batch_size)
+            self.text_prefill_chunk_lengths.append(seq_len)
             logits = torch.full((batch_size, 1, self.config.text_config.vocab_size), -1000.0)
             planned = [1, 2]
             for idx in range(batch_size):
@@ -222,6 +225,60 @@ def test_scheduler_batches_same_length_requests() -> None:
         assert snapshot.generation_tokens_total == 2
         assert snapshot.running_requests == 0
         assert snapshot.waiting_requests == 0
+    finally:
+        scheduler.shutdown()
+
+
+def test_scheduler_chunks_long_same_length_prefills() -> None:
+    config = Qwen3Config(
+        text_config=Qwen3TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            vocab_size=16,
+            eos_token_id=9,
+            pad_token_id=0,
+            layer_types=["full_attention"],
+        )
+    )
+    fake_model = _FakeModel(config)
+    engine = AnnaEngine(
+        model=fake_model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="fake",
+        device_context=_FakeDeviceContext(),
+        optimization_config=EngineOptimizationConfig(prefill_chunk_size=2),
+    )
+    scheduler = AnnaScheduler(engine, max_batch_size=4, batch_wait_ms=20.0)
+    engine.set_scheduler(scheduler)
+
+    try:
+        request_a = scheduler._submit(
+            _prepared([4, 5, 6, 7]),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            stream=False,
+        )
+        request_b = scheduler._submit(
+            _prepared([8, 9, 10, 11]),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            stream=False,
+        )
+
+        assert request_a.done.wait(timeout=2.0)
+        assert request_b.done.wait(timeout=2.0)
+        assert request_a.error is None
+        assert request_b.error is None
+        assert fake_model.text_prefill_batch_sizes == [2, 2]
+        assert fake_model.text_prefill_chunk_lengths == [2, 2]
+        assert fake_model.text_decode_batch_sizes == [2]
     finally:
         scheduler.shutdown()
 

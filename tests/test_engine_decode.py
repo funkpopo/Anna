@@ -121,6 +121,67 @@ def test_generate_without_streaming_overhead_decodes_once() -> None:
     assert result.completion_tokens == 3
 
 
+def test_generate_text_prepares_prompt_on_preprocess_device() -> None:
+    class DummyProcessor:
+        def __init__(self) -> None:
+            self.tensor_device = None
+
+        def encode_text(self, prompt: str, *, tensor_device=None):
+            del prompt
+            self.tensor_device = tensor_device
+            return object()
+
+    engine = object.__new__(AnnaEngine)
+    engine.processor = DummyProcessor()
+    engine.device_context = SimpleNamespace(
+        device=torch.device("xpu"),
+        dtype=torch.bfloat16,
+        migration_policy=SimpleNamespace(preprocess_device=torch.device("cpu")),
+    )
+    engine._generate = MethodType(
+        lambda self, prepared, *, config: TextGenerationResult(
+            text="ok",
+            reasoning_text=None,
+            finish_reason="stop",
+            prompt_tokens=1,
+            completion_tokens=1,
+        ),
+        engine,
+    )
+
+    result = engine.generate_text("hello", config=GenerationConfig())
+
+    assert result.text == "ok"
+    assert engine.processor.tensor_device == torch.device("cpu")
+
+
+def test_prepare_messages_uses_preprocess_device_before_xpu_transfer() -> None:
+    class DummyProcessor:
+        def __init__(self) -> None:
+            self.tensor_device = None
+            self.tensor_dtype = None
+
+        def prepare_messages(self, messages, *, enable_thinking: bool, tensor_device=None, tensor_dtype=None):
+            del messages, enable_thinking
+            self.tensor_device = tensor_device
+            self.tensor_dtype = tensor_dtype
+            return object()
+
+    engine = object.__new__(AnnaEngine)
+    engine.processor = DummyProcessor()
+    engine.device_context = SimpleNamespace(
+        device=torch.device("xpu"),
+        dtype=torch.bfloat16,
+        migration_policy=SimpleNamespace(preprocess_device=torch.device("cpu")),
+    )
+
+    prepared = engine._prepare_messages([{"role": "user", "content": "hi"}], enable_thinking=True)
+
+    assert prepared is not None
+    assert engine.processor.tensor_device == torch.device("cpu")
+    assert engine.processor.tensor_dtype == torch.bfloat16
+
+
 def test_generate_chat_keeps_raw_think_tags_when_reasoning_format_is_none() -> None:
     engine = object.__new__(AnnaEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)

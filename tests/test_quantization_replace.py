@@ -65,6 +65,21 @@ def test_convert_module_linears_to_xpu_int4_replaces_supported_linears() -> None
     assert isinstance(model.block[2], XPUInt4Linear)
 
 
+def test_convert_module_linears_to_xpu_int4_respects_include_predicate() -> None:
+    model = _TinyQuantNet()
+    converted = convert_module_linears_to_xpu_int4(
+        model,
+        group_size=32,
+        device=torch.device("cpu"),
+        include_predicate=lambda module_name, _module: module_name.startswith("block."),
+    )
+
+    assert converted == 2
+    assert isinstance(model.proj, nn.Linear)
+    assert isinstance(model.block[0], XPUInt4Linear)
+    assert isinstance(model.block[2], XPUInt4Linear)
+
+
 def test_xpu_int4_linear_cpu_fallback_matches_dense_linear_closely() -> None:
     linear = nn.Linear(32, 16, bias=False)
     with torch.no_grad():

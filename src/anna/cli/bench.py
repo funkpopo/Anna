@@ -48,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--prefill-chunk-size",
         type=_non_negative_int,
         default=0,
-        help="Split long text-only prefills into token chunks. Set 0 to disable.",
+        help="Split long text-only prefills into token chunks. Set 0 to let Anna auto-size the chunk on XPU.",
     )
     parser.add_argument(
         "--prompt-cache-size",
