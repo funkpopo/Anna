@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "anna"
-version = "0.1.0"
+dynamic = ["version"]
 description = "From-scratch Qwen3.5 inference service for Intel Arc with an OpenAI-compatible API."
 requires-python = ">=3.11"
 dependencies = [
@@ -34,6 +34,9 @@ anna-bench = "anna.cli.bench:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "anna.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

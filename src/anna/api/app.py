@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from anna import __version__
 from anna.api.routes import router
 from anna.runtime.engine import AnnaEngineError
 
@@ -47,7 +48,7 @@ def create_app(engine, *, scheduler=None) -> FastAPI:
             if scheduler is not None:
                 scheduler.shutdown()
 
-    app = FastAPI(title="Anna", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Anna", version=__version__, lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
