@@ -14,7 +14,7 @@ import torch
 from anna.mm.processor import PreparedInputs, Qwen3MultimodalProcessor
 from anna.model.quantization import convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
 from anna.model.qwen import Qwen3ForConditionalGeneration
-from anna.model.ops import Qwen3PageAllocator, Qwen3SparseMoeBlock
+from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
@@ -332,9 +332,11 @@ class AnnaEngine:
         if memory_info is None:
             target_chunk_budget = 96 << 20
         else:
+            policy = self.device_context.safety_policy
+            available_budget = max(0, memory_info.free_bytes - policy.reserve_margin_bytes)
             available_budget = max(
                 64 << 20,
-                min(memory_info.free_bytes // 8, 256 << 20),
+                min(max(available_budget // 6, 256 << 20), 1024 << 20),
             )
             target_chunk_budget = available_budget
 
@@ -966,6 +968,35 @@ class AnnaEngine:
         if text_model is not None and hasattr(text_model, "cache_allocator"):
             text_model.cache_allocator = self.cache_allocator
 
+    def _reserve_prefill_cache(self, prepared: PreparedInputs) -> Qwen3DynamicCache | None:
+        config = getattr(self, "config", None)
+        allocator = getattr(self, "cache_allocator", None)
+        text_config = getattr(config, "text_config", None)
+        if text_config is None or allocator is None:
+            return None
+        batch_size = int(prepared.input_ids.shape[0])
+        cache = Qwen3DynamicCache(
+            text_config,
+            allocator=allocator,
+            batch_size=batch_size,
+        )
+        cache.reserve_sequence_capacity(int(prepared.input_ids.shape[1]))
+        return cache
+
+    def _trim_runtime_cache_if_idle(self) -> None:
+        metrics = getattr(self, "metrics", None)
+        if metrics is not None:
+            snapshot = metrics.snapshot()
+            if snapshot.running_requests > 0 or snapshot.waiting_requests > 0:
+                return
+        trimmed_pages = self.cache_allocator.trim()
+        if trimmed_pages <= 0:
+            return
+        release_unused_memory = getattr(self.device_context, "release_unused_memory", None)
+        if callable(release_unused_memory):
+            release_unused_memory()
+        logger.info("Trimmed idle KV cache pages: released_pages=%s", trimmed_pages)
+
     def set_scheduler(self, scheduler: object | None) -> None:
         self.scheduler = scheduler
 
@@ -1383,9 +1414,11 @@ class AnnaEngine:
         past_key_values = None
         outputs = None
         chunk_size = self.optimization_config.prefill_chunk_size
+        prompt_tokens_recorded = 0
 
         try:
             if chunk_size > 0 and not self._has_multimodal_inputs(prepared) and int(input_ids.shape[1]) > chunk_size:
+                past_key_values = self._reserve_prefill_cache(prepared)
                 total_tokens = int(input_ids.shape[1])
                 for start_idx in range(0, total_tokens, chunk_size):
                     end_idx = min(total_tokens, start_idx + chunk_size)
@@ -1403,6 +1436,11 @@ class AnnaEngine:
                         logits_to_keep=1,
                     )
                     past_key_values = outputs.past_key_values
+                    if metrics is not None:
+                        chunk_tokens = end_idx - start_idx
+                        if chunk_tokens > 0:
+                            metrics.record_prompt_tokens(chunk_tokens)
+                            prompt_tokens_recorded += chunk_tokens
                     pixel_values = None
                     image_grid_thw = None
                     pixel_values_videos = None
@@ -1438,8 +1476,8 @@ class AnnaEngine:
             past_key_values=past_key_values,
             prompt_tokens=int(prepared.input_ids.shape[1]),
         )
-        if metrics is not None:
-            metrics.record_prompt_tokens(prompt_tokens)
+        if metrics is not None and prompt_tokens_recorded < prompt_tokens:
+            metrics.record_prompt_tokens(prompt_tokens - prompt_tokens_recorded)
         return PromptPrefillResult(
             logits=logits,
             past_key_values=past_key_values,
@@ -1820,6 +1858,7 @@ class AnnaEngine:
         finally:
             if metrics is not None:
                 metrics.record_request_finished(success=success)
+            self._trim_runtime_cache_if_idle()
 
     def _generate_direct(self, prepared: PreparedInputs, *, config: GenerationConfig) -> TextGenerationResult:
         if not config.stop_strings:
@@ -1885,6 +1924,7 @@ class AnnaEngine:
         finally:
             if metrics is not None:
                 metrics.record_request_finished(success=success)
+            self._trim_runtime_cache_if_idle()
 
     def _stream_direct(self, prepared: PreparedInputs, *, config: GenerationConfig) -> Iterator[StreamEvent]:
         for delta, finished, reason, _, _, _ in self._iter_generation(prepared, config):

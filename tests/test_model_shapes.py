@@ -258,6 +258,39 @@ def test_dynamic_cache_release_reuses_freed_pages() -> None:
     assert cache_b.page_tables[1][0] == first_page_ids
 
 
+def test_dynamic_cache_reserve_sequence_capacity_preallocates_pages_and_visible_buffers() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config)
+    cache = Qwen3DynamicCache(config, allocator=allocator)
+    cache.reserve_sequence_capacity(config.cache_block_size * 20)
+    key = torch.randn(1, 2, 1, 16)
+    value = torch.randn(1, 2, 1, 16)
+
+    visible_key, visible_value, _ = cache.update(key, value, layer_idx=1)
+
+    assert allocator.layers[1].capacity() >= 20
+    assert cache.visible_cache_capacities[1] >= config.cache_block_size * 20
+    assert visible_key.shape[-2] == 1
+    assert visible_value.shape[-2] == 1
+
+
+def test_page_allocator_trim_releases_idle_page_storage() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config)
+    cache = Qwen3DynamicCache(config, allocator=allocator)
+    key = torch.randn(1, 2, config.cache_block_size, 16)
+    value = torch.randn(1, 2, config.cache_block_size, 16)
+
+    cache.update(key, value, layer_idx=1)
+    cache.release()
+    trimmed_pages = allocator.trim()
+
+    assert trimmed_pages > 0
+    assert allocator.layers[1].key_pages is None
+    assert allocator.layers[1].value_pages is None
+    assert allocator.layers[1].free_pages == []
+
+
 def test_recurrent_gated_delta_rule_single_token_fast_path_matches_general_path() -> None:
     with _temporary_torch_seed(0):
         query = torch.randn(2, 1, 3, 4)

@@ -182,6 +182,60 @@ def test_prepare_messages_uses_preprocess_device_before_xpu_transfer() -> None:
     assert engine.processor.tensor_dtype == torch.bfloat16
 
 
+def test_trim_runtime_cache_if_idle_releases_allocator_pages() -> None:
+    class DummyAllocator:
+        def __init__(self) -> None:
+            self.trim_calls = 0
+
+        def trim(self) -> int:
+            self.trim_calls += 1
+            return 32
+
+    class DummyDeviceContext:
+        def __init__(self) -> None:
+            self.release_calls = 0
+
+        def release_unused_memory(self) -> None:
+            self.release_calls += 1
+
+    engine = object.__new__(AnnaEngine)
+    engine.cache_allocator = DummyAllocator()
+    engine.device_context = DummyDeviceContext()
+    engine.metrics = SimpleNamespace(snapshot=lambda: SimpleNamespace(running_requests=0, waiting_requests=0))
+
+    engine._trim_runtime_cache_if_idle()
+
+    assert engine.cache_allocator.trim_calls == 1
+    assert engine.device_context.release_calls == 1
+
+
+def test_trim_runtime_cache_if_idle_skips_when_requests_are_active() -> None:
+    class DummyAllocator:
+        def __init__(self) -> None:
+            self.trim_calls = 0
+
+        def trim(self) -> int:
+            self.trim_calls += 1
+            return 32
+
+    class DummyDeviceContext:
+        def __init__(self) -> None:
+            self.release_calls = 0
+
+        def release_unused_memory(self) -> None:
+            self.release_calls += 1
+
+    engine = object.__new__(AnnaEngine)
+    engine.cache_allocator = DummyAllocator()
+    engine.device_context = DummyDeviceContext()
+    engine.metrics = SimpleNamespace(snapshot=lambda: SimpleNamespace(running_requests=1, waiting_requests=0))
+
+    engine._trim_runtime_cache_if_idle()
+
+    assert engine.cache_allocator.trim_calls == 0
+    assert engine.device_context.release_calls == 0
+
+
 def test_generate_chat_keeps_raw_think_tags_when_reasoning_format_is_none() -> None:
     engine = object.__new__(AnnaEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
