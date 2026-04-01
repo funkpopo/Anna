@@ -125,6 +125,22 @@ pytest tests\test_fused_op_xpu.py -q
 pytest -q
 ```
 
+### 8. SoX (optional)
+
+上游 `qwen-tts` 运行时若找不到 SoX 命令行（`PATH` 中无 `sox`，终端可能提示「不是内部或外部命令」），会打出警告。推理仍可继续；安装 SoX 可消除警告，并在栈内调用 SoX 相关音频工具时使其可用。
+
+在 Windows 上任选其一：
+
+- **Chocolatey**（管理员 PowerShell）：`choco install sox`
+- **Scoop**：`scoop install sox`
+- **手动安装**：安装包含 `sox.exe` 的版本（参见 [SoX](http://sox.sourceforge.net/)），将其所在目录加入用户或系统 `PATH`。
+
+打开**新的**终端验证：
+
+```powershell
+sox --version
+```
+
 ## 模型目录要求
 
 ### 文本 / 多模态 Qwen 模型
@@ -164,7 +180,7 @@ D:\Projects\Anna\models\Qwen\Qwen3-TTS-12Hz-1___7B-Base
 
 - `anna-generate` 和 `anna-bench` 当前只面向 `qwen3_5_text` 家族；`qwen3_tts` 家族请使用 `anna-speak` 或 `POST /v1/audio/speech`
 - 当前 TTS 支持面向官方 12Hz 目录结构，如 `Base`、`CustomVoice`、`VoiceDesign`
-- 上游 `qwen-tts` 包在导入时可能提示系统缺少 `SoX`；按这里验证过的 12Hz 路径，这个警告不会阻塞推理
+- **SoX** 为可选项：见 [步骤 8：SoX (optional)](#8-sox-optional)；未安装时仅告警，不会阻塞此处验证过的 12Hz 推理
 
 ## 运行命令示例
 
@@ -285,11 +301,13 @@ anna-serve `
 
 服务端会直接返回音频字节。对于 `Base` 语音克隆模型，需要带上 `ref_audio` 和 `ref_text`。
 
+在 **PowerShell** 中，请用**单引号**包住 `-d` 的整段 JSON，使请求体为合法 JSON：JSON 内直接使用双引号 `"`，**不要**写成 `\"`（否则反斜杠会原样进入请求体，导致解析失败）。在 Windows 上建议 `ref_audio` 使用正斜杠路径。
+
 ```powershell
 curl.exe http://127.0.0.1:8000/v1/audio/speech `
   -H "Content-Type: application/json" `
   --output speech.wav `
-  -d "{\"model\":\"Qwen3-TTS-1.7B-Base\",\"input\":\"This request goes through the Anna FastAPI speech route.\",\"language\":\"English\",\"ref_audio\":\"D:\\Projects\\Anna\\.build\\tts_ref.wav\",\"ref_text\":\"Hello Anna. This is a reference voice for local synthesis testing.\",\"response_format\":\"wav\",\"max_new_tokens\":1024}"
+  -d '{"model":"Qwen3-TTS-1.7B-Base","input":"This request goes through the Anna FastAPI speech route.","language":"English","ref_audio":"D:/Projects/Anna/.build/tts_ref.wav","ref_text":"Hello Anna. This is a reference voice for local synthesis testing.","response_format":"wav","max_new_tokens":1024}'
 ```
 
 当前支持的主要请求字段包括：
@@ -311,7 +329,7 @@ curl.exe http://127.0.0.1:8000/v1/audio/speech `
 ```powershell
 curl.exe http://127.0.0.1:8000/v1/chat/completions `
   -H "Content-Type: application/json" `
-  -d "{\"model\":\"Qwen3.5-2B\",\"messages\":[{\"role\":\"user\",\"content\":\"你好，介绍一下你自己。\"}],\"max_completion_tokens\":128}"
+  -d '{"model":"Qwen3.5-2B","messages":[{"role":"user","content":"你好，介绍一下你自己。"}],"max_completion_tokens":128}'
 ```
 
 ### Completions
@@ -319,7 +337,7 @@ curl.exe http://127.0.0.1:8000/v1/chat/completions `
 ```powershell
 curl.exe http://127.0.0.1:8000/v1/completions `
   -H "Content-Type: application/json" `
-  -d "{\"model\":\"Qwen3.5-2B\",\"prompt\":\"Hello\",\"max_tokens\":32}"
+  -d '{"model":"Qwen3.5-2B","prompt":"Hello","max_tokens":32}'
 ```
 
 ### 查看模型列表
