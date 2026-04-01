@@ -127,6 +127,22 @@ For a full regression run:
 pytest -q
 ```
 
+### 8. SoX (optional)
+
+The upstream `qwen-tts` runtime may print a warning if the SoX CLI is not on your `PATH` (`'sox' is not recognized...`). Inference still runs; installing SoX silences the warning and enables SoX-based audio helpers when the stack invokes them.
+
+On Windows, pick one:
+
+- **Chocolatey** (Administrator shell): `choco install sox`
+- **Scoop**: `scoop install sox`
+- **Manual**: Install a build that provides `sox.exe` (see [SoX](http://sox.sourceforge.net/)), then add its directory to your user or system `PATH`.
+
+Open a **new** terminal and confirm:
+
+```powershell
+sox --version
+```
+
 ## Local Model Directory Requirements
 
 ### Text / multimodal Qwen models
@@ -166,7 +182,7 @@ Notes:
 
 - `anna-generate` and `anna-bench` remain for the `qwen3_5_text` family; use `anna-speak` or `POST /v1/audio/speech` for the `qwen3_tts` family
 - current TTS support is aimed at official 12Hz model layouts such as `Base`, `CustomVoice`, and `VoiceDesign`
-- the upstream `qwen-tts` package may warn about missing system `SoX` on import; that warning does not block 12Hz inference on the path validated here
+- optional **SoX** install: see [Step 8: SoX (optional)](#8-sox-optional); missing SoX only triggers a warning and does not block 12Hz inference here
 
 ## Command Examples
 
@@ -287,11 +303,13 @@ anna-serve `
 
 The server returns raw audio bytes. For `Base` voice-clone models, include `ref_audio` and `ref_text`.
 
+In **PowerShell**, pass JSON with a **single-quoted** `-d` argument so the body is valid JSON: use `"` inside the JSON and **do not** write `\"` (those backslashes would be sent literally and break parsing). Prefer forward slashes in `ref_audio` paths on Windows.
+
 ```powershell
 curl.exe http://127.0.0.1:8000/v1/audio/speech `
   -H "Content-Type: application/json" `
   --output speech.wav `
-  -d "{\"model\":\"Qwen3-TTS-1.7B-Base\",\"input\":\"This request goes through the Anna FastAPI speech route.\",\"language\":\"English\",\"ref_audio\":\"D:\\Projects\\Anna\\.build\\tts_ref.wav\",\"ref_text\":\"Hello Anna. This is a reference voice for local synthesis testing.\",\"response_format\":\"wav\",\"max_new_tokens\":1024}"
+  -d '{"model":"Qwen3-TTS-1.7B-Base","input":"This request goes through the Anna FastAPI speech route.","language":"English","ref_audio":"D:/Projects/Anna/.build/tts_ref.wav","ref_text":"Hello Anna. This is a reference voice for local synthesis testing.","response_format":"wav","max_new_tokens":1024}'
 ```
 
 Supported request fields include:
@@ -313,7 +331,7 @@ Supported request fields include:
 ```powershell
 curl.exe http://127.0.0.1:8000/v1/chat/completions `
   -H "Content-Type: application/json" `
-  -d "{\"model\":\"Qwen3.5-2B\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello, please introduce yourself.\"}],\"max_completion_tokens\":128}"
+  -d '{"model":"Qwen3.5-2B","messages":[{"role":"user","content":"Hello, please introduce yourself."}],"max_completion_tokens":128}'
 ```
 
 ### Completions
@@ -321,7 +339,7 @@ curl.exe http://127.0.0.1:8000/v1/chat/completions `
 ```powershell
 curl.exe http://127.0.0.1:8000/v1/completions `
   -H "Content-Type: application/json" `
-  -d "{\"model\":\"Qwen3.5-2B\",\"prompt\":\"Hello\",\"max_tokens\":32}"
+  -d '{"model":"Qwen3.5-2B","prompt":"Hello","max_tokens":32}'
 ```
 
 ### List models
