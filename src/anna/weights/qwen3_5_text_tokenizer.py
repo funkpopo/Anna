@@ -7,7 +7,7 @@ from typing import Any
 from tokenizers import Tokenizer
 
 
-class QwenTokenizer:
+class Qwen3_5TextTokenizer:
     def __init__(self, backend: Tokenizer, metadata: dict[str, Any] | None = None):
         self.backend = backend
         self.metadata = metadata or {}
@@ -18,7 +18,7 @@ class QwenTokenizer:
         self.vision_end_token = extra.get("vision_eos_token", "<|vision_end|>")
 
     @classmethod
-    def from_model_dir(cls, model_dir: str | Path) -> "QwenTokenizer":
+    def from_model_dir(cls, model_dir: str | Path) -> "Qwen3_5TextTokenizer":
         model_path = Path(model_dir)
         tokenizer_path = model_path / "tokenizer.json"
         if not tokenizer_path.exists():

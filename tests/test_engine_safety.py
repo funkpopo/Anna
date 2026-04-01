@@ -4,16 +4,16 @@ from types import SimpleNamespace
 
 import torch
 
-from anna.mm.processor import PreparedInputs
-from anna.model.config import QuantizationConfig, Qwen3TextConfig, RopeParameters
+from anna.mm.qwen3_5_text_processor import PreparedInputs
+from anna.model.qwen3_5_text_config import QuantizationConfig, Qwen3_5TextConfig, RopeParameters
 from anna.model.quantization import estimate_module_xpu_int4_bytes
-from anna.model.qwen import Qwen3ForCausalLM
+from anna.model.qwen3_5_text_model import Qwen3_5TextForCausalLM
 from anna.runtime.device import DeviceMemoryInfo, RuntimeSafetyPolicy
-from anna.runtime.engine import AnnaEngine, AnnaEngineError, GenerationConfig
+from anna.runtime.qwen3_5_text_engine import AnnaEngineError, AnnaQwen3_5TextEngine, GenerationConfig
 
 
 def test_guard_generation_memory_rejects_oversized_request() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.config = SimpleNamespace(
         text_config=SimpleNamespace(
             hidden_size=4096,
@@ -61,7 +61,7 @@ def test_guard_generation_memory_rejects_oversized_request() -> None:
 
 
 def test_validate_generation_request_uses_remaining_context_when_no_memory_info_is_available() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.config = SimpleNamespace(
         text_config=SimpleNamespace(
             max_position_embeddings=32,
@@ -87,7 +87,7 @@ def test_validate_generation_request_uses_remaining_context_when_no_memory_info_
 
 
 def test_validate_generation_request_auto_resolves_memory_bounded_limit() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.config = SimpleNamespace(
         text_config=SimpleNamespace(
             hidden_size=4096,
@@ -138,7 +138,7 @@ def test_validate_generation_request_auto_resolves_memory_bounded_limit() -> Non
 
 
 def test_auto_resident_expert_estimation_uses_conservative_free_memory_budget() -> None:
-    config = Qwen3TextConfig(
+    config = Qwen3_5TextConfig(
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=4,
@@ -165,8 +165,8 @@ def test_auto_resident_expert_estimation_uses_conservative_free_memory_budget() 
         num_experts_per_tok=2,
         mlp_only_layers=[3],
     )
-    model = Qwen3ForCausalLM(config)
-    layer_bytes = AnnaEngine._module_nbytes(model.model.layers[0].mlp.experts)
+    model = Qwen3_5TextForCausalLM(config)
+    layer_bytes = AnnaQwen3_5TextEngine._module_nbytes(model.model.layers[0].mlp.experts)
     budget_bytes = (layer_bytes * 5) // 2
     free_bytes = budget_bytes * 2
 
@@ -187,7 +187,7 @@ def test_auto_resident_expert_estimation_uses_conservative_free_memory_budget() 
         ),
     )
 
-    selected = AnnaEngine._estimate_resident_expert_layer_indices(
+    selected = AnnaQwen3_5TextEngine._estimate_resident_expert_layer_indices(
         model=model,
         device_context=fake_device_context,
         expert_quant="none",
@@ -198,7 +198,7 @@ def test_auto_resident_expert_estimation_uses_conservative_free_memory_budget() 
 
 
 def test_auto_resident_expert_estimation_accounts_for_int4_expert_storage() -> None:
-    config = Qwen3TextConfig(
+    config = Qwen3_5TextConfig(
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=4,
@@ -225,8 +225,8 @@ def test_auto_resident_expert_estimation_accounts_for_int4_expert_storage() -> N
         num_experts_per_tok=2,
         mlp_only_layers=[3],
     )
-    model = Qwen3ForCausalLM(config)
-    dense_layer_bytes = AnnaEngine._module_nbytes(model.model.layers[0].mlp.experts)
+    model = Qwen3_5TextForCausalLM(config)
+    dense_layer_bytes = AnnaQwen3_5TextEngine._module_nbytes(model.model.layers[0].mlp.experts)
     int4_layer_bytes = estimate_module_xpu_int4_bytes(model.model.layers[0].mlp.experts)
     dense_device_context = SimpleNamespace(
         device=torch.device("xpu"),
@@ -261,12 +261,12 @@ def test_auto_resident_expert_estimation_accounts_for_int4_expert_storage() -> N
         ),
     )
 
-    selected_dense = AnnaEngine._estimate_resident_expert_layer_indices(
+    selected_dense = AnnaQwen3_5TextEngine._estimate_resident_expert_layer_indices(
         model=model,
         device_context=dense_device_context,
         expert_quant="none",
     )
-    selected_int4 = AnnaEngine._estimate_resident_expert_layer_indices(
+    selected_int4 = AnnaQwen3_5TextEngine._estimate_resident_expert_layer_indices(
         model=model,
         device_context=int4_device_context,
         expert_quant="int4",
@@ -278,7 +278,7 @@ def test_auto_resident_expert_estimation_accounts_for_int4_expert_storage() -> N
 
 
 def test_auto_cached_experts_per_layer_scales_with_available_xpu_budget() -> None:
-    config = Qwen3TextConfig(
+    config = Qwen3_5TextConfig(
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=4,
@@ -305,7 +305,7 @@ def test_auto_cached_experts_per_layer_scales_with_available_xpu_budget() -> Non
         num_experts_per_tok=2,
         mlp_only_layers=[3],
     )
-    model = Qwen3ForCausalLM(config)
+    model = Qwen3_5TextForCausalLM(config)
     model.configure_runtime(
         torch.device("cpu"),
         offload_experts=True,
@@ -333,7 +333,7 @@ def test_auto_cached_experts_per_layer_scales_with_available_xpu_budget() -> Non
         ),
     )
 
-    estimated = AnnaEngine._estimate_cached_experts_per_layer(
+    estimated = AnnaQwen3_5TextEngine._estimate_cached_experts_per_layer(
         model=model,
         device_context=fake_device_context,
         expert_quant="int4",
@@ -345,7 +345,7 @@ def test_auto_cached_experts_per_layer_scales_with_available_xpu_budget() -> Non
 
 def test_auto_weight_quantization_promotes_oversized_dense_xpu_models(monkeypatch) -> None:
     config = SimpleNamespace(
-        text_config=Qwen3TextConfig(
+        text_config=Qwen3_5TextConfig(
             hidden_size=64,
             intermediate_size=128,
             num_hidden_layers=4,
@@ -378,9 +378,9 @@ def test_auto_weight_quantization_promotes_oversized_dense_xpu_models(monkeypatc
             reserved_bytes=0,
         ),
     )
-    monkeypatch.setattr("anna.runtime.engine.estimate_model_weight_bytes", lambda _model_path: 15 << 30)
+    monkeypatch.setattr("anna.runtime.qwen3_5_text_engine.estimate_qwen3_5_text_model_weight_bytes", lambda _model_path: 15 << 30)
 
-    resolved = AnnaEngine._resolve_weight_quant(
+    resolved = AnnaQwen3_5TextEngine._resolve_weight_quant(
         requested_quant="auto",
         resolved_offload_mode="none",
         model_path=SimpleNamespace(),
@@ -393,7 +393,7 @@ def test_auto_weight_quantization_promotes_oversized_dense_xpu_models(monkeypatc
 
 def test_auto_weight_quantization_can_promote_oversized_expert_offload_models(monkeypatch) -> None:
     config = SimpleNamespace(
-        text_config=Qwen3TextConfig(
+        text_config=Qwen3_5TextConfig(
             hidden_size=64,
             intermediate_size=128,
             num_hidden_layers=4,
@@ -431,9 +431,9 @@ def test_auto_weight_quantization_can_promote_oversized_expert_offload_models(mo
             reserved_bytes=0,
         ),
     )
-    monkeypatch.setattr("anna.runtime.engine.estimate_model_weight_bytes", lambda _model_path: 14 << 30)
+    monkeypatch.setattr("anna.runtime.qwen3_5_text_engine.estimate_qwen3_5_text_model_weight_bytes", lambda _model_path: 14 << 30)
 
-    resolved = AnnaEngine._resolve_weight_quant(
+    resolved = AnnaQwen3_5TextEngine._resolve_weight_quant(
         requested_quant="auto",
         resolved_offload_mode="experts",
         model_path=SimpleNamespace(),

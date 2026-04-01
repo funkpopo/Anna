@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from anna.cli.speak import build_parser
+from anna.cli.qwen3_tts_speak import build_parser
 
 
 def test_speak_parser_accepts_voice_clone_arguments() -> None:

@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
-from anna.runtime.engine import AnnaEngineError
+from anna.runtime.qwen3_5_text_engine import AnnaEngineError
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ def _stringify_dtype(dtype) -> str:
 
 
 @dataclass(slots=True)
-class SpeechSynthesisConfig:
+class Qwen3TTSSynthesisConfig:
     max_new_tokens: int | None = None
     do_sample: bool = True
     temperature: float = 0.9
@@ -37,14 +37,15 @@ class SpeechSynthesisConfig:
 
 
 @dataclass(slots=True)
-class SpeechSynthesisResult:
+class Qwen3TTSSynthesisResult:
     audio: np.ndarray
     sample_rate: int
     duration_seconds: float
     total_seconds: float
 
 
-class AnnaTTSEngine:
+class AnnaQwen3TTSEngine:
+    qwen_model_family = "qwen3_tts"
     supports_chat_completions = False
     supports_text_completions = False
     supports_speech_synthesis = True
@@ -95,7 +96,7 @@ class AnnaTTSEngine:
         resident_expert_layers: int | None = None,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         cached_experts_per_layer: int | None = None,
-    ) -> "AnnaTTSEngine":
+    ) -> "AnnaQwen3TTSEngine":
         del (
             default_max_completion_tokens,
             default_enable_thinking,
@@ -134,7 +135,7 @@ class AnnaTTSEngine:
             ignored_options.append(f"weight_quant={weight_quant}")
         if ignored_options:
             logger.info(
-                "Ignoring text-only runtime options for Qwen3-TTS model load: %s",
+                "Ignoring qwen3_5_text-family runtime options for qwen3_tts model load: %s",
                 ", ".join(ignored_options),
             )
 
@@ -142,7 +143,7 @@ class AnnaTTSEngine:
             from qwen_tts import Qwen3TTSModel
         except ImportError as exc:  # pragma: no cover - exercised in environment setup, not unit tests
             raise RuntimeError(
-                "Qwen3-TTS support requires the optional dependency 'qwen-tts'. Install project dependencies again to enable TTS models."
+                "Qwen3-TTS support requires the optional dependency 'qwen-tts'. Install project dependencies again to enable the qwen3_tts model family."
             ) from exc
 
         started_at = time.perf_counter()
@@ -198,7 +199,7 @@ class AnnaTTSEngine:
         return {
             "status": "ok",
             "model": self.default_model_id,
-            "model_family": "qwen3_tts",
+            "qwen_model_family": self.qwen_model_family,
             "tts_model_type": self.tts_model_type,
             "tts_model_size": self.tts_model_size,
             "tokenizer_type": self.tokenizer_type,
@@ -227,21 +228,21 @@ class AnnaTTSEngine:
             },
         }
 
-    def synthesize_speech(
+    def synthesize_qwen3_tts_speech(
         self,
         text: str,
         *,
-        config: SpeechSynthesisConfig,
+        config: Qwen3TTSSynthesisConfig,
         language: str | None = None,
         speaker: str | None = None,
         instruct: str | None = None,
         ref_audio: str | None = None,
         ref_text: str | None = None,
         x_vector_only_mode: bool = False,
-    ) -> SpeechSynthesisResult:
+    ) -> Qwen3TTSSynthesisResult:
         normalized_text = text.strip()
         if not normalized_text:
-            raise AnnaEngineError("Speech synthesis input must not be empty.")
+            raise AnnaEngineError("Qwen3-TTS speech synthesis input must not be empty.")
 
         self.metrics.record_request_submitted(waiting=False)
         success = False
@@ -273,14 +274,14 @@ class AnnaTTSEngine:
         self,
         text: str,
         *,
-        config: SpeechSynthesisConfig,
+        config: Qwen3TTSSynthesisConfig,
         language: str | None,
         speaker: str | None,
         instruct: str | None,
         ref_audio: str | None,
         ref_text: str | None,
         x_vector_only_mode: bool,
-    ) -> SpeechSynthesisResult:
+    ) -> Qwen3TTSSynthesisResult:
         generation_kwargs = self._build_generation_kwargs(config)
         language_value = language or "Auto"
         started_at = time.perf_counter()
@@ -354,14 +355,14 @@ class AnnaTTSEngine:
 
         audio = np.asarray(wavs[0], dtype=np.float32)
         total_seconds = time.perf_counter() - started_at
-        return SpeechSynthesisResult(
+        return Qwen3TTSSynthesisResult(
             audio=audio,
             sample_rate=int(sample_rate),
             duration_seconds=0.0 if sample_rate <= 0 else float(audio.shape[0]) / float(sample_rate),
             total_seconds=total_seconds,
         )
 
-    def _build_generation_kwargs(self, config: SpeechSynthesisConfig) -> dict[str, Any]:
+    def _build_generation_kwargs(self, config: Qwen3TTSSynthesisConfig) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "do_sample": config.do_sample,
             "temperature": config.temperature,

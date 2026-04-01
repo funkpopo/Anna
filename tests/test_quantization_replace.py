@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from anna.model.config import QuantizationConfig
+from anna.model.qwen3_5_text_config import QuantizationConfig
 from anna.model.quantization import AWQLinear, FP8Linear, XPUInt4Linear, convert_module_linears_to_xpu_int4, replace_linear_modules
 
 

@@ -15,8 +15,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from anna.model.config import Qwen3Config, VisionPreprocessorConfig
-from anna.weights.tokenizer import QwenTokenizer
+from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig, VisionPreprocessorConfig
+from anna.weights.qwen3_5_text_tokenizer import Qwen3_5TextTokenizer
 
 
 @dataclass(slots=True)
@@ -47,8 +47,8 @@ def smart_resize(height: int, width: int, factor: int, min_pixels: int, max_pixe
     return h_bar, w_bar
 
 
-class Qwen3MultimodalProcessor:
-    def __init__(self, config: Qwen3Config, tokenizer: QwenTokenizer):
+class Qwen3_5TextMultimodalProcessor:
+    def __init__(self, config: Qwen3_5TextModelConfig, tokenizer: Qwen3_5TextTokenizer):
         self.config = config
         self.tokenizer = tokenizer
         self.preprocessor = config.preprocessor_config

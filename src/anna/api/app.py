@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 
 from anna import __version__
 from anna.api.routes import router
-from anna.runtime.engine import AnnaEngineError
+from anna.runtime.qwen3_5_text_engine import AnnaEngineError
 
 _HTTP_METHOD_ORDER = {
     "HEAD": 0,

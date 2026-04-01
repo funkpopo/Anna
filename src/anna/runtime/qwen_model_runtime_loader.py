@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anna.core.model_family import inspect_model_family
-from anna.runtime.engine import AnnaEngine
-from anna.runtime.tts_engine import AnnaTTSEngine
+from anna.core.qwen_model_family import inspect_qwen_model_family
+from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine
+from anna.runtime.qwen3_tts_engine import AnnaQwen3TTSEngine
 
 
-def load_engine_from_model_dir(
+def load_qwen_model_runtime_from_model_dir(
     model_dir: str | Path,
     *,
     model_id: str | None = None,
@@ -30,9 +30,9 @@ def load_engine_from_model_dir(
     resident_expert_layer_indices: tuple[int, ...] | None = None,
     cached_experts_per_layer: int | None = None,
 ):
-    family_info = inspect_model_family(model_dir)
-    if family_info.family == "tts":
-        return AnnaTTSEngine.from_model_dir(
+    qwen_model_family_info = inspect_qwen_model_family(model_dir)
+    if qwen_model_family_info.qwen_model_family == "qwen3_tts":
+        return AnnaQwen3TTSEngine.from_model_dir(
             model_dir,
             model_id=model_id,
             device=device,
@@ -55,7 +55,7 @@ def load_engine_from_model_dir(
             cached_experts_per_layer=cached_experts_per_layer,
         )
 
-    return AnnaEngine.from_model_dir(
+    return AnnaQwen3_5TextEngine.from_model_dir(
         model_dir,
         model_id=model_id,
         device=device,

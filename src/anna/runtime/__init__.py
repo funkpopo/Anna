@@ -1,9 +1,15 @@
 from anna.runtime.device import DeviceContext, DeviceMemoryInfo, RuntimeSafetyPolicy, TensorMigrationPolicy
-from anna.runtime.engine import AnnaEngine, AnnaEngineError, GenerationConfig, StreamEvent, TextGenerationResult
+from anna.runtime.qwen3_5_text_engine import (
+    AnnaEngineError,
+    AnnaQwen3_5TextEngine,
+    GenerationConfig,
+    StreamEvent,
+    TextGenerationResult,
+)
 
 __all__ = [
-    "AnnaEngine",
     "AnnaEngineError",
+    "AnnaQwen3_5TextEngine",
     "DeviceContext",
     "DeviceMemoryInfo",
     "GenerationConfig",

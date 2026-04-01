@@ -33,7 +33,7 @@ dev = [
 anna-serve = "anna.cli.serve:main"
 anna-generate = "anna.cli.generate:main"
 anna-bench = "anna.cli.bench:main"
-anna-speak = "anna.cli.speak:main"
+anna-speak = "anna.cli.qwen3_tts_speak:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

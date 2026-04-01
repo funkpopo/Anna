@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from anna.mm.processor import PreparedInputs
-from anna.model.config import Qwen3Config, Qwen3TextConfig
+from anna.mm.qwen3_5_text_processor import PreparedInputs
+from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig, Qwen3_5TextConfig
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
 from anna.runtime.device import RuntimeSafetyPolicy
-from anna.runtime.engine import AnnaEngine, EngineOptimizationConfig, GenerationConfig
+from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, EngineOptimizationConfig, GenerationConfig
 from anna.runtime.scheduler import AnnaScheduler
 
 
@@ -80,7 +80,7 @@ class _FakePrefillRunner:
 
 
 class _FakeModel:
-    def __init__(self, config: Qwen3Config) -> None:
+    def __init__(self, config: Qwen3_5TextModelConfig) -> None:
         self.config = config
         self.cache_allocator = Qwen3PageAllocator(config.text_config)
         self.prefill_batch_sizes: list[int] = []
@@ -172,8 +172,8 @@ def _prepared(prompt_tokens: list[int]) -> PreparedInputs:
 
 
 def test_scheduler_batches_same_length_requests() -> None:
-    config = Qwen3Config(
-        text_config=Qwen3TextConfig(
+    config = Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
             hidden_size=4,
             intermediate_size=8,
             num_hidden_layers=1,
@@ -191,7 +191,7 @@ def test_scheduler_batches_same_length_requests() -> None:
         )
     )
     fake_model = _FakeModel(config)
-    engine = AnnaEngine(
+    engine = AnnaQwen3_5TextEngine(
         model=fake_model,
         tokenizer=_FakeTokenizer(),
         processor=object(),
@@ -230,8 +230,8 @@ def test_scheduler_batches_same_length_requests() -> None:
 
 
 def test_scheduler_chunks_long_same_length_prefills() -> None:
-    config = Qwen3Config(
-        text_config=Qwen3TextConfig(
+    config = Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
             hidden_size=4,
             intermediate_size=8,
             num_hidden_layers=1,
@@ -249,7 +249,7 @@ def test_scheduler_chunks_long_same_length_prefills() -> None:
         )
     )
     fake_model = _FakeModel(config)
-    engine = AnnaEngine(
+    engine = AnnaQwen3_5TextEngine(
         model=fake_model,
         tokenizer=_FakeTokenizer(),
         processor=object(),
@@ -284,8 +284,8 @@ def test_scheduler_chunks_long_same_length_prefills() -> None:
 
 
 def test_scheduler_batches_mixed_length_requests_during_decode() -> None:
-    config = Qwen3Config(
-        text_config=Qwen3TextConfig(
+    config = Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
             hidden_size=4,
             intermediate_size=8,
             num_hidden_layers=1,
@@ -303,7 +303,7 @@ def test_scheduler_batches_mixed_length_requests_during_decode() -> None:
         )
     )
     fake_model = _FakeModel(config)
-    engine = AnnaEngine(
+    engine = AnnaQwen3_5TextEngine(
         model=fake_model,
         tokenizer=_FakeTokenizer(),
         processor=object(),

@@ -5,12 +5,13 @@ import logging
 from fastapi.testclient import TestClient
 
 from anna.api.app import create_app, list_app_routes
-from anna.runtime.engine import AnnaEngineError, GenerationPerfStats, TextGenerationResult
+from anna.runtime.qwen3_5_text_engine import AnnaEngineError, GenerationPerfStats, TextGenerationResult
 
 
 class _FailingStreamEngine:
     default_model_id = "fake-model"
     default_max_completion_tokens = 256
+    qwen_model_family = "qwen3_5_text"
 
     def health(self) -> dict[str, str]:
         return {"status": "ok"}
@@ -33,6 +34,7 @@ class _FailingStreamEngine:
 
 class _CapturingEngine:
     default_model_id = "fake-model"
+    qwen_model_family = "qwen3_5_text"
 
     def __init__(
         self,
@@ -272,7 +274,7 @@ def test_streaming_chat_emits_fragmented_reasoning_deltas_immediately() -> None:
             return [self.default_model_id]
 
         def stream_chat(self, *_args, **_kwargs):
-            from anna.runtime.engine import StreamEvent
+            from anna.runtime.qwen3_5_text_engine import StreamEvent
 
             yield StreamEvent(text="", reasoning_text="用户", finish_reason=None)
             yield StreamEvent(text="", reasoning_text="要求", finish_reason=None)
@@ -311,7 +313,7 @@ def test_streaming_chat_flushes_reasoning_before_content_switch() -> None:
             return [self.default_model_id]
 
         def stream_chat(self, *_args, **_kwargs):
-            from anna.runtime.engine import StreamEvent
+            from anna.runtime.qwen3_5_text_engine import StreamEvent
 
             yield StreamEvent(text="", reasoning_text="先分析", finish_reason=None)
             yield StreamEvent(text="最终答案。", reasoning_text=None, finish_reason="stop")
@@ -346,7 +348,7 @@ def test_streaming_chat_emits_content_deltas_immediately() -> None:
             return [self.default_model_id]
 
         def stream_chat(self, *_args, **_kwargs):
-            from anna.runtime.engine import StreamEvent
+            from anna.runtime.qwen3_5_text_engine import StreamEvent
 
             yield StreamEvent(text="夏天", reasoning_text=None, finish_reason=None)
             yield StreamEvent(text="到了。", reasoning_text=None, finish_reason="stop")
@@ -447,6 +449,7 @@ def test_chat_completion_logs_prefill_and_decode_metrics(caplog) -> None:
 def test_audio_speech_returns_wav_bytes_and_forwards_request_fields() -> None:
     class _SpeechEngine:
         default_model_id = "fake-tts-model"
+        qwen_model_family = "qwen3_tts"
 
         def __init__(self) -> None:
             self.last_request = None
@@ -457,7 +460,7 @@ def test_audio_speech_returns_wav_bytes_and_forwards_request_fields() -> None:
         def list_models(self) -> list[str]:
             return [self.default_model_id]
 
-        def synthesize_speech(
+        def synthesize_qwen3_tts_speech(
             self,
             text,
             *,
@@ -469,7 +472,7 @@ def test_audio_speech_returns_wav_bytes_and_forwards_request_fields() -> None:
             ref_text=None,
             x_vector_only_mode=False,
         ):
-            from anna.runtime.tts_engine import SpeechSynthesisResult
+            from anna.runtime.qwen3_tts_engine import Qwen3TTSSynthesisResult
             import numpy as np
 
             self.last_request = {
@@ -482,7 +485,7 @@ def test_audio_speech_returns_wav_bytes_and_forwards_request_fields() -> None:
                 "x_vector_only_mode": x_vector_only_mode,
                 "config": config,
             }
-            return SpeechSynthesisResult(
+            return Qwen3TTSSynthesisResult(
                 audio=np.zeros(2400, dtype=np.float32),
                 sample_rate=24000,
                 duration_seconds=0.1,
@@ -537,4 +540,4 @@ def test_audio_speech_rejects_models_without_speech_support() -> None:
     )
 
     assert response.status_code == 400
-    assert response.json()["error"]["message"] == "The loaded model does not support speech synthesis."
+    assert response.json()["error"]["message"] == "The loaded qwen3_5_text model family does not support speech synthesis."

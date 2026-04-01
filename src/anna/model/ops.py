@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from anna.model.config import Qwen3TextConfig
+from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.model.fused_ops import run_gated_delta_fused
 from anna.model.quantization import convert_module_linears_to_xpu_int4
 
@@ -148,7 +148,7 @@ class Qwen3PagedLayerAllocator:
 
 
 class Qwen3PageAllocator:
-    def __init__(self, config: Qwen3TextConfig):
+    def __init__(self, config: Qwen3_5TextConfig):
         self.config = config
         self.block_size = max(1, int(config.cache_block_size))
         self.layers = [Qwen3PagedLayerAllocator(self.block_size) for _ in range(config.num_hidden_layers)]
@@ -209,7 +209,7 @@ class Qwen3PageAllocator:
 class Qwen3DynamicCache:
     def __init__(
         self,
-        config: Qwen3TextConfig,
+        config: Qwen3_5TextConfig,
         *,
         allocator: Qwen3PageAllocator | None = None,
         batch_size: int = 0,
@@ -518,7 +518,7 @@ class Qwen3DynamicCache:
         return key_batch, value_batch, visible_lengths
 
     @classmethod
-    def stack(cls, caches: list["Qwen3DynamicCache"], config: Qwen3TextConfig) -> "Qwen3DynamicCache":
+    def stack(cls, caches: list["Qwen3DynamicCache"], config: Qwen3_5TextConfig) -> "Qwen3DynamicCache":
         if not caches:
             return cls(config)
 
@@ -707,7 +707,7 @@ class Qwen3RMSNormGated(nn.Module):
 
 
 class Qwen3TextRotaryEmbedding(nn.Module):
-    def __init__(self, config: Qwen3TextConfig):
+    def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
         self.config = config
         inv_freq, attention_scaling = self.compute_default_rope_parameters(config)
@@ -717,7 +717,7 @@ class Qwen3TextRotaryEmbedding(nn.Module):
         self.mrope_section = tuple(config.rope_parameters.mrope_section)
 
     @staticmethod
-    def compute_default_rope_parameters(config: Qwen3TextConfig) -> tuple[torch.Tensor, float]:
+    def compute_default_rope_parameters(config: Qwen3_5TextConfig) -> tuple[torch.Tensor, float]:
         base = config.rope_parameters.rope_theta
         dim = int(config.head_dim * config.rope_parameters.partial_rotary_factor)
         dim = max(2, dim - (dim % 2))
@@ -949,7 +949,7 @@ def torch_recurrent_gated_delta_rule(
 
 
 class Qwen3Attention(nn.Module):
-    def __init__(self, config: Qwen3TextConfig, layer_idx: int):
+    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.head_dim = config.head_dim
@@ -1040,7 +1040,7 @@ class Qwen3Attention(nn.Module):
 
 
 class Qwen3GatedDeltaNet(nn.Module):
-    def __init__(self, config: Qwen3TextConfig, layer_idx: int):
+    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
         super().__init__()
         self.num_v_heads = config.linear_num_value_heads
         self.num_k_heads = config.linear_num_key_heads
@@ -1133,7 +1133,7 @@ class Qwen3GatedDeltaNet(nn.Module):
 
 
 class Qwen3MLP(nn.Module):
-    def __init__(self, config: Qwen3TextConfig, intermediate_size: int | None = None):
+    def __init__(self, config: Qwen3_5TextConfig, intermediate_size: int | None = None):
         super().__init__()
         self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
         self.gate_proj = nn.Linear(config.hidden_size, self.intermediate_size, bias=False)
@@ -1145,7 +1145,7 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3SparseMoeBlock(nn.Module):
-    def __init__(self, config: Qwen3TextConfig):
+    def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
         self._config = config
         self._expert_intermediate_size = config.moe_intermediate_size
@@ -1363,7 +1363,7 @@ class Qwen3SparseMoeBlock(nn.Module):
 
 
 class Qwen3DecoderLayer(nn.Module):
-    def __init__(self, config: Qwen3TextConfig, layer_idx: int):
+    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx]
         if self.layer_type == "linear_attention":
