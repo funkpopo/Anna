@@ -86,6 +86,7 @@ def test_list_app_routes_includes_openapi_and_completion_endpoints() -> None:
     assert ("/healthz", "GET") in routes
     assert ("/v1/chat/completions", "POST") in routes
     assert ("/v1/completions", "POST") in routes
+    assert ("/v1/audio/speech", "POST") in routes
 
 def test_streaming_chat_returns_sse_error_frame_for_engine_failures() -> None:
     client = TestClient(create_app(_FailingStreamEngine()))
@@ -441,3 +442,99 @@ def test_chat_completion_logs_prefill_and_decode_metrics(caplog) -> None:
     log_lines = [record.message for record in caplog.records if record.name == "anna.api.routes"]
     assert any("prefill_seconds=0.250" in line for line in log_lines)
     assert any("decode_tokens_per_second=16.00" in line for line in log_lines)
+
+
+def test_audio_speech_returns_wav_bytes_and_forwards_request_fields() -> None:
+    class _SpeechEngine:
+        default_model_id = "fake-tts-model"
+
+        def __init__(self) -> None:
+            self.last_request = None
+
+        def health(self) -> dict[str, str]:
+            return {"status": "ok"}
+
+        def list_models(self) -> list[str]:
+            return [self.default_model_id]
+
+        def synthesize_speech(
+            self,
+            text,
+            *,
+            config,
+            language=None,
+            speaker=None,
+            instruct=None,
+            ref_audio=None,
+            ref_text=None,
+            x_vector_only_mode=False,
+        ):
+            from anna.runtime.tts_engine import SpeechSynthesisResult
+            import numpy as np
+
+            self.last_request = {
+                "text": text,
+                "language": language,
+                "speaker": speaker,
+                "instruct": instruct,
+                "ref_audio": ref_audio,
+                "ref_text": ref_text,
+                "x_vector_only_mode": x_vector_only_mode,
+                "config": config,
+            }
+            return SpeechSynthesisResult(
+                audio=np.zeros(2400, dtype=np.float32),
+                sample_rate=24000,
+                duration_seconds=0.1,
+                total_seconds=0.2,
+            )
+
+    engine = _SpeechEngine()
+    client = TestClient(create_app(engine))
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "fake-tts-model",
+            "input": "Hello from Anna.",
+            "voice": "Vivian",
+            "language": "English",
+            "instruct": "Speak warmly.",
+            "reference_audio": "ref.wav",
+            "reference_text": "Reference line.",
+            "x_vector_only_mode": True,
+            "response_format": "wav",
+            "temperature": 0.8,
+            "top_p": 0.95,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+    assert response.headers["x-audio-sample-rate"] == "24000"
+    assert response.content[:4] == b"RIFF"
+    assert engine.last_request is not None
+    assert engine.last_request["text"] == "Hello from Anna."
+    assert engine.last_request["speaker"] == "Vivian"
+    assert engine.last_request["language"] == "English"
+    assert engine.last_request["instruct"] == "Speak warmly."
+    assert engine.last_request["ref_audio"] == "ref.wav"
+    assert engine.last_request["ref_text"] == "Reference line."
+    assert engine.last_request["x_vector_only_mode"] is True
+    assert engine.last_request["config"].temperature == 0.8
+    assert engine.last_request["config"].top_p == 0.95
+
+
+def test_audio_speech_rejects_models_without_speech_support() -> None:
+    client = TestClient(create_app(_CapturingEngine()))
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "fake-model",
+            "input": "Hello from Anna.",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "The loaded model does not support speech synthesis."

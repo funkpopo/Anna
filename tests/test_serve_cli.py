@@ -127,3 +127,4 @@ def test_log_available_routes_reports_server_address_and_paths(caplog) -> None:
     assert "Available routes are:" in caplog.text
     assert "Route: /healthz, Methods: GET" in caplog.text
     assert "Route: /v1/chat/completions, Methods: POST" in caplog.text
+    assert "Route: /v1/audio/speech, Methods: POST" in caplog.text
