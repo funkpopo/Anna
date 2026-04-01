@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from anna.api.schemas import ChatCompletionRequest, CompletionRequest, SpeechRequest
-from anna.runtime.engine import (
+from anna.runtime.qwen3_5_text_engine import (
     AnnaEngineError,
     GenerationConfig,
     ReasoningFormat,
@@ -21,7 +21,7 @@ from anna.runtime.engine import (
     TextGenerationResult,
     normalize_reasoning_format,
 )
-from anna.runtime.tts_engine import SpeechSynthesisConfig
+from anna.runtime.qwen3_tts_engine import Qwen3TTSSynthesisConfig
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -76,6 +76,13 @@ def _require_method(engine: object, method_name: str, *, message: str, code: str
     if not hasattr(engine, method_name):
         raise AnnaEngineError(message, code=code)
     return getattr(engine, method_name)
+
+
+def _qwen_model_family_name(engine: object) -> str:
+    value = getattr(engine, "qwen_model_family", None)
+    if isinstance(value, str) and value:
+        return value
+    return "unknown_qwen_model_family"
 
 
 def _resolve_enable_thinking(engine: object, payload: ChatCompletionRequest) -> bool:
@@ -380,7 +387,7 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
             stream_chat = _require_method(
                 engine,
                 "stream_chat",
-                message="The loaded model does not support chat completions.",
+                message=f"The loaded {_qwen_model_family_name(engine)} model family does not support chat completions.",
                 code="unsupported_chat_completions",
             )
             events = stream_chat(
@@ -402,7 +409,7 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
         generate_chat = _require_method(
             engine,
             "generate_chat",
-            message="The loaded model does not support chat completions.",
+            message=f"The loaded {_qwen_model_family_name(engine)} model family does not support chat completions.",
             code="unsupported_chat_completions",
         )
         result = generate_chat(
@@ -455,7 +462,7 @@ def completions(request: Request, payload: CompletionRequest):
             stream_text = _require_method(
                 engine,
                 "stream_text",
-                message="The loaded model does not support text completions.",
+                message=f"The loaded {_qwen_model_family_name(engine)} model family does not support text completions.",
                 code="unsupported_text_completions",
             )
             events = stream_text(payload.prompt, config=config)
@@ -472,7 +479,7 @@ def completions(request: Request, payload: CompletionRequest):
         generate_text = _require_method(
             engine,
             "generate_text",
-            message="The loaded model does not support text completions.",
+            message=f"The loaded {_qwen_model_family_name(engine)} model family does not support text completions.",
             code="unsupported_text_completions",
         )
         result = generate_text(payload.prompt, config=config)
@@ -501,10 +508,10 @@ def completions(request: Request, payload: CompletionRequest):
 @router.post("/v1/audio/speech")
 def audio_speech(request: Request, payload: SpeechRequest):
     engine = _engine(request)
-    synthesize_speech = _require_method(
+    synthesize_qwen3_tts_speech = _require_method(
         engine,
-        "synthesize_speech",
-        message="The loaded model does not support speech synthesis.",
+        "synthesize_qwen3_tts_speech",
+        message=f"The loaded {_qwen_model_family_name(engine)} model family does not support speech synthesis.",
         code="unsupported_speech_synthesis",
     )
     model_id = payload.model or engine.default_model_id
@@ -513,7 +520,7 @@ def audio_speech(request: Request, payload: SpeechRequest):
     started_at = time.perf_counter()
 
     try:
-        result = synthesize_speech(
+        result = synthesize_qwen3_tts_speech(
             payload.input,
             language=payload.language,
             speaker=speaker,
@@ -521,7 +528,7 @@ def audio_speech(request: Request, payload: SpeechRequest):
             ref_audio=payload.ref_audio,
             ref_text=payload.ref_text,
             x_vector_only_mode=payload.x_vector_only_mode,
-            config=SpeechSynthesisConfig(
+            config=Qwen3TTSSynthesisConfig(
                 max_new_tokens=payload.max_new_tokens,
                 do_sample=payload.do_sample,
                 temperature=payload.temperature,

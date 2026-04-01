@@ -10,7 +10,7 @@ from anna.core.config import ServeSettings, parse_resident_expert_layer_indices
 from anna.core.logging import setup_logging
 from anna.core.model_path import resolve_model_dir, resolve_model_name
 from anna.runtime.device import RuntimeSafetyPolicy
-from anna.runtime.loader import load_engine_from_model_dir
+from anna.runtime.qwen_model_runtime_loader import load_qwen_model_runtime_from_model_dir
 from anna.runtime.service_metrics import AnnaServiceMetricsLogger
 from anna.runtime.scheduler import AnnaScheduler
 
@@ -108,7 +108,7 @@ def _build_scheduler(engine, settings: ServeSettings) -> AnnaScheduler | None:
     return scheduler
 
 
-def _build_metrics_logger(engine: AnnaEngine, settings: ServeSettings) -> AnnaServiceMetricsLogger | None:
+def _build_metrics_logger(engine: object, settings: ServeSettings) -> AnnaServiceMetricsLogger | None:
     if settings.metrics_log_interval_seconds <= 0:
         return None
     return AnnaServiceMetricsLogger(
@@ -300,7 +300,7 @@ def main() -> None:
     )
 
     setup_logging(settings.log_level)
-    engine = load_engine_from_model_dir(
+    engine = load_qwen_model_runtime_from_model_dir(
         settings.model_dir,
         model_id=settings.model_id,
         device=settings.device,

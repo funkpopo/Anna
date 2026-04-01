@@ -7,8 +7,8 @@ import soundfile as sf
 
 from anna.core.logging import setup_logging
 from anna.core.model_path import resolve_model_dir, resolve_model_name
-from anna.runtime.loader import load_engine_from_model_dir
-from anna.runtime.tts_engine import SpeechSynthesisConfig
+from anna.runtime.qwen3_tts_engine import Qwen3TTSSynthesisConfig
+from anna.runtime.qwen_model_runtime_loader import load_qwen_model_runtime_from_model_dir
 
 
 def _positive_int(value: str) -> int:
@@ -19,7 +19,7 @@ def _positive_int(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Synthesize speech with Anna.")
+    parser = argparse.ArgumentParser(description="Synthesize qwen3_tts speech with Anna.")
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--model-name", default=None, help="Model name used in logs and API-compatible output.")
     parser.add_argument("--input", required=True, help="Text to synthesize.")
@@ -86,16 +86,18 @@ def main() -> None:
     output_path = Path(args.output).expanduser().resolve()
 
     setup_logging(args.log_level)
-    engine = load_engine_from_model_dir(
+    engine = load_qwen_model_runtime_from_model_dir(
         model_dir,
         model_id=model_name,
         device=args.device,
         dtype=args.dtype,
     )
     if not getattr(engine, "supports_speech_synthesis", False):
-        raise SystemExit("The selected model does not support speech synthesis. Use anna-generate for text models.")
+        raise SystemExit(
+            "The selected model belongs to the qwen3_5_text family and does not support speech synthesis. Use anna-generate for qwen3_5_text models."
+        )
 
-    result = engine.synthesize_speech(
+    result = engine.synthesize_qwen3_tts_speech(
         args.input,
         language=args.language,
         speaker=args.speaker,
@@ -103,7 +105,7 @@ def main() -> None:
         ref_audio=args.ref_audio,
         ref_text=args.ref_text,
         x_vector_only_mode=args.x_vector_only_mode,
-        config=SpeechSynthesisConfig(
+        config=Qwen3TTSSynthesisConfig(
             max_new_tokens=args.max_new_tokens,
             do_sample=args.do_sample,
             temperature=args.temperature,

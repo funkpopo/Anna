@@ -4,9 +4,9 @@ import argparse
 
 from anna.core.config import GenerateSettings, parse_resident_expert_layer_indices
 from anna.core.logging import setup_logging
-from anna.core.model_family import inspect_model_family
+from anna.core.qwen_model_family import inspect_qwen_model_family
 from anna.core.model_path import resolve_model_dir, resolve_model_name
-from anna.runtime.engine import AnnaEngine, GenerationConfig
+from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, GenerationConfig
 
 
 def _positive_int(value: str) -> int:
@@ -110,9 +110,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     model_dir = resolve_model_dir(args.model_dir)
-    family_info = inspect_model_family(model_dir)
-    if family_info.family == "tts":
-        raise SystemExit("The selected model is a Qwen3-TTS model. Use anna-speak instead of anna-generate.")
+    qwen_model_family_info = inspect_qwen_model_family(model_dir)
+    if qwen_model_family_info.qwen_model_family == "qwen3_tts":
+        raise SystemExit("The selected model belongs to the qwen3_tts family. Use anna-speak instead of anna-generate.")
     model_name = resolve_model_name(model_name=args.model_name, model_dir=model_dir)
     settings = GenerateSettings(
         model_dir=model_dir,
@@ -140,7 +140,7 @@ def main() -> None:
     )
 
     setup_logging(args.log_level)
-    engine = AnnaEngine.from_model_dir(
+    engine = AnnaQwen3_5TextEngine.from_model_dir(
         settings.model_dir,
         model_id=settings.model_id,
         device=settings.device,

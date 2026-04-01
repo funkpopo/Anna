@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from anna.mm.processor import PreparedInputs
+from anna.mm.qwen3_5_text_processor import PreparedInputs
 from anna.model.ops import Qwen3DynamicCache
 
 

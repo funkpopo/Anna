@@ -5,14 +5,14 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
-from anna.mm.processor import PreparedInputs
-from anna.runtime.engine import AnnaEngine, GenerationConfig, ThinkingStreamParser
-from anna.runtime.engine import EngineOptimizationConfig, StreamEvent, TextGenerationResult
+from anna.mm.qwen3_5_text_processor import PreparedInputs
+from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, GenerationConfig, ThinkingStreamParser
+from anna.runtime.qwen3_5_text_engine import EngineOptimizationConfig, StreamEvent, TextGenerationResult
 from anna.runtime.streaming import IncrementalTextAssembler
 
 
 def test_stable_decode_delta_avoids_repeated_prefix_output() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     emitted = ""
     parts: list[str] = []
 
@@ -43,7 +43,7 @@ def test_stable_decode_delta_avoids_repeated_prefix_output() -> None:
 
 
 def test_flush_decode_tail_returns_remaining_buffer() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     tail, emitted = engine._flush_decode_tail(
         current_text="冰镇西瓜🍉",
         emitted_text="冰镇",
@@ -54,7 +54,7 @@ def test_flush_decode_tail_returns_remaining_buffer() -> None:
 
 
 def test_stable_decode_skips_unstable_replacement_suffix() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     emitted = ""
     previous = ""
     outputs: list[str] = []
@@ -77,7 +77,7 @@ def test_stable_decode_skips_unstable_replacement_suffix() -> None:
 
 
 def test_split_chat_output_separates_reasoning_and_content() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     reasoning, content = engine._split_chat_output(
         "先分析问题。</think>\n\n最终答案。",
         enable_thinking=True,
@@ -109,7 +109,7 @@ def test_generate_without_streaming_overhead_decodes_once() -> None:
             assert skip_special_tokens is False
             return ",".join(str(token_id) for token_id in token_ids)
 
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.tokenizer = DummyTokenizer()
     engine._generate_token_ids = lambda prepared, config: ([3, 4, 5], "stop", 7, 3, None)
 
@@ -131,7 +131,7 @@ def test_generate_text_prepares_prompt_on_preprocess_device() -> None:
             self.tensor_device = tensor_device
             return object()
 
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.processor = DummyProcessor()
     engine.device_context = SimpleNamespace(
         device=torch.device("xpu"),
@@ -167,7 +167,7 @@ def test_prepare_messages_uses_preprocess_device_before_xpu_transfer() -> None:
             self.tensor_dtype = tensor_dtype
             return object()
 
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.processor = DummyProcessor()
     engine.device_context = SimpleNamespace(
         device=torch.device("xpu"),
@@ -198,7 +198,7 @@ def test_trim_runtime_cache_if_idle_releases_allocator_pages() -> None:
         def release_unused_memory(self) -> None:
             self.release_calls += 1
 
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.cache_allocator = DummyAllocator()
     engine.device_context = DummyDeviceContext()
     engine.metrics = SimpleNamespace(snapshot=lambda: SimpleNamespace(running_requests=0, waiting_requests=0))
@@ -225,7 +225,7 @@ def test_trim_runtime_cache_if_idle_skips_when_requests_are_active() -> None:
         def release_unused_memory(self) -> None:
             self.release_calls += 1
 
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.cache_allocator = DummyAllocator()
     engine.device_context = DummyDeviceContext()
     engine.metrics = SimpleNamespace(snapshot=lambda: SimpleNamespace(running_requests=1, waiting_requests=0))
@@ -237,7 +237,7 @@ def test_trim_runtime_cache_if_idle_skips_when_requests_are_active() -> None:
 
 
 def test_generate_chat_keeps_raw_think_tags_when_reasoning_format_is_none() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
     engine._generate = MethodType(
         lambda self, prepared, *, config: TextGenerationResult(
@@ -261,7 +261,7 @@ def test_generate_chat_keeps_raw_think_tags_when_reasoning_format_is_none() -> N
 
 
 def test_generate_chat_projects_reasoning_into_deepseek_format() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
     engine._generate = MethodType(
         lambda self, prepared, *, config: TextGenerationResult(
@@ -285,7 +285,7 @@ def test_generate_chat_projects_reasoning_into_deepseek_format() -> None:
 
 
 def test_generate_chat_leaves_thoughts_inline_when_reasoning_format_is_none() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
     engine._generate = MethodType(
         lambda self, prepared, *, config: TextGenerationResult(
@@ -309,7 +309,7 @@ def test_generate_chat_leaves_thoughts_inline_when_reasoning_format_is_none() ->
 
 
 def test_stream_chat_keeps_inline_think_chunks_when_reasoning_format_is_none() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
     engine._stream = MethodType(
         lambda self, prepared, *, config: iter(
@@ -339,7 +339,7 @@ def test_stream_chat_keeps_inline_think_chunks_when_reasoning_format_is_none() -
 
 
 def test_stream_chat_separates_reasoning_and_content_in_deepseek_format() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
     engine._stream = MethodType(
         lambda self, prepared, *, config: iter(
@@ -369,7 +369,7 @@ def test_stream_chat_separates_reasoning_and_content_in_deepseek_format() -> Non
 
 
 def test_generate_chat_keeps_incomplete_think_block_when_length_limited() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
     engine._generate = MethodType(
         lambda self, prepared, *, config: TextGenerationResult(
@@ -394,7 +394,7 @@ def test_generate_chat_keeps_incomplete_think_block_when_length_limited() -> Non
 
 
 def test_generate_chat_keeps_incomplete_think_block_inline_when_reasoning_format_is_none() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
     engine._generate = MethodType(
         lambda self, prepared, *, config: TextGenerationResult(
@@ -431,7 +431,7 @@ def test_forward_generation_model_uses_text_fast_path_for_text_only_requests() -
             self.calls.append("full")
             return object()
 
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.model = _FakeModel()
 
     prepared = type(
@@ -472,7 +472,7 @@ def test_forward_generation_model_prefers_compiled_text_fast_path_when_available
             self.calls.append("full")
             return object()
 
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.model = _FakeModel()
     compiled_calls: list[str] = []
     engine._compiled_text_forward = lambda **_kwargs: compiled_calls.append("compiled") or object()
@@ -507,7 +507,7 @@ def test_forward_generation_model_keeps_full_path_for_multimodal_requests() -> N
             self.calls.append("full")
             return object()
 
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.model = _FakeModel()
 
     engine._forward_generation_model(
@@ -527,7 +527,7 @@ def test_forward_generation_model_keeps_full_path_for_multimodal_requests() -> N
 
 
 def test_prefill_generation_chunks_long_text_prompts() -> None:
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.optimization_config = EngineOptimizationConfig(prefill_chunk_size=3)
     engine._prompt_cache = OrderedDict()
     engine._compiled_text_forward = None
@@ -571,7 +571,7 @@ def test_prefill_generation_reuses_prompt_cache_for_exact_prompt_matches() -> No
         def release(self) -> None:
             self.released = True
 
-    engine = object.__new__(AnnaEngine)
+    engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.optimization_config = EngineOptimizationConfig(prompt_cache_size=1)
     engine._prompt_cache = OrderedDict()
     engine._compiled_text_forward = None

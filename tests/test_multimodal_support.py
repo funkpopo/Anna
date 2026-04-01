@@ -4,9 +4,9 @@ import imageio.v3 as iio
 import numpy as np
 import torch
 
-from anna.mm.processor import Qwen3MultimodalProcessor
-from anna.model.config import Qwen3Config, Qwen3TextConfig, Qwen3VisionConfig, VisionPreprocessorConfig
-from anna.weights.tokenizer import QwenTokenizer
+from anna.mm.qwen3_5_text_processor import Qwen3_5TextMultimodalProcessor
+from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig, Qwen3_5TextConfig, Qwen3_5TextVisionConfig, VisionPreprocessorConfig
+from anna.weights.qwen3_5_text_tokenizer import Qwen3_5TextTokenizer
 
 
 class _FakeBackend:
@@ -30,8 +30,8 @@ class _FakeBackend:
         raise NotImplementedError
 
 
-def _tokenizer() -> QwenTokenizer:
-    return QwenTokenizer(
+def _tokenizer() -> Qwen3_5TextTokenizer:
+    return Qwen3_5TextTokenizer(
         _FakeBackend(),
         metadata={
             "extra_special_tokens": {
@@ -44,9 +44,9 @@ def _tokenizer() -> QwenTokenizer:
     )
 
 
-def _config() -> Qwen3Config:
-    return Qwen3Config(
-        text_config=Qwen3TextConfig(
+def _config() -> Qwen3_5TextModelConfig:
+    return Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
             hidden_size=64,
             intermediate_size=128,
             num_hidden_layers=2,
@@ -60,7 +60,7 @@ def _config() -> Qwen3Config:
             vocab_size=256,
             layer_types=["linear_attention", "full_attention"],
         ),
-        vision_config=Qwen3VisionConfig(
+        vision_config=Qwen3_5TextVisionConfig(
             depth=2,
             hidden_size=32,
             intermediate_size=64,
@@ -81,7 +81,7 @@ def _config() -> Qwen3Config:
 
 
 def test_qwen3_config_keeps_multimodal_fields() -> None:
-    config = Qwen3Config.from_dict(
+    config = Qwen3_5TextModelConfig.from_dict(
         {
             "model_type": "qwen3_5_vl",
             "max_completion_tokens": 1536,
@@ -135,7 +135,7 @@ def test_qwen3_config_keeps_multimodal_fields() -> None:
 
 
 def test_qwen3_config_leaves_default_max_completion_tokens_unset_when_missing() -> None:
-    config = Qwen3Config.from_dict(
+    config = Qwen3_5TextModelConfig.from_dict(
         {
             "model_type": "qwen3_5_vl",
             "text_config": {
@@ -159,7 +159,7 @@ def test_qwen3_config_leaves_default_max_completion_tokens_unset_when_missing() 
 
 
 def test_qwen3_config_uses_top_level_pad_token_when_text_config_value_is_null() -> None:
-    config = Qwen3Config.from_dict(
+    config = Qwen3_5TextModelConfig.from_dict(
         {
             "pad_token_id": 248055,
             "eos_token_id": 248046,
@@ -249,7 +249,7 @@ def test_tokenizer_renders_raw_assistant_output_with_reasoning_content_without_d
 
 
 def test_processor_expands_qwen3_native_placeholders() -> None:
-    processor = Qwen3MultimodalProcessor(_config(), _tokenizer())
+    processor = Qwen3_5TextMultimodalProcessor(_config(), _tokenizer())
     image_prompt = "<|vision_start|><|image_pad|><|vision_end|>"
     video_prompt = "<|vision_start|><|video_pad|><|vision_end|>"
 
@@ -267,7 +267,7 @@ def test_processor_expands_qwen3_native_placeholders() -> None:
 
 
 def test_processor_loads_local_video_file(tmp_path) -> None:
-    processor = Qwen3MultimodalProcessor(_config(), _tokenizer())
+    processor = Qwen3_5TextMultimodalProcessor(_config(), _tokenizer())
     video_path = tmp_path / "colors.mp4"
     frames = []
     for color in [(255, 0, 0), (0, 255, 0), (0, 0, 255)]:

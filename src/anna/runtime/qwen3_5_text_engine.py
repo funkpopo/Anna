@@ -11,16 +11,16 @@ from typing import Any, Iterator, Literal, cast
 
 import torch
 
-from anna.mm.processor import PreparedInputs, Qwen3MultimodalProcessor
+from anna.mm.qwen3_5_text_processor import PreparedInputs, Qwen3_5TextMultimodalProcessor
 from anna.model.quantization import convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
-from anna.model.qwen import Qwen3ForConditionalGeneration
+from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
 from anna.sampling.sampler import sample_next_token
-from anna.weights.loader import build_model, estimate_model_weight_bytes, load_model_config, load_model_weights
-from anna.weights.tokenizer import QwenTokenizer
+from anna.weights.qwen3_5_text_weight_loader import build_qwen3_5_text_model, estimate_qwen3_5_text_model_weight_bytes, load_qwen3_5_text_model_config, load_qwen3_5_text_model_weights
+from anna.weights.qwen3_5_text_tokenizer import Qwen3_5TextTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -230,13 +230,18 @@ class TextGenerationResult:
     perf: GenerationPerfStats | None = None
 
 
-class AnnaEngine:
+class AnnaQwen3_5TextEngine:
+    qwen_model_family = "qwen3_5_text"
+    supports_chat_completions = True
+    supports_text_completions = True
+    supports_speech_synthesis = False
+
     def __init__(
         self,
         *,
-        model: Qwen3ForConditionalGeneration,
-        tokenizer: QwenTokenizer,
-        processor: Qwen3MultimodalProcessor,
+        model: Qwen3_5TextForConditionalGeneration,
+        tokenizer: Qwen3_5TextTokenizer,
+        processor: Qwen3_5TextMultimodalProcessor,
         model_id: str,
         device_context: DeviceContext,
         quantized_replacements: int = 0,
@@ -407,9 +412,9 @@ class AnnaEngine:
         resident_expert_layers: int | None = None,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         cached_experts_per_layer: int | None = None,
-    ) -> "AnnaEngine":
+    ) -> "AnnaQwen3_5TextEngine":
         model_path = Path(model_dir)
-        config = load_model_config(model_path)
+        config = load_qwen3_5_text_model_config(model_path)
         device_context = DeviceContext.resolve(
             device=device,
             dtype=dtype,
@@ -457,12 +462,12 @@ class AnnaEngine:
             else device_context.device
         )
         try:
-            model, model_quantized_replacements = build_model(
+            model, model_quantized_replacements = build_qwen3_5_text_model(
                 config,
                 device=model_device,
                 dtype=device_context.dtype,
             )
-            report = load_model_weights(model, model_path)
+            report = load_qwen3_5_text_model_weights(model, model_path)
             runtime_weight_quantized_replacements = 0
             if resolved_weight_quant == "int4":
                 runtime_weight_quantized_replacements = cls._apply_runtime_weight_quantization(
@@ -529,8 +534,8 @@ class AnnaEngine:
                     logger.exception("Failed to recover device context after model load failure.")
             raise
 
-        tokenizer = QwenTokenizer.from_model_dir(model_path)
-        processor = Qwen3MultimodalProcessor(config, tokenizer)
+        tokenizer = Qwen3_5TextTokenizer.from_model_dir(model_path)
+        processor = Qwen3_5TextMultimodalProcessor(config, tokenizer)
         resolved_model_id = model_id or model_path.name
         resolved_default_max_completion_tokens = (
             config.default_max_completion_tokens
@@ -608,7 +613,7 @@ class AnnaEngine:
         if memory_info is None:
             return "none"
 
-        weight_bytes = estimate_model_weight_bytes(model_path)
+        weight_bytes = estimate_qwen3_5_text_model_weight_bytes(model_path)
         if config.text_config.is_moe_model and weight_bytes > int(memory_info.total_bytes * 0.85):
             return "experts"
         return "none"
@@ -666,7 +671,7 @@ class AnnaEngine:
         if memory_info is None:
             return "none"
 
-        weight_bytes = estimate_model_weight_bytes(model_path)
+        weight_bytes = estimate_qwen3_5_text_model_weight_bytes(model_path)
         usage_threshold = 0.70 if resolved_offload_mode == "experts" or config.text_config.is_moe_model else 0.85
         if weight_bytes > int(memory_info.total_bytes * usage_threshold):
             return "int4"
@@ -676,7 +681,7 @@ class AnnaEngine:
     def _apply_runtime_weight_quantization(
         cls,
         *,
-        model: Qwen3ForConditionalGeneration,
+        model: Qwen3_5TextForConditionalGeneration,
         device: torch.device,
         compute_dtype: torch.dtype,
     ) -> int:
@@ -782,14 +787,14 @@ class AnnaEngine:
         return total
 
     @staticmethod
-    def _text_model(model: Qwen3ForConditionalGeneration) -> object | None:
+    def _text_model(model: Qwen3_5TextForConditionalGeneration) -> object | None:
         text_model = getattr(getattr(model, "model", None), "language_model", None)
         if text_model is None:
             text_model = getattr(model, "model", None)
         return text_model
 
     @classmethod
-    def _offloaded_sparse_moe_blocks(cls, model: Qwen3ForConditionalGeneration) -> list[tuple[int, Qwen3SparseMoeBlock]]:
+    def _offloaded_sparse_moe_blocks(cls, model: Qwen3_5TextForConditionalGeneration) -> list[tuple[int, Qwen3SparseMoeBlock]]:
         text_model = cls._text_model(model)
         if text_model is None or not hasattr(text_model, "layers"):
             return []
@@ -800,7 +805,7 @@ class AnnaEngine:
         return blocks
 
     @classmethod
-    def _effective_cached_experts_per_layer(cls, model: Qwen3ForConditionalGeneration) -> int:
+    def _effective_cached_experts_per_layer(cls, model: Qwen3_5TextForConditionalGeneration) -> int:
         offloaded_blocks = cls._offloaded_sparse_moe_blocks(model)
         if offloaded_blocks:
             return int(offloaded_blocks[0][1].cached_experts_per_layer)
@@ -839,7 +844,7 @@ class AnnaEngine:
     def _estimate_resident_expert_layer_indices(
         cls,
         *,
-        model: Qwen3ForConditionalGeneration,
+        model: Qwen3_5TextForConditionalGeneration,
         device_context: DeviceContext,
         expert_quant: str,
     ) -> tuple[int, ...]:
@@ -906,7 +911,7 @@ class AnnaEngine:
     def _estimate_cached_experts_per_layer(
         cls,
         *,
-        model: Qwen3ForConditionalGeneration,
+        model: Qwen3_5TextForConditionalGeneration,
         device_context: DeviceContext,
         expert_quant: str,
     ) -> int:
@@ -1031,6 +1036,7 @@ class AnnaEngine:
         return {
             "status": "ok",
             "model": self.default_model_id,
+            "qwen_model_family": self.qwen_model_family,
             "device": str(self.device_context.device),
             "compute_dtype": str(self.device_context.dtype),
             "requested_dtype": self.device_context.requested_dtype,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from anna.runtime.device import DeviceContext
-from anna.mm.processor import PreparedInputs
+from anna.mm.qwen3_5_text_processor import PreparedInputs
 
 
 def test_classify_runtime_error_out_of_memory() -> None:

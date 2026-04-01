@@ -144,7 +144,7 @@ D:\Projects\Anna\models\Qwen\Qwen3___5-2B
 
 ### Qwen3-TTS 12Hz 模型
 
-Anna 也支持官方 `Qwen3-TTS` 12Hz 模型目录，底层走 `qwen-tts` 运行时。一个本地 TTS 模型目录至少应包含：
+Anna 也支持官方 `Qwen3-TTS` 12Hz 模型目录，底层走 `qwen-tts` 运行时。一个本地 `qwen3_tts` 模型目录至少应包含：
 
 - `config.json`
 - `tokenizer_config.json`
@@ -162,7 +162,7 @@ D:\Projects\Anna\models\Qwen\Qwen3-TTS-12Hz-1___7B-Base
 
 说明：
 
-- `anna-generate` 和 `anna-bench` 仍然只支持文本模型；TTS 模型请使用 `anna-speak` 或 `POST /v1/audio/speech`
+- `anna-generate` 和 `anna-bench` 当前只面向 `qwen3_5_text` 家族；`qwen3_tts` 家族请使用 `anna-speak` 或 `POST /v1/audio/speech`
 - 当前 TTS 支持面向官方 12Hz 目录结构，如 `Base`、`CustomVoice`、`VoiceDesign`
 - 上游 `qwen-tts` 包在导入时可能提示系统缺少 `SoX`；按这里验证过的 12Hz 路径，这个警告不会阻塞推理
 

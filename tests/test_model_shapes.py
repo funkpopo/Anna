@@ -7,7 +7,7 @@ import torch
 
 import anna.model.ops as model_ops
 from anna.model.quantization import XPUInt4Linear
-from anna.model.config import Qwen3TextConfig, RopeParameters
+from anna.model.qwen3_5_text_config import Qwen3_5TextConfig, RopeParameters
 from anna.model.ops import (
     Qwen3DynamicCache,
     Qwen3PageAllocator,
@@ -16,8 +16,8 @@ from anna.model.ops import (
     torch_chunk_gated_delta_rule,
     torch_recurrent_gated_delta_rule,
 )
-from anna.model.qwen import Qwen3ForCausalLM
-from anna.runtime.engine import AnnaEngine
+from anna.model.qwen3_5_text_model import Qwen3_5TextForCausalLM
+from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine
 
 
 @contextmanager
@@ -80,8 +80,8 @@ def _stub_gated_delta_fused(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(model_ops, "run_gated_delta_fused", _stub_run_gated_delta_fused)
 
 
-def _tiny_config() -> Qwen3TextConfig:
-    return Qwen3TextConfig(
+def _tiny_config() -> Qwen3_5TextConfig:
+    return Qwen3_5TextConfig(
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=4,
@@ -109,8 +109,8 @@ def _tiny_config() -> Qwen3TextConfig:
     )
 
 
-def _tiny_moe_config() -> Qwen3TextConfig:
-    return Qwen3TextConfig(
+def _tiny_moe_config() -> Qwen3_5TextConfig:
+    return Qwen3_5TextConfig(
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=4,
@@ -146,7 +146,7 @@ def _tiny_moe_config() -> Qwen3TextConfig:
 
 def test_qwen3_forward_shapes() -> None:
     with _temporary_torch_seed(0):
-        model = Qwen3ForCausalLM(_tiny_config())
+        model = Qwen3_5TextForCausalLM(_tiny_config())
         input_ids = torch.randint(0, 256, (1, 6))
         outputs = model(input_ids=input_ids, use_cache=True)
     assert outputs.logits.shape == (1, 6, 256)
@@ -156,7 +156,7 @@ def test_qwen3_forward_shapes() -> None:
 
 def test_qwen3_incremental_decode() -> None:
     with _temporary_torch_seed(0):
-        model = Qwen3ForCausalLM(_tiny_config())
+        model = Qwen3_5TextForCausalLM(_tiny_config())
         prompt_ids = torch.randint(0, 256, (1, 6))
         first = model(input_ids=prompt_ids, use_cache=True)
         next_token = torch.randint(0, 256, (1, 1))
@@ -172,7 +172,7 @@ def test_qwen3_incremental_decode() -> None:
 
 def test_qwen3_prefill_can_project_only_last_logit() -> None:
     with _temporary_torch_seed(0):
-        model = Qwen3ForCausalLM(_tiny_config())
+        model = Qwen3_5TextForCausalLM(_tiny_config())
         input_ids = torch.randint(0, 256, (1, 6))
         outputs = model(input_ids=input_ids, use_cache=True, logits_to_keep=1)
     assert outputs.logits.shape == (1, 1, 256)
@@ -361,12 +361,12 @@ def test_causal_conv1d_update_single_token_fast_path_matches_grouped_conv() -> N
 
 
 def test_qwen3_allows_out_of_range_padding_idx_for_tiny_configs() -> None:
-    model = Qwen3ForCausalLM(_tiny_config())
+    model = Qwen3_5TextForCausalLM(_tiny_config())
     assert model.model.embed_tokens.padding_idx is None
 
 
 def test_qwen3_runtime_can_pin_first_sparse_moe_layers() -> None:
-    model = Qwen3ForCausalLM(_tiny_moe_config())
+    model = Qwen3_5TextForCausalLM(_tiny_moe_config())
 
     model.configure_runtime(
         torch.device("cpu"),
@@ -383,7 +383,7 @@ def test_qwen3_runtime_can_pin_first_sparse_moe_layers() -> None:
 
 
 def test_qwen3_runtime_can_pin_sparse_moe_layers_by_decoder_index() -> None:
-    model = Qwen3ForCausalLM(_tiny_moe_config())
+    model = Qwen3_5TextForCausalLM(_tiny_moe_config())
 
     model.configure_runtime(
         torch.device("cpu"),
@@ -421,7 +421,7 @@ def test_sparse_moe_cached_expert_materialization_copies_weights_without_aliasin
 
 
 def test_engine_resolves_explicit_resident_expert_indices() -> None:
-    resolved = AnnaEngine._resolve_resident_expert_layer_indices(
+    resolved = AnnaQwen3_5TextEngine._resolve_resident_expert_layer_indices(
         requested_layers=None,
         requested_indices=(2, 0, 2),
         config=type("ConfigBox", (), {"text_config": _tiny_moe_config()})(),
@@ -432,7 +432,7 @@ def test_engine_resolves_explicit_resident_expert_indices() -> None:
 
 
 def test_engine_leaves_resident_expert_indices_for_auto_estimation_when_unspecified() -> None:
-    resolved = AnnaEngine._resolve_resident_expert_layer_indices(
+    resolved = AnnaQwen3_5TextEngine._resolve_resident_expert_layer_indices(
         requested_layers=None,
         requested_indices=None,
         config=type("ConfigBox", (), {"text_config": _tiny_moe_config()})(),
@@ -443,15 +443,15 @@ def test_engine_leaves_resident_expert_indices_for_auto_estimation_when_unspecif
 
 
 def test_engine_runtime_weight_quantization_converts_dense_text_linears() -> None:
-    model = Qwen3ForCausalLM(_tiny_config())
-    before_bytes = AnnaEngine._module_nbytes(model)
+    model = Qwen3_5TextForCausalLM(_tiny_config())
+    before_bytes = AnnaQwen3_5TextEngine._module_nbytes(model)
 
-    replacements = AnnaEngine._apply_runtime_weight_quantization(
+    replacements = AnnaQwen3_5TextEngine._apply_runtime_weight_quantization(
         model=model,
         device=torch.device("cpu"),
         compute_dtype=torch.bfloat16,
     )
-    after_bytes = AnnaEngine._module_nbytes(model)
+    after_bytes = AnnaQwen3_5TextEngine._module_nbytes(model)
 
     assert replacements > 0
     assert after_bytes < before_bytes
@@ -460,9 +460,9 @@ def test_engine_runtime_weight_quantization_converts_dense_text_linears() -> Non
 
 
 def test_engine_runtime_weight_quantization_skips_sparse_expert_modules() -> None:
-    model = Qwen3ForCausalLM(_tiny_moe_config())
+    model = Qwen3_5TextForCausalLM(_tiny_moe_config())
 
-    AnnaEngine._apply_runtime_weight_quantization(
+    AnnaQwen3_5TextEngine._apply_runtime_weight_quantization(
         model=model,
         device=torch.device("cpu"),
         compute_dtype=torch.bfloat16,
@@ -474,9 +474,9 @@ def test_engine_runtime_weight_quantization_skips_sparse_expert_modules() -> Non
 
 
 def test_runtime_weight_quantized_lm_head_preserves_forward_shapes() -> None:
-    model = Qwen3ForCausalLM(_tiny_config())
+    model = Qwen3_5TextForCausalLM(_tiny_config())
     model.configure_runtime(torch.device("cpu"))
-    AnnaEngine._apply_runtime_weight_quantization(
+    AnnaQwen3_5TextEngine._apply_runtime_weight_quantization(
         model=model,
         device=torch.device("cpu"),
         compute_dtype=torch.bfloat16,

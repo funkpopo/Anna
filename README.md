@@ -146,7 +146,7 @@ D:\Projects\Anna\models\Qwen\Qwen3___5-2B
 
 ### Qwen3-TTS 12Hz models
 
-Anna also supports official `Qwen3-TTS` 12Hz model directories through the `qwen-tts` runtime path. A local TTS model directory should contain at least:
+Anna also supports official `Qwen3-TTS` 12Hz model directories through the `qwen-tts` runtime path. A local `qwen3_tts` model directory should contain at least:
 
 - `config.json`
 - `tokenizer_config.json`
@@ -164,7 +164,7 @@ D:\Projects\Anna\models\Qwen\Qwen3-TTS-12Hz-1___7B-Base
 
 Notes:
 
-- `anna-generate` and `anna-bench` remain text-only; use `anna-speak` or `POST /v1/audio/speech` for TTS models
+- `anna-generate` and `anna-bench` remain for the `qwen3_5_text` family; use `anna-speak` or `POST /v1/audio/speech` for the `qwen3_tts` family
 - current TTS support is aimed at official 12Hz model layouts such as `Base`, `CustomVoice`, and `VoiceDesign`
 - the upstream `qwen-tts` package may warn about missing system `SoX` on import; that warning does not block 12Hz inference on the path validated here
 

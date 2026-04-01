@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from anna.model.config import QuantizationConfig
+from anna.model.qwen3_5_text_config import QuantizationConfig
 
 
 def _float8_dtype():

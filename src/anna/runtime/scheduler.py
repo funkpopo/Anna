@@ -9,13 +9,19 @@ from typing import TYPE_CHECKING, Iterator
 
 import torch
 
-from anna.mm.processor import PreparedInputs
+from anna.mm.qwen3_5_text_processor import PreparedInputs
 from anna.model.ops import Qwen3DynamicCache
 from anna.runtime.streaming import IncrementalTextAssembler
 from anna.sampling.sampler import sample_next_token
 
 if TYPE_CHECKING:
-    from anna.runtime.engine import AnnaEngine, AnnaEngineError, GenerationConfig, StreamEvent, TextGenerationResult
+    from anna.runtime.qwen3_5_text_engine import (
+        AnnaEngineError,
+        AnnaQwen3_5TextEngine,
+        GenerationConfig,
+        StreamEvent,
+        TextGenerationResult,
+    )
 
 
 _DONE = object()
@@ -46,7 +52,7 @@ class SchedulerRequest:
 class AnnaScheduler:
     def __init__(
         self,
-        engine: "AnnaEngine",
+        engine: "AnnaQwen3_5TextEngine",
         *,
         max_batch_size: int = 4,
         batch_wait_ms: float = 2.0,
@@ -380,7 +386,7 @@ class AnnaScheduler:
         if memory_info.free_bytes < policy.min_free_bytes:
             raise self.engine._handle_runtime_failure(RuntimeError("out of memory"))
         if estimated_bytes > available_budget or estimated_bytes > max_allowed:
-            from anna.runtime.engine import AnnaEngineError
+            from anna.runtime.qwen3_5_text_engine import AnnaEngineError
 
             raise AnnaEngineError(
                 "Scheduler batch rejected by memory guard. Reduce prompt length, batch size, or max_completion_tokens.",
@@ -392,7 +398,7 @@ class AnnaScheduler:
     def _emit_text(self, request: SchedulerRequest, text: str) -> None:
         request.text_parts.append(text)
         if request.stream:
-            from anna.runtime.engine import StreamEvent
+            from anna.runtime.qwen3_5_text_engine import StreamEvent
 
             request.events.put(StreamEvent(text=text, finish_reason=None))
 
@@ -407,7 +413,7 @@ class AnnaScheduler:
             request.past_key_values = None
 
         if request.stream:
-            from anna.runtime.engine import StreamEvent
+            from anna.runtime.qwen3_5_text_engine import StreamEvent
 
             request.events.put(StreamEvent(text="", finish_reason=finish_reason))
             request.events.put(_DONE)
@@ -417,7 +423,7 @@ class AnnaScheduler:
             self.engine._trim_runtime_cache_if_idle()
             return
 
-        from anna.runtime.engine import TextGenerationResult
+        from anna.runtime.qwen3_5_text_engine import TextGenerationResult
 
         request.result = TextGenerationResult(
             text="".join(request.text_parts),
@@ -449,7 +455,7 @@ class AnnaScheduler:
         )
 
     def _normalize_error(self, exc: Exception) -> "AnnaEngineError":
-        from anna.runtime.engine import AnnaEngineError
+        from anna.runtime.qwen3_5_text_engine import AnnaEngineError
 
         if isinstance(exc, AnnaEngineError):
             return exc
@@ -458,7 +464,7 @@ class AnnaScheduler:
         return AnnaEngineError(str(exc), status_code=500, error_type="server_error", code="scheduler_failed")
 
     def _normalize_worker_crash(self, exc: BaseException) -> "AnnaEngineError":
-        from anna.runtime.engine import AnnaEngineError
+        from anna.runtime.qwen3_5_text_engine import AnnaEngineError
 
         if isinstance(exc, Exception):
             return self._normalize_error(exc)
@@ -474,7 +480,7 @@ class AnnaScheduler:
             self._fail_request(request, exc)
 
     def _fail_request(self, request: SchedulerRequest, exc: Exception) -> None:
-        from anna.runtime.engine import AnnaEngineError
+        from anna.runtime.qwen3_5_text_engine import AnnaEngineError
 
         normalized = exc if isinstance(exc, AnnaEngineError) else self._normalize_error(exc)
         metrics = getattr(self.engine, "metrics", None)

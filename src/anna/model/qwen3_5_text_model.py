@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from anna.model.config import Qwen3Config, Qwen3TextConfig, Qwen3VisionConfig
+from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig, Qwen3_5TextConfig, Qwen3_5TextVisionConfig
 from anna.model.ops import (
     Qwen3DecoderLayer,
     Qwen3DynamicCache,
@@ -60,7 +60,7 @@ def _align_tensor_device(tensor: torch.Tensor | None, device: torch.device) -> t
 
 
 class Qwen3TextModel(nn.Module):
-    def __init__(self, config: Qwen3TextConfig):
+    def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
         self.config = config
         self.cache_allocator: Qwen3PageAllocator | None = None
@@ -184,7 +184,7 @@ class Qwen3VisionRotaryEmbedding(nn.Module):
 
 
 class Qwen3VisionMLP(nn.Module):
-    def __init__(self, config: Qwen3VisionConfig):
+    def __init__(self, config: Qwen3_5TextVisionConfig):
         super().__init__()
         self.linear_fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=True)
         self.linear_fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=True)
@@ -194,7 +194,7 @@ class Qwen3VisionMLP(nn.Module):
 
 
 class Qwen3VisionPatchEmbed(nn.Module):
-    def __init__(self, config: Qwen3VisionConfig) -> None:
+    def __init__(self, config: Qwen3_5TextVisionConfig) -> None:
         super().__init__()
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
@@ -212,7 +212,7 @@ class Qwen3VisionPatchEmbed(nn.Module):
 
 
 class Qwen3VisionPatchMerger(nn.Module):
-    def __init__(self, config: Qwen3VisionConfig) -> None:
+    def __init__(self, config: Qwen3_5TextVisionConfig) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
         self.norm = nn.LayerNorm(config.hidden_size, eps=1e-6)
@@ -242,7 +242,7 @@ def apply_rotary_pos_emb_vision(
 
 
 class Qwen3VisionAttention(nn.Module):
-    def __init__(self, config: Qwen3VisionConfig) -> None:
+    def __init__(self, config: Qwen3_5TextVisionConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
         self.num_heads = config.num_heads
@@ -287,7 +287,7 @@ class Qwen3VisionAttention(nn.Module):
 
 
 class Qwen3VisionBlock(nn.Module):
-    def __init__(self, config: Qwen3VisionConfig) -> None:
+    def __init__(self, config: Qwen3_5TextVisionConfig) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
@@ -306,7 +306,7 @@ class Qwen3VisionBlock(nn.Module):
 
 
 class Qwen3VisionModel(nn.Module):
-    def __init__(self, config: Qwen3VisionConfig):
+    def __init__(self, config: Qwen3_5TextVisionConfig):
         super().__init__()
         self.config = config
         self.spatial_merge_size = config.spatial_merge_size
@@ -420,7 +420,7 @@ class Qwen3VisionModel(nn.Module):
 
 
 class Qwen3Model(nn.Module):
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: Qwen3_5TextModelConfig):
         super().__init__()
         self.config = config
         self.visual = Qwen3VisionModel(config.vision_config) if config.vision_config is not None else None
@@ -688,8 +688,8 @@ class Qwen3Model(nn.Module):
         )
 
 
-class Qwen3ForCausalLM(nn.Module):
-    def __init__(self, config: Qwen3TextConfig):
+class Qwen3_5TextForCausalLM(nn.Module):
+    def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
         self.config = config
         self.model = Qwen3TextModel(config)
@@ -749,8 +749,8 @@ class Qwen3ForCausalLM(nn.Module):
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)
 
 
-class Qwen3ForConditionalGeneration(nn.Module):
-    def __init__(self, config: Qwen3Config):
+class Qwen3_5TextForConditionalGeneration(nn.Module):
+    def __init__(self, config: Qwen3_5TextModelConfig):
         super().__init__()
         self.config = config
         self.model = Qwen3Model(config)

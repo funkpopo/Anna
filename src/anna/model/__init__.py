@@ -1,20 +1,20 @@
-from anna.model.config import (
+from anna.model.qwen3_5_text_config import (
     QuantizationConfig,
-    Qwen3Config,
-    Qwen3TextConfig,
-    Qwen3VisionConfig,
+    Qwen3_5TextModelConfig,
+    Qwen3_5TextConfig,
+    Qwen3_5TextVisionConfig,
     RopeParameters,
     VisionPreprocessorConfig,
 )
-from anna.model.qwen import Qwen3ForCausalLM, Qwen3ForConditionalGeneration
+from anna.model.qwen3_5_text_model import Qwen3_5TextForCausalLM, Qwen3_5TextForConditionalGeneration
 
 __all__ = [
     "QuantizationConfig",
-    "Qwen3Config",
-    "Qwen3ForCausalLM",
-    "Qwen3ForConditionalGeneration",
-    "Qwen3TextConfig",
-    "Qwen3VisionConfig",
+    "Qwen3_5TextModelConfig",
+    "Qwen3_5TextForCausalLM",
+    "Qwen3_5TextForConditionalGeneration",
+    "Qwen3_5TextConfig",
+    "Qwen3_5TextVisionConfig",
     "RopeParameters",
     "VisionPreprocessorConfig",
 ]

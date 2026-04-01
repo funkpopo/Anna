@@ -7,8 +7,8 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-from anna.model.config import Qwen3Config
-from anna.model.qwen import Qwen3ForConditionalGeneration
+from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig
+from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.quantization import replace_linear_modules
 
 
@@ -19,12 +19,12 @@ class WeightLoadReport:
     quantized_replacements: int = 0
 
 
-def load_model_config(model_dir: str | Path) -> Qwen3Config:
+def load_qwen3_5_text_model_config(model_dir: str | Path) -> Qwen3_5TextModelConfig:
     model_path = Path(model_dir)
     config_path = model_path / "config.json"
     if not config_path.exists():
         raise FileNotFoundError(f"Missing config file: {config_path}")
-    return Qwen3Config.from_model_dir(model_path)
+    return Qwen3_5TextModelConfig.from_model_dir(model_path)
 
 
 def _iter_weight_files(model_dir: Path) -> list[Path]:
@@ -44,7 +44,7 @@ def _iter_weight_files(model_dir: Path) -> list[Path]:
     return files
 
 
-def estimate_model_weight_bytes(model_dir: str | Path) -> int:
+def estimate_qwen3_5_text_model_weight_bytes(model_dir: str | Path) -> int:
     model_path = Path(model_dir)
     index_path = model_path / "model.safetensors.index.json"
     if index_path.exists():
@@ -56,18 +56,18 @@ def estimate_model_weight_bytes(model_dir: str | Path) -> int:
     return sum(weight_file.stat().st_size for weight_file in _iter_weight_files(model_path))
 
 
-def build_model(
-    config: Qwen3Config,
+def build_qwen3_5_text_model(
+    config: Qwen3_5TextModelConfig,
     *,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[Qwen3ForConditionalGeneration, int]:
+) -> tuple[Qwen3_5TextForConditionalGeneration, int]:
     default_dtype = torch.get_default_dtype()
     build_dtype = dtype if dtype in {torch.float16, torch.bfloat16, torch.float32} else torch.float32
     try:
         torch.set_default_dtype(build_dtype)
         with torch.device("meta"):
-            model = Qwen3ForConditionalGeneration(config)
+            model = Qwen3_5TextForConditionalGeneration(config)
     finally:
         torch.set_default_dtype(default_dtype)
 
@@ -78,7 +78,7 @@ def build_model(
     return model, len(quantized_specs)
 
 
-def load_model_weights(model: Qwen3ForConditionalGeneration, model_dir: str | Path) -> WeightLoadReport:
+def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, model_dir: str | Path) -> WeightLoadReport:
     model_path = Path(model_dir)
     tensor_targets = {name: tensor for name, tensor in model.named_parameters()}
     tensor_targets.update({name: tensor for name, tensor in model.named_buffers()})

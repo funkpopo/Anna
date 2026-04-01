@@ -104,7 +104,7 @@ class VisionPreprocessorConfig:
 
 
 @dataclass(slots=True)
-class Qwen3TextConfig:
+class Qwen3_5TextConfig:
     model_type: str = "qwen3_5_text"
     hidden_size: int = 1024
     intermediate_size: int = 3584
@@ -153,7 +153,7 @@ class Qwen3TextConfig:
         return (layer_idx + 1) % max(1, self.decoder_sparse_step) == 0
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Qwen3TextConfig":
+    def from_dict(cls, data: dict[str, Any]) -> "Qwen3_5TextConfig":
         text_config = data.get("text_config", data)
         interval = int(text_config.get("full_attention_interval", 4))
         layer_types = list(text_config.get("layer_types", []))
@@ -223,7 +223,7 @@ class Qwen3TextConfig:
 
 
 @dataclass(slots=True)
-class Qwen3VisionConfig:
+class Qwen3_5TextVisionConfig:
     depth: int = 12
     hidden_size: int = 768
     hidden_act: str = "gelu_pytorch_tanh"
@@ -237,7 +237,7 @@ class Qwen3VisionConfig:
     temporal_patch_size: int = 2
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> "Qwen3VisionConfig":
+    def from_dict(cls, data: dict[str, Any] | None) -> "Qwen3_5TextVisionConfig":
         if not data:
             return cls()
         return cls(
@@ -256,10 +256,10 @@ class Qwen3VisionConfig:
 
 
 @dataclass(slots=True)
-class Qwen3Config:
+class Qwen3_5TextModelConfig:
     model_type: str = "qwen3_5"
-    text_config: Qwen3TextConfig = field(default_factory=Qwen3TextConfig)
-    vision_config: Qwen3VisionConfig | None = None
+    text_config: Qwen3_5TextConfig = field(default_factory=Qwen3_5TextConfig)
+    vision_config: Qwen3_5TextVisionConfig | None = None
     preprocessor_config: VisionPreprocessorConfig = field(default_factory=VisionPreprocessorConfig)
     quantization_config: QuantizationConfig = field(default_factory=QuantizationConfig)
     default_max_completion_tokens: int | None = None
@@ -276,7 +276,7 @@ class Qwen3Config:
         *,
         preprocessor_data: dict[str, Any] | None = None,
         generation_config_data: dict[str, Any] | None = None,
-    ) -> "Qwen3Config":
+    ) -> "Qwen3_5TextModelConfig":
         text_config_data = config_data.get("text_config", {})
         default_max_completion_tokens_value = _first_non_null(
             config_data.get("max_completion_tokens"),
@@ -294,8 +294,8 @@ class Qwen3Config:
         )
         return cls(
             model_type=config_data.get("model_type", "qwen3_5"),
-            text_config=Qwen3TextConfig.from_dict(config_data),
-            vision_config=Qwen3VisionConfig.from_dict(config_data.get("vision_config")),
+            text_config=Qwen3_5TextConfig.from_dict(config_data),
+            vision_config=Qwen3_5TextVisionConfig.from_dict(config_data.get("vision_config")),
             preprocessor_config=VisionPreprocessorConfig.from_dict(preprocessor_data),
             quantization_config=QuantizationConfig.from_dict(config_data.get("quantization_config")),
             default_max_completion_tokens=default_max_completion_tokens,
@@ -307,7 +307,7 @@ class Qwen3Config:
         )
 
     @classmethod
-    def from_model_dir(cls, model_dir: str | Path) -> "Qwen3Config":
+    def from_model_dir(cls, model_dir: str | Path) -> "Qwen3_5TextModelConfig":
         model_path = Path(model_dir)
         config_data = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
         preprocessor_data = None
