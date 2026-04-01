@@ -81,6 +81,34 @@ class GenerateSettings:
 
 
 @dataclass(slots=True)
+class SpeakSettings:
+    model_dir: Path
+    text: str
+    output: Path
+    model_id: str | None = None
+    device: str = "auto"
+    dtype: str = "auto"
+    language: str | None = None
+    speaker: str | None = None
+    instruct: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    x_vector_only_mode: bool = False
+    response_format: str = "wav"
+    max_new_tokens: int | None = None
+    do_sample: bool = True
+    temperature: float = 0.9
+    top_p: float = 1.0
+    top_k: int = 50
+    repetition_penalty: float = 1.05
+    subtalker_do_sample: bool = True
+    subtalker_temperature: float = 0.9
+    subtalker_top_p: float = 1.0
+    subtalker_top_k: int = 50
+    non_streaming_mode: bool = True
+
+
+@dataclass(slots=True)
 class BenchmarkSettings:
     model_dir: Path
     prompt: str

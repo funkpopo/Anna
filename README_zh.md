@@ -17,7 +17,10 @@
   - `GET /v1/models`
   - `POST /v1/chat/completions`
   - `POST /v1/completions`
+  - `POST /v1/audio/speech`
 - 文本生成与流式输出
+- Qwen3-TTS 语音合成
+- `anna-speak` 本地语音生成命令
 - `xpu` 设备推理
 - 线性注意力 SYCL fused op
 - 启动时终端打印服务地址与可用路由
@@ -124,6 +127,8 @@ pytest -q
 
 ## 模型目录要求
 
+### 文本 / 多模态 Qwen 模型
+
 本地模型目录至少应包含：
 
 - `config.json`
@@ -136,6 +141,30 @@ pytest -q
 ```text
 D:\Projects\Anna\models\Qwen\Qwen3___5-2B
 ```
+
+### Qwen3-TTS 12Hz 模型
+
+Anna 也支持官方 `Qwen3-TTS` 12Hz 模型目录，底层走 `qwen-tts` 运行时。一个本地 TTS 模型目录至少应包含：
+
+- `config.json`
+- `tokenizer_config.json`
+- `vocab.json`
+- `merges.txt`
+- `model.safetensors`
+- `speech_tokenizer\config.json`
+- `speech_tokenizer\model.safetensors`
+
+例如：
+
+```text
+D:\Projects\Anna\models\Qwen\Qwen3-TTS-12Hz-1___7B-Base
+```
+
+说明：
+
+- `anna-generate` 和 `anna-bench` 仍然只支持文本模型；TTS 模型请使用 `anna-speak` 或 `POST /v1/audio/speech`
+- 当前 TTS 支持面向官方 12Hz 目录结构，如 `Base`、`CustomVoice`、`VoiceDesign`
+- 上游 `qwen-tts` 包在导入时可能提示系统缺少 `SoX`；按这里验证过的 12Hz 路径，这个警告不会阻塞推理
 
 ## 运行命令示例
 
@@ -190,6 +219,7 @@ INFO anna.cli.serve: Route: /healthz, Methods: GET
 INFO anna.cli.serve: Route: /v1/models, Methods: GET
 INFO anna.cli.serve: Route: /v1/chat/completions, Methods: POST
 INFO anna.cli.serve: Route: /v1/completions, Methods: POST
+INFO anna.cli.serve: Route: /v1/audio/speech, Methods: POST
 ```
 
 ### 3. 直接文本生成
@@ -217,6 +247,62 @@ anna-bench `
   --prompt "你好，请介绍一下你自己。" `
   --runs 5
 ```
+
+### 5. 直接运行 Qwen3-TTS Base 语音合成
+
+这条路径适合本地语音克隆模型，例如 `Qwen3-TTS-12Hz-1.7B-Base`。
+
+```powershell
+anna-speak `
+  --model-dir D:\Projects\Anna\models\Qwen\Qwen3-TTS-12Hz-1___7B-Base `
+  --device xpu `
+  --dtype bfloat16 `
+  --input "Anna CLI smoke test on Intel Arc." `
+  --output D:\Projects\Anna\.build\anna_tts_cli_smoke.wav `
+  --language English `
+  --ref-audio D:\Projects\Anna\.build\tts_ref.wav `
+  --ref-text "Hello Anna. This is a reference voice for local synthesis testing." `
+  --max-new-tokens 1024
+```
+
+如果你加载的是 `CustomVoice` 模型，就使用 `--speaker`，可选再加 `--instruct`。
+
+如果你加载的是 `VoiceDesign` 模型，就提供 `--instruct`，不需要 `--speaker`。
+
+### 6. 启动 Qwen3-TTS 服务
+
+```powershell
+anna-serve `
+  --model-dir D:\Projects\Anna\models\Qwen\Qwen3-TTS-12Hz-1___7B-Base `
+  --model-name Qwen3-TTS-1.7B-Base `
+  --device xpu `
+  --dtype bfloat16 `
+  --host 127.0.0.1 `
+  --port 8000
+```
+
+### 7. 调用语音接口
+
+服务端会直接返回音频字节。对于 `Base` 语音克隆模型，需要带上 `ref_audio` 和 `ref_text`。
+
+```powershell
+curl.exe http://127.0.0.1:8000/v1/audio/speech `
+  -H "Content-Type: application/json" `
+  --output speech.wav `
+  -d "{\"model\":\"Qwen3-TTS-1.7B-Base\",\"input\":\"This request goes through the Anna FastAPI speech route.\",\"language\":\"English\",\"ref_audio\":\"D:\\Projects\\Anna\\.build\\tts_ref.wav\",\"ref_text\":\"Hello Anna. This is a reference voice for local synthesis testing.\",\"response_format\":\"wav\",\"max_new_tokens\":1024}"
+```
+
+当前支持的主要请求字段包括：
+
+- `input`：待合成文本
+- `response_format`：`wav`、`flac`、`pcm`
+- `language`
+- `speaker` 或 `voice`，用于 `CustomVoice`
+- `instruct`，用于 `VoiceDesign`，也可用于 `CustomVoice` 的风格控制
+- `ref_audio`、`ref_text`、`x_vector_only_mode`，用于 `Base`
+- `max_new_tokens`、`do_sample`、`temperature`、`top_p`、`top_k`、`repetition_penalty`
+- `subtalker_do_sample`、`subtalker_temperature`、`subtalker_top_p`、`subtalker_top_k`
+- `non_streaming_mode`
 
 ## API 调用示例
 

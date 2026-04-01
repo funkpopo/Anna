@@ -10,7 +10,7 @@ from anna.core.config import ServeSettings, parse_resident_expert_layer_indices
 from anna.core.logging import setup_logging
 from anna.core.model_path import resolve_model_dir, resolve_model_name
 from anna.runtime.device import RuntimeSafetyPolicy
-from anna.runtime.engine import AnnaEngine
+from anna.runtime.loader import load_engine_from_model_dir
 from anna.runtime.service_metrics import AnnaServiceMetricsLogger
 from anna.runtime.scheduler import AnnaScheduler
 
@@ -90,9 +90,13 @@ def _build_safety_policy(settings: ServeSettings) -> RuntimeSafetyPolicy | None:
     )
 
 
-def _build_scheduler(engine: AnnaEngine, settings: ServeSettings) -> AnnaScheduler | None:
+def _build_scheduler(engine, settings: ServeSettings) -> AnnaScheduler | None:
     if settings.scheduler_max_batch_size <= 1:
-        engine.set_scheduler(None)
+        if hasattr(engine, "set_scheduler"):
+            engine.set_scheduler(None)
+        return None
+    if not hasattr(engine, "set_scheduler"):
+        logger.info("Skipping scheduler setup because the loaded model backend does not support continuous batching.")
         return None
 
     scheduler = AnnaScheduler(
@@ -296,7 +300,7 @@ def main() -> None:
     )
 
     setup_logging(settings.log_level)
-    engine = AnnaEngine.from_model_dir(
+    engine = load_engine_from_model_dir(
         settings.model_dir,
         model_id=settings.model_id,
         device=settings.device,

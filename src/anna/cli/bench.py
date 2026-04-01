@@ -6,6 +6,7 @@ import time
 
 from anna.core.config import BenchmarkSettings, parse_resident_expert_layer_indices
 from anna.core.logging import setup_logging
+from anna.core.model_family import inspect_model_family
 from anna.core.model_path import resolve_model_dir, resolve_model_name
 from anna.runtime.engine import AnnaEngine, GenerationConfig
 
@@ -127,6 +128,9 @@ def _build_messages(settings: BenchmarkSettings) -> list[dict]:
 def main() -> None:
     args = build_parser().parse_args()
     model_dir = resolve_model_dir(args.model_dir)
+    family_info = inspect_model_family(model_dir)
+    if family_info.family == "tts":
+        raise SystemExit("The selected model is a Qwen3-TTS model. Benchmark support is currently text-only; use anna-speak or anna-serve.")
     model_name = resolve_model_name(model_name=args.model_name, model_dir=model_dir)
     settings = BenchmarkSettings(
         model_dir=model_dir,

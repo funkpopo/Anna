@@ -19,7 +19,10 @@ If you want to run a local Qwen3.5 model on an Arc A770 or A750, this README is 
   - `GET /v1/models`
   - `POST /v1/chat/completions`
   - `POST /v1/completions`
+  - `POST /v1/audio/speech`
 - Text generation and streaming responses
+- Qwen3-TTS speech synthesis
+- `anna-speak` CLI for local TTS generation
 - `xpu` inference
 - Linear-attention SYCL fused op
 - Service address and available routes printed on startup
@@ -126,6 +129,8 @@ pytest -q
 
 ## Local Model Directory Requirements
 
+### Text / multimodal Qwen models
+
 Your local model directory should contain at least:
 
 - `config.json`
@@ -138,6 +143,30 @@ For example:
 ```text
 D:\Projects\Anna\models\Qwen\Qwen3___5-2B
 ```
+
+### Qwen3-TTS 12Hz models
+
+Anna also supports official `Qwen3-TTS` 12Hz model directories through the `qwen-tts` runtime path. A local TTS model directory should contain at least:
+
+- `config.json`
+- `tokenizer_config.json`
+- `vocab.json`
+- `merges.txt`
+- `model.safetensors`
+- `speech_tokenizer\config.json`
+- `speech_tokenizer\model.safetensors`
+
+For example:
+
+```text
+D:\Projects\Anna\models\Qwen\Qwen3-TTS-12Hz-1___7B-Base
+```
+
+Notes:
+
+- `anna-generate` and `anna-bench` remain text-only; use `anna-speak` or `POST /v1/audio/speech` for TTS models
+- current TTS support is aimed at official 12Hz model layouts such as `Base`, `CustomVoice`, and `VoiceDesign`
+- the upstream `qwen-tts` package may warn about missing system `SoX` on import; that warning does not block 12Hz inference on the path validated here
 
 ## Command Examples
 
@@ -192,6 +221,7 @@ INFO anna.cli.serve: Route: /healthz, Methods: GET
 INFO anna.cli.serve: Route: /v1/models, Methods: GET
 INFO anna.cli.serve: Route: /v1/chat/completions, Methods: POST
 INFO anna.cli.serve: Route: /v1/completions, Methods: POST
+INFO anna.cli.serve: Route: /v1/audio/speech, Methods: POST
 ```
 
 ### 3. Generate text directly
@@ -219,6 +249,62 @@ anna-bench `
   --prompt "Hello, please introduce yourself." `
   --runs 5
 ```
+
+### 5. Generate speech directly with Qwen3-TTS Base
+
+This path is intended for local voice-clone models such as `Qwen3-TTS-12Hz-1.7B-Base`.
+
+```powershell
+anna-speak `
+  --model-dir D:\Projects\Anna\models\Qwen\Qwen3-TTS-12Hz-1___7B-Base `
+  --device xpu `
+  --dtype bfloat16 `
+  --input "Anna CLI smoke test on Intel Arc." `
+  --output D:\Projects\Anna\.build\anna_tts_cli_smoke.wav `
+  --language English `
+  --ref-audio D:\Projects\Anna\.build\tts_ref.wav `
+  --ref-text "Hello Anna. This is a reference voice for local synthesis testing." `
+  --max-new-tokens 1024
+```
+
+For `CustomVoice` models, replace the voice-clone arguments with `--speaker` and optional `--instruct`.
+
+For `VoiceDesign` models, provide `--instruct` without `--speaker`.
+
+### 6. Serve a Qwen3-TTS model
+
+```powershell
+anna-serve `
+  --model-dir D:\Projects\Anna\models\Qwen\Qwen3-TTS-12Hz-1___7B-Base `
+  --model-name Qwen3-TTS-1.7B-Base `
+  --device xpu `
+  --dtype bfloat16 `
+  --host 127.0.0.1 `
+  --port 8000
+```
+
+### 7. Call the speech API
+
+The server returns raw audio bytes. For `Base` voice-clone models, include `ref_audio` and `ref_text`.
+
+```powershell
+curl.exe http://127.0.0.1:8000/v1/audio/speech `
+  -H "Content-Type: application/json" `
+  --output speech.wav `
+  -d "{\"model\":\"Qwen3-TTS-1.7B-Base\",\"input\":\"This request goes through the Anna FastAPI speech route.\",\"language\":\"English\",\"ref_audio\":\"D:\\Projects\\Anna\\.build\\tts_ref.wav\",\"ref_text\":\"Hello Anna. This is a reference voice for local synthesis testing.\",\"response_format\":\"wav\",\"max_new_tokens\":1024}"
+```
+
+Supported request fields include:
+
+- `input`: text to synthesize
+- `response_format`: `wav`, `flac`, or `pcm`
+- `language`
+- `speaker` or `voice` for `CustomVoice`
+- `instruct` for `VoiceDesign` or optional style control on `CustomVoice`
+- `ref_audio`, `ref_text`, `x_vector_only_mode` for `Base`
+- `max_new_tokens`, `do_sample`, `temperature`, `top_p`, `top_k`, `repetition_penalty`
+- `subtalker_do_sample`, `subtalker_temperature`, `subtalker_top_p`, `subtalker_top_k`
+- `non_streaming_mode`
 
 ## API Examples
 

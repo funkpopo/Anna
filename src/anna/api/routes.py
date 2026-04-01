@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 import logging
+import io
 import time
 import uuid
 from typing import Iterator
 
+import numpy as np
+import soundfile as sf
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from anna.api.schemas import ChatCompletionRequest, CompletionRequest
+from anna.api.schemas import ChatCompletionRequest, CompletionRequest, SpeechRequest
 from anna.runtime.engine import (
     AnnaEngineError,
     GenerationConfig,
@@ -18,6 +21,7 @@ from anna.runtime.engine import (
     TextGenerationResult,
     normalize_reasoning_format,
 )
+from anna.runtime.tts_engine import SpeechSynthesisConfig
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -66,6 +70,12 @@ def _default_reasoning_format(engine: object) -> ReasoningFormat:
 
 def _default_enable_thinking(engine: object) -> bool:
     return getattr(engine, "default_enable_thinking", True) is not False
+
+
+def _require_method(engine: object, method_name: str, *, message: str, code: str):
+    if not hasattr(engine, method_name):
+        raise AnnaEngineError(message, code=code)
+    return getattr(engine, method_name)
 
 
 def _resolve_enable_thinking(engine: object, payload: ChatCompletionRequest) -> bool:
@@ -181,6 +191,25 @@ def _completion_response_payload(
             "total_tokens": result.prompt_tokens + result.completion_tokens,
         },
     }
+
+
+def _encode_pcm16(audio: np.ndarray) -> bytes:
+    clipped = np.clip(audio, -1.0, 1.0)
+    scaled = np.rint(clipped * 32767.0).astype(np.int16)
+    return scaled.tobytes()
+
+
+def _encode_audio_bytes(audio: np.ndarray, *, sample_rate: int, response_format: str) -> tuple[bytes, str]:
+    if response_format == "pcm":
+        return _encode_pcm16(audio), "audio/pcm"
+
+    buffer = io.BytesIO()
+    if response_format == "flac":
+        sf.write(buffer, audio, sample_rate, format="FLAC", subtype="PCM_16")
+        return buffer.getvalue(), "audio/flac"
+
+    sf.write(buffer, audio, sample_rate, format="WAV", subtype="PCM_16")
+    return buffer.getvalue(), "audio/wav"
 
 
 def _error_payload_from_exception(exc: AnnaEngineError) -> dict:
@@ -348,7 +377,13 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
 
     try:
         if payload.stream:
-            events = engine.stream_chat(
+            stream_chat = _require_method(
+                engine,
+                "stream_chat",
+                message="The loaded model does not support chat completions.",
+                code="unsupported_chat_completions",
+            )
+            events = stream_chat(
                 payload.messages,
                 config=config,
                 enable_thinking=enable_thinking,
@@ -364,7 +399,13 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
                 media_type="text/event-stream",
             )
 
-        result = engine.generate_chat(
+        generate_chat = _require_method(
+            engine,
+            "generate_chat",
+            message="The loaded model does not support chat completions.",
+            code="unsupported_chat_completions",
+        )
+        result = generate_chat(
             payload.messages,
             config=config,
             enable_thinking=enable_thinking,
@@ -411,7 +452,13 @@ def completions(request: Request, payload: CompletionRequest):
 
     try:
         if payload.stream:
-            events = engine.stream_text(payload.prompt, config=config)
+            stream_text = _require_method(
+                engine,
+                "stream_text",
+                message="The loaded model does not support text completions.",
+                code="unsupported_text_completions",
+            )
+            events = stream_text(payload.prompt, config=config)
             return StreamingResponse(
                 _stream_sse_completion(
                     response_id=response_id,
@@ -422,7 +469,13 @@ def completions(request: Request, payload: CompletionRequest):
                 media_type="text/event-stream",
             )
 
-        result = engine.generate_text(payload.prompt, config=config)
+        generate_text = _require_method(
+            engine,
+            "generate_text",
+            message="The loaded model does not support text completions.",
+            code="unsupported_text_completions",
+        )
+        result = generate_text(payload.prompt, config=config)
     except AnnaEngineError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
@@ -443,3 +496,69 @@ def completions(request: Request, payload: CompletionRequest):
             result=result,
         )
     )
+
+
+@router.post("/v1/audio/speech")
+def audio_speech(request: Request, payload: SpeechRequest):
+    engine = _engine(request)
+    synthesize_speech = _require_method(
+        engine,
+        "synthesize_speech",
+        message="The loaded model does not support speech synthesis.",
+        code="unsupported_speech_synthesis",
+    )
+    model_id = payload.model or engine.default_model_id
+    speaker = payload.speaker or payload.voice
+    memory_before = _memory_snapshot(engine)
+    started_at = time.perf_counter()
+
+    try:
+        result = synthesize_speech(
+            payload.input,
+            language=payload.language,
+            speaker=speaker,
+            instruct=payload.instruct,
+            ref_audio=payload.ref_audio,
+            ref_text=payload.ref_text,
+            x_vector_only_mode=payload.x_vector_only_mode,
+            config=SpeechSynthesisConfig(
+                max_new_tokens=payload.max_new_tokens,
+                do_sample=payload.do_sample,
+                temperature=payload.temperature,
+                top_p=payload.top_p,
+                top_k=payload.top_k,
+                repetition_penalty=payload.repetition_penalty,
+                subtalker_do_sample=payload.subtalker_do_sample,
+                subtalker_temperature=payload.subtalker_temperature,
+                subtalker_top_p=payload.subtalker_top_p,
+                subtalker_top_k=payload.subtalker_top_k,
+                non_streaming_mode=payload.non_streaming_mode,
+            ),
+        )
+    except AnnaEngineError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    memory_after = _memory_snapshot(engine)
+    elapsed_seconds = time.perf_counter() - started_at
+    logger.info(
+        "audio_speech model=%s audio_seconds=%.3f sample_rate=%s total_seconds=%.3f xpu_free_before=%s xpu_free_after=%s",
+        model_id,
+        result.duration_seconds,
+        result.sample_rate,
+        elapsed_seconds,
+        _format_bytes(None if memory_before is None else memory_before.free_bytes),
+        _format_bytes(None if memory_after is None else memory_after.free_bytes),
+    )
+    audio_bytes, media_type = _encode_audio_bytes(
+        result.audio,
+        sample_rate=result.sample_rate,
+        response_format=payload.response_format,
+    )
+    extension = "pcm" if payload.response_format == "pcm" else payload.response_format
+    headers = {
+        "X-Model-Id": str(model_id),
+        "X-Audio-Sample-Rate": str(result.sample_rate),
+        "X-Audio-Duration-Seconds": f"{result.duration_seconds:.3f}",
+        "Content-Disposition": f'inline; filename=\"speech.{extension}\"',
+    }
+    return Response(content=audio_bytes, media_type=media_type, headers=headers)
