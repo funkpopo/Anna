@@ -101,12 +101,16 @@ def main() -> None:
         causal_conv1d_fused_is_available,
         gated_delta_fused_is_available,
         maybe_load_gated_delta_library,
+        qk_norm_rotary_fused_is_available,
+        rmsnorm_fused_is_available,
     )
 
     if not maybe_load_gated_delta_library(output):
         raise RuntimeError(f"Failed to load compiled Anna fused-op library: {output}")
 
     print(f"library_path={output}")
+    print(f"rmsnorm_registered={rmsnorm_fused_is_available()}")
+    print(f"qk_norm_rotary_registered={qk_norm_rotary_fused_is_available()}")
     print(f"gated_delta_registered={gated_delta_fused_is_available()}")
     print(f"causal_conv1d_registered={causal_conv1d_fused_is_available()}")
 
