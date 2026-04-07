@@ -65,11 +65,33 @@ def _gated_delta_op():
     return getattr(namespace, "gated_delta_fused", None)
 
 
+def _rmsnorm_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "rmsnorm_fused", None)
+
+
+def _qk_norm_rotary_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "qk_norm_rotary_fused", None)
+
+
 def _causal_conv1d_op():
     namespace = getattr(torch.ops, "anna", None)
     if namespace is None:
         return None
     return getattr(namespace, "causal_conv1d_fused", None)
+
+
+def rmsnorm_fused_is_available() -> bool:
+    return _rmsnorm_op() is not None
+
+
+def qk_norm_rotary_fused_is_available() -> bool:
+    return _qk_norm_rotary_op() is not None
 
 
 def gated_delta_fused_is_available() -> bool:
@@ -115,6 +137,56 @@ def maybe_load_gated_delta_library(path: str | os.PathLike[str] | None = None) -
             logger.info("Loaded Anna fused-op library from %s", resolved)
             return True
     return gated_delta_fused_is_available()
+
+
+def run_rmsnorm_fused(
+    *,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    op = _rmsnorm_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _rmsnorm_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna rmsnorm_fused op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(input, weight, float(eps))
+
+
+def run_qk_norm_rotary_fused(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_norm_weight: torch.Tensor,
+    key_norm_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    query_norm_eps: float,
+    key_norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op = _qk_norm_rotary_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _qk_norm_rotary_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna qk_norm_rotary_fused op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(
+        query,
+        key,
+        query_norm_weight,
+        key_norm_weight,
+        cos,
+        sin,
+        float(query_norm_eps),
+        float(key_norm_eps),
+    )
 
 
 def run_causal_conv1d_fused(

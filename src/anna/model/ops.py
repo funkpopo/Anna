@@ -9,7 +9,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
-from anna.model.fused_ops import run_causal_conv1d_fused, run_gated_delta_fused
+from anna.model.fused_ops import (
+    run_causal_conv1d_fused,
+    run_gated_delta_fused,
+    run_qk_norm_rotary_fused,
+    run_rmsnorm_fused,
+)
 from anna.model.quantization import convert_module_linears_to_xpu_int4
 
 logger = logging.getLogger(__name__)
@@ -685,6 +690,8 @@ class Qwen3RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "xpu":
+            return run_rmsnorm_fused(input=x, weight=self.weight, eps=self.eps)
         output = x.float()
         output = output * torch.rsqrt(output.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         output = output * (1.0 + self.weight.float())
@@ -993,12 +1000,26 @@ class Qwen3Attention(nn.Module):
             dim=-1,
         )
         gate = gate.reshape(*input_shape, -1)
-        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        query_states = query_states.view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if hidden_states.device.type == "xpu":
+            query_states, key_states = run_qk_norm_rotary_fused(
+                query=query_states,
+                key=key_states,
+                query_norm_weight=self.q_norm.weight,
+                key_norm_weight=self.k_norm.weight,
+                cos=cos,
+                sin=sin,
+                query_norm_eps=self.q_norm.eps,
+                key_norm_eps=self.k_norm.eps,
+            )
+        else:
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         past_lengths = torch.zeros(batch_size, device=hidden_states.device, dtype=torch.long)
         if past_key_values is not None:
