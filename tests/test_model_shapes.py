@@ -9,9 +9,13 @@ import anna.model.ops as model_ops
 from anna.model.quantization import XPUInt4Linear
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig, RopeParameters
 from anna.model.ops import (
+    Qwen3Attention,
     Qwen3DynamicCache,
     Qwen3PageAllocator,
     Qwen3SparseMoeBlock,
+    Qwen3TextRotaryEmbedding,
+    grouped_query_attention,
+    repeat_kv,
     torch_causal_conv1d_update,
     torch_chunk_gated_delta_rule,
     torch_recurrent_gated_delta_rule,
@@ -404,6 +408,104 @@ def test_causal_conv1d_update_multi_token_path_matches_grouped_conv() -> None:
 
     assert torch.allclose(fast, expected, atol=1e-5, rtol=1e-4)
     assert torch.allclose(fast_state, baseline_state, atol=1e-5, rtol=1e-4)
+
+
+def test_grouped_query_attention_matches_materialized_kv_reference() -> None:
+    with _temporary_torch_seed(0):
+        query_states = torch.randn(2, 4, 3, 16)
+        key_states = torch.randn(2, 2, 5, 16)
+        value_states = torch.randn(2, 2, 5, 16)
+
+    q_positions = torch.tensor([[2, 3, 4], [1, 2, 3]])
+    causal_mask = torch.arange(5).view(1, 1, -1) > q_positions[:, :, None]
+    visible_mask = torch.arange(5).view(1, -1) < torch.tensor([[5], [4]])
+    key_padding_mask = torch.tensor(
+        [
+            [True, True, True, True, False],
+            [True, True, True, False, False],
+        ]
+    )
+
+    grouped_output = grouped_query_attention(
+        query_states,
+        key_states,
+        value_states,
+        scaling=16**-0.5,
+        causal_mask=causal_mask,
+        visible_mask=visible_mask,
+        key_padding_mask=key_padding_mask,
+    )
+
+    materialized_key_states = repeat_kv(key_states, 2)
+    materialized_value_states = repeat_kv(value_states, 2)
+    attn_scores = torch.matmul(query_states, materialized_key_states.transpose(-1, -2)) * (16**-0.5)
+    attn_scores = attn_scores.masked_fill(causal_mask[:, None, :, :], float("-inf"))
+    attn_scores = attn_scores.masked_fill(~visible_mask[:, None, None, :], float("-inf"))
+    attn_scores = attn_scores.masked_fill(~key_padding_mask[:, None, None, :], float("-inf"))
+    attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
+    expected = torch.matmul(attn_probs, materialized_value_states)
+
+    assert torch.allclose(grouped_output, expected, atol=1e-5, rtol=1e-4)
+
+
+def test_qwen3_attention_incremental_cache_matches_full_forward_without_repeat_kv_materialization() -> None:
+    with _temporary_torch_seed(0):
+        config = _tiny_config()
+        attention = Qwen3Attention(config, layer_idx=1).eval()
+        rotary = Qwen3TextRotaryEmbedding(config)
+        prompt_states = torch.randn(1, 5, config.hidden_size)
+        append_states = torch.randn(1, 2, config.hidden_size)
+        full_states = torch.cat([prompt_states, append_states], dim=1)
+
+    with torch.no_grad():
+        full_position_ids = torch.arange(full_states.shape[1]).view(1, -1)
+        full_embeddings = rotary(full_states, full_position_ids)
+        full_output = attention(full_states, full_embeddings)
+
+        cache = Qwen3DynamicCache(config)
+        prompt_position_ids = torch.arange(prompt_states.shape[1]).view(1, -1)
+        prompt_embeddings = rotary(prompt_states, prompt_position_ids)
+        _ = attention(prompt_states, prompt_embeddings, past_key_values=cache)
+
+        append_position_ids = torch.arange(prompt_states.shape[1], full_states.shape[1]).view(1, -1)
+        append_embeddings = rotary(append_states, append_position_ids)
+        append_output = attention(append_states, append_embeddings, past_key_values=cache)
+
+    assert torch.allclose(append_output, full_output[:, -append_states.shape[1] :], atol=1e-5, rtol=1e-4)
+
+
+def test_sparse_moe_routing_assignments_match_reference_without_expert_mask_materialization() -> None:
+    with _temporary_torch_seed(0):
+        block = Qwen3SparseMoeBlock(_tiny_moe_config())
+        hidden_states = torch.randn(2, 3, block._config.hidden_size)
+
+    flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    router_logits = block.gate(flat_hidden_states)
+    routing_weights, selected_experts, usage = block._route_tokens(router_logits, hidden_dtype=flat_hidden_states.dtype)
+    sorted_token_idx, sorted_route_idx, expert_offsets = block._sorted_routing_assignments(selected_experts, usage)
+
+    reference_weights = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+    reference_weights, reference_selected = torch.topk(reference_weights, block.top_k, dim=-1)
+    if block.norm_topk_prob:
+        reference_weights = reference_weights / reference_weights.sum(dim=-1, keepdim=True)
+    reference_usage = torch.bincount(reference_selected.reshape(-1), minlength=block.num_experts)
+    reference_mask = torch.nn.functional.one_hot(reference_selected, num_classes=block.num_experts).permute(2, 1, 0)
+
+    assert torch.allclose(routing_weights.float(), reference_weights.float(), atol=1e-5, rtol=1e-4)
+    assert torch.equal(selected_experts, reference_selected)
+    assert torch.equal(usage.to(dtype=torch.long), reference_usage.to(dtype=torch.long))
+
+    for expert_idx in range(block.num_experts):
+        start_idx = int(expert_offsets[expert_idx].item())
+        end_idx = int(expert_offsets[expert_idx + 1].item())
+        got_pairs = torch.stack([sorted_token_idx[start_idx:end_idx], sorted_route_idx[start_idx:end_idx]], dim=-1)
+        ref_route_idx, ref_token_idx = torch.where(reference_mask[expert_idx])
+        ref_pairs = torch.stack([ref_token_idx, ref_route_idx], dim=-1)
+        if got_pairs.numel() == 0 and ref_pairs.numel() == 0:
+            continue
+        got_order = torch.argsort(got_pairs[:, 0] * block.top_k + got_pairs[:, 1])
+        ref_order = torch.argsort(ref_pairs[:, 0] * block.top_k + ref_pairs[:, 1])
+        assert torch.equal(got_pairs.index_select(0, got_order), ref_pairs.index_select(0, ref_order))
 
 
 def test_qwen3_allows_out_of_range_padding_idx_for_tiny_configs() -> None:

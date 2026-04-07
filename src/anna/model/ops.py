@@ -12,6 +12,7 @@ from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.model.fused_ops import (
     run_causal_conv1d_fused,
     run_gated_delta_fused,
+    run_moe_router_fused,
     run_qk_norm_rotary_fused,
     run_rmsnorm_fused,
 )
@@ -786,6 +787,31 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, seq_len, head_dim)
 
 
+def grouped_query_attention(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    *,
+    scaling: float,
+    causal_mask: torch.Tensor | None = None,
+    visible_mask: torch.Tensor | None = None,
+    key_padding_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    batch_size, num_heads, query_len, _ = query_states.shape
+    num_key_value_heads = key_states.shape[1]
+    grouped_query_states = query_states.unflatten(1, (num_key_value_heads, num_heads // num_key_value_heads))
+    attn_scores = torch.matmul(grouped_query_states, key_states.unsqueeze(2).transpose(-1, -2)) * scaling
+    if causal_mask is not None:
+        attn_scores = attn_scores.masked_fill(causal_mask[:, None, None, :, :], float("-inf"))
+    if visible_mask is not None:
+        attn_scores = attn_scores.masked_fill(~visible_mask[:, None, None, None, :], float("-inf"))
+    if key_padding_mask is not None:
+        attn_scores = attn_scores.masked_fill(~key_padding_mask[:, None, None, None, :], float("-inf"))
+    attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
+    attn_output = torch.matmul(attn_probs, value_states.unsqueeze(2))
+    return attn_output.reshape(batch_size, num_heads, query_len, -1)
+
+
 def apply_mask_to_padding_states(hidden_states: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
     if attention_mask is not None and attention_mask.ndim == 2 and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
         hidden_states = hidden_states * attention_mask[:, :, None].to(dtype=hidden_states.dtype)
@@ -1025,8 +1051,6 @@ class Qwen3Attention(nn.Module):
         if past_key_values is not None:
             key_states, value_states, past_lengths = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
         if past_key_values is None and attention_mask is None:
             attn_output = F.scaled_dot_product_attention(
                 query_states,
@@ -1034,27 +1058,32 @@ class Qwen3Attention(nn.Module):
                 value_states,
                 dropout_p=0.0,
                 is_causal=seq_len > 1,
+                enable_gqa=self.num_key_value_groups > 1,
             )
         else:
+            causal_mask = None
+            visible_mask = None
+            key_padding_mask = None
             # XPU SDPA produced corrupted long-form decode outputs when fed
-            # the visible-cache mirror. Keep decode on the explicit path.
-            attn_scores = torch.matmul(query_states, key_states.transpose(-1, -2)) * self.scaling
+            # the visible-cache mirror. Keep decode on the explicit grouped path.
             if not (batch_size == 1 and seq_len == 1 and attention_mask is None and past_key_values is not None):
                 visible_lengths = past_lengths + seq_len
 
                 causal_mask = self._causal_mask(seq_len, key_states.shape[-2], past_lengths, hidden_states.device)
-                if causal_mask is not None:
-                    attn_scores = attn_scores.masked_fill(causal_mask.unsqueeze(1), float("-inf"))
-
                 key_positions = torch.arange(key_states.shape[-2], device=hidden_states.device)[None, :]
                 visible_mask = key_positions < visible_lengths[:, None]
-                attn_scores = attn_scores.masked_fill(~visible_mask[:, None, None, :], float("-inf"))
                 if attention_mask is not None and past_key_values is None:
-                    key_padding_mask = attention_mask[:, None, None, :].to(dtype=torch.bool)
-                    attn_scores = attn_scores.masked_fill(~key_padding_mask, float("-inf"))
+                    key_padding_mask = attention_mask.to(dtype=torch.bool)
 
-            attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
-            attn_output = torch.matmul(attn_probs, value_states)
+            attn_output = grouped_query_attention(
+                query_states,
+                key_states,
+                value_states,
+                scaling=self.scaling,
+                causal_mask=causal_mask,
+                visible_mask=visible_mask,
+                key_padding_mask=key_padding_mask,
+            )
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)
@@ -1339,41 +1368,81 @@ class Qwen3SparseMoeBlock(nn.Module):
         self._expert_cache[expert_idx] = cached
         return cached
 
+    def _route_tokens(
+        self,
+        router_logits: torch.Tensor,
+        *,
+        hidden_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if router_logits.device.type == "xpu":
+            routing_weights, selected_experts, usage = run_moe_router_fused(
+                router_logits=router_logits,
+                top_k=self.top_k,
+                normalize_topk_prob=self.norm_topk_prob,
+            )
+        else:
+            routing_weights = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+            if self.norm_topk_prob:
+                routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+            usage = torch.bincount(selected_experts.reshape(-1), minlength=self.num_experts)
+        return routing_weights.to(dtype=hidden_dtype), selected_experts, usage
+
+    def _sorted_routing_assignments(
+        self,
+        selected_experts: torch.Tensor,
+        usage: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_tokens = selected_experts.shape[0]
+        flat_selected_experts = selected_experts.reshape(-1)
+        flat_token_idx = torch.arange(num_tokens, device=selected_experts.device, dtype=torch.long).repeat_interleave(
+            self.top_k
+        )
+        flat_route_idx = torch.arange(self.top_k, device=selected_experts.device, dtype=torch.long).repeat(num_tokens)
+        sort_key = (
+            flat_selected_experts.to(dtype=torch.long) * (num_tokens * self.top_k)
+            + flat_token_idx * self.top_k
+            + flat_route_idx
+        )
+        sorted_order = torch.argsort(sort_key)
+        sorted_token_idx = flat_token_idx.index_select(0, sorted_order)
+        sorted_route_idx = flat_route_idx.index_select(0, sorted_order)
+        expert_offsets = torch.zeros(self.num_experts + 1, device=selected_experts.device, dtype=torch.long)
+        expert_offsets[1:] = usage.to(dtype=torch.long).cumsum(dim=0)
+        return sorted_token_idx, sorted_route_idx, expert_offsets
+
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         execution_device = hidden_states.device
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_dim)
         router_logits = self.gate(hidden_states)
 
-        routing_weights = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(dtype=hidden_states.dtype)
+        routing_weights, selected_experts, usage = self._route_tokens(router_logits, hidden_dtype=hidden_states.dtype)
 
         final_hidden_states = hidden_states.new_zeros((batch_size * sequence_length, hidden_dim))
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-        hit_experts = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero(as_tuple=False).flatten()
+        usage = usage.to(device=selected_experts.device)
+        hit_experts = usage.nonzero(as_tuple=False).flatten()
         gpu_candidates: set[int] = set()
         if self.offload_experts and self.execution_device is not None and hit_experts.numel() > 0:
-            usage = expert_mask.sum(dim=(-1, -2))
             gpu_count = min(int(hit_experts.numel()), self.cached_experts_per_layer)
             if gpu_count > 0:
                 _, candidate_idx = torch.topk(usage, k=gpu_count)
                 gpu_candidates = {int(idx) for idx in candidate_idx.tolist() if int(usage[idx].item()) > 0}
 
+        sorted_token_idx, sorted_route_idx, expert_offsets = self._sorted_routing_assignments(selected_experts, usage)
         for expert_idx in hit_experts.tolist():
             expert_layer = self.experts[expert_idx]
             if expert_idx in gpu_candidates:
                 cached = self._get_cached_expert(expert_idx)
                 if cached is not None:
                     expert_layer = cached
-            route_idx, token_idx = torch.where(expert_mask[expert_idx])
-            if token_idx.numel() == 0:
-                continue
+            start_idx = int(expert_offsets[expert_idx].item())
+            end_idx = int(expert_offsets[expert_idx + 1].item())
+            token_idx = sorted_token_idx[start_idx:end_idx]
+            route_idx = sorted_route_idx[start_idx:end_idx]
             expert_device = _module_device(expert_layer)
             current_state = hidden_states.index_select(0, token_idx)
-            current_routing_weights = routing_weights[token_idx, route_idx, None]
+            current_routing_weights = routing_weights.index_select(0, token_idx).gather(1, route_idx[:, None])
             if current_state.device != expert_device:
                 current_state = current_state.to(device=expert_device)
             if current_routing_weights.device != expert_device:

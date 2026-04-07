@@ -19,6 +19,20 @@ def _reference_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> tor
     return output.to(dtype=x.dtype)
 
 
+def _reference_moe_router(
+    router_logits: torch.Tensor,
+    *,
+    top_k: int,
+    normalize_topk_prob: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    routing_weights = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    if normalize_topk_prob:
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    usage = torch.bincount(selected_experts.reshape(-1), minlength=router_logits.shape[-1])
+    return routing_weights, selected_experts, usage
+
+
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
 def test_causal_conv1d_fused_xpu_matches_reference() -> None:
     if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "causal_conv1d_fused"):
@@ -39,6 +53,28 @@ def test_causal_conv1d_fused_xpu_matches_reference() -> None:
     torch.xpu.synchronize()
     assert torch.allclose(output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)
     assert torch.allclose(fused_state.float().cpu(), reference_state.float().cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_moe_router_fused_xpu_matches_reference() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "moe_router_fused"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(0)
+    device = "xpu"
+    router_logits = torch.randn(11, 16, device=device, dtype=torch.bfloat16)
+
+    fused_weights, fused_selected, fused_usage = torch.ops.anna.moe_router_fused(router_logits, 4, True)
+    ref_weights, ref_selected, ref_usage = _reference_moe_router(
+        router_logits,
+        top_k=4,
+        normalize_topk_prob=True,
+    )
+
+    torch.xpu.synchronize()
+    assert torch.allclose(fused_weights.float().cpu(), ref_weights.float().cpu(), atol=2e-2, rtol=2e-2)
+    assert torch.equal(fused_selected.cpu(), ref_selected.cpu())
+    assert torch.equal(fused_usage.cpu().to(dtype=torch.long), ref_usage.cpu().to(dtype=torch.long))
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
