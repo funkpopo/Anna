@@ -251,6 +251,35 @@ def test_dynamic_cache_stack_and_split_round_trips_batches() -> None:
     assert torch.equal(split[1].visible_value_cache(1), value_b)
 
 
+def test_dynamic_cache_stack_preserves_visible_prefix_for_batched_decode_updates() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config)
+    cache_a = Qwen3DynamicCache(config, allocator=allocator)
+    cache_b = Qwen3DynamicCache(config, allocator=allocator)
+    key_a = torch.randn(1, 2, 3, 16)
+    value_a = torch.randn(1, 2, 3, 16)
+    key_b = torch.randn(1, 2, 5, 16)
+    value_b = torch.randn(1, 2, 5, 16)
+    append_key = torch.randn(2, 2, 1, 16)
+    append_value = torch.randn(2, 2, 1, 16)
+
+    cache_a.update(key_a, value_a, layer_idx=1)
+    cache_b.update(key_b, value_b, layer_idx=1)
+
+    stacked = Qwen3DynamicCache.stack([cache_a, cache_b], config)
+    combined_key, combined_value, past_lengths = stacked.update(append_key, append_value, layer_idx=1)
+
+    assert torch.equal(past_lengths, torch.tensor([3, 5], dtype=torch.long))
+    assert torch.equal(combined_key[0:1, :, :3, :], key_a)
+    assert torch.equal(combined_value[0:1, :, :3, :], value_a)
+    assert torch.equal(combined_key[0:1, :, 3:4, :], append_key[0:1])
+    assert torch.equal(combined_value[0:1, :, 3:4, :], append_value[0:1])
+    assert torch.equal(combined_key[1:2, :, :5, :], key_b)
+    assert torch.equal(combined_value[1:2, :, :5, :], value_b)
+    assert torch.equal(combined_key[1:2, :, 5:6, :], append_key[1:2])
+    assert torch.equal(combined_value[1:2, :, 5:6, :], append_value[1:2])
+
+
 def test_dynamic_cache_clone_preserves_contents_with_distinct_page_tables() -> None:
     config = _tiny_config()
     allocator = Qwen3PageAllocator(config)
@@ -506,6 +535,38 @@ def test_sparse_moe_routing_assignments_match_reference_without_expert_mask_mate
         got_order = torch.argsort(got_pairs[:, 0] * block.top_k + got_pairs[:, 1])
         ref_order = torch.argsort(ref_pairs[:, 0] * block.top_k + ref_pairs[:, 1])
         assert torch.equal(got_pairs.index_select(0, got_order), ref_pairs.index_select(0, ref_order))
+
+
+def test_sparse_moe_compacted_execution_matches_reference() -> None:
+    with _temporary_torch_seed(0):
+        block = Qwen3SparseMoeBlock(_tiny_moe_config()).eval()
+        hidden_states = torch.randn(2, 3, block._config.hidden_size)
+
+    flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    router_logits = block.gate(flat_hidden_states)
+    routing_weights = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+    routing_weights, selected_experts = torch.topk(routing_weights, block.top_k, dim=-1)
+    if block.norm_topk_prob:
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    routing_weights = routing_weights.to(dtype=flat_hidden_states.dtype)
+
+    reference_hidden_states = flat_hidden_states.new_zeros(flat_hidden_states.shape)
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=block.num_experts).permute(2, 1, 0)
+    for expert_idx in torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero(as_tuple=False).flatten().tolist():
+        route_idx, token_idx = torch.where(expert_mask[expert_idx])
+        current_state = flat_hidden_states.index_select(0, token_idx)
+        current_routing_weights = routing_weights[token_idx, route_idx, None]
+        current_hidden_states = block.experts[expert_idx](current_state) * current_routing_weights
+        reference_hidden_states.index_add_(0, token_idx, current_hidden_states.to(dtype=flat_hidden_states.dtype))
+
+    shared_expert_output = torch.sigmoid(block.shared_expert_gate(flat_hidden_states)) * block.shared_expert(flat_hidden_states)
+    reference_hidden_states = reference_hidden_states + shared_expert_output
+
+    with torch.no_grad():
+        compacted_hidden_states, compacted_router_logits = block(hidden_states)
+
+    assert torch.allclose(compacted_hidden_states, reference_hidden_states.reshape_as(hidden_states), atol=1e-5, rtol=1e-4)
+    assert torch.allclose(compacted_router_logits, router_logits, atol=1e-5, rtol=1e-4)
 
 
 def test_qwen3_allows_out_of_range_padding_idx_for_tiny_configs() -> None:

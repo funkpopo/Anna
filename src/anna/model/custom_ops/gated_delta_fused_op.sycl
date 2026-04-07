@@ -186,6 +186,46 @@ void validate_moe_router_xpu_inputs(const at::Tensor& router_logits) {
   TORCH_CHECK(device.type() == c10::DeviceType::XPU, "router_logits must be an XPU tensor");
 }
 
+void validate_gqa_decode_inputs(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& visible_lengths) {
+  TORCH_CHECK(query.dim() == 4, "query must be [batch, heads, 1, head_dim]");
+  TORCH_CHECK(key.dim() == 4, "key must be [batch, kv_heads, key_len, head_dim]");
+  TORCH_CHECK(value.dim() == 4, "value must be [batch, kv_heads, key_len, head_dim]");
+  TORCH_CHECK(query.size(2) == 1, "gqa_decode_fused only supports single-token query");
+  TORCH_CHECK(query.size(0) == key.size(0), "query/key batch size mismatch");
+  TORCH_CHECK(key.sizes() == value.sizes(), "key and value must share the same shape");
+  TORCH_CHECK(query.size(3) == key.size(3), "query/key head_dim mismatch");
+  TORCH_CHECK(query.size(3) <= 256, "gqa_decode_fused currently supports head_dim <= 256");
+  TORCH_CHECK(key.size(1) >= 1, "kv_heads must be positive");
+  TORCH_CHECK(query.size(1) % key.size(1) == 0, "query heads must be divisible by kv_heads");
+  TORCH_CHECK(key.size(2) >= 1, "key_len must be positive");
+  TORCH_CHECK(visible_lengths.dim() == 1, "visible_lengths must be [batch]");
+  TORCH_CHECK(visible_lengths.size(0) == query.size(0), "visible_lengths batch size mismatch");
+  TORCH_CHECK(visible_lengths.scalar_type() == at::kLong, "visible_lengths must be int64");
+  TORCH_CHECK(
+      query.scalar_type() == key.scalar_type() && query.scalar_type() == value.scalar_type(),
+      "query, key, and value must share the same dtype");
+  TORCH_CHECK(
+      query.scalar_type() == at::kHalf || query.scalar_type() == at::kBFloat16 ||
+          query.scalar_type() == at::kFloat,
+      "gqa_decode_fused XPU kernel supports float16, bfloat16, and float32 inputs");
+}
+
+void validate_gqa_decode_xpu_inputs(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& visible_lengths) {
+  auto device = query.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "query must be an XPU tensor");
+  TORCH_CHECK(key.device() == device, "key must be on the same device as query");
+  TORCH_CHECK(value.device() == device, "value must be on the same device as query");
+  TORCH_CHECK(visible_lengths.device() == device, "visible_lengths must be on the same device as query");
+}
+
 void validate_causal_conv_inputs(
     const at::Tensor& hidden_states,
     const at::Tensor& conv_state,
@@ -703,6 +743,135 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_router_fused_xpu(
   return {routing_weights, selected_experts, expert_usage};
 }
 
+at::Tensor gqa_decode_fused_meta(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& visible_lengths,
+    double /*scaling*/) {
+  validate_gqa_decode_inputs(query, key, value, visible_lengths);
+  auto meta_options = query.options().device(c10::Device(c10::DeviceType::Meta));
+  return at::empty(query.sizes(), meta_options);
+}
+
+at::Tensor gqa_decode_fused_xpu(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& visible_lengths_in,
+    double scaling) {
+  validate_gqa_decode_inputs(query_in, key_in, value_in, visible_lengths_in);
+  validate_gqa_decode_xpu_inputs(query_in, key_in, value_in, visible_lengths_in);
+
+  auto query = query_in.contiguous();
+  auto key = key_in.contiguous();
+  auto value = value_in.contiguous();
+  auto visible_lengths = visible_lengths_in.contiguous();
+  auto output = at::empty(query.sizes(), query.options());
+
+  const auto batch_size = query.size(0);
+  const auto num_heads = query.size(1);
+  const auto num_kv_heads = key.size(1);
+  const auto key_len = key.size(2);
+  const auto head_dim = query.size(3);
+  const auto groups_per_kv_head = num_heads / num_kv_heads;
+  const int64_t local_size =
+      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(head_dim, 32))), 32);
+  const float scaling_f = static_cast<float>(scaling);
+  auto stream = c10::xpu::getCurrentXPUStream(query.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      query.scalar_type(),
+      "gqa_decode_fused_xpu",
+      [&] {
+        const scalar_t* query_ptr = query.const_data_ptr<scalar_t>();
+        const scalar_t* key_ptr = key.const_data_ptr<scalar_t>();
+        const scalar_t* value_ptr = value.const_data_ptr<scalar_t>();
+        const int64_t* visible_lengths_ptr = visible_lengths.const_data_ptr<int64_t>();
+        scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
+        const size_t group_count = static_cast<size_t>(batch_size * num_heads);
+
+        stream.queue().submit([&](sycl::handler& cgh) {
+          sycl::local_accessor<float, 1> partial_dot(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
+          cgh.parallel_for(
+              sycl::nd_range<2>(
+                  sycl::range<2>(group_count, static_cast<size_t>(local_size)),
+                  sycl::range<2>(1, static_cast<size_t>(local_size))),
+              [=](sycl::nd_item<2> item) {
+                const int64_t bh = static_cast<int64_t>(item.get_group(0));
+                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+                const int64_t batch_idx = bh / num_heads;
+                const int64_t head_idx = bh % num_heads;
+                const int64_t kv_head_idx = head_idx / groups_per_kv_head;
+                const int64_t query_base = ((batch_idx * num_heads + head_idx) * head_dim);
+                const int64_t key_base = ((batch_idx * num_kv_heads + kv_head_idx) * key_len) * head_dim;
+                const int64_t output_base = query_base;
+
+                int64_t visible_len = visible_lengths_ptr[batch_idx];
+                visible_len = sycl::max<int64_t>(0, sycl::min<int64_t>(visible_len, key_len));
+                float running_max = -std::numeric_limits<float>::infinity();
+                float denom = 0.0f;
+                float acc_values[8];
+                for (int64_t slot = 0; slot < 8; ++slot) {
+                  acc_values[slot] = 0.0f;
+                }
+
+                for (int64_t key_idx = 0; key_idx < visible_len; ++key_idx) {
+                  float local_dot = 0.0f;
+                  for (int64_t slot = 0; slot < 8; ++slot) {
+                    const int64_t dim_idx = lane + slot * local_size;
+                    if (dim_idx >= head_dim) {
+                      break;
+                    }
+                    local_dot +=
+                        load_as_float(query_ptr, query_base + dim_idx) *
+                        load_as_float(key_ptr, key_base + key_idx * head_dim + dim_idx);
+                  }
+                  partial_dot[lane] = local_dot;
+                  item.barrier(sycl::access::fence_space::local_space);
+
+                  for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
+                    if (lane < stride) {
+                      partial_dot[lane] += partial_dot[lane + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                  }
+
+                  const float score = partial_dot[0] * scaling_f;
+                  const float new_max = sycl::fmax(running_max, score);
+                  const float old_scale = denom == 0.0f ? 0.0f : sycl::exp(running_max - new_max);
+                  const float score_scale = sycl::exp(score - new_max);
+                  for (int64_t slot = 0; slot < 8; ++slot) {
+                    const int64_t dim_idx = lane + slot * local_size;
+                    if (dim_idx >= head_dim) {
+                      break;
+                    }
+                    acc_values[slot] =
+                        acc_values[slot] * old_scale +
+                        score_scale * load_as_float(value_ptr, key_base + key_idx * head_dim + dim_idx);
+                  }
+                  denom = denom * old_scale + score_scale;
+                  running_max = new_max;
+                  item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                for (int64_t slot = 0; slot < 8; ++slot) {
+                  const int64_t dim_idx = lane + slot * local_size;
+                  if (dim_idx >= head_dim) {
+                    break;
+                  }
+                  const float out_value = denom > 0.0f ? acc_values[slot] / denom : 0.0f;
+                  output_ptr[output_base + dim_idx] = static_cast<scalar_t>(out_value);
+                }
+              });
+        });
+      });
+
+  return output;
+}
+
 std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_meta(
     const at::Tensor& query_in,
     const at::Tensor& key_in,
@@ -934,6 +1103,14 @@ std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_xpu(
 
 TORCH_LIBRARY(anna, m) {
   m.def(
+      "gqa_decode_fused("
+      "Tensor query, "
+      "Tensor key, "
+      "Tensor value, "
+      "Tensor visible_lengths, "
+      "float scaling"
+      ") -> Tensor");
+  m.def(
       "moe_router_fused("
       "Tensor router_logits, "
       "int top_k, "
@@ -979,6 +1156,7 @@ TORCH_LIBRARY(anna, m) {
 }
 
 TORCH_LIBRARY_IMPL(anna, Meta, m) {
+  m.impl("gqa_decode_fused", anna::gqa_decode_fused_meta);
   m.impl("moe_router_fused", anna::moe_router_fused_meta);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_meta);
   m.impl("qk_norm_rotary_fused", anna::qk_norm_rotary_fused_meta);
@@ -987,6 +1165,7 @@ TORCH_LIBRARY_IMPL(anna, Meta, m) {
 }
 
 TORCH_LIBRARY_IMPL(anna, XPU, m) {
+  m.impl("gqa_decode_fused", anna::gqa_decode_fused_xpu);
   m.impl("moe_router_fused", anna::moe_router_fused_xpu);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_xpu);
   m.impl("qk_norm_rotary_fused", anna::qk_norm_rotary_fused_xpu);

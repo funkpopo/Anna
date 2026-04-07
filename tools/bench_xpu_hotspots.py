@@ -214,6 +214,137 @@ def _benchmark_grouped_attention(
     return baseline_ms, grouped_ms, max_abs_diff
 
 
+def _benchmark_gqa_decode_fused(
+    *,
+    batch_size: int,
+    key_len: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    warmup: int,
+    iters: int,
+) -> tuple[float, float, float]:
+    query_states = torch.randn(batch_size, num_heads, 1, head_dim, device="xpu", dtype=dtype)
+    key_states = torch.randn(batch_size, num_kv_heads, key_len, head_dim, device="xpu", dtype=dtype)
+    value_states = torch.randn(batch_size, num_kv_heads, key_len, head_dim, device="xpu", dtype=dtype)
+    num_key_value_groups = max(1, num_heads // max(1, num_kv_heads))
+    visible_lengths = torch.randint(max(1, key_len // 2), key_len + 1, (batch_size,), device="xpu", dtype=torch.long)
+    key_positions = torch.arange(key_len, device="xpu")[None, :]
+    visible_mask = key_positions < visible_lengths[:, None]
+    scaling = head_dim**-0.5
+
+    def materialized():
+        repeated_key_states = repeat_kv(key_states, num_key_value_groups)
+        repeated_value_states = repeat_kv(value_states, num_key_value_groups)
+        attn_scores = torch.matmul(query_states, repeated_key_states.transpose(-1, -2)) * scaling
+        attn_scores = attn_scores.masked_fill(~visible_mask[:, None, None, :], float("-inf"))
+        attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
+        return torch.matmul(attn_probs, repeated_value_states)
+
+    gqa = lambda: torch.ops.anna.gqa_decode_fused(
+        query_states,
+        key_states,
+        value_states,
+        visible_lengths,
+        scaling,
+    )
+
+    baseline_ms = _time_op(materialized, warmup=warmup, iters=iters)
+    gqa_output = gqa()
+    baseline_output = materialized()
+    max_abs_diff = float((gqa_output.float() - baseline_output.float()).abs().max().item())
+    gqa_ms = _time_op(gqa, warmup=warmup, iters=iters)
+    return baseline_ms, gqa_ms, max_abs_diff
+
+
+def _benchmark_sdpa_gqa_decode_full_visible(
+    *,
+    batch_size: int,
+    key_len: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    warmup: int,
+    iters: int,
+) -> tuple[float, float, float]:
+    query_states = torch.randn(batch_size, num_heads, 1, head_dim, device="xpu", dtype=dtype)
+    key_states = torch.randn(batch_size, num_kv_heads, key_len, head_dim, device="xpu", dtype=dtype)
+    value_states = torch.randn(batch_size, num_kv_heads, key_len, head_dim, device="xpu", dtype=dtype)
+    num_key_value_groups = max(1, num_heads // max(1, num_kv_heads))
+    scaling = head_dim**-0.5
+
+    def materialized():
+        repeated_key_states = repeat_kv(key_states, num_key_value_groups)
+        repeated_value_states = repeat_kv(value_states, num_key_value_groups)
+        attn_scores = torch.matmul(query_states, repeated_key_states.transpose(-1, -2)) * scaling
+        attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
+        return torch.matmul(attn_probs, repeated_value_states)
+
+    gqa = lambda: F.scaled_dot_product_attention(
+        query_states,
+        key_states,
+        value_states,
+        dropout_p=0.0,
+        is_causal=False,
+        enable_gqa=True,
+    )
+
+    baseline_ms = _time_op(materialized, warmup=warmup, iters=iters)
+    gqa_output = gqa()
+    baseline_output = materialized()
+    max_abs_diff = float((gqa_output.float() - baseline_output.float()).abs().max().item())
+    gqa_ms = _time_op(gqa, warmup=warmup, iters=iters)
+    return baseline_ms, gqa_ms, max_abs_diff
+
+
+def _benchmark_sdpa_gqa_decode_variable_visible(
+    *,
+    batch_size: int,
+    key_len: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    warmup: int,
+    iters: int,
+) -> tuple[float, float, float]:
+    query_states = torch.randn(batch_size, num_heads, 1, head_dim, device="xpu", dtype=dtype)
+    key_states = torch.randn(batch_size, num_kv_heads, key_len, head_dim, device="xpu", dtype=dtype)
+    value_states = torch.randn(batch_size, num_kv_heads, key_len, head_dim, device="xpu", dtype=dtype)
+    num_key_value_groups = max(1, num_heads // max(1, num_kv_heads))
+    visible_lengths = torch.randint(max(1, key_len // 2), key_len + 1, (batch_size,), device="xpu", dtype=torch.long)
+    visible_mask = torch.arange(key_len, device="xpu")[None, :] < visible_lengths[:, None]
+    scaling = head_dim**-0.5
+
+    def grouped():
+        return grouped_query_attention(
+            query_states,
+            key_states,
+            value_states,
+            scaling=scaling,
+            visible_mask=visible_mask,
+        )
+
+    gqa = lambda: F.scaled_dot_product_attention(
+        query_states,
+        key_states,
+        value_states,
+        attn_mask=visible_mask[:, None, None, :],
+        dropout_p=0.0,
+        is_causal=False,
+        enable_gqa=num_key_value_groups > 1,
+    )
+
+    baseline_ms = _time_op(grouped, warmup=warmup, iters=iters)
+    gqa_output = gqa()
+    baseline_output = grouped()
+    max_abs_diff = float((gqa_output.float() - baseline_output.float()).abs().max().item())
+    gqa_ms = _time_op(gqa, warmup=warmup, iters=iters)
+    return baseline_ms, gqa_ms, max_abs_diff
+
+
 def _reference_moe_router(
     *,
     router_logits: torch.Tensor,
@@ -346,6 +477,36 @@ def main() -> None:
         warmup=args.warmup,
         iters=args.iters,
     )
+    decode_baseline_ms, decode_gqa_ms, decode_gqa_diff = _benchmark_gqa_decode_fused(
+        batch_size=args.batch_size,
+        key_len=kv_len,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        head_dim=args.head_dim,
+        dtype=dtype,
+        warmup=args.warmup,
+        iters=args.iters,
+    )
+    decode_sdpa_baseline_ms, decode_sdpa_gqa_ms, decode_sdpa_gqa_diff = _benchmark_sdpa_gqa_decode_full_visible(
+        batch_size=args.batch_size,
+        key_len=kv_len,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        head_dim=args.head_dim,
+        dtype=dtype,
+        warmup=args.warmup,
+        iters=args.iters,
+    )
+    decode_variable_baseline_ms, decode_variable_gqa_ms, decode_variable_gqa_diff = _benchmark_sdpa_gqa_decode_variable_visible(
+        batch_size=args.batch_size,
+        key_len=kv_len,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        head_dim=args.head_dim,
+        dtype=dtype,
+        warmup=args.warmup,
+        iters=args.iters,
+    )
     router_baseline_ms, router_fused_ms, router_diff = _benchmark_router(
         tokens=tokens,
         num_experts=args.experts,
@@ -379,14 +540,26 @@ def main() -> None:
         f"{_format_speedup(gqa_baseline_ms, gqa_grouped_ms)},{gqa_diff:.6f}"
     )
     print(
+        f"sdpa_gqa_decode_full_visible,{decode_sdpa_baseline_ms:.4f},{decode_sdpa_gqa_ms:.4f},"
+        f"{_format_speedup(decode_sdpa_baseline_ms, decode_sdpa_gqa_ms)},{decode_sdpa_gqa_diff:.6f}"
+    )
+    print(
+        f"sdpa_gqa_decode_variable_visible,{decode_variable_baseline_ms:.4f},{decode_variable_gqa_ms:.4f},"
+        f"{_format_speedup(decode_variable_baseline_ms, decode_variable_gqa_ms)},{decode_variable_gqa_diff:.6f}"
+    )
+    print(
+        f"gqa_decode_fused_proto,{decode_baseline_ms:.4f},{decode_gqa_ms:.4f},"
+        f"{_format_speedup(decode_baseline_ms, decode_gqa_ms)},{decode_gqa_diff:.6f}"
+    )
+    print(
         f"moe_router,{router_baseline_ms:.4f},{router_fused_ms:.4f},"
         f"{_format_speedup(router_baseline_ms, router_fused_ms)},{router_diff:.6f}"
     )
 
     print("next_paths")
-    print("visible-cache gather and mask application are the next full-attention costs after repeat_kv removal.")
-    print("expert execution still pays per-expert launches and per-expert index gathering after router fusion.")
-    print("full-attention score/softmax remains matmul-dominated; pursue it after routing and cache-layout work.")
+    print("single-token variable-visible decode now maps to native masked GQA; multi-token masked decode remains the main full-attention gap.")
+    print("expert execution still pays per-expert launches after assignment compaction and router fusion.")
+    print("MoE assignment compaction is in place; the next material win is batched expert execution or packed expert weights.")
 
 
 if __name__ == "__main__":

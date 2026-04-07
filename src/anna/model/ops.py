@@ -523,6 +523,17 @@ class Qwen3DynamicCache:
 
         return key_batch, value_batch, visible_lengths
 
+    def _visible_layer_state(self, layer_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
+        key_buffer = self.visible_key_caches[layer_idx]
+        value_buffer = self.visible_value_caches[layer_idx]
+        if key_buffer is not None and value_buffer is not None:
+            return key_buffer, value_buffer, max(self.visible_cache_capacities[layer_idx], int(key_buffer.shape[2]))
+
+        key_tensor, value_tensor, _ = self._gather_layer_cache(layer_idx)
+        if key_tensor is None or value_tensor is None:
+            return None, None, 0
+        return key_tensor, value_tensor, int(key_tensor.shape[2])
+
     @classmethod
     def stack(cls, caches: list["Qwen3DynamicCache"], config: Qwen3_5TextConfig) -> "Qwen3DynamicCache":
         if not caches:
@@ -564,6 +575,39 @@ class Qwen3DynamicCache:
             else:
                 stacked.recurrent_states[layer_idx] = torch.cat(recurrent_states, dim=0)
 
+            if stacked._uses_contiguous_full_attention_mirror(layer_idx):
+                visible_rows: list[tuple[torch.Tensor | None, torch.Tensor | None, int]] = []
+                visible_capacity = 0
+                ref_key: torch.Tensor | None = None
+                ref_value: torch.Tensor | None = None
+                for row in rows:
+                    key_buffer, value_buffer, capacity = row._visible_layer_state(layer_idx)
+                    visible_rows.append((key_buffer, value_buffer, capacity))
+                    if key_buffer is None or value_buffer is None:
+                        continue
+                    if ref_key is None or ref_value is None:
+                        ref_key = key_buffer
+                        ref_value = value_buffer
+                    visible_capacity = max(visible_capacity, capacity)
+
+                if ref_key is not None and ref_value is not None:
+                    stacked_key = ref_key.new_empty((len(rows), ref_key.shape[1], visible_capacity, ref_key.shape[3]))
+                    stacked_value = ref_value.new_empty((len(rows), ref_value.shape[1], visible_capacity, ref_value.shape[3]))
+                    for batch_idx, (key_buffer, value_buffer, _) in enumerate(visible_rows):
+                        if key_buffer is None or value_buffer is None:
+                            continue
+                        key_copy_length = min(visible_capacity, int(key_buffer.shape[2]))
+                        value_copy_length = min(visible_capacity, int(value_buffer.shape[2]))
+                        if key_copy_length > 0:
+                            stacked_key[batch_idx, :, :key_copy_length, :].copy_(key_buffer[0, :, :key_copy_length, :])
+                        if value_copy_length > 0:
+                            stacked_value[batch_idx, :, :value_copy_length, :].copy_(
+                                value_buffer[0, :, :value_copy_length, :]
+                            )
+                    stacked.visible_key_caches[layer_idx] = stacked_key
+                    stacked.visible_value_caches[layer_idx] = stacked_value
+                    stacked.visible_cache_capacities[layer_idx] = visible_capacity
+
         return stacked
 
     def split_batch(self) -> list["Qwen3DynamicCache"]:
@@ -592,6 +636,11 @@ class Qwen3DynamicCache:
             if self.recurrent_states[layer_idx] is not None:
                 for idx, chunk in enumerate(self.recurrent_states[layer_idx].split(1, dim=0)):
                     outputs[idx].recurrent_states[layer_idx] = chunk.clone()
+            if self.visible_key_caches[layer_idx] is not None and self.visible_value_caches[layer_idx] is not None:
+                for idx, cache in enumerate(outputs):
+                    cache.visible_key_caches[layer_idx] = self.visible_key_caches[layer_idx][idx : idx + 1].clone()
+                    cache.visible_value_caches[layer_idx] = self.visible_value_caches[layer_idx][idx : idx + 1].clone()
+                    cache.visible_cache_capacities[layer_idx] = self.visible_cache_capacities[layer_idx]
         return outputs
 
     def clone(self) -> "Qwen3DynamicCache":
@@ -1064,8 +1113,35 @@ class Qwen3Attention(nn.Module):
             causal_mask = None
             visible_mask = None
             key_padding_mask = None
-            # XPU SDPA produced corrupted long-form decode outputs when fed
-            # the visible-cache mirror. Keep decode on the explicit grouped path.
+            if attention_mask is None and past_key_values is not None and seq_len == 1 and hidden_states.device.type == "xpu":
+                visible_lengths = past_lengths + seq_len
+                if bool(torch.all(visible_lengths == key_states.shape[-2]).item()):
+                    attn_output = F.scaled_dot_product_attention(
+                        query_states,
+                        key_states,
+                        value_states,
+                        dropout_p=0.0,
+                        is_causal=False,
+                        enable_gqa=self.num_key_value_groups > 1,
+                    )
+                    attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
+                    attn_output = attn_output * torch.sigmoid(gate)
+                    return self.o_proj(attn_output)
+                key_positions = torch.arange(key_states.shape[-2], device=hidden_states.device)[None, :]
+                visible_mask = key_positions < visible_lengths[:, None]
+                attn_output = F.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=visible_mask[:, None, None, :],
+                    dropout_p=0.0,
+                    is_causal=False,
+                    enable_gqa=self.num_key_value_groups > 1,
+                )
+                attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
+                attn_output = attn_output * torch.sigmoid(gate)
+                return self.o_proj(attn_output)
+            # Multi-token decode and masked full-attention stay on the explicit grouped path.
             if not (batch_size == 1 and seq_len == 1 and attention_mask is None and past_key_values is not None):
                 visible_lengths = past_lengths + seq_len
 
@@ -1411,6 +1487,17 @@ class Qwen3SparseMoeBlock(nn.Module):
         expert_offsets[1:] = usage.to(dtype=torch.long).cumsum(dim=0)
         return sorted_token_idx, sorted_route_idx, expert_offsets
 
+    @staticmethod
+    def _compact_routing_inputs(
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        sorted_token_idx: torch.Tensor,
+        sorted_route_idx: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        compact_hidden_states = hidden_states.index_select(0, sorted_token_idx)
+        compact_routing_weights = routing_weights.index_select(0, sorted_token_idx).gather(1, sorted_route_idx[:, None])
+        return compact_hidden_states, compact_routing_weights
+
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         execution_device = hidden_states.device
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -1430,6 +1517,13 @@ class Qwen3SparseMoeBlock(nn.Module):
                 gpu_candidates = {int(idx) for idx in candidate_idx.tolist() if int(usage[idx].item()) > 0}
 
         sorted_token_idx, sorted_route_idx, expert_offsets = self._sorted_routing_assignments(selected_experts, usage)
+        compact_hidden_states, compact_routing_weights = self._compact_routing_inputs(
+            hidden_states,
+            routing_weights,
+            sorted_token_idx,
+            sorted_route_idx,
+        )
+        compact_outputs = hidden_states.new_empty((compact_hidden_states.shape[0], hidden_dim))
         for expert_idx in hit_experts.tolist():
             expert_layer = self.experts[expert_idx]
             if expert_idx in gpu_candidates:
@@ -1438,11 +1532,9 @@ class Qwen3SparseMoeBlock(nn.Module):
                     expert_layer = cached
             start_idx = int(expert_offsets[expert_idx].item())
             end_idx = int(expert_offsets[expert_idx + 1].item())
-            token_idx = sorted_token_idx[start_idx:end_idx]
-            route_idx = sorted_route_idx[start_idx:end_idx]
             expert_device = _module_device(expert_layer)
-            current_state = hidden_states.index_select(0, token_idx)
-            current_routing_weights = routing_weights.index_select(0, token_idx).gather(1, route_idx[:, None])
+            current_state = compact_hidden_states[start_idx:end_idx]
+            current_routing_weights = compact_routing_weights[start_idx:end_idx]
             if current_state.device != expert_device:
                 current_state = current_state.to(device=expert_device)
             if current_routing_weights.device != expert_device:
@@ -1450,7 +1542,10 @@ class Qwen3SparseMoeBlock(nn.Module):
             current_hidden_states = expert_layer(current_state) * current_routing_weights
             if current_hidden_states.device != execution_device:
                 current_hidden_states = current_hidden_states.to(device=execution_device, dtype=hidden_states.dtype)
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(dtype=hidden_states.dtype))
+            compact_outputs[start_idx:end_idx] = current_hidden_states.to(dtype=hidden_states.dtype)
+
+        if compact_outputs.numel() > 0:
+            final_hidden_states.index_add_(0, sorted_token_idx, compact_outputs)
 
         shared_expert_device = _module_device(self.shared_expert)
         shared_gate_device = _module_device(self.shared_expert_gate)
