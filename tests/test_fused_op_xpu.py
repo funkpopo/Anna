@@ -4,8 +4,11 @@ import torch
 from anna.model.fused_ops import maybe_load_gated_delta_library
 from anna.model.ops import (
     Qwen3Attention,
+    Qwen3DynamicCache,
+    Qwen3PageAllocator,
     Qwen3TextRotaryEmbedding,
     apply_rotary_pos_emb,
+    grouped_query_attention,
     torch_causal_conv1d_update,
     torch_recurrent_gated_delta_rule,
 )
@@ -53,6 +56,32 @@ def test_causal_conv1d_fused_xpu_matches_reference() -> None:
     torch.xpu.synchronize()
     assert torch.allclose(output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)
     assert torch.allclose(fused_state.float().cpu(), reference_state.float().cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gqa_decode_fused_xpu_matches_reference() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gqa_decode_fused"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(0)
+    device = "xpu"
+    query = torch.randn(2, 8, 1, 32, device=device, dtype=torch.bfloat16)
+    key = torch.randn(2, 2, 19, 32, device=device, dtype=torch.bfloat16)
+    value = torch.randn(2, 2, 19, 32, device=device, dtype=torch.bfloat16)
+    visible_lengths = torch.tensor([19, 13], device=device, dtype=torch.long)
+
+    fused_output = torch.ops.anna.gqa_decode_fused(query, key, value, visible_lengths, 32**-0.5)
+    visible_mask = torch.arange(key.shape[2], device=device)[None, :] < visible_lengths[:, None]
+    reference = grouped_query_attention(
+        query,
+        key,
+        value,
+        scaling=32**-0.5,
+        visible_mask=visible_mask,
+    )
+
+    torch.xpu.synchronize()
+    assert torch.allclose(fused_output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
@@ -165,6 +194,89 @@ def test_qwen3_attention_xpu_fused_norm_rotary_matches_cpu_reference() -> None:
 
     torch.xpu.synchronize()
     assert torch.allclose(output_xpu.float().cpu(), output_cpu.float().cpu(), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_qwen3_attention_xpu_single_token_decode_matches_full_forward() -> None:
+    torch.manual_seed(0)
+    config = Qwen3_5TextConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        layer_types=["full_attention"],
+    )
+    attention = Qwen3Attention(config, 0).eval().to("xpu", dtype=torch.bfloat16)
+    rotary = Qwen3TextRotaryEmbedding(config).to("xpu")
+
+    prompt_states = torch.randn(2, 6, config.hidden_size, device="xpu", dtype=torch.bfloat16)
+    append_states = torch.randn(2, 1, config.hidden_size, device="xpu", dtype=torch.bfloat16)
+    full_states = torch.cat([prompt_states, append_states], dim=1)
+
+    with torch.no_grad():
+        full_position_ids = torch.arange(full_states.shape[1], device="xpu").view(1, -1).expand(full_states.shape[0], -1)
+        full_embeddings = rotary(full_states, full_position_ids)
+        full_output = attention(full_states, full_embeddings)
+
+        cache = Qwen3DynamicCache(config)
+        prompt_position_ids = torch.arange(prompt_states.shape[1], device="xpu").view(1, -1).expand(prompt_states.shape[0], -1)
+        prompt_embeddings = rotary(prompt_states, prompt_position_ids)
+        _ = attention(prompt_states, prompt_embeddings, past_key_values=cache)
+
+        append_position_ids = torch.full((append_states.shape[0], 1), prompt_states.shape[1], device="xpu", dtype=torch.long)
+        append_embeddings = rotary(append_states, append_position_ids)
+        append_output = attention(append_states, append_embeddings, past_key_values=cache)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(append_output.float().cpu(), full_output[:, -1:].float().cpu(), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_qwen3_attention_xpu_mixed_length_single_token_decode_matches_full_forward() -> None:
+    torch.manual_seed(0)
+    config = Qwen3_5TextConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        layer_types=["full_attention"],
+    )
+    allocator = Qwen3PageAllocator(config)
+    attention = Qwen3Attention(config, 0).eval().to("xpu", dtype=torch.bfloat16)
+    rotary = Qwen3TextRotaryEmbedding(config).to("xpu")
+
+    prompt_a = torch.randn(1, 6, config.hidden_size, device="xpu", dtype=torch.bfloat16)
+    prompt_b = torch.randn(1, 9, config.hidden_size, device="xpu", dtype=torch.bfloat16)
+    append_a = torch.randn(1, 1, config.hidden_size, device="xpu", dtype=torch.bfloat16)
+    append_b = torch.randn(1, 1, config.hidden_size, device="xpu", dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        full_a = torch.cat([prompt_a, append_a], dim=1)
+        full_b = torch.cat([prompt_b, append_b], dim=1)
+        full_positions_a = torch.arange(full_a.shape[1], device="xpu").view(1, -1)
+        full_positions_b = torch.arange(full_b.shape[1], device="xpu").view(1, -1)
+        full_output_a = attention(full_a, rotary(full_a, full_positions_a))
+        full_output_b = attention(full_b, rotary(full_b, full_positions_b))
+
+        cache_a = Qwen3DynamicCache(config, allocator=allocator)
+        cache_b = Qwen3DynamicCache(config, allocator=allocator)
+        prompt_positions_a = torch.arange(prompt_a.shape[1], device="xpu").view(1, -1)
+        prompt_positions_b = torch.arange(prompt_b.shape[1], device="xpu").view(1, -1)
+        _ = attention(prompt_a, rotary(prompt_a, prompt_positions_a), past_key_values=cache_a)
+        _ = attention(prompt_b, rotary(prompt_b, prompt_positions_b), past_key_values=cache_b)
+
+        stacked_cache = Qwen3DynamicCache.stack([cache_a, cache_b], config)
+        append_states = torch.cat([append_a, append_b], dim=0)
+        append_positions = torch.tensor([[prompt_a.shape[1]], [prompt_b.shape[1]]], device="xpu", dtype=torch.long)
+        append_output = attention(append_states, rotary(append_states, append_positions), past_key_values=stacked_cache)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(append_output[0:1].float().cpu(), full_output_a[:, -1:].float().cpu(), atol=5e-2, rtol=5e-2)
+    assert torch.allclose(append_output[1:2].float().cpu(), full_output_b[:, -1:].float().cpu(), atol=5e-2, rtol=5e-2)
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")

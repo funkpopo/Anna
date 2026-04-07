@@ -65,6 +65,13 @@ def _gated_delta_op():
     return getattr(namespace, "gated_delta_fused", None)
 
 
+def _gqa_decode_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "gqa_decode_fused", None)
+
+
 def _moe_router_op():
     namespace = getattr(torch.ops, "anna", None)
     if namespace is None:
@@ -91,6 +98,10 @@ def _causal_conv1d_op():
     if namespace is None:
         return None
     return getattr(namespace, "causal_conv1d_fused", None)
+
+
+def gqa_decode_fused_is_available() -> bool:
+    return _gqa_decode_op() is not None
 
 
 def moe_router_fused_is_available() -> bool:
@@ -148,6 +159,26 @@ def maybe_load_gated_delta_library(path: str | os.PathLike[str] | None = None) -
             logger.info("Loaded Anna fused-op library from %s", resolved)
             return True
     return gated_delta_fused_is_available()
+
+
+def run_gqa_decode_fused(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    visible_lengths: torch.Tensor,
+    scaling: float,
+) -> torch.Tensor:
+    op = _gqa_decode_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _gqa_decode_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna gqa_decode_fused op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(query, key, value, visible_lengths, float(scaling))
 
 
 def run_moe_router_fused(
