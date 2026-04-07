@@ -170,6 +170,26 @@ def test_qwen3_incremental_decode() -> None:
     assert second.past_key_values.get_seq_length() == 7
 
 
+def test_qwen3_incremental_multi_token_decode_matches_full_forward() -> None:
+    with _temporary_torch_seed(0):
+        model = Qwen3_5TextForCausalLM(_tiny_config())
+        prompt_ids = torch.randint(0, 256, (1, 6))
+        append_ids = torch.randint(0, 256, (1, 3))
+
+        prefix = model(input_ids=prompt_ids, use_cache=True)
+        continued = model(
+            input_ids=append_ids,
+            past_key_values=prefix.past_key_values,
+            use_cache=True,
+        )
+        full = model(input_ids=torch.cat([prompt_ids, append_ids], dim=1), use_cache=True)
+
+    assert continued.logits.shape == (1, 3, 256)
+    assert continued.past_key_values is not None
+    assert continued.past_key_values.get_seq_length() == 9
+    assert torch.allclose(continued.logits, full.logits[:, -append_ids.shape[1] :, :], atol=1e-5, rtol=1e-4)
+
+
 def test_qwen3_prefill_can_project_only_last_logit() -> None:
     with _temporary_torch_seed(0):
         model = Qwen3_5TextForCausalLM(_tiny_config())
@@ -355,6 +375,32 @@ def test_causal_conv1d_update_single_token_fast_path_matches_grouped_conv() -> N
         groups=hidden_states.shape[1],
     )
     expected = torch.nn.functional.silu(expected[:, :, -1:]).to(dtype=hidden_states.dtype)
+
+    assert torch.allclose(fast, expected, atol=1e-5, rtol=1e-4)
+    assert torch.allclose(fast_state, baseline_state, atol=1e-5, rtol=1e-4)
+
+
+def test_causal_conv1d_update_multi_token_path_matches_grouped_conv() -> None:
+    with _temporary_torch_seed(0):
+        hidden_states = torch.randn(2, 6, 7)
+        conv_state = torch.randn(2, 6, 4)
+        weight = torch.randn(6, 4)
+        bias = torch.randn(6)
+
+    fast_state = conv_state.clone()
+    fast = torch_causal_conv1d_update(hidden_states, fast_state, weight, bias)
+
+    baseline_state = conv_state.clone()
+    hidden_states_new = torch.cat([baseline_state, hidden_states], dim=-1).to(dtype=weight.dtype)
+    baseline_state.copy_(hidden_states_new[:, :, -baseline_state.shape[-1] :])
+    expected = torch.nn.functional.conv1d(
+        hidden_states_new,
+        weight.unsqueeze(1),
+        bias=bias,
+        padding=0,
+        groups=hidden_states.shape[1],
+    )
+    expected = torch.nn.functional.silu(expected[:, :, -hidden_states.shape[-1] :]).to(dtype=hidden_states.dtype)
 
     assert torch.allclose(fast, expected, atol=1e-5, rtol=1e-4)
     assert torch.allclose(fast_state, baseline_state, atol=1e-5, rtol=1e-4)

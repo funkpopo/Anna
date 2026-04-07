@@ -22,7 +22,7 @@
 - Qwen3-TTS 语音合成
 - `anna-speak` 本地语音生成命令
 - `xpu` 设备推理
-- 线性注意力 SYCL fused op
+- 线性注意力 SYCL fused ops
 - 启动时终端打印服务地址与可用路由
 - 运行时终端打印聚合指标
   - 空闲时不会持续刷日志
@@ -108,9 +108,10 @@ python tools\build_gated_delta_fused_op.py
 终端通常会看到类似输出：
 
 ```text
-Compiling Anna gated_delta_fused SYCL op...
+Compiling Anna fused XPU/SYCL ops...
 library_path=D:\Projects\Anna\.build\anna_gated_delta_fused\anna_gated_delta_fused.pyd
-op_registered=True
+gated_delta_registered=True
+causal_conv1d_registered=True
 ```
 
 ### 7. 可选验证

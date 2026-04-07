@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
-from anna.model.fused_ops import run_gated_delta_fused
+from anna.model.fused_ops import run_causal_conv1d_fused, run_gated_delta_fused
 from anna.model.quantization import convert_module_linears_to_xpu_int4
 
 logger = logging.getLogger(__name__)
@@ -1078,7 +1078,7 @@ class Qwen3GatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
         batch_size, seq_len, _ = hidden_states.shape
-        use_precomputed_states = cache_params is not None and cache_params.has_previous_state and seq_len == 1
+        use_precomputed_states = cache_params is not None and cache_params.has_previous_state
         conv_state = None if cache_params is None else cache_params.conv_states[self.layer_idx]
         recurrent_state = None if cache_params is None else cache_params.recurrent_states[self.layer_idx]
 
@@ -1087,18 +1087,30 @@ class Qwen3GatedDeltaNet(nn.Module):
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
-        if use_precomputed_states and conv_state is not None:
-            mixed_qkv = torch_causal_conv1d_update(
-                mixed_qkv,
-                conv_state,
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias,
+        if hidden_states.device.type == "xpu":
+            if conv_state is None:
+                conv_state = mixed_qkv.new_zeros((batch_size, self.conv_dim, self.conv_kernel_size))
+            mixed_qkv, conv_state = run_causal_conv1d_fused(
+                hidden_states=mixed_qkv,
+                conv_state=conv_state,
+                weight=self.conv1d.weight.squeeze(1),
+                bias=self.conv1d.bias,
             )
-        else:
             if cache_params is not None:
-                conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
                 cache_params.conv_states[self.layer_idx] = conv_state
-            mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+        else:
+            if use_precomputed_states and conv_state is not None:
+                mixed_qkv = torch_causal_conv1d_update(
+                    mixed_qkv,
+                    conv_state,
+                    self.conv1d.weight.squeeze(1),
+                    self.conv1d.bias,
+                )
+            else:
+                if cache_params is not None:
+                    conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+                    cache_params.conv_states[self.layer_idx] = conv_state
+                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)

@@ -24,7 +24,7 @@ If you want to run a local Qwen3.5 model on an Arc A770 or A750, this README is 
 - Qwen3-TTS speech synthesis
 - `anna-speak` CLI for local TTS generation
 - `xpu` inference
-- Linear-attention SYCL fused op
+- Linear-attention SYCL fused ops
 - Service address and available routes printed on startup
 - Aggregated runtime metrics printed in the terminal
   - Idle periods do not keep spamming logs
@@ -110,9 +110,10 @@ If the build succeeds, the dynamic library will be generated here:
 The terminal usually prints output similar to:
 
 ```text
-Compiling Anna gated_delta_fused SYCL op...
+Compiling Anna fused XPU/SYCL ops...
 library_path=D:\Projects\Anna\.build\anna_gated_delta_fused\anna_gated_delta_fused.pyd
-op_registered=True
+gated_delta_registered=True
+causal_conv1d_registered=True
 ```
 
 ### 7. Optional verification

@@ -93,6 +93,160 @@ inline float load_as_float(const scalar_t* ptr, int64_t idx) {
   return static_cast<float>(ptr[idx]);
 }
 
+void validate_causal_conv_inputs(
+    const at::Tensor& hidden_states,
+    const at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias_opt) {
+  TORCH_CHECK(hidden_states.dim() == 3, "hidden_states must be [batch, channels, seq_len]");
+  TORCH_CHECK(conv_state.dim() == 3, "conv_state must be [batch, channels, kernel_size]");
+  TORCH_CHECK(weight.dim() == 2, "weight must be [channels, kernel_size]");
+  TORCH_CHECK(hidden_states.size(0) == conv_state.size(0), "hidden_states/conv_state batch size mismatch");
+  TORCH_CHECK(hidden_states.size(1) == conv_state.size(1), "hidden_states/conv_state channel count mismatch");
+  TORCH_CHECK(hidden_states.size(1) == weight.size(0), "hidden_states/weight channel count mismatch");
+  TORCH_CHECK(conv_state.size(2) == weight.size(1), "conv_state length must match kernel size");
+  TORCH_CHECK(hidden_states.size(2) >= 1, "hidden_states sequence length must be positive");
+  TORCH_CHECK(conv_state.size(2) >= 1, "kernel size must be positive");
+  TORCH_CHECK(
+      hidden_states.scalar_type() == conv_state.scalar_type() &&
+          hidden_states.scalar_type() == weight.scalar_type(),
+      "hidden_states, conv_state, and weight must share the same dtype");
+  TORCH_CHECK(
+      hidden_states.scalar_type() == at::kHalf || hidden_states.scalar_type() == at::kBFloat16 ||
+          hidden_states.scalar_type() == at::kFloat,
+      "causal_conv1d_fused XPU kernel supports float16, bfloat16, and float32 inputs");
+
+  if (bias_opt.has_value() && bias_opt->defined()) {
+    TORCH_CHECK(bias_opt->dim() == 1, "bias must be [channels]");
+    TORCH_CHECK(bias_opt->size(0) == hidden_states.size(1), "bias size must match channel count");
+    TORCH_CHECK(bias_opt->scalar_type() == hidden_states.scalar_type(), "bias dtype must match hidden_states");
+  }
+}
+
+void validate_causal_conv_xpu_inputs(
+    const at::Tensor& hidden_states,
+    const at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias_opt) {
+  auto device = hidden_states.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "hidden_states must be an XPU tensor");
+  TORCH_CHECK(conv_state.device() == device, "conv_state must be on the same device as hidden_states");
+  TORCH_CHECK(weight.device() == device, "weight must be on the same device as hidden_states");
+  if (bias_opt.has_value() && bias_opt->defined()) {
+    TORCH_CHECK(bias_opt->device() == device, "bias must be on the same device as hidden_states");
+  }
+  TORCH_CHECK(conv_state.is_contiguous(), "conv_state must be contiguous");
+}
+
+std::tuple<at::Tensor, at::Tensor> causal_conv1d_fused_meta(
+    const at::Tensor& hidden_states,
+    const at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias_opt) {
+  validate_causal_conv_inputs(hidden_states, conv_state, weight, bias_opt);
+  auto meta_options = hidden_states.options().device(c10::Device(c10::DeviceType::Meta));
+  return {
+      at::empty(hidden_states.sizes(), meta_options),
+      at::empty(conv_state.sizes(), meta_options),
+  };
+}
+
+std::tuple<at::Tensor, at::Tensor> causal_conv1d_fused_xpu(
+    const at::Tensor& hidden_states_in,
+    const at::Tensor& conv_state_in,
+    const at::Tensor& weight_in,
+    const c10::optional<at::Tensor>& bias_opt) {
+  validate_causal_conv_inputs(hidden_states_in, conv_state_in, weight_in, bias_opt);
+  validate_causal_conv_xpu_inputs(hidden_states_in, conv_state_in, weight_in, bias_opt);
+
+  auto hidden_states = hidden_states_in.contiguous();
+  auto conv_state = conv_state_in.contiguous();
+  auto weight = weight_in.contiguous();
+  c10::optional<at::Tensor> bias;
+  if (bias_opt.has_value() && bias_opt->defined()) {
+    bias = bias_opt->contiguous();
+  }
+
+  const auto batch_size = hidden_states.size(0);
+  const auto channels = hidden_states.size(1);
+  const auto sequence_length = hidden_states.size(2);
+  const auto kernel_size = weight.size(1);
+
+  auto output = at::empty(hidden_states.sizes(), hidden_states.options());
+  auto final_state = at::empty(conv_state.sizes(), conv_state.options());
+  auto stream = c10::xpu::getCurrentXPUStream(hidden_states.device().index());
+  const int64_t total_outputs = batch_size * channels * sequence_length;
+  const int64_t total_states = batch_size * channels;
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      hidden_states.scalar_type(),
+      "causal_conv1d_fused_xpu",
+      [&] {
+        const scalar_t* hidden_ptr = hidden_states.const_data_ptr<scalar_t>();
+        const scalar_t* state_read_ptr = conv_state.const_data_ptr<scalar_t>();
+        scalar_t* state_write_ptr = final_state.mutable_data_ptr<scalar_t>();
+        const scalar_t* weight_ptr = weight.const_data_ptr<scalar_t>();
+        const bool has_bias = bias.has_value() && bias->defined();
+        const scalar_t* bias_ptr = has_bias ? bias->const_data_ptr<scalar_t>() : nullptr;
+        scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
+
+        stream.queue().submit([&](sycl::handler& cgh) {
+          cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_outputs)), [=](sycl::item<1> item) {
+            const int64_t linear_idx = static_cast<int64_t>(item.get_id(0));
+            const int64_t t = linear_idx % sequence_length;
+            const int64_t batch_channel = linear_idx / sequence_length;
+            const int64_t b = batch_channel / channels;
+            const int64_t c = batch_channel % channels;
+            const int64_t hidden_base = (b * channels + c) * sequence_length;
+            const int64_t state_base = (b * channels + c) * kernel_size;
+            const int64_t weight_base = c * kernel_size;
+
+            float acc = has_bias ? load_as_float(bias_ptr, c) : 0.0f;
+            for (int64_t k = 0; k < kernel_size; ++k) {
+              const int64_t source_index = t + 1 + k;
+              const float input_value = source_index < kernel_size
+                  ? load_as_float(state_read_ptr, state_base + source_index)
+                  : load_as_float(hidden_ptr, hidden_base + (source_index - kernel_size));
+              acc += input_value * load_as_float(weight_ptr, weight_base + k);
+            }
+
+            const float silu = acc / (1.0f + sycl::exp(-acc));
+            output_ptr[hidden_base + t] = static_cast<scalar_t>(silu);
+          });
+        });
+
+        stream.queue().submit([&](sycl::handler& cgh) {
+          cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_states)), [=](sycl::item<1> item) {
+            const int64_t batch_channel = static_cast<int64_t>(item.get_id(0));
+            const int64_t b = batch_channel / channels;
+            const int64_t c = batch_channel % channels;
+            const int64_t hidden_base = (b * channels + c) * sequence_length;
+            const int64_t state_base = (b * channels + c) * kernel_size;
+
+            if (sequence_length >= kernel_size) {
+              for (int64_t k = 0; k < kernel_size; ++k) {
+                state_write_ptr[state_base + k] =
+                    hidden_ptr[hidden_base + (sequence_length - kernel_size + k)];
+              }
+              return;
+            }
+
+            const int64_t retained = kernel_size - sequence_length;
+            for (int64_t k = 0; k < retained; ++k) {
+              state_write_ptr[state_base + k] = state_read_ptr[state_base + sequence_length + k];
+            }
+            for (int64_t k = 0; k < sequence_length; ++k) {
+              state_write_ptr[state_base + retained + k] = hidden_ptr[hidden_base + k];
+            }
+          });
+        });
+      });
+
+  return {output, final_state};
+}
+
 std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_meta(
     const at::Tensor& query_in,
     const at::Tensor& key_in,
@@ -324,6 +478,13 @@ std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_xpu(
 
 TORCH_LIBRARY(anna, m) {
   m.def(
+      "causal_conv1d_fused("
+      "Tensor hidden_states, "
+      "Tensor conv_state, "
+      "Tensor weight, "
+      "Tensor? bias=None"
+      ") -> (Tensor, Tensor)");
+  m.def(
       "gated_delta_fused("
       "Tensor query, "
       "Tensor key, "
@@ -339,9 +500,11 @@ TORCH_LIBRARY(anna, m) {
 }
 
 TORCH_LIBRARY_IMPL(anna, Meta, m) {
+  m.impl("causal_conv1d_fused", anna::causal_conv1d_fused_meta);
   m.impl("gated_delta_fused", anna::gated_delta_fused_meta);
 }
 
 TORCH_LIBRARY_IMPL(anna, XPU, m) {
+  m.impl("causal_conv1d_fused", anna::causal_conv1d_fused_xpu);
   m.impl("gated_delta_fused", anna::gated_delta_fused_xpu);
 }
