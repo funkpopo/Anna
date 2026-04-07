@@ -65,8 +65,19 @@ def _gated_delta_op():
     return getattr(namespace, "gated_delta_fused", None)
 
 
+def _causal_conv1d_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "causal_conv1d_fused", None)
+
+
 def gated_delta_fused_is_available() -> bool:
     return _gated_delta_op() is not None
+
+
+def causal_conv1d_fused_is_available() -> bool:
+    return _causal_conv1d_op() is not None
 
 
 def maybe_load_gated_delta_library(path: str | os.PathLike[str] | None = None) -> bool:
@@ -104,6 +115,27 @@ def maybe_load_gated_delta_library(path: str | os.PathLike[str] | None = None) -
             logger.info("Loaded Anna fused-op library from %s", resolved)
             return True
     return gated_delta_fused_is_available()
+
+
+def run_causal_conv1d_fused(
+    *,
+    hidden_states: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op = _causal_conv1d_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _causal_conv1d_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna causal_conv1d_fused op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    if bias is None:
+        return op(hidden_states, conv_state, weight)
+    return op(hidden_states, conv_state, weight, bias)
 
 
 def run_gated_delta_fused(

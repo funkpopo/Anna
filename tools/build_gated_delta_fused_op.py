@@ -48,7 +48,7 @@ def _write_runtime_paths(build_dir: Path, *paths: Path) -> None:
 
 def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    python_root = Path(sys.executable).resolve().parents[1]
+    python_root = Path(sys.executable).resolve().parent
     torch_root = Path(torch.__file__).resolve().parent
     torch_lib_dir = torch_root / "lib"
     compiler_bin = Path(r"D:\Intel\oneAPI\compiler\2025.3\bin")
@@ -89,15 +89,26 @@ def main() -> None:
         str(output),
     ]
 
-    print("Compiling Anna gated_delta_fused SYCL op...")
+    print("Compiling Anna fused XPU/SYCL ops...")
     print(" ".join(compile_command))
     subprocess.run(compile_command, check=True, cwd=str(build_dir), env=os.environ.copy())
 
     _write_runtime_paths(build_dir, build_dir, python_root / "Library" / "bin", torch_lib_dir, compiler_bin)
+    _prepend_env_path("PATH", build_dir, python_root / "Library" / "bin", torch_lib_dir, compiler_bin)
 
-    torch.ops.load_library(str(output))
+    sys.path.insert(0, str(repo_root / "src"))
+    from anna.model.fused_ops import (  # noqa: PLC0415
+        causal_conv1d_fused_is_available,
+        gated_delta_fused_is_available,
+        maybe_load_gated_delta_library,
+    )
+
+    if not maybe_load_gated_delta_library(output):
+        raise RuntimeError(f"Failed to load compiled Anna fused-op library: {output}")
+
     print(f"library_path={output}")
-    print(f"op_registered={hasattr(torch.ops.anna, 'gated_delta_fused')}")
+    print(f"gated_delta_registered={gated_delta_fused_is_available()}")
+    print(f"causal_conv1d_registered={causal_conv1d_fused_is_available()}")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,29 @@ import pytest
 import torch
 
 from anna.model.fused_ops import maybe_load_gated_delta_library
-from anna.model.ops import torch_recurrent_gated_delta_rule
+from anna.model.ops import torch_causal_conv1d_update, torch_recurrent_gated_delta_rule
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_causal_conv1d_fused_xpu_matches_reference() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "causal_conv1d_fused"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(0)
+    device = "xpu"
+    hidden_states = torch.randn(2, 6, 7, device=device, dtype=torch.float16)
+    conv_state = torch.randn(2, 6, 4, device=device, dtype=torch.float16)
+    weight = torch.randn(6, 4, device=device, dtype=torch.float16)
+    bias = torch.randn(6, device=device, dtype=torch.float16)
+
+    output, fused_state = torch.ops.anna.causal_conv1d_fused(hidden_states, conv_state, weight, bias)
+
+    reference_state = conv_state.clone()
+    reference = torch_causal_conv1d_update(hidden_states, reference_state, weight, bias)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(fused_state.float().cpu(), reference_state.float().cpu(), atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
