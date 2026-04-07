@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <tuple>
 
 namespace anna {
@@ -164,6 +165,25 @@ void validate_qk_norm_rotary_xpu_inputs(
   TORCH_CHECK(key_norm_weight.device() == device, "key_norm_weight must be on the same device as query");
   TORCH_CHECK(cos.device() == device, "cos must be on the same device as query");
   TORCH_CHECK(sin.device() == device, "sin must be on the same device as query");
+}
+
+void validate_moe_router_inputs(
+    const at::Tensor& router_logits,
+    int64_t top_k) {
+  TORCH_CHECK(router_logits.dim() == 2, "router_logits must be [tokens, num_experts]");
+  TORCH_CHECK(router_logits.size(1) >= 1, "num_experts must be positive");
+  TORCH_CHECK(top_k >= 1, "top_k must be positive");
+  TORCH_CHECK(top_k <= router_logits.size(1), "top_k must be <= num_experts");
+  TORCH_CHECK(at::isFloatingType(router_logits.scalar_type()), "router_logits must be a floating-point tensor");
+  TORCH_CHECK(
+      router_logits.scalar_type() == at::kHalf || router_logits.scalar_type() == at::kBFloat16 ||
+          router_logits.scalar_type() == at::kFloat,
+      "moe_router_fused XPU kernel supports float16, bfloat16, and float32 inputs");
+}
+
+void validate_moe_router_xpu_inputs(const at::Tensor& router_logits) {
+  auto device = router_logits.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "router_logits must be an XPU tensor");
 }
 
 void validate_causal_conv_inputs(
@@ -539,6 +559,150 @@ std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_xpu(
   return {query_output, key_output};
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_router_fused_meta(
+    const at::Tensor& router_logits,
+    int64_t top_k,
+    bool /*normalize_topk_prob*/) {
+  validate_moe_router_inputs(router_logits, top_k);
+  auto weights_options = router_logits.options().device(c10::Device(c10::DeviceType::Meta)).dtype(at::kFloat);
+  auto index_options = router_logits.options().device(c10::Device(c10::DeviceType::Meta)).dtype(at::kLong);
+  auto usage_options = router_logits.options().device(c10::Device(c10::DeviceType::Meta)).dtype(at::kInt);
+  return {
+      at::empty({router_logits.size(0), top_k}, weights_options),
+      at::empty({router_logits.size(0), top_k}, index_options),
+      at::empty({router_logits.size(1)}, usage_options),
+  };
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_router_fused_xpu(
+    const at::Tensor& router_logits_in,
+    int64_t top_k,
+    bool normalize_topk_prob) {
+  validate_moe_router_inputs(router_logits_in, top_k);
+  validate_moe_router_xpu_inputs(router_logits_in);
+
+  auto router_logits = router_logits_in.contiguous();
+  const auto tokens = router_logits.size(0);
+  const auto num_experts = router_logits.size(1);
+  const int64_t local_size = std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, num_experts)), 256);
+
+  auto routing_weights = at::empty({tokens, top_k}, router_logits.options().dtype(at::kFloat));
+  auto selected_experts = at::empty({tokens, top_k}, router_logits.options().dtype(at::kLong));
+  auto expert_usage = at::zeros({num_experts}, router_logits.options().dtype(at::kInt));
+  auto stream = c10::xpu::getCurrentXPUStream(router_logits.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      router_logits.scalar_type(),
+      "moe_router_fused_xpu",
+      [&] {
+        const scalar_t* logits_ptr = router_logits.const_data_ptr<scalar_t>();
+        float* routing_weights_ptr = routing_weights.mutable_data_ptr<float>();
+        int64_t* selected_experts_ptr = selected_experts.mutable_data_ptr<int64_t>();
+        int32_t* expert_usage_ptr = expert_usage.mutable_data_ptr<int32_t>();
+        const bool normalize_topk_prob_value = normalize_topk_prob;
+
+        stream.queue().submit([&](sycl::handler& cgh) {
+          sycl::local_accessor<float, 1> partial_max(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
+          sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
+          sycl::local_accessor<float, 1> probabilities(sycl::range<1>(static_cast<size_t>(num_experts)), cgh);
+          sycl::local_accessor<float, 1> top_values(sycl::range<1>(static_cast<size_t>(top_k)), cgh);
+          sycl::local_accessor<int64_t, 1> top_indices(sycl::range<1>(static_cast<size_t>(top_k)), cgh);
+
+          cgh.parallel_for(
+              sycl::nd_range<2>(
+                  sycl::range<2>(static_cast<size_t>(tokens), static_cast<size_t>(local_size)),
+                  sycl::range<2>(1, static_cast<size_t>(local_size))),
+              [=](sycl::nd_item<2> item) {
+                const int64_t token_idx = static_cast<int64_t>(item.get_group(0));
+                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+                const int64_t row_base = token_idx * num_experts;
+
+                float local_max = -std::numeric_limits<float>::infinity();
+                for (int64_t expert_idx = lane; expert_idx < num_experts; expert_idx += local_size) {
+                  const float value = load_as_float(logits_ptr, row_base + expert_idx);
+                  local_max = sycl::fmax(local_max, value);
+                }
+                partial_max[lane] = local_max;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
+                  if (lane < stride) {
+                    partial_max[lane] = sycl::fmax(partial_max[lane], partial_max[lane + stride]);
+                  }
+                  item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                const float max_value = partial_max[0];
+                float local_sum = 0.0f;
+                for (int64_t expert_idx = lane; expert_idx < num_experts; expert_idx += local_size) {
+                  const float exp_value = sycl::exp(load_as_float(logits_ptr, row_base + expert_idx) - max_value);
+                  probabilities[expert_idx] = exp_value;
+                  local_sum += exp_value;
+                }
+                partial_sum[lane] = local_sum;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
+                  if (lane < stride) {
+                    partial_sum[lane] += partial_sum[lane + stride];
+                  }
+                  item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                const float inv_sum = 1.0f / partial_sum[0];
+                for (int64_t expert_idx = lane; expert_idx < num_experts; expert_idx += local_size) {
+                  probabilities[expert_idx] *= inv_sum;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                if (lane == 0) {
+                  for (int64_t route_idx = 0; route_idx < top_k; ++route_idx) {
+                    top_values[route_idx] = -std::numeric_limits<float>::infinity();
+                    top_indices[route_idx] = 0;
+                  }
+
+                  for (int64_t expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+                    const float prob = probabilities[expert_idx];
+                    if (prob <= top_values[top_k - 1]) {
+                      continue;
+                    }
+                    int64_t insert_idx = top_k - 1;
+                    while (insert_idx > 0 && prob > top_values[insert_idx - 1]) {
+                      top_values[insert_idx] = top_values[insert_idx - 1];
+                      top_indices[insert_idx] = top_indices[insert_idx - 1];
+                      --insert_idx;
+                    }
+                    top_values[insert_idx] = prob;
+                    top_indices[insert_idx] = expert_idx;
+                  }
+
+                  float top_sum = 0.0f;
+                  for (int64_t route_idx = 0; route_idx < top_k; ++route_idx) {
+                    top_sum += top_values[route_idx];
+                  }
+                  const float renorm_scale = normalize_topk_prob_value && top_sum > 0.0f ? 1.0f / top_sum : 1.0f;
+                  const int64_t out_base = token_idx * top_k;
+                  for (int64_t route_idx = 0; route_idx < top_k; ++route_idx) {
+                    const int64_t expert_idx = top_indices[route_idx];
+                    routing_weights_ptr[out_base + route_idx] = top_values[route_idx] * renorm_scale;
+                    selected_experts_ptr[out_base + route_idx] = expert_idx;
+                    sycl::atomic_ref<
+                        int32_t,
+                        sycl::memory_order::relaxed,
+                        sycl::memory_scope::device,
+                        sycl::access::address_space::global_space>(expert_usage_ptr[expert_idx])
+                        .fetch_add(1);
+                  }
+                }
+              });
+        });
+      });
+
+  return {routing_weights, selected_experts, expert_usage};
+}
+
 std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_meta(
     const at::Tensor& query_in,
     const at::Tensor& key_in,
@@ -770,6 +934,12 @@ std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_xpu(
 
 TORCH_LIBRARY(anna, m) {
   m.def(
+      "moe_router_fused("
+      "Tensor router_logits, "
+      "int top_k, "
+      "bool normalize_topk_prob=True"
+      ") -> (Tensor, Tensor, Tensor)");
+  m.def(
       "rmsnorm_fused("
       "Tensor input, "
       "Tensor weight, "
@@ -809,6 +979,7 @@ TORCH_LIBRARY(anna, m) {
 }
 
 TORCH_LIBRARY_IMPL(anna, Meta, m) {
+  m.impl("moe_router_fused", anna::moe_router_fused_meta);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_meta);
   m.impl("qk_norm_rotary_fused", anna::qk_norm_rotary_fused_meta);
   m.impl("causal_conv1d_fused", anna::causal_conv1d_fused_meta);
@@ -816,6 +987,7 @@ TORCH_LIBRARY_IMPL(anna, Meta, m) {
 }
 
 TORCH_LIBRARY_IMPL(anna, XPU, m) {
+  m.impl("moe_router_fused", anna::moe_router_fused_xpu);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_xpu);
   m.impl("qk_norm_rotary_fused", anna::qk_norm_rotary_fused_xpu);
   m.impl("causal_conv1d_fused", anna::causal_conv1d_fused_xpu);

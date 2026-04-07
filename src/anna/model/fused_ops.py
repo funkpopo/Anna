@@ -65,6 +65,13 @@ def _gated_delta_op():
     return getattr(namespace, "gated_delta_fused", None)
 
 
+def _moe_router_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "moe_router_fused", None)
+
+
 def _rmsnorm_op():
     namespace = getattr(torch.ops, "anna", None)
     if namespace is None:
@@ -84,6 +91,10 @@ def _causal_conv1d_op():
     if namespace is None:
         return None
     return getattr(namespace, "causal_conv1d_fused", None)
+
+
+def moe_router_fused_is_available() -> bool:
+    return _moe_router_op() is not None
 
 
 def rmsnorm_fused_is_available() -> bool:
@@ -137,6 +148,24 @@ def maybe_load_gated_delta_library(path: str | os.PathLike[str] | None = None) -
             logger.info("Loaded Anna fused-op library from %s", resolved)
             return True
     return gated_delta_fused_is_available()
+
+
+def run_moe_router_fused(
+    *,
+    router_logits: torch.Tensor,
+    top_k: int,
+    normalize_topk_prob: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    op = _moe_router_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _moe_router_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna moe_router_fused op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(router_logits, int(top_k), bool(normalize_topk_prob))
 
 
 def run_rmsnorm_fused(
