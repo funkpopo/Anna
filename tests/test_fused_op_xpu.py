@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import anna.model.ops as model_ops
 from anna.model.fused_ops import maybe_load_gated_delta_library
 from anna.model.ops import (
     Qwen3Attention,
@@ -77,6 +78,34 @@ def test_gqa_decode_fused_xpu_matches_reference() -> None:
         key,
         value,
         scaling=32**-0.5,
+        visible_mask=visible_mask,
+    )
+
+    torch.xpu.synchronize()
+    assert torch.allclose(fused_output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gqa_decode_fused_xpu_long_qwen35_shape_matches_reference() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gqa_decode_fused"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(0)
+    device = "xpu"
+    head_dim = 256
+    key_len = 4096
+    query = torch.randn(1, 16, 1, head_dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(1, 4, key_len, head_dim, device=device, dtype=torch.bfloat16)
+    value = torch.randn(1, 4, key_len, head_dim, device=device, dtype=torch.bfloat16)
+    visible_lengths = torch.tensor([key_len], device=device, dtype=torch.long)
+
+    fused_output = torch.ops.anna.gqa_decode_fused(query, key, value, visible_lengths, head_dim**-0.5)
+    visible_mask = torch.arange(key.shape[2], device=device)[None, :] < visible_lengths[:, None]
+    reference = grouped_query_attention(
+        query,
+        key,
+        value,
+        scaling=head_dim**-0.5,
         visible_mask=visible_mask,
     )
 
@@ -231,6 +260,103 @@ def test_qwen3_attention_xpu_single_token_decode_matches_full_forward() -> None:
 
     torch.xpu.synchronize()
     assert torch.allclose(append_output.float().cpu(), full_output[:, -1:].float().cpu(), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_materialized_kv_single_token_decode_attention_matches_reference_on_long_qwen35_shape() -> None:
+    torch.manual_seed(0)
+    device = "xpu"
+    head_dim = 256
+    key_len = 4096
+    query = torch.randn(1, 16, 1, head_dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(1, 4, key_len, head_dim, device=device, dtype=torch.bfloat16)
+    value = torch.randn(1, 4, key_len, head_dim, device=device, dtype=torch.bfloat16)
+    visible_lengths = torch.tensor([key_len], device=device, dtype=torch.long)
+
+    output = model_ops.materialized_kv_single_token_decode_attention(
+        query,
+        key,
+        value,
+        scaling=head_dim**-0.5,
+        num_key_value_groups=4,
+        visible_lengths=visible_lengths,
+    )
+    repeated_key = model_ops.repeat_kv(key, 4)
+    repeated_value = model_ops.repeat_kv(value, 4)
+    attn_scores = torch.matmul(query, repeated_key.transpose(-1, -2)) * (head_dim**-0.5)
+    attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query.dtype)
+    reference = torch.matmul(attn_probs, repeated_value)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_qwen3_attention_xpu_single_token_decode_uses_materialized_kv_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "qk_norm_rotary_fused"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(0)
+    calls: list[tuple[torch.Size, torch.Size, int, tuple[int, ...]]] = []
+    materialized_impl = model_ops.materialized_kv_single_token_decode_attention
+
+    def _stub_materialized_decode(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        scaling: float,
+        num_key_value_groups: int,
+        visible_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        calls.append(
+            (
+                query.shape,
+                key.shape,
+                num_key_value_groups,
+                tuple(int(item) for item in visible_lengths.cpu().tolist()),
+            )
+        )
+        return materialized_impl(
+            query,
+            key,
+            value,
+            scaling=scaling,
+            num_key_value_groups=num_key_value_groups,
+            visible_lengths=visible_lengths,
+        )
+
+    monkeypatch.setattr(model_ops, "materialized_kv_single_token_decode_attention", _stub_materialized_decode)
+    config = Qwen3_5TextConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        layer_types=["full_attention"],
+    )
+    attention = Qwen3Attention(config, 0).eval().to("xpu", dtype=torch.bfloat16)
+    rotary = Qwen3TextRotaryEmbedding(config).to("xpu")
+    cache = Qwen3DynamicCache(config)
+    prompt_states = torch.randn(1, 6, config.hidden_size, device="xpu", dtype=torch.bfloat16)
+    append_states = torch.randn(1, 1, config.hidden_size, device="xpu", dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        prompt_position_ids = torch.arange(prompt_states.shape[1], device="xpu").view(1, -1)
+        _ = attention(prompt_states, rotary(prompt_states, prompt_position_ids), past_key_values=cache)
+        append_position_ids = torch.full((1, 1), prompt_states.shape[1], device="xpu", dtype=torch.long)
+        _ = attention(append_states, rotary(append_states, append_position_ids), past_key_values=cache)
+
+    torch.xpu.synchronize()
+    assert calls == [
+        (
+            torch.Size([1, config.num_attention_heads, 1, config.head_dim]),
+            torch.Size([1, config.num_key_value_heads, 7, config.head_dim]),
+            config.num_attention_heads // config.num_key_value_heads,
+            (7,),
+        )
+    ]
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")

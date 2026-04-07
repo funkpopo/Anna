@@ -861,6 +861,29 @@ def grouped_query_attention(
     return attn_output.reshape(batch_size, num_heads, query_len, -1)
 
 
+def materialized_kv_single_token_decode_attention(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    *,
+    scaling: float,
+    num_key_value_groups: int,
+    visible_lengths: torch.Tensor,
+) -> torch.Tensor:
+    key_positions = torch.arange(key_states.shape[-2], device=query_states.device)[None, :]
+    visible_mask = key_positions < visible_lengths[:, None]
+    if not bool(torch.all(visible_mask).item()):
+        key_states = key_states.masked_fill(~visible_mask[:, None, :, None], 0)
+        value_states = value_states.masked_fill(~visible_mask[:, None, :, None], 0)
+
+    repeated_key_states = repeat_kv(key_states, num_key_value_groups)
+    repeated_value_states = repeat_kv(value_states, num_key_value_groups)
+    attn_scores = torch.matmul(query_states, repeated_key_states.transpose(-1, -2)) * scaling
+    attn_scores = attn_scores.masked_fill(~visible_mask[:, None, None, :], float("-inf"))
+    attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
+    return torch.matmul(attn_probs, repeated_value_states)
+
+
 def apply_mask_to_padding_states(hidden_states: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
     if attention_mask is not None and attention_mask.ndim == 2 and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
         hidden_states = hidden_states * attention_mask[:, :, None].to(dtype=hidden_states.dtype)
@@ -1115,28 +1138,13 @@ class Qwen3Attention(nn.Module):
             key_padding_mask = None
             if attention_mask is None and past_key_values is not None and seq_len == 1 and hidden_states.device.type == "xpu":
                 visible_lengths = past_lengths + seq_len
-                if bool(torch.all(visible_lengths == key_states.shape[-2]).item()):
-                    attn_output = F.scaled_dot_product_attention(
-                        query_states,
-                        key_states,
-                        value_states,
-                        dropout_p=0.0,
-                        is_causal=False,
-                        enable_gqa=self.num_key_value_groups > 1,
-                    )
-                    attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
-                    attn_output = attn_output * torch.sigmoid(gate)
-                    return self.o_proj(attn_output)
-                key_positions = torch.arange(key_states.shape[-2], device=hidden_states.device)[None, :]
-                visible_mask = key_positions < visible_lengths[:, None]
-                attn_output = F.scaled_dot_product_attention(
+                attn_output = materialized_kv_single_token_decode_attention(
                     query_states,
                     key_states,
                     value_states,
-                    attn_mask=visible_mask[:, None, None, :],
-                    dropout_p=0.0,
-                    is_causal=False,
-                    enable_gqa=self.num_key_value_groups > 1,
+                    scaling=self.scaling,
+                    num_key_value_groups=self.num_key_value_groups,
+                    visible_lengths=visible_lengths,
                 )
                 attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
                 attn_output = attn_output * torch.sigmoid(gate)
