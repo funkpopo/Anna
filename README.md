@@ -209,6 +209,24 @@ anna-serve `
   --port 8000
 ```
 
+Example for an Arc A770 deployment with a local Qwen3.5 9B distilled model, int4 dense weights, and tighter memory guardrails:
+
+```powershell
+anna-serve `
+  --model-dir D:\Projects\Anna\models\Jackrong\Qwen3___5-9B-Claude-4___6-Opus-Reasoning-Distilled-v2 `
+  --model-name qwen3.5 `
+  --device xpu `
+  --dtype bf16 `
+  --weight-quant int4 `
+  --offload-vision `
+  --disable-thinking `
+  --reasoning-format deepseek `
+  --min-free-memory-mib 256 `
+  --reserve-memory-mib 128 `
+  --max-estimated-usage-ratio 0.95 `
+  --generation-memory-safety-factor 1.25
+```
+
 If you do not want periodic metrics logs:
 
 ```powershell
