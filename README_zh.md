@@ -207,6 +207,24 @@ anna-serve `
   --port 8000
 ```
 
+面向 Arc A770 上本地 Qwen3.5 9B distilled 模型、启用 int4 稠密权重并收紧显存保护参数的示例：
+
+```powershell
+anna-serve `
+  --model-dir D:\Projects\Anna\models\Jackrong\Qwen3___5-9B-Claude-4___6-Opus-Reasoning-Distilled-v2 `
+  --model-name qwen3.5 `
+  --device xpu `
+  --dtype bf16 `
+  --weight-quant int4 `
+  --offload-vision `
+  --disable-thinking `
+  --reasoning-format deepseek `
+  --min-free-memory-mib 256 `
+  --reserve-memory-mib 128 `
+  --max-estimated-usage-ratio 0.95 `
+  --generation-memory-safety-factor 1.25
+```
+
 如果你不想看周期指标日志：
 
 ```powershell
