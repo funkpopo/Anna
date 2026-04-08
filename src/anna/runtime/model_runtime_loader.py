@@ -55,7 +55,7 @@ def load_model_runtime_from_model_dir(
             resident_expert_layer_indices=resident_expert_layer_indices,
             cached_experts_per_layer=cached_experts_per_layer,
         )
-    if model_family_info.model_family == "gemma4_text":
+    if model_family_info.model_family == "gemma4":
         return AnnaGemma4TextEngine.from_model_dir(
             model_dir,
             model_id=model_id,

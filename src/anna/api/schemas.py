@@ -6,10 +6,11 @@ from pydantic import AliasChoices, BaseModel, Field
 
 
 class MessageContentPart(BaseModel):
-    type: Literal["text", "image_url", "video_url"]
+    type: Literal["text", "image_url", "video_url", "audio_url"]
     text: str | None = None
     image_url: Any | None = None
     video_url: Any | None = None
+    audio_url: Any | None = None
 
 
 class ChatMessage(BaseModel):

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 
-SupportedModelFamily = Literal["qwen3_5_text", "qwen3_tts", "gemma4_text"]
+SupportedModelFamily = Literal["qwen3_5_text", "qwen3_tts", "gemma4"]
 
 
 @dataclass(slots=True)
@@ -28,7 +28,7 @@ def inspect_model_family(model_dir: str | Path) -> ModelFamilyInfo:
     if model_type == "qwen3_tts":
         model_family: SupportedModelFamily = "qwen3_tts"
     elif model_type == "gemma4":
-        model_family = "gemma4_text"
+        model_family = "gemma4"
     else:
         model_family = "qwen3_5_text"
     return ModelFamilyInfo(

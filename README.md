@@ -227,6 +227,24 @@ anna-serve `
   --generation-memory-safety-factor 1.25
 ```
 
+Example for running the local Gemma 4 E4B multimodal runtime on Arc A770 with the same safety-oriented admission settings:
+
+```powershell
+anna-serve `
+  --model-dir D:\Projects\Anna\models\google\gemma-4-E4B-it `
+  --model-name gemma4 `
+  --device xpu `
+  --dtype bf16 `
+  --weight-quant int4 `
+  --offload-vision `
+  --disable-thinking `
+  --reasoning-format deepseek `
+  --min-free-memory-mib 256 `
+  --reserve-memory-mib 128 `
+  --max-estimated-usage-ratio 0.95 `
+  --generation-memory-safety-factor 1.25
+```
+
 If you do not want periodic metrics logs:
 
 ```powershell

@@ -16,6 +16,7 @@ class Gemma4Tokenizer:
         self.sot_token = str(self.metadata.get("sot_token", "<|turn>"))
         self.eot_token = str(self.metadata.get("eot_token", "<turn|>"))
         self.soc_token = str(self.metadata.get("soc_token", "<|channel>"))
+        self.eoc_token = str(self.metadata.get("eoc_token", "<channel|>"))
         self.think_token = str(self.metadata.get("think_token", "<|think|>"))
         self.boi_token = str(self.metadata.get("boi_token", "<|image>"))
         self.eoi_token = str(self.metadata.get("eoi_token", "<image|>"))
@@ -52,6 +53,18 @@ class Gemma4Tokenizer:
         return None if token_id is None else int(token_id)
 
     @property
+    def image_token_id(self) -> int | None:
+        return self.token_id(self.image_token)
+
+    @property
+    def video_token_id(self) -> int | None:
+        return self.token_id(self.video_token)
+
+    @property
+    def audio_token_id(self) -> int | None:
+        return self.token_id(self.audio_token)
+
+    @property
     def eos_token_ids(self) -> set[int]:
         eos_ids: set[int] = set()
         for token in (self.eos_token, self.eot_token):
@@ -86,16 +99,20 @@ class Gemma4Tokenizer:
             item_type = getattr(item, "type", None)
             if item_type is None and isinstance(item, dict):
                 item_type = item.get("type")
-            if item_type != "text":
-                raise ValueError(
-                    "Gemma4 text runtime currently loads only the language tower. "
-                    "Image, video, and audio chat inputs are not supported in this runtime path."
-                )
-            text = getattr(item, "text", None)
-            if text is None and isinstance(item, dict):
-                text = item.get("text")
-            if text:
-                chunks.append(self._strip_thinking(text) if role == "assistant" else str(text).strip())
+            if item_type == "text":
+                text = getattr(item, "text", None)
+                if text is None and isinstance(item, dict):
+                    text = item.get("text")
+                if text:
+                    chunks.append(self._strip_thinking(text) if role == "assistant" else str(text).strip())
+            elif item_type == "image_url":
+                chunks.append(self.image_token)
+            elif item_type == "video_url":
+                chunks.append(self.video_token)
+            elif item_type == "audio_url":
+                chunks.append(self.audio_token)
+            else:
+                raise ValueError(f"Unsupported content part type: {item_type}")
         return "".join(chunks)
 
     def render_messages(

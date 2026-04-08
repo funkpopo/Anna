@@ -37,7 +37,7 @@ def test_inspect_model_family_detects_qwen3_tts_model(tmp_path: Path) -> None:
     assert info.architectures == ("Qwen3TTSForConditionalGeneration",)
 
 
-def test_inspect_model_family_detects_gemma4_text_model(tmp_path: Path) -> None:
+def test_inspect_model_family_detects_gemma4_model(tmp_path: Path) -> None:
     model_dir = tmp_path / "gemma4-model"
     model_dir.mkdir()
     (model_dir / "config.json").write_text(
@@ -52,6 +52,6 @@ def test_inspect_model_family_detects_gemma4_text_model(tmp_path: Path) -> None:
 
     info = inspect_model_family(model_dir)
 
-    assert info.model_family == "gemma4_text"
+    assert info.model_family == "gemma4"
     assert info.model_type == "gemma4"
     assert info.architectures == ("Gemma4ForConditionalGeneration",)

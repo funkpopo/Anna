@@ -225,6 +225,24 @@ anna-serve `
   --generation-memory-safety-factor 1.25
 ```
 
+面向 Arc A770 上本地 Gemma 4 E4B 多模态运行时、沿用同一组显存保护参数的示例：
+
+```powershell
+anna-serve `
+  --model-dir D:\Projects\Anna\models\google\gemma-4-E4B-it `
+  --model-name gemma4 `
+  --device xpu `
+  --dtype bf16 `
+  --weight-quant int4 `
+  --offload-vision `
+  --disable-thinking `
+  --reasoning-format deepseek `
+  --min-free-memory-mib 256 `
+  --reserve-memory-mib 128 `
+  --max-estimated-usage-ratio 0.95 `
+  --generation-memory-safety-factor 1.25
+```
+
 如果你不想看周期指标日志：
 
 ```powershell

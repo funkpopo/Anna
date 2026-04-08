@@ -177,47 +177,99 @@ class Gemma4TextConfig:
 
 @dataclass(slots=True)
 class Gemma4VisionConfig:
+    model_type: str = "gemma4_vision"
+    dtype: str = "bfloat16"
     hidden_size: int = 768
     intermediate_size: int = 3_072
     num_hidden_layers: int = 16
     num_attention_heads: int = 12
     num_key_value_heads: int = 12
+    global_head_dim: int = 64
     head_dim: int = 64
     hidden_activation: str = "gelu_pytorch_tanh"
+    attention_bias: bool = False
+    attention_dropout: float = 0.0
     rms_norm_eps: float = 1e-6
     patch_size: int = 16
     pooling_kernel_size: int = 3
+    max_position_embeddings: int = 131_072
+    position_embedding_size: int = 10_240
+    rope_parameters: dict[str, Any] = field(default_factory=dict)
+    standardize: bool = False
+    use_clipped_linears: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "Gemma4VisionConfig | None":
         if not data:
             return None
         return cls(
+            model_type=str(data.get("model_type", "gemma4_vision")),
+            dtype=str(data.get("dtype", "bfloat16")),
             hidden_size=int(data.get("hidden_size", 768)),
             intermediate_size=int(data.get("intermediate_size", 3_072)),
             num_hidden_layers=int(data.get("num_hidden_layers", 16)),
             num_attention_heads=int(data.get("num_attention_heads", 12)),
             num_key_value_heads=int(data.get("num_key_value_heads", 12)),
+            global_head_dim=int(data.get("global_head_dim", data.get("head_dim", 64))),
             head_dim=int(data.get("head_dim", 64)),
             hidden_activation=str(data.get("hidden_activation", "gelu_pytorch_tanh")),
+            attention_bias=bool(data.get("attention_bias", False)),
+            attention_dropout=float(data.get("attention_dropout", 0.0)),
             rms_norm_eps=float(data.get("rms_norm_eps", 1e-6)),
             patch_size=int(data.get("patch_size", 16)),
             pooling_kernel_size=int(data.get("pooling_kernel_size", 3)),
+            max_position_embeddings=int(data.get("max_position_embeddings", 131_072)),
+            position_embedding_size=int(data.get("position_embedding_size", 10_240)),
+            rope_parameters=dict(data.get("rope_parameters") or {"rope_type": "default", "rope_theta": 100.0}),
+            standardize=bool(data.get("standardize", False)),
+            use_clipped_linears=bool(data.get("use_clipped_linears", True)),
         )
 
 
 @dataclass(slots=True)
 class Gemma4AudioConfig:
+    model_type: str = "gemma4_audio"
+    dtype: str = "bfloat16"
     hidden_size: int = 1_024
+    hidden_act: str = "silu"
+    num_attention_heads: int = 8
+    num_hidden_layers: int = 12
+    attention_chunk_size: int = 12
+    attention_context_left: int = 13
+    attention_context_right: int = 0
+    attention_invalid_logits_value: float = -1_000_000_000.0
+    attention_logit_cap: float = 50.0
+    conv_kernel_size: int = 5
+    gradient_clipping: float = 10_000_000_000.0
     output_proj_dims: int = 1_536
+    residual_weight: float = 0.5
+    rms_norm_eps: float = 1e-6
+    subsampling_conv_channels: tuple[int, int] = (128, 32)
+    use_clipped_linears: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "Gemma4AudioConfig | None":
         if not data:
             return None
         return cls(
+            model_type=str(data.get("model_type", "gemma4_audio")),
+            dtype=str(data.get("dtype", "bfloat16")),
             hidden_size=int(data.get("hidden_size", 1_024)),
+            hidden_act=str(data.get("hidden_act", "silu")),
+            num_attention_heads=int(data.get("num_attention_heads", 8)),
+            num_hidden_layers=int(data.get("num_hidden_layers", 12)),
+            attention_chunk_size=int(data.get("attention_chunk_size", 12)),
+            attention_context_left=int(data.get("attention_context_left", 13)),
+            attention_context_right=int(data.get("attention_context_right", 0)),
+            attention_invalid_logits_value=float(data.get("attention_invalid_logits_value", -1_000_000_000.0)),
+            attention_logit_cap=float(data.get("attention_logit_cap", 50.0)),
+            conv_kernel_size=int(data.get("conv_kernel_size", 5)),
+            gradient_clipping=float(data.get("gradient_clipping", 10_000_000_000.0)),
             output_proj_dims=int(data.get("output_proj_dims", 1_536)),
+            residual_weight=float(data.get("residual_weight", 0.5)),
+            rms_norm_eps=float(data.get("rms_norm_eps", 1e-6)),
+            subsampling_conv_channels=tuple(int(value) for value in data.get("subsampling_conv_channels", [128, 32])),
+            use_clipped_linears=bool(data.get("use_clipped_linears", True)),
         )
 
 
@@ -227,6 +279,7 @@ class Gemma4Config:
     text_config: Gemma4TextConfig = field(default_factory=Gemma4TextConfig)
     vision_config: Gemma4VisionConfig | None = None
     audio_config: Gemma4AudioConfig | None = None
+    vision_soft_tokens_per_image: int = 280
     default_max_completion_tokens: int | None = None
     tie_word_embeddings: bool = True
     image_token_id: int = 258_880
@@ -260,6 +313,7 @@ class Gemma4Config:
             text_config=Gemma4TextConfig.from_dict(config_data),
             vision_config=Gemma4VisionConfig.from_dict(config_data.get("vision_config")),
             audio_config=Gemma4AudioConfig.from_dict(config_data.get("audio_config")),
+            vision_soft_tokens_per_image=int(_first_non_null(config_data.get("vision_soft_tokens_per_image"), 280)),
             default_max_completion_tokens=default_max_completion_tokens,
             tie_word_embeddings=bool(_first_non_null(config_data.get("tie_word_embeddings"), True)),
             image_token_id=int(_first_non_null(config_data.get("image_token_id"), 258_880)),

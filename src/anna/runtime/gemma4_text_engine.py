@@ -10,6 +10,7 @@ import torch
 
 from anna.mm.gemma4_text_processor import Gemma4TextProcessor
 from anna.model.gemma4_text_model import Gemma4DynamicCache, Gemma4ForConditionalGeneration
+from anna.model.quantization import convert_module_linears_to_xpu_int4
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.qwen3_5_text_engine import (
     _DEFAULT_REASONING_FORMAT,
@@ -39,7 +40,7 @@ class _NullCacheAllocator:
 
 
 class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
-    model_family = "gemma4_text"
+    model_family = "gemma4"
 
     def __init__(
         self,
@@ -49,9 +50,14 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         processor: Gemma4TextProcessor,
         model_id: str,
         device_context: DeviceContext,
+        quantized_replacements: int = 0,
         default_max_completion_tokens: int | None = None,
         default_enable_thinking: bool = True,
         reasoning_format: ReasoningFormat | str = _DEFAULT_REASONING_FORMAT,
+        offload_mode: str = "none",
+        offload_vision: bool = False,
+        expert_quant: str = "none",
+        weight_quant: str = "none",
         optimization_config: EngineOptimizationConfig | None = None,
         offload_per_layer_input_embeddings: bool = False,
     ) -> None:
@@ -61,16 +67,16 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         self.default_model_id = model_id
         self.device_context = device_context
         self.config = model.config
-        self.quantized_replacements = 0
+        self.quantized_replacements = quantized_replacements
         self.default_max_completion_tokens = (
             None if default_max_completion_tokens is None else max(1, int(default_max_completion_tokens))
         )
         self.default_enable_thinking = bool(default_enable_thinking)
         self.reasoning_format = normalize_reasoning_format(reasoning_format)
-        self.offload_mode = "none"
-        self.offload_vision = False
-        self.expert_quant = "none"
-        self.weight_quant = "none"
+        self.offload_mode = offload_mode
+        self.offload_vision = offload_vision
+        self.expert_quant = expert_quant
+        self.weight_quant = weight_quant
         self.resident_expert_layer_indices = ()
         self.resident_expert_layers = 0
         self.cached_experts_per_layer = 0
@@ -116,12 +122,10 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
     ) -> "AnnaGemma4TextEngine":
         if offload_mode.lower() not in {"auto", "none"}:
             raise ValueError("Gemma4 text runtime does not support expert offload.")
-        if offload_vision:
-            raise ValueError("Gemma4 text runtime does not load the vision tower, so --offload-vision is unsupported.")
         if expert_quant.lower() not in {"auto", "none"}:
             raise ValueError("Gemma4 text runtime does not support expert quantization.")
-        if weight_quant.lower() not in {"auto", "none"}:
-            raise ValueError("Gemma4 text runtime does not support dense runtime quantization.")
+        if weight_quant.lower() not in {"auto", "none", "int4"}:
+            raise ValueError(f"Unsupported weight quant mode: {weight_quant}")
         if resident_expert_layers not in {None, 0}:
             raise ValueError("Gemma4 text runtime does not use resident expert layers.")
         if resident_expert_layer_indices not in {None, ()}:
@@ -139,13 +143,26 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         if safety_policy is not None:
             device_context.safety_policy = safety_policy
 
+        resolved_offload_mode = "none"
+        resolved_offload_vision = cls._resolve_offload_vision(
+            requested_offload_vision=offload_vision,
+            config=config,
+            device_context=device_context,
+        )
+        resolved_weight_quant = cls._resolve_weight_quant(
+            requested_quant=weight_quant,
+            model_path=model_path,
+            device_context=device_context,
+        )
         resolved_offload_per_layer_input_embeddings = cls._resolve_per_layer_input_embedding_offload(
             model_path=model_path,
             config=config,
             device_context=device_context,
         )
         build_device = (
-            torch.device("cpu") if resolved_offload_per_layer_input_embeddings else device_context.device
+            torch.device("cpu")
+            if resolved_offload_per_layer_input_embeddings or resolved_weight_quant == "int4"
+            else device_context.device
         )
 
         model, _ = build_gemma4_text_model(
@@ -154,28 +171,46 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             dtype=device_context.dtype,
         )
         report = load_gemma4_text_model_weights(model, model_path)
+        runtime_weight_quantized_replacements = 0
+        if resolved_weight_quant == "int4":
+            runtime_weight_quantized_replacements = cls._apply_runtime_weight_quantization(
+                model=model,
+                device=device_context.device,
+                compute_dtype=device_context.dtype,
+                offload_vision=resolved_offload_vision,
+            )
         model.configure_runtime(
             device_context.device,
+            offload_vision=resolved_offload_vision,
             offload_token_io=False,
             offload_per_layer_input_embeddings=resolved_offload_per_layer_input_embeddings,
         )
         model.eval()
 
         tokenizer = Gemma4Tokenizer.from_model_dir(model_path)
-        processor = Gemma4TextProcessor(tokenizer)
+        processor = Gemma4TextProcessor.from_model_dir(model_path, tokenizer=tokenizer)
+        resolved_model_id = model_id or model_path.name
+        resolved_default_max_completion_tokens = (
+            config.default_max_completion_tokens
+            if default_max_completion_tokens is None
+            else default_max_completion_tokens
+        )
+        if resolved_default_max_completion_tokens is not None:
+            resolved_default_max_completion_tokens = max(1, int(resolved_default_max_completion_tokens))
         engine = cls(
             model=model,
             tokenizer=tokenizer,
             processor=processor,
-            model_id=model_id or model_path.name,
+            model_id=resolved_model_id,
             device_context=device_context,
-            default_max_completion_tokens=(
-                default_max_completion_tokens
-                if default_max_completion_tokens is not None
-                else config.default_max_completion_tokens
-            ),
+            quantized_replacements=runtime_weight_quantized_replacements,
+            default_max_completion_tokens=resolved_default_max_completion_tokens,
             default_enable_thinking=default_enable_thinking,
             reasoning_format=reasoning_format,
+            offload_mode=resolved_offload_mode,
+            offload_vision=resolved_offload_vision,
+            expert_quant="none",
+            weight_quant=resolved_weight_quant,
             optimization_config=EngineOptimizationConfig(
                 compile_mode=compile_mode,
                 compile_fullgraph=compile_fullgraph,
@@ -186,15 +221,87 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             offload_per_layer_input_embeddings=resolved_offload_per_layer_input_embeddings,
         )
         logger.info(
-            "Loaded Gemma4 text runtime from %s: loaded_tensors=%s skipped_tensors=%s device=%s dtype=%s offload_per_layer_input_embeddings=%s",
-            model_path,
-            report.loaded,
-            report.skipped,
+            "Loaded Gemma4 runtime %s on %s (compute=%s, requested=%s, offload_vision=%s, weight_quant=%s, weights=%s, offload_per_layer_input_embeddings=%s); tensors loaded=%s skipped=%s quantized=%s",
+            resolved_model_id,
             device_context.device,
             device_context.dtype,
+            device_context.reported_dtype,
+            resolved_offload_vision,
+            resolved_weight_quant,
+            build_device,
             resolved_offload_per_layer_input_embeddings,
+            report.loaded,
+            report.skipped,
+            runtime_weight_quantized_replacements,
         )
         return engine
+
+    @staticmethod
+    def _resolve_offload_vision(
+        *,
+        requested_offload_vision: bool,
+        config,
+        device_context: DeviceContext,
+    ) -> bool:
+        if device_context.device.type != "xpu":
+            return False
+        if getattr(config, "vision_config", None) is None:
+            return False
+        return bool(requested_offload_vision)
+
+    @staticmethod
+    def _resolve_weight_quant(
+        *,
+        requested_quant: str,
+        model_path: Path,
+        device_context: DeviceContext,
+    ) -> str:
+        normalized = requested_quant.lower()
+        if normalized not in {"auto", "none", "int4"}:
+            raise ValueError(f"Unsupported weight quant mode: {requested_quant}")
+        if device_context.device.type != "xpu":
+            return "none"
+        if normalized != "auto":
+            return normalized
+        memory_info = device_context.get_memory_info()
+        if memory_info is None:
+            return "none"
+        weight_bytes = estimate_gemma4_text_model_weight_bytes(model_path)
+        if weight_bytes > int(memory_info.total_bytes * 0.85):
+            return "int4"
+        return "none"
+
+    @classmethod
+    def _apply_runtime_weight_quantization(
+        cls,
+        *,
+        model: Gemma4ForConditionalGeneration,
+        device: torch.device,
+        compute_dtype: torch.dtype,
+        offload_vision: bool,
+    ) -> int:
+        def _should_quantize(module_name: str, _module: torch.nn.Module) -> bool:
+            normalized = module_name.replace("\\", "/")
+            if offload_vision and (
+                normalized.startswith("model.vision_tower.") or normalized.startswith("model.embed_vision.")
+            ):
+                return False
+            return True
+
+        replacements = convert_module_linears_to_xpu_int4(
+            model,
+            compute_dtype=compute_dtype,
+            device=device,
+            include_predicate=_should_quantize,
+        )
+        logger.info(
+            "Runtime dense XPU int4 quantization for Gemma4: replacements=%s device=%s compute_dtype=%s offload_vision=%s",
+            replacements,
+            device,
+            compute_dtype,
+            offload_vision,
+        )
+        return replacements
 
     def _attach_cache_allocator(self) -> None:
         return None
@@ -339,7 +446,8 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
                 "prompt_cache_entries": len(self._prompt_cache),
                 "profile_runtime": self.optimization_config.profile_runtime,
             },
-            "vision_enabled": False,
+            "vision_enabled": self.config.vision_config is not None,
+            "audio_enabled": self.config.audio_config is not None,
             "cache_device": str(self.device_context.migration_policy.execution_device),
             "preprocess_device": str(self.device_context.migration_policy.preprocess_device),
             "safety_policy": {

@@ -4,10 +4,12 @@ import json
 
 import pytest
 import torch
+from safetensors.torch import save_file
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 
+from anna.runtime.model_runtime_loader import load_model_runtime_from_model_dir
 from anna.model.gemma4_config import Gemma4Config
 from anna.model.gemma4_text_model import Gemma4ForConditionalGeneration
 from anna.weights.gemma4_tokenizer import Gemma4Tokenizer
@@ -215,3 +217,180 @@ def test_gemma4_build_restores_runtime_buffers_after_to_empty() -> None:
     )
     assert torch.allclose(text_model.layers[0].layer_scalar.float().cpu(), torch.ones(1))
     assert float(getattr(text_model.rotary_emb, "full_attention_inv_freq").float().abs().sum()) > 0.0
+
+
+def test_gemma4_runtime_loader_builds_standalone_multimodal_engine(tmp_path) -> None:
+    model_dir = tmp_path / "gemma4-runtime"
+    model_dir.mkdir()
+
+    config_dict = {
+        "model_type": "gemma4",
+        "image_token_id": 13,
+        "video_token_id": 17,
+        "audio_token_id": 16,
+        "boi_token_id": 11,
+        "eoi_token_id": 12,
+        "boa_token_id": 14,
+        "eoa_token_id": 15,
+        "vision_soft_tokens_per_image": 70,
+        "text_config": {
+            "model_type": "gemma4_text",
+            "vocab_size": 256,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "global_head_dim": 16,
+            "hidden_size_per_layer_input": 4,
+            "vocab_size_per_layer_input": 256,
+            "sliding_window": 16,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "rope_parameters": {
+                "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                "full_attention": {
+                    "rope_type": "proportional",
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                    "original_max_position_embeddings": 16,
+                    "factor": 2.0,
+                },
+            },
+        },
+        "vision_config": {
+            "model_type": "gemma4_vision",
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "head_dim": 4,
+            "global_head_dim": 4,
+            "patch_size": 2,
+            "pooling_kernel_size": 1,
+            "position_embedding_size": 32,
+            "rope_parameters": {"rope_type": "default", "rope_theta": 100.0},
+            "standardize": False,
+            "use_clipped_linears": True,
+        },
+        "audio_config": {
+            "model_type": "gemma4_audio",
+            "hidden_size": 16,
+            "hidden_act": "silu",
+            "num_attention_heads": 4,
+            "num_hidden_layers": 1,
+            "attention_chunk_size": 4,
+            "attention_context_left": 5,
+            "attention_context_right": 0,
+            "attention_invalid_logits_value": -1000000000.0,
+            "attention_logit_cap": 50.0,
+            "conv_kernel_size": 3,
+            "gradient_clipping": 10000000000.0,
+            "output_proj_dims": 16,
+            "residual_weight": 0.5,
+            "rms_norm_eps": 1e-6,
+            "subsampling_conv_channels": [8, 4],
+            "use_clipped_linears": True,
+        },
+    }
+    (model_dir / "config.json").write_text(json.dumps(config_dict), encoding="utf-8")
+    (model_dir / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "audio_ms_per_token": 40,
+                "audio_seq_length": 64,
+                "image_processor": {
+                    "patch_size": 2,
+                        "max_soft_tokens": 70,
+                    "pooling_kernel_size": 1,
+                    "rescale_factor": 1.0 / 255.0,
+                    "image_mean": [0.0, 0.0, 0.0],
+                    "image_std": [1.0, 1.0, 1.0],
+                },
+                "video_processor": {
+                    "patch_size": 2,
+                        "max_soft_tokens": 70,
+                    "pooling_kernel_size": 1,
+                    "num_frames": 2,
+                    "do_sample_frames": True,
+                    "rescale_factor": 1.0 / 255.0,
+                    "image_mean": [0.0, 0.0, 0.0],
+                    "image_std": [1.0, 1.0, 1.0],
+                },
+                "feature_extractor": {
+                    "feature_size": 8,
+                    "sampling_rate": 16000,
+                    "frame_length": 320,
+                    "hop_length": 160,
+                    "min_frequency": 0.0,
+                    "max_frequency": 8000.0,
+                    "preemphasis": 0.0,
+                    "preemphasis_htk_flavor": True,
+                    "fft_overdrive": False,
+                    "dither": 0.0,
+                    "input_scale_factor": 1.0,
+                    "mel_floor": 0.001,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    backend = Tokenizer(
+        WordLevel(
+            vocab={
+                "<bos>": 1,
+                "<eos>": 2,
+                "<|turn>": 3,
+                "<turn|>": 4,
+                "<|channel>": 5,
+                "<channel|>": 6,
+                "<|think|>": 7,
+                "<|image>": 11,
+                "<image|>": 12,
+                "<|image|>": 13,
+                "<|audio>": 14,
+                "<audio|>": 15,
+                "<|audio|>": 16,
+                "<|video|>": 17,
+                "hello": 18,
+            },
+            unk_token="<eos>",
+        )
+    )
+    backend.pre_tokenizer = Whitespace()
+    backend.save(str(model_dir / "tokenizer.json"))
+    (model_dir / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "bos_token": "<bos>",
+                "eos_token": "<eos>",
+                "sot_token": "<|turn>",
+                "eot_token": "<turn|>",
+                "soc_token": "<|channel>",
+                "eoc_token": "<channel|>",
+                "think_token": "<|think|>",
+                "boi_token": "<|image>",
+                "eoi_token": "<image|>",
+                "image_token": "<|image|>",
+                "boa_token": "<|audio>",
+                "eoa_token": "<audio|>",
+                "audio_token": "<|audio|>",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    model = Gemma4ForConditionalGeneration(Gemma4Config.from_dict(config_dict)).eval()
+    model.tie_weights()
+    save_file(model.state_dict(), str(model_dir / "model.safetensors"))
+
+    engine = load_model_runtime_from_model_dir(model_dir, model_id="gemma4-test", device="cpu", dtype="float32")
+    health = engine.health()
+
+    assert engine.model_family == "gemma4"
+    assert health["model_family"] == "gemma4"
+    assert health["vision_enabled"] is True
+    assert health["audio_enabled"] is True
+    assert health["weight_quant"] == "none"
