@@ -86,11 +86,25 @@ def _rmsnorm_op():
     return getattr(namespace, "rmsnorm_fused", None)
 
 
+def _rmsnorm_ex_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "rmsnorm_fused_ex", None)
+
+
 def _qk_norm_rotary_op():
     namespace = getattr(torch.ops, "anna", None)
     if namespace is None:
         return None
     return getattr(namespace, "qk_norm_rotary_fused", None)
+
+
+def _qk_norm_rotary_ex_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "qk_norm_rotary_fused_ex", None)
 
 
 def _causal_conv1d_op():
@@ -116,12 +130,20 @@ def qk_norm_rotary_fused_is_available() -> bool:
     return _qk_norm_rotary_op() is not None
 
 
+def rmsnorm_fused_ex_is_available() -> bool:
+    return _rmsnorm_ex_op() is not None
+
+
 def gated_delta_fused_is_available() -> bool:
     return _gated_delta_op() is not None
 
 
 def causal_conv1d_fused_is_available() -> bool:
     return _causal_conv1d_op() is not None
+
+
+def qk_norm_rotary_fused_ex_is_available() -> bool:
+    return _qk_norm_rotary_ex_op() is not None
 
 
 def maybe_load_gated_delta_library(path: str | os.PathLike[str] | None = None) -> bool:
@@ -217,6 +239,25 @@ def run_rmsnorm_fused(
     return op(input, weight, float(eps))
 
 
+def run_rmsnorm_fused_ex(
+    *,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    add_unit_offset: bool,
+) -> torch.Tensor:
+    op = _rmsnorm_ex_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _rmsnorm_ex_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna rmsnorm_fused_ex op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(input, weight, float(eps), bool(add_unit_offset))
+
+
 def run_qk_norm_rotary_fused(
     *,
     query: torch.Tensor,
@@ -246,6 +287,40 @@ def run_qk_norm_rotary_fused(
         sin,
         float(query_norm_eps),
         float(key_norm_eps),
+    )
+
+
+def run_qk_norm_rotary_fused_ex(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_norm_weight: torch.Tensor,
+    key_norm_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    query_norm_eps: float,
+    key_norm_eps: float,
+    add_unit_offset: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op = _qk_norm_rotary_ex_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _qk_norm_rotary_ex_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna qk_norm_rotary_fused_ex op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(
+        query,
+        key,
+        query_norm_weight,
+        key_norm_weight,
+        cos,
+        sin,
+        float(query_norm_eps),
+        float(key_norm_eps),
+        bool(add_unit_offset),
     )
 
 

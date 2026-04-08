@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 
 from anna.mm.qwen3_5_text_processor import PreparedInputs
-from anna.model.ops import Qwen3DynamicCache
 from anna.runtime.streaming import IncrementalTextAssembler
 from anna.sampling.sampler import sample_next_token
 
@@ -37,7 +36,7 @@ class SchedulerRequest:
     completion_ids: list[int] = field(default_factory=list)
     text_parts: list[str] = field(default_factory=list)
     input_ids: torch.Tensor | None = None
-    past_key_values: Qwen3DynamicCache | None = None
+    past_key_values: object | None = None
     repetition_history: torch.Tensor | None = None
     repetition_history_ids: set[int] | None = None
     assembler: IncrementalTextAssembler | None = None
@@ -287,10 +286,14 @@ class AnnaScheduler:
 
     def _decode_batch(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest]:
         input_ids = torch.cat([request.input_ids for request in requests if request.input_ids is not None], dim=0)
-        batch_cache = Qwen3DynamicCache.stack(
-            [request.past_key_values for request in requests if request.past_key_values is not None],
-            self.engine.config.text_config,
-        )
+        caches = [request.past_key_values for request in requests if request.past_key_values is not None]
+        if not caches:
+            raise RuntimeError("Scheduler decode batch is missing cache state.")
+        cache_type = type(caches[0])
+        stack = getattr(cache_type, "stack", None)
+        if not callable(stack):
+            raise RuntimeError(f"Cache type {cache_type.__name__} does not support scheduler batching.")
+        batch_cache = stack(caches, self.engine.config.text_config)
 
         try:
             with self.engine.execution_lock:

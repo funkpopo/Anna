@@ -103,7 +103,9 @@ def main() -> None:
         gqa_decode_fused_is_available,
         maybe_load_gated_delta_library,
         moe_router_fused_is_available,
+        qk_norm_rotary_fused_ex_is_available,
         qk_norm_rotary_fused_is_available,
+        rmsnorm_fused_ex_is_available,
         rmsnorm_fused_is_available,
     )
 
@@ -114,7 +116,9 @@ def main() -> None:
     print(f"gqa_decode_registered={gqa_decode_fused_is_available()}")
     print(f"moe_router_registered={moe_router_fused_is_available()}")
     print(f"rmsnorm_registered={rmsnorm_fused_is_available()}")
+    print(f"rmsnorm_ex_registered={rmsnorm_fused_ex_is_available()}")
     print(f"qk_norm_rotary_registered={qk_norm_rotary_fused_is_available()}")
+    print(f"qk_norm_rotary_ex_registered={qk_norm_rotary_fused_ex_is_available()}")
     print(f"gated_delta_registered={gated_delta_fused_is_available()}")
     print(f"causal_conv1d_registered={causal_conv1d_fused_is_available()}")
 

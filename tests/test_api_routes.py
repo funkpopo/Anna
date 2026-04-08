@@ -11,7 +11,7 @@ from anna.runtime.qwen3_5_text_engine import AnnaEngineError, GenerationPerfStat
 class _FailingStreamEngine:
     default_model_id = "fake-model"
     default_max_completion_tokens = 256
-    qwen_model_family = "qwen3_5_text"
+    model_family = "qwen3_5_text"
 
     def health(self) -> dict[str, str]:
         return {"status": "ok"}
@@ -34,7 +34,7 @@ class _FailingStreamEngine:
 
 class _CapturingEngine:
     default_model_id = "fake-model"
-    qwen_model_family = "qwen3_5_text"
+    model_family = "qwen3_5_text"
 
     def __init__(
         self,
@@ -449,7 +449,7 @@ def test_chat_completion_logs_prefill_and_decode_metrics(caplog) -> None:
 def test_audio_speech_returns_wav_bytes_and_forwards_request_fields() -> None:
     class _SpeechEngine:
         default_model_id = "fake-tts-model"
-        qwen_model_family = "qwen3_tts"
+        model_family = "qwen3_tts"
 
         def __init__(self) -> None:
             self.last_request = None
