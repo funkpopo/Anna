@@ -177,17 +177,25 @@ class DeviceContext:
         attention_mask = self._move_tensor(prepared.attention_mask, dtype=torch.long)
         mm_token_type_ids = self._move_tensor(prepared.mm_token_type_ids, dtype=torch.int32)
         pixel_values = self._move_tensor(prepared.pixel_values, dtype=self.dtype)
+        image_position_ids = self._move_tensor(prepared.image_position_ids, dtype=torch.long)
         image_grid_thw = self._move_tensor(prepared.image_grid_thw, dtype=torch.long)
         pixel_values_videos = self._move_tensor(prepared.pixel_values_videos, dtype=self.dtype)
+        video_position_ids = self._move_tensor(prepared.video_position_ids, dtype=torch.long)
         video_grid_thw = self._move_tensor(prepared.video_grid_thw, dtype=torch.long)
+        input_features = self._move_tensor(prepared.input_features, dtype=self.dtype)
+        input_features_mask = self._move_tensor(prepared.input_features_mask, dtype=torch.bool)
         if (
             input_ids is prepared.input_ids
             and attention_mask is prepared.attention_mask
             and mm_token_type_ids is prepared.mm_token_type_ids
             and pixel_values is prepared.pixel_values
+            and image_position_ids is prepared.image_position_ids
             and image_grid_thw is prepared.image_grid_thw
             and pixel_values_videos is prepared.pixel_values_videos
+            and video_position_ids is prepared.video_position_ids
             and video_grid_thw is prepared.video_grid_thw
+            and input_features is prepared.input_features
+            and input_features_mask is prepared.input_features_mask
         ):
             return prepared
         return PreparedInputs(
@@ -196,9 +204,13 @@ class DeviceContext:
             attention_mask=attention_mask,
             mm_token_type_ids=mm_token_type_ids,
             pixel_values=pixel_values,
+            image_position_ids=image_position_ids,
             image_grid_thw=image_grid_thw,
             pixel_values_videos=pixel_values_videos,
+            video_position_ids=video_position_ids,
             video_grid_thw=video_grid_thw,
+            input_features=input_features,
+            input_features_mask=input_features_mask,
         )
 
     def move_token_ids(self, token_ids: torch.Tensor) -> torch.Tensor:

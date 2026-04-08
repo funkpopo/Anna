@@ -1212,11 +1212,16 @@ class AnnaQwen3_5TextEngine:
             self.scheduler is not None
             and prepared.pixel_values is None
             and prepared.pixel_values_videos is None
+            and prepared.input_features is None
         )
 
     @staticmethod
     def _has_multimodal_inputs(prepared: PreparedInputs) -> bool:
-        return prepared.pixel_values is not None or prepared.pixel_values_videos is not None
+        return (
+            prepared.pixel_values is not None
+            or prepared.pixel_values_videos is not None
+            or prepared.input_features is not None
+        )
 
     @staticmethod
     def _profile_memory_stats_snapshot(memory_stats: dict[str, int | float] | None) -> dict[str, int | float] | None:
@@ -1269,8 +1274,12 @@ class AnnaQwen3_5TextEngine:
         attention_mask: torch.Tensor | None = None,
         past_key_values: object | None = None,
         pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
+        input_features: torch.Tensor | None = None,
+        input_features_mask: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
+        video_position_ids: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
         use_cache: bool | None = None,
@@ -1282,8 +1291,12 @@ class AnnaQwen3_5TextEngine:
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 pixel_values=pixel_values,
+                image_position_ids=image_position_ids,
                 pixel_values_videos=pixel_values_videos,
+                input_features=input_features,
+                input_features_mask=input_features_mask,
                 image_grid_thw=image_grid_thw,
+                video_position_ids=video_position_ids,
                 video_grid_thw=video_grid_thw,
                 mm_token_type_ids=mm_token_type_ids,
                 use_cache=use_cache,
@@ -1299,8 +1312,12 @@ class AnnaQwen3_5TextEngine:
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             pixel_values=pixel_values,
+            image_position_ids=image_position_ids,
             pixel_values_videos=pixel_values_videos,
+            input_features=input_features,
+            input_features_mask=input_features_mask,
             image_grid_thw=image_grid_thw,
+            video_position_ids=video_position_ids,
             video_grid_thw=video_grid_thw,
             mm_token_type_ids=mm_token_type_ids,
             use_cache=use_cache,
@@ -1414,9 +1431,13 @@ class AnnaQwen3_5TextEngine:
         attention_mask = prepared.attention_mask
         mm_token_type_ids = prepared.mm_token_type_ids
         pixel_values = prepared.pixel_values
+        image_position_ids = prepared.image_position_ids
         image_grid_thw = prepared.image_grid_thw
         pixel_values_videos = prepared.pixel_values_videos
+        video_position_ids = prepared.video_position_ids
         video_grid_thw = prepared.video_grid_thw
+        input_features = prepared.input_features
+        input_features_mask = prepared.input_features_mask
         past_key_values = None
         outputs = None
         chunk_size = self.optimization_config.prefill_chunk_size
@@ -1434,8 +1455,12 @@ class AnnaQwen3_5TextEngine:
                         attention_mask=attention_mask[:, :end_idx] if start_idx == 0 else None,
                         past_key_values=past_key_values,
                         pixel_values=pixel_values,
+                        image_position_ids=image_position_ids,
                         pixel_values_videos=pixel_values_videos,
+                        input_features=input_features,
+                        input_features_mask=input_features_mask,
                         image_grid_thw=image_grid_thw,
+                        video_position_ids=video_position_ids,
                         video_grid_thw=video_grid_thw,
                         mm_token_type_ids=mm_token_type_ids[:, start_idx:end_idx] if mm_token_type_ids is not None else None,
                         use_cache=True,
@@ -1448,8 +1473,12 @@ class AnnaQwen3_5TextEngine:
                             metrics.record_prompt_tokens(chunk_tokens)
                             prompt_tokens_recorded += chunk_tokens
                     pixel_values = None
+                    image_position_ids = None
                     image_grid_thw = None
                     pixel_values_videos = None
+                    input_features = None
+                    input_features_mask = None
+                    video_position_ids = None
                     video_grid_thw = None
             else:
                 outputs = self._profiled_forward_generation_model(
@@ -1458,8 +1487,12 @@ class AnnaQwen3_5TextEngine:
                     attention_mask=attention_mask,
                     past_key_values=None,
                     pixel_values=pixel_values,
+                    image_position_ids=image_position_ids,
                     pixel_values_videos=pixel_values_videos,
+                    input_features=input_features,
+                    input_features_mask=input_features_mask,
                     image_grid_thw=image_grid_thw,
+                    video_position_ids=video_position_ids,
                     video_grid_thw=video_grid_thw,
                     mm_token_type_ids=mm_token_type_ids,
                     use_cache=True,
@@ -1498,15 +1531,24 @@ class AnnaQwen3_5TextEngine:
         attention_mask: torch.Tensor | None = None,
         past_key_values: object | None = None,
         pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
+        input_features: torch.Tensor | None = None,
+        input_features_mask: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
+        video_position_ids: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
     ):
         attention_mask = self._prune_trivial_attention_mask(attention_mask)
-        if pixel_values is None and pixel_values_videos is None and hasattr(self.model, "forward_text_only"):
+        if (
+            pixel_values is None
+            and pixel_values_videos is None
+            and input_features is None
+            and hasattr(self.model, "forward_text_only")
+        ):
             forward_text_only = getattr(self, "_compiled_text_forward", None) or self.model.forward_text_only
             return forward_text_only(
                 input_ids=input_ids,
@@ -1520,8 +1562,12 @@ class AnnaQwen3_5TextEngine:
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             pixel_values=pixel_values,
+            image_position_ids=image_position_ids,
             pixel_values_videos=pixel_values_videos,
+            input_features=input_features,
+            input_features_mask=input_features_mask,
             image_grid_thw=image_grid_thw,
+            video_position_ids=video_position_ids,
             video_grid_thw=video_grid_thw,
             mm_token_type_ids=mm_token_type_ids,
             use_cache=use_cache,
@@ -1717,6 +1763,8 @@ class AnnaQwen3_5TextEngine:
             media_bytes += prepared.pixel_values.numel() * bytes_per_elem
         if prepared.pixel_values_videos is not None:
             media_bytes += prepared.pixel_values_videos.numel() * bytes_per_elem
+        if prepared.input_features is not None:
+            media_bytes += prepared.input_features.numel() * bytes_per_elem
 
         if getattr(self, "full_attention_cache_mirror", False):
             kv_cache_bytes *= 2

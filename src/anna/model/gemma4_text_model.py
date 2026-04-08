@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from anna.model.gemma4_config import Gemma4Config, Gemma4RopeParameters, Gemma4TextConfig
+from anna.model.gemma4_multimodal import Gemma4AudioModel, Gemma4MultimodalEmbedder, Gemma4VisionModel
 from anna.model.fused_ops import run_gqa_decode_fused, run_qk_norm_rotary_fused_ex, run_rmsnorm_fused_ex
 from anna.model.ops import (
     apply_mask_to_padding_states,
@@ -1071,11 +1072,24 @@ class Gemma4Model(nn.Module):
         super().__init__()
         self.config = config
         self.language_model = Gemma4TextModel(config.text_config)
+        self.vision_tower = Gemma4VisionModel(config.vision_config) if config.vision_config is not None else None
+        self.embed_vision = (
+            Gemma4MultimodalEmbedder(config.vision_config, config.text_config)
+            if config.vision_config is not None
+            else None
+        )
+        self.audio_tower = Gemma4AudioModel(config.audio_config) if config.audio_config is not None else None
+        self.embed_audio = (
+            Gemma4MultimodalEmbedder(config.audio_config, config.text_config)
+            if config.audio_config is not None
+            else None
+        )
 
     def configure_runtime(
         self,
         execution_device: torch.device,
         *,
+        offload_vision: bool = False,
         offload_token_io: bool = False,
         offload_per_layer_input_embeddings: bool = False,
     ) -> None:
@@ -1084,6 +1098,15 @@ class Gemma4Model(nn.Module):
             offload_token_io=offload_token_io,
             offload_per_layer_input_embeddings=offload_per_layer_input_embeddings,
         )
+        vision_device = torch.device("cpu") if offload_vision else execution_device
+        if self.vision_tower is not None:
+            self.vision_tower.to(vision_device)
+        if self.embed_vision is not None:
+            self.embed_vision.to(vision_device)
+        if self.audio_tower is not None:
+            self.audio_tower.to(execution_device)
+        if self.embed_audio is not None:
+            self.embed_audio.to(execution_device)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.embed_tokens
@@ -1091,8 +1114,58 @@ class Gemma4Model(nn.Module):
     def set_input_embeddings(self, value: nn.Embedding) -> None:
         self.language_model.embed_tokens = value
 
+    def get_image_features(
+        self,
+        pixel_values: torch.Tensor,
+        image_position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.vision_tower is None or self.embed_vision is None:
+            raise ValueError("The loaded Gemma4 model does not include a vision tower.")
+        vision_device = next(self.vision_tower.parameters()).device
+        pixel_values = pixel_values.to(device=vision_device, dtype=next(self.vision_tower.parameters()).dtype)
+        image_position_ids = image_position_ids.to(device=vision_device, dtype=torch.long)
+        output_length = int(pixel_values.shape[-2] // (int(self.config.vision_config.pooling_kernel_size) ** 2))
+        features = self.vision_tower(
+            pixel_values=pixel_values,
+            pixel_position_ids=image_position_ids,
+            output_length=output_length,
+        )
+        return self.embed_vision(features)
+
+    def get_video_features(
+        self,
+        pixel_values_videos: torch.Tensor,
+        video_position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        flattened_pixels = pixel_values_videos.flatten(0, 1)
+        flattened_positions = video_position_ids.flatten(0, 1)
+        return self.get_image_features(flattened_pixels, flattened_positions)
+
+    def get_audio_features(
+        self,
+        input_features: torch.Tensor,
+        input_features_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.audio_tower is None or self.embed_audio is None:
+            raise ValueError("The loaded Gemma4 model does not include an audio tower.")
+        audio_device = _module_device(self.audio_tower)
+        audio_dtype = next(self.audio_tower.parameters()).dtype
+        input_features = input_features.to(device=audio_device, dtype=audio_dtype)
+        input_features_mask = input_features_mask.to(device=audio_device, dtype=torch.bool)
+        audio_outputs = self.audio_tower(input_features, input_features_mask)
+        return self.embed_audio(audio_outputs.last_hidden_state), audio_outputs.attention_mask
+
     def reset_runtime_buffers(self) -> None:
         self.language_model.reset_runtime_buffers()
+
+    def get_placeholder_mask(
+        self,
+        input_ids: torch.LongTensor,
+    ) -> tuple[torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
+        image_mask = input_ids == self.config.image_token_id
+        video_mask = input_ids == self.config.video_token_id
+        audio_mask = input_ids == self.config.audio_token_id
+        return image_mask, video_mask, audio_mask
 
 
 class Gemma4ForConditionalGeneration(nn.Module):
@@ -1110,11 +1183,13 @@ class Gemma4ForConditionalGeneration(nn.Module):
         self,
         execution_device: torch.device,
         *,
+        offload_vision: bool = False,
         offload_token_io: bool = False,
         offload_per_layer_input_embeddings: bool = False,
     ) -> None:
         self.model.configure_runtime(
             execution_device,
+            offload_vision=offload_vision,
             offload_token_io=offload_token_io,
             offload_per_layer_input_embeddings=offload_per_layer_input_embeddings,
         )
@@ -1185,23 +1260,81 @@ class Gemma4ForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
+        input_features: torch.Tensor | None = None,
+        input_features_mask: torch.Tensor | None = None,
+        image_position_ids: torch.LongTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
+        video_position_ids: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
     ) -> Gemma4CausalLMOutput:
-        if pixel_values is not None or pixel_values_videos is not None or image_grid_thw is not None or video_grid_thw is not None:
-            raise ValueError(
-                "Gemma4 text runtime loads only the language tower. Image, video, and audio inputs are not supported."
-            )
-        del mm_token_type_ids
-        return self.forward_text_only(
-            input_ids=input_ids,
+        del image_grid_thw, video_grid_thw, mm_token_type_ids
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Specify exactly one of input_ids or inputs_embeds.")
+        if inputs_embeds is not None and (
+            pixel_values is not None or pixel_values_videos is not None or input_features is not None
+        ):
+            raise ValueError("Gemma4 multimodal inputs require input_ids so placeholder tokens can be expanded.")
+        if input_features is not None and input_features_mask is None:
+            raise ValueError("Gemma4 audio inputs require input_features_mask.")
+        if input_features_mask is not None and input_features is None:
+            raise ValueError("Gemma4 input_features_mask requires input_features.")
+
+        image_mask = video_mask = audio_mask = None
+        llm_input_ids = input_ids
+        if input_ids is not None:
+            if pixel_values is not None or pixel_values_videos is not None or input_features is not None:
+                image_mask, video_mask, audio_mask = self.model.get_placeholder_mask(input_ids)
+                llm_input_ids = input_ids.clone()
+                llm_input_ids[image_mask | video_mask | audio_mask] = self.config.text_config.pad_token_id
+            embedding_device = self.get_input_embeddings().weight.device
+            if llm_input_ids.device != embedding_device:
+                llm_input_ids = llm_input_ids.to(device=embedding_device)
+            inputs_embeds = self.get_input_embeddings()(llm_input_ids)
+
+        per_layer_inputs = None
+        if self.config.text_config.hidden_size_per_layer_input > 0 and llm_input_ids is not None:
+            per_layer_inputs = self.model.language_model.get_per_layer_inputs(llm_input_ids, inputs_embeds)
+
+        if pixel_values is not None:
+            if image_position_ids is None:
+                raise ValueError("Gemma4 image inputs require image_position_ids.")
+            image_features = self.model.get_image_features(pixel_values, image_position_ids)
+            image_features = image_features.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            expanded_image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+            if inputs_embeds[expanded_image_mask].numel() != image_features.numel():
+                raise ValueError("Gemma4 image features and image placeholder tokens do not match.")
+            inputs_embeds = inputs_embeds.masked_scatter(expanded_image_mask, image_features)
+
+        if pixel_values_videos is not None:
+            if video_position_ids is None:
+                raise ValueError("Gemma4 video inputs require video_position_ids.")
+            video_features = self.model.get_video_features(pixel_values_videos, video_position_ids)
+            video_features = video_features.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            expanded_video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds)
+            if inputs_embeds[expanded_video_mask].numel() != video_features.numel():
+                raise ValueError("Gemma4 video features and video placeholder tokens do not match.")
+            inputs_embeds = inputs_embeds.masked_scatter(expanded_video_mask, video_features)
+
+        if input_features is not None:
+            audio_features, encoded_audio_mask = self.model.get_audio_features(input_features, input_features_mask)
+            audio_features = audio_features[encoded_audio_mask]
+            audio_features = audio_features.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            expanded_audio_mask = audio_mask.unsqueeze(-1).expand_as(inputs_embeds)
+            if inputs_embeds[expanded_audio_mask].numel() != audio_features.numel():
+                raise ValueError("Gemma4 audio features and audio placeholder tokens do not match.")
+            inputs_embeds = inputs_embeds.masked_scatter(expanded_audio_mask, audio_features)
+
+        outputs = self.model.language_model(
+            input_ids=None,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
+            per_layer_inputs=per_layer_inputs,
             use_cache=use_cache,
-            logits_to_keep=logits_to_keep,
         )
+        logits = self._compute_logits(outputs.last_hidden_state, logits_to_keep)
+        return Gemma4CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)
