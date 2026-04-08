@@ -6,17 +6,17 @@ from pathlib import Path
 from typing import Literal
 
 
-SupportedQwenModelFamily = Literal["qwen3_5_text", "qwen3_tts"]
+SupportedModelFamily = Literal["qwen3_5_text", "qwen3_tts", "gemma4_text"]
 
 
 @dataclass(slots=True)
-class QwenModelFamilyInfo:
-    qwen_model_family: SupportedQwenModelFamily
+class ModelFamilyInfo:
+    model_family: SupportedModelFamily
     model_type: str
     architectures: tuple[str, ...] = ()
 
 
-def inspect_qwen_model_family(model_dir: str | Path) -> QwenModelFamilyInfo:
+def inspect_model_family(model_dir: str | Path) -> ModelFamilyInfo:
     model_path = Path(model_dir)
     config_path = model_path / "config.json"
     if not config_path.exists():
@@ -25,9 +25,14 @@ def inspect_qwen_model_family(model_dir: str | Path) -> QwenModelFamilyInfo:
     config_data = json.loads(config_path.read_text(encoding="utf-8"))
     model_type = str(config_data.get("model_type", "")).strip()
     architectures = tuple(str(value) for value in config_data.get("architectures", []))
-    qwen_model_family: SupportedQwenModelFamily = "qwen3_tts" if model_type == "qwen3_tts" else "qwen3_5_text"
-    return QwenModelFamilyInfo(
-        qwen_model_family=qwen_model_family,
+    if model_type == "qwen3_tts":
+        model_family: SupportedModelFamily = "qwen3_tts"
+    elif model_type == "gemma4":
+        model_family = "gemma4_text"
+    else:
+        model_family = "qwen3_5_text"
+    return ModelFamilyInfo(
+        model_family=model_family,
         model_type=model_type,
         architectures=architectures,
     )

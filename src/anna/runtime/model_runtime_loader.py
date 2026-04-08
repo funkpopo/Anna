@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anna.core.qwen_model_family import inspect_qwen_model_family
+from anna.core.model_family import inspect_model_family
+from anna.runtime.gemma4_text_engine import AnnaGemma4TextEngine
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine
 from anna.runtime.qwen3_tts_engine import AnnaQwen3TTSEngine
 
 
-def load_qwen_model_runtime_from_model_dir(
+def load_model_runtime_from_model_dir(
     model_dir: str | Path,
     *,
     model_id: str | None = None,
@@ -30,9 +31,32 @@ def load_qwen_model_runtime_from_model_dir(
     resident_expert_layer_indices: tuple[int, ...] | None = None,
     cached_experts_per_layer: int | None = None,
 ):
-    qwen_model_family_info = inspect_qwen_model_family(model_dir)
-    if qwen_model_family_info.qwen_model_family == "qwen3_tts":
+    model_family_info = inspect_model_family(model_dir)
+    if model_family_info.model_family == "qwen3_tts":
         return AnnaQwen3TTSEngine.from_model_dir(
+            model_dir,
+            model_id=model_id,
+            device=device,
+            dtype=dtype,
+            compile_mode=compile_mode,
+            compile_fullgraph=compile_fullgraph,
+            prefill_chunk_size=prefill_chunk_size,
+            prompt_cache_size=prompt_cache_size,
+            profile_runtime=profile_runtime,
+            safety_policy=safety_policy,
+            default_max_completion_tokens=default_max_completion_tokens,
+            default_enable_thinking=default_enable_thinking,
+            reasoning_format=reasoning_format,
+            offload_mode=offload_mode,
+            offload_vision=offload_vision,
+            expert_quant=expert_quant,
+            weight_quant=weight_quant,
+            resident_expert_layers=resident_expert_layers,
+            resident_expert_layer_indices=resident_expert_layer_indices,
+            cached_experts_per_layer=cached_experts_per_layer,
+        )
+    if model_family_info.model_family == "gemma4_text":
+        return AnnaGemma4TextEngine.from_model_dir(
             model_dir,
             model_id=model_id,
             device=device,

@@ -1,4 +1,5 @@
 from anna.runtime.device import DeviceContext, DeviceMemoryInfo, RuntimeSafetyPolicy, TensorMigrationPolicy
+from anna.runtime.gemma4_text_engine import AnnaGemma4TextEngine
 from anna.runtime.qwen3_5_text_engine import (
     AnnaEngineError,
     AnnaQwen3_5TextEngine,
@@ -9,6 +10,7 @@ from anna.runtime.qwen3_5_text_engine import (
 
 __all__ = [
     "AnnaEngineError",
+    "AnnaGemma4TextEngine",
     "AnnaQwen3_5TextEngine",
     "DeviceContext",
     "DeviceMemoryInfo",

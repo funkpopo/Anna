@@ -78,11 +78,11 @@ def _require_method(engine: object, method_name: str, *, message: str, code: str
     return getattr(engine, method_name)
 
 
-def _qwen_model_family_name(engine: object) -> str:
-    value = getattr(engine, "qwen_model_family", None)
+def _model_family_name(engine: object) -> str:
+    value = getattr(engine, "model_family", None)
     if isinstance(value, str) and value:
         return value
-    return "unknown_qwen_model_family"
+    return "unknown_model_family"
 
 
 def _resolve_enable_thinking(engine: object, payload: ChatCompletionRequest) -> bool:
@@ -387,7 +387,7 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
             stream_chat = _require_method(
                 engine,
                 "stream_chat",
-                message=f"The loaded {_qwen_model_family_name(engine)} model family does not support chat completions.",
+                message=f"The loaded {_model_family_name(engine)} model family does not support chat completions.",
                 code="unsupported_chat_completions",
             )
             events = stream_chat(
@@ -409,7 +409,7 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
         generate_chat = _require_method(
             engine,
             "generate_chat",
-            message=f"The loaded {_qwen_model_family_name(engine)} model family does not support chat completions.",
+            message=f"The loaded {_model_family_name(engine)} model family does not support chat completions.",
             code="unsupported_chat_completions",
         )
         result = generate_chat(
@@ -462,7 +462,7 @@ def completions(request: Request, payload: CompletionRequest):
             stream_text = _require_method(
                 engine,
                 "stream_text",
-                message=f"The loaded {_qwen_model_family_name(engine)} model family does not support text completions.",
+                message=f"The loaded {_model_family_name(engine)} model family does not support text completions.",
                 code="unsupported_text_completions",
             )
             events = stream_text(payload.prompt, config=config)
@@ -479,7 +479,7 @@ def completions(request: Request, payload: CompletionRequest):
         generate_text = _require_method(
             engine,
             "generate_text",
-            message=f"The loaded {_qwen_model_family_name(engine)} model family does not support text completions.",
+            message=f"The loaded {_model_family_name(engine)} model family does not support text completions.",
             code="unsupported_text_completions",
         )
         result = generate_text(payload.prompt, config=config)
@@ -511,7 +511,7 @@ def audio_speech(request: Request, payload: SpeechRequest):
     synthesize_qwen3_tts_speech = _require_method(
         engine,
         "synthesize_qwen3_tts_speech",
-        message=f"The loaded {_qwen_model_family_name(engine)} model family does not support speech synthesis.",
+        message=f"The loaded {_model_family_name(engine)} model family does not support speech synthesis.",
         code="unsupported_speech_synthesis",
     )
     model_id = payload.model or engine.default_model_id

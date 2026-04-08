@@ -198,7 +198,6 @@ void validate_gqa_decode_inputs(
   TORCH_CHECK(query.size(0) == key.size(0), "query/key batch size mismatch");
   TORCH_CHECK(key.sizes() == value.sizes(), "key and value must share the same shape");
   TORCH_CHECK(query.size(3) == key.size(3), "query/key head_dim mismatch");
-  TORCH_CHECK(query.size(3) <= 256, "gqa_decode_fused currently supports head_dim <= 256");
   TORCH_CHECK(key.size(1) >= 1, "kv_heads must be positive");
   TORCH_CHECK(query.size(1) % key.size(1) == 0, "query heads must be divisible by kv_heads");
   TORCH_CHECK(key.size(2) >= 1, "key_len must be positive");
@@ -389,7 +388,18 @@ at::Tensor rmsnorm_fused_meta(
   return at::empty(input.sizes(), meta_options);
 }
 
-at::Tensor rmsnorm_fused_xpu(
+at::Tensor rmsnorm_fused_ex_meta(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    double /*eps*/,
+    bool /*add_unit_offset*/) {
+  validate_rmsnorm_inputs(input, weight);
+  auto meta_options = input.options().device(c10::Device(c10::DeviceType::Meta));
+  return at::empty(input.sizes(), meta_options);
+}
+
+template <bool AddUnitOffset>
+at::Tensor rmsnorm_fused_xpu_impl(
     const at::Tensor& input_in,
     const at::Tensor& weight_in,
     double eps) {
@@ -447,7 +457,8 @@ at::Tensor rmsnorm_fused_xpu(
                 const float inv_rms = sycl::rsqrt(partial_sum[0] / static_cast<float>(hidden_size) + eps_f);
                 for (int64_t idx = lane; idx < hidden_size; idx += local_size) {
                   const float value = load_as_float(input_ptr, row_base + idx);
-                  const float scaled = value * inv_rms * (1.0f + weight_ptr[idx]);
+                  const float weight_value = AddUnitOffset ? (1.0f + weight_ptr[idx]) : weight_ptr[idx];
+                  const float scaled = value * inv_rms * weight_value;
                   output_ptr[row_base + idx] = static_cast<scalar_t>(scaled);
                 }
               });
@@ -455,6 +466,24 @@ at::Tensor rmsnorm_fused_xpu(
       });
 
   return output;
+}
+
+at::Tensor rmsnorm_fused_xpu(
+    const at::Tensor& input_in,
+    const at::Tensor& weight_in,
+    double eps) {
+  return rmsnorm_fused_xpu_impl<true>(input_in, weight_in, eps);
+}
+
+at::Tensor rmsnorm_fused_ex_xpu(
+    const at::Tensor& input_in,
+    const at::Tensor& weight_in,
+    double eps,
+    bool add_unit_offset) {
+  if (add_unit_offset) {
+    return rmsnorm_fused_xpu_impl<true>(input_in, weight_in, eps);
+  }
+  return rmsnorm_fused_xpu_impl<false>(input_in, weight_in, eps);
 }
 
 std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_meta(
@@ -474,7 +503,26 @@ std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_meta(
   };
 }
 
-std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_xpu(
+std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_ex_meta(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& query_norm_weight,
+    const at::Tensor& key_norm_weight,
+    const at::Tensor& cos,
+    const at::Tensor& sin,
+    double /*query_norm_eps*/,
+    double /*key_norm_eps*/,
+    bool /*add_unit_offset*/) {
+  validate_qk_norm_rotary_inputs(query, key, query_norm_weight, key_norm_weight, cos, sin);
+  auto meta_options = query.options().device(c10::Device(c10::DeviceType::Meta));
+  return {
+      at::empty(query.sizes(), meta_options),
+      at::empty(key.sizes(), meta_options),
+  };
+}
+
+template <bool AddUnitOffset>
+std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_xpu_impl(
     const at::Tensor& query_in,
     const at::Tensor& key_in,
     const at::Tensor& query_norm_weight_in,
@@ -562,7 +610,8 @@ std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_xpu(
                   const float inv_rms = sycl::rsqrt(partial_sum[0] / static_cast<float>(head_dim) + norm_eps_f);
                   for (int64_t idx = lane; idx < head_dim; idx += local_size) {
                     const float value = load_as_float(input_ptr, row_base + idx);
-                    normalized_values[idx] = value * inv_rms * (1.0f + weight_ptr[idx]);
+                    const float weight_value = AddUnitOffset ? (1.0f + weight_ptr[idx]) : weight_ptr[idx];
+                    normalized_values[idx] = value * inv_rms * weight_value;
                   }
                   item.barrier(sycl::access::fence_space::local_space);
 
@@ -597,6 +646,58 @@ std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_xpu(
       });
 
   return {query_output, key_output};
+}
+
+std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_xpu(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& query_norm_weight_in,
+    const at::Tensor& key_norm_weight_in,
+    const at::Tensor& cos_in,
+    const at::Tensor& sin_in,
+    double query_norm_eps,
+    double key_norm_eps) {
+  return qk_norm_rotary_fused_xpu_impl<true>(
+      query_in,
+      key_in,
+      query_norm_weight_in,
+      key_norm_weight_in,
+      cos_in,
+      sin_in,
+      query_norm_eps,
+      key_norm_eps);
+}
+
+std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_ex_xpu(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& query_norm_weight_in,
+    const at::Tensor& key_norm_weight_in,
+    const at::Tensor& cos_in,
+    const at::Tensor& sin_in,
+    double query_norm_eps,
+    double key_norm_eps,
+    bool add_unit_offset) {
+  if (add_unit_offset) {
+    return qk_norm_rotary_fused_xpu_impl<true>(
+        query_in,
+        key_in,
+        query_norm_weight_in,
+        key_norm_weight_in,
+        cos_in,
+        sin_in,
+        query_norm_eps,
+        key_norm_eps);
+  }
+  return qk_norm_rotary_fused_xpu_impl<false>(
+      query_in,
+      key_in,
+      query_norm_weight_in,
+      key_norm_weight_in,
+      cos_in,
+      sin_in,
+      query_norm_eps,
+      key_norm_eps);
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_router_fused_meta(
@@ -776,7 +877,11 @@ at::Tensor gqa_decode_fused_xpu(
   const auto head_dim = query.size(3);
   const auto groups_per_kv_head = num_heads / num_kv_heads;
   const int64_t local_size =
-      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(head_dim, 32))), 32);
+      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(head_dim, 128))), 128);
+  constexpr int64_t kMaxAccumSlots = 8;
+  TORCH_CHECK(
+      ((head_dim + local_size - 1) / local_size) <= kMaxAccumSlots,
+      "gqa_decode_fused_xpu head_dim is too large for the current accumulator configuration");
   const float scaling_f = static_cast<float>(scaling);
   auto stream = c10::xpu::getCurrentXPUStream(query.device().index());
 
@@ -813,18 +918,15 @@ at::Tensor gqa_decode_fused_xpu(
                 visible_len = sycl::max<int64_t>(0, sycl::min<int64_t>(visible_len, key_len));
                 float running_max = -std::numeric_limits<float>::infinity();
                 float denom = 0.0f;
-                float acc_values[8];
-                for (int64_t slot = 0; slot < 8; ++slot) {
-                  acc_values[slot] = 0.0f;
+                float accumulators[kMaxAccumSlots];
+                for (int64_t slot = 0; slot < kMaxAccumSlots; ++slot) {
+                  accumulators[slot] = 0.0f;
                 }
+                item.barrier(sycl::access::fence_space::local_space);
 
                 for (int64_t key_idx = 0; key_idx < visible_len; ++key_idx) {
                   float local_dot = 0.0f;
-                  for (int64_t slot = 0; slot < 8; ++slot) {
-                    const int64_t dim_idx = lane + slot * local_size;
-                    if (dim_idx >= head_dim) {
-                      break;
-                    }
+                  for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size) {
                     local_dot +=
                         load_as_float(query_ptr, query_base + dim_idx) *
                         load_as_float(key_ptr, key_base + key_idx * head_dim + dim_idx);
@@ -843,13 +945,10 @@ at::Tensor gqa_decode_fused_xpu(
                   const float new_max = sycl::fmax(running_max, score);
                   const float old_scale = denom == 0.0f ? 0.0f : sycl::exp(running_max - new_max);
                   const float score_scale = sycl::exp(score - new_max);
-                  for (int64_t slot = 0; slot < 8; ++slot) {
-                    const int64_t dim_idx = lane + slot * local_size;
-                    if (dim_idx >= head_dim) {
-                      break;
-                    }
-                    acc_values[slot] =
-                        acc_values[slot] * old_scale +
+                  int64_t slot = 0;
+                  for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size, ++slot) {
+                    accumulators[slot] =
+                        accumulators[slot] * old_scale +
                         score_scale * load_as_float(value_ptr, key_base + key_idx * head_dim + dim_idx);
                   }
                   denom = denom * old_scale + score_scale;
@@ -857,12 +956,9 @@ at::Tensor gqa_decode_fused_xpu(
                   item.barrier(sycl::access::fence_space::local_space);
                 }
 
-                for (int64_t slot = 0; slot < 8; ++slot) {
-                  const int64_t dim_idx = lane + slot * local_size;
-                  if (dim_idx >= head_dim) {
-                    break;
-                  }
-                  const float out_value = denom > 0.0f ? acc_values[slot] / denom : 0.0f;
+                int64_t slot = 0;
+                for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size, ++slot) {
+                  const float out_value = denom > 0.0f ? accumulators[slot] / denom : 0.0f;
                   output_ptr[output_base + dim_idx] = static_cast<scalar_t>(out_value);
                 }
               });
@@ -1123,6 +1219,13 @@ TORCH_LIBRARY(anna, m) {
       "float eps"
       ") -> Tensor");
   m.def(
+      "rmsnorm_fused_ex("
+      "Tensor input, "
+      "Tensor weight, "
+      "float eps, "
+      "bool add_unit_offset=False"
+      ") -> Tensor");
+  m.def(
       "qk_norm_rotary_fused("
       "Tensor query, "
       "Tensor key, "
@@ -1132,6 +1235,18 @@ TORCH_LIBRARY(anna, m) {
       "Tensor sin, "
       "float query_norm_eps, "
       "float key_norm_eps"
+      ") -> (Tensor, Tensor)");
+  m.def(
+      "qk_norm_rotary_fused_ex("
+      "Tensor query, "
+      "Tensor key, "
+      "Tensor query_norm_weight, "
+      "Tensor key_norm_weight, "
+      "Tensor cos, "
+      "Tensor sin, "
+      "float query_norm_eps, "
+      "float key_norm_eps, "
+      "bool add_unit_offset=False"
       ") -> (Tensor, Tensor)");
   m.def(
       "causal_conv1d_fused("
@@ -1159,7 +1274,9 @@ TORCH_LIBRARY_IMPL(anna, Meta, m) {
   m.impl("gqa_decode_fused", anna::gqa_decode_fused_meta);
   m.impl("moe_router_fused", anna::moe_router_fused_meta);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_meta);
+  m.impl("rmsnorm_fused_ex", anna::rmsnorm_fused_ex_meta);
   m.impl("qk_norm_rotary_fused", anna::qk_norm_rotary_fused_meta);
+  m.impl("qk_norm_rotary_fused_ex", anna::qk_norm_rotary_fused_ex_meta);
   m.impl("causal_conv1d_fused", anna::causal_conv1d_fused_meta);
   m.impl("gated_delta_fused", anna::gated_delta_fused_meta);
 }
@@ -1168,7 +1285,9 @@ TORCH_LIBRARY_IMPL(anna, XPU, m) {
   m.impl("gqa_decode_fused", anna::gqa_decode_fused_xpu);
   m.impl("moe_router_fused", anna::moe_router_fused_xpu);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_xpu);
+  m.impl("rmsnorm_fused_ex", anna::rmsnorm_fused_ex_xpu);
   m.impl("qk_norm_rotary_fused", anna::qk_norm_rotary_fused_xpu);
+  m.impl("qk_norm_rotary_fused_ex", anna::qk_norm_rotary_fused_ex_xpu);
   m.impl("causal_conv1d_fused", anna::causal_conv1d_fused_xpu);
   m.impl("gated_delta_fused", anna::gated_delta_fused_xpu);
 }

@@ -6,9 +6,10 @@ import time
 
 from anna.core.config import BenchmarkSettings, parse_resident_expert_layer_indices
 from anna.core.logging import setup_logging
-from anna.core.qwen_model_family import inspect_qwen_model_family
+from anna.core.model_family import inspect_model_family
 from anna.core.model_path import resolve_model_dir, resolve_model_name
-from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, GenerationConfig
+from anna.runtime.qwen3_5_text_engine import GenerationConfig
+from anna.runtime.model_runtime_loader import load_model_runtime_from_model_dir
 
 
 def _positive_int(value: str) -> int:
@@ -128,10 +129,10 @@ def _build_messages(settings: BenchmarkSettings) -> list[dict]:
 def main() -> None:
     args = build_parser().parse_args()
     model_dir = resolve_model_dir(args.model_dir)
-    qwen_model_family_info = inspect_qwen_model_family(model_dir)
-    if qwen_model_family_info.qwen_model_family == "qwen3_tts":
+    model_family_info = inspect_model_family(model_dir)
+    if model_family_info.model_family == "qwen3_tts":
         raise SystemExit(
-            "The selected model belongs to the qwen3_tts family. Benchmark support is currently limited to the qwen3_5_text family; use anna-speak or anna-serve."
+            "The selected model belongs to the qwen3_tts family. Benchmark support is limited to text-generation model families; use anna-speak or anna-serve."
         )
     model_name = resolve_model_name(model_name=args.model_name, model_dir=model_dir)
     settings = BenchmarkSettings(
@@ -164,7 +165,7 @@ def main() -> None:
     )
 
     setup_logging(args.log_level)
-    engine = AnnaQwen3_5TextEngine.from_model_dir(
+    engine = load_model_runtime_from_model_dir(
         settings.model_dir,
         model_id=settings.model_id,
         device=settings.device,

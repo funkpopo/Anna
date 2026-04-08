@@ -10,6 +10,7 @@ from anna.model.ops import (
     Qwen3TextRotaryEmbedding,
     apply_rotary_pos_emb,
     grouped_query_attention,
+    rotate_half,
     torch_causal_conv1d_update,
     torch_recurrent_gated_delta_rule,
 )
@@ -21,6 +22,47 @@ def _reference_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> tor
     output = output * torch.rsqrt(output.pow(2).mean(dim=-1, keepdim=True) + eps)
     output = output * (1.0 + weight.float())
     return output.to(dtype=x.dtype)
+
+
+def _reference_rmsnorm_ex(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    add_unit_offset: bool,
+) -> torch.Tensor:
+    output = x.float()
+    output = output * torch.rsqrt(output.pow(2).mean(dim=-1, keepdim=True) + eps)
+    scale = weight.float() + (1.0 if add_unit_offset else 0.0)
+    output = output * scale
+    return output.to(dtype=x.dtype)
+
+
+def _apply_rotary_only(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    rotary_dim = cos.shape[-1]
+    x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
+    x_embed = (x_rot * cos) + (rotate_half(x_rot) * sin)
+    return torch.cat([x_embed, x_pass], dim=-1)
+
+
+def _reference_rope_cos_sin(
+    *,
+    batch_size: int,
+    seq_len: int,
+    rotary_dim: int,
+    device: str,
+    rope_theta: float,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32) / rotary_dim))
+    freqs = torch.outer(positions, inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos().unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+    sin = emb.sin().unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+    return cos.to(dtype=dtype), sin.to(dtype=dtype)
 
 
 def _reference_moe_router(
@@ -114,6 +156,68 @@ def test_gqa_decode_fused_xpu_long_qwen35_shape_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gqa_decode_fused_xpu_gemma4_full_head_dim_512_matches_reference() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gqa_decode_fused"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(0)
+    device = "xpu"
+    head_dim = 512
+    rotary_dim = 128
+    key_len = 1024
+
+    # Gemma4 full-attention decode uses RMS-normalized q/k with scaling=1.0.
+    # These constants match the full-attention q_norm/k_norm weights in gemma-4-E4B-it.
+    query = torch.randn(1, 8, 1, head_dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(1, 2, key_len, head_dim, device=device, dtype=torch.bfloat16)
+    value = torch.randn(1, 2, key_len, head_dim, device=device, dtype=torch.bfloat16)
+    query = _reference_rmsnorm_ex(
+        query,
+        torch.full((head_dim,), 1.0234375, device=device, dtype=torch.float32),
+        1e-6,
+        add_unit_offset=False,
+    )
+    key = _reference_rmsnorm_ex(
+        key,
+        torch.full((head_dim,), 0.06103515625, device=device, dtype=torch.float32),
+        1e-6,
+        add_unit_offset=False,
+    )
+    query_cos, query_sin = _reference_rope_cos_sin(
+        batch_size=1,
+        seq_len=1,
+        rotary_dim=rotary_dim,
+        device=device,
+        rope_theta=1_000_000.0,
+        dtype=query.dtype,
+    )
+    key_cos, key_sin = _reference_rope_cos_sin(
+        batch_size=1,
+        seq_len=key_len,
+        rotary_dim=rotary_dim,
+        device=device,
+        rope_theta=1_000_000.0,
+        dtype=key.dtype,
+    )
+    query = _apply_rotary_only(query, query_cos, query_sin)
+    key = _apply_rotary_only(key, key_cos, key_sin)
+    visible_lengths = torch.tensor([key_len], device=device, dtype=torch.long)
+
+    fused_output = torch.ops.anna.gqa_decode_fused(query, key, value, visible_lengths, 1.0)
+    visible_mask = torch.arange(key.shape[2], device=device)[None, :] < visible_lengths[:, None]
+    reference = grouped_query_attention(
+        query,
+        key,
+        value,
+        scaling=1.0,
+        visible_mask=visible_mask,
+    )
+
+    torch.xpu.synchronize()
+    assert torch.allclose(fused_output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
 def test_moe_router_fused_xpu_matches_reference() -> None:
     if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "moe_router_fused"):
         pytest.skip("Anna fused-op library is not built")
@@ -180,6 +284,41 @@ def test_qk_norm_rotary_fused_xpu_matches_reference() -> None:
 
     reference_query = _reference_rmsnorm(query, query_norm_weight, 1e-6)
     reference_key = _reference_rmsnorm(key, key_norm_weight, 1e-5)
+    reference_query, reference_key = apply_rotary_pos_emb(reference_query, reference_key, cos, sin)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(fused_query.float().cpu(), reference_query.float().cpu(), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(fused_key.float().cpu(), reference_key.float().cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_qk_norm_rotary_fused_ex_xpu_matches_reference_without_unit_offset() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "qk_norm_rotary_fused_ex"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(0)
+    device = "xpu"
+    query = torch.randn(2, 8, 5, 128, device=device, dtype=torch.bfloat16)
+    key = torch.randn(2, 2, 5, 128, device=device, dtype=torch.bfloat16)
+    query_norm_weight = torch.randn(128, device=device, dtype=torch.float32)
+    key_norm_weight = torch.randn(128, device=device, dtype=torch.float32)
+    cos = torch.randn(2, 5, 32, device=device, dtype=torch.float32)
+    sin = torch.randn(2, 5, 32, device=device, dtype=torch.float32)
+
+    fused_query, fused_key = torch.ops.anna.qk_norm_rotary_fused_ex(
+        query,
+        key,
+        query_norm_weight,
+        key_norm_weight,
+        cos,
+        sin,
+        1e-6,
+        1e-6,
+        False,
+    )
+
+    reference_query = _reference_rmsnorm_ex(query, query_norm_weight, 1e-6, add_unit_offset=False)
+    reference_key = _reference_rmsnorm_ex(key, key_norm_weight, 1e-6, add_unit_offset=False)
     reference_query, reference_key = apply_rotary_pos_emb(reference_query, reference_key, cos, sin)
 
     torch.xpu.synchronize()
@@ -286,6 +425,24 @@ def test_materialized_kv_single_token_decode_attention_matches_reference_on_long
     attn_scores = torch.matmul(query, repeated_key.transpose(-1, -2)) * (head_dim**-0.5)
     attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query.dtype)
     reference = torch.matmul(attn_probs, repeated_value)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_rmsnorm_fused_ex_xpu_matches_reference_without_unit_offset() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "rmsnorm_fused_ex"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(0)
+    device = "xpu"
+    hidden_states = torch.randn(3, 5, 64, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(64, device=device, dtype=torch.float32)
+    eps = 1e-6
+
+    output = torch.ops.anna.rmsnorm_fused_ex(hidden_states, weight, eps, False)
+    reference = _reference_rmsnorm_ex(hidden_states, weight, eps, add_unit_offset=False)
 
     torch.xpu.synchronize()
     assert torch.allclose(output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)

@@ -231,7 +231,7 @@ class TextGenerationResult:
 
 
 class AnnaQwen3_5TextEngine:
-    qwen_model_family = "qwen3_5_text"
+    model_family = "qwen3_5_text"
     supports_chat_completions = True
     supports_text_completions = True
     supports_speech_synthesis = False
@@ -1036,7 +1036,7 @@ class AnnaQwen3_5TextEngine:
         return {
             "status": "ok",
             "model": self.default_model_id,
-            "qwen_model_family": self.qwen_model_family,
+            "model_family": self.model_family,
             "device": str(self.device_context.device),
             "compute_dtype": str(self.device_context.dtype),
             "requested_dtype": self.device_context.requested_dtype,

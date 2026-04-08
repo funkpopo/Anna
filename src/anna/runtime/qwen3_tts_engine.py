@@ -45,7 +45,7 @@ class Qwen3TTSSynthesisResult:
 
 
 class AnnaQwen3TTSEngine:
-    qwen_model_family = "qwen3_tts"
+    model_family = "qwen3_tts"
     supports_chat_completions = False
     supports_text_completions = False
     supports_speech_synthesis = True
@@ -135,7 +135,7 @@ class AnnaQwen3TTSEngine:
             ignored_options.append(f"weight_quant={weight_quant}")
         if ignored_options:
             logger.info(
-                "Ignoring qwen3_5_text-family runtime options for qwen3_tts model load: %s",
+                "Ignoring text-generation runtime options for qwen3_tts model load: %s",
                 ", ".join(ignored_options),
             )
 
@@ -199,7 +199,7 @@ class AnnaQwen3TTSEngine:
         return {
             "status": "ok",
             "model": self.default_model_id,
-            "qwen_model_family": self.qwen_model_family,
+            "model_family": self.model_family,
             "tts_model_type": self.tts_model_type,
             "tts_model_size": self.tts_model_size,
             "tokenizer_type": self.tokenizer_type,
