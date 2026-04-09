@@ -4,14 +4,14 @@
 
 Anna is a from-scratch Qwen3.5 inference service for Intel Arc GPUs with an OpenAI-compatible API.
 
-## Requirements (local development and testing; not validated on Linux)
+## Requirements (local development and testing)
 
-- Windows + Intel Arc GPU
+- Windows or Linux + Intel Arc GPU
 - PyTorch with `xpu`
 - Intel oneAPI DPC++/C++
 - Ability to build and load the custom `anna_gated_delta_fused` operator locally
 
-If you want to run a local Qwen3.5 model on an Arc A770 or A750, this README is written for that path.
+If you want to run a local Qwen3.5 model on an Arc A770 or A750, this README is written for that path. Windows remains the primary development environment; Linux uses the same runtime with a Linux-specific fused-op build flow.
 
 ## Main Features
 
@@ -33,13 +33,13 @@ If you want to run a local Qwen3.5 model on an Arc A770 or A750, this README is 
 
 The current `main` branch is expected to run in an environment like this:
 
-- Windows 11
+- Windows 11 or a recent Linux distribution
 - Python 3.11 or 3.12
 - Intel Arc A770 / A750
 - Intel GPU driver installed correctly
 - PyTorch installed with `xpu` support
 - Intel oneAPI DPC++/C++ Compiler
-- Visual Studio 2022 Build Tools
+- Visual Studio 2022 Build Tools on Windows only
 
 ## Setup
 
@@ -50,13 +50,21 @@ git clone -b main <your-repo-url> Anna
 cd Anna
 ```
 
-### 2. Create a Conda environment
+### 2. Create a Python environment
 
-Using Miniforge or Conda is recommended:
+Windows example with Conda/Miniforge:
 
 ```powershell
 conda create -n anna python=3.12 -y
 conda activate anna
+python -m pip install -U pip
+```
+
+Linux example with `venv`:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -U pip
 ```
 
@@ -84,34 +92,52 @@ pip install -e .
 Notes:
 
 - `pip install -e .` only installs the Python package, it does not compile the SYCL fused op
-- After installation, you must still run `python tools\build_gated_delta_fused_op.py`
+- After installation, you must still run `python tools/build_gated_delta_fused_op.py`
 
 ### 5. Prepare the compiler environment
 
-The current build script defaults to these two paths:
+The build script is now platform-aware and supports overrides through environment variables.
 
-- oneAPI compiler: `D:\Intel\oneAPI\compiler\2025.3\bin\dpcpp.exe`
-- MSVC environment script: `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat`
+On Windows:
 
-If your installation uses different paths, update those values in `tools/build_gated_delta_fused_op.py`.
+- Prefer having `dpcpp.exe` on `PATH`
+- If it is not on `PATH`, the build script also searches standard oneAPI install directories under `Program Files`
+- For the MSVC environment, the build script searches standard Visual Studio Build Tools / IDE locations; if you use a non-standard installation, set `ANNA_VCVARS64`
+- You can always override the compiler path explicitly with `ANNA_DPCPP`
+
+```powershell
+$env:ANNA_DPCPP = "C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin\dpcpp.exe"
+$env:ANNA_VCVARS64 = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+```
+
+On Linux:
+
+- Ensure `dpcpp` is on `PATH`, or set `ANNA_DPCPP` to its absolute path
+- If your oneAPI runtime libraries live outside the compiler-relative `lib` directories, set `ANNA_ONEAPI_RUNTIME_PATHS` with `:`-separated directories
+
+```bash
+export ANNA_DPCPP=/opt/intel/oneapi/compiler/latest/bin/dpcpp
+export ANNA_ONEAPI_RUNTIME_PATHS=/opt/intel/oneapi/compiler/latest/lib:/opt/intel/oneapi/compiler/latest/lib/x64
+```
 
 ### 6. Build the SYCL fused op
 
 This is a required step on the current `main` branch when running on Intel Arc with `xpu`:
 
 ```powershell
-python tools\build_gated_delta_fused_op.py
+python tools/build_gated_delta_fused_op.py
 ```
 
 If the build succeeds, the dynamic library will be generated here:
 
-- `.build\anna_gated_delta_fused\anna_gated_delta_fused.pyd`
+- Windows: `.build\anna_gated_delta_fused\anna_gated_delta_fused.pyd`
+- Linux: `.build/anna_gated_delta_fused/anna_gated_delta_fused.so`
 
 The terminal usually prints output similar to:
 
 ```text
 Compiling Anna fused XPU/SYCL ops...
-library_path=D:\Projects\Anna\.build\anna_gated_delta_fused\anna_gated_delta_fused.pyd
+library_path=<repo>/.build/anna_gated_delta_fused/anna_gated_delta_fused.<pyd|so>
 gated_delta_registered=True
 causal_conv1d_registered=True
 ```
@@ -119,7 +145,7 @@ causal_conv1d_registered=True
 ### 7. Optional verification
 
 ```powershell
-pytest tests\test_fused_op_xpu.py -q
+pytest tests/test_fused_op_xpu.py -q
 ```
 
 For a full regression run:
@@ -137,6 +163,8 @@ On Windows, pick one:
 - **Chocolatey** (Administrator shell): `choco install sox`
 - **Scoop**: `scoop install sox`
 - **Manual**: Install a build that provides `sox.exe` (see [SoX](http://sox.sourceforge.net/)), then add its directory to your user or system `PATH`.
+
+On Linux, install `sox` from your distribution package manager and confirm `sox --version` works in a new shell.
 
 Open a **new** terminal and confirm:
 
@@ -193,6 +221,18 @@ Minimal example:
 
 ```powershell
 anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16
+```
+
+Linux/bash example:
+
+```bash
+anna-serve \
+  --model-dir /path/to/model \
+  --model-name Qwen3.5-2B \
+  --device xpu \
+  --dtype bfloat16 \
+  --host 127.0.0.1 \
+  --port 8000
 ```
 
 Example aligned with the current `main` branch and environment:
@@ -405,9 +445,10 @@ Check these first:
 
 Check these first:
 
-- Whether the `dpcpp.exe` path is correct
-- Whether the `vcvars64.bat` path is correct
-- Whether both oneAPI and MSVC are installed
+- Whether `ANNA_DPCPP` points to the right compiler, or `dpcpp` is on `PATH`
+- On Windows, whether `ANNA_VCVARS64` or `vcvars64.bat` is correct
+- Whether the required oneAPI runtime libraries are reachable; on Linux you can set `ANNA_ONEAPI_RUNTIME_PATHS` if the auto-detected directories are incomplete
+- On Windows, whether both oneAPI and MSVC are installed
 - Whether the active environment's `torch` includes the required headers and `torch_xpu` related libraries
 
 ### 3. The server starts, but generation fails with fused-op related errors
@@ -415,7 +456,7 @@ Check these first:
 Rebuild the custom operator once:
 
 ```powershell
-python tools\build_gated_delta_fused_op.py
+python tools/build_gated_delta_fused_op.py
 ```
 
 Then restart the server.
@@ -430,6 +471,6 @@ anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16 --metrics-
 
 ## Development Notes
 
-- After changing the SYCL source, rerun `python tools\build_gated_delta_fused_op.py`
-- Then run `pytest tests\test_fused_op_xpu.py -q`
+- After changing the SYCL source, rerun `python tools/build_gated_delta_fused_op.py`
+- Then run `pytest tests/test_fused_op_xpu.py -q`
 - Restart `anna-serve` after that

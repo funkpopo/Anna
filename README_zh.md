@@ -2,14 +2,14 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-## 环境要求（本地开发和测试，未经Linux平台验证）
+## 环境要求（本地开发和测试）
 
-- Windows + Intel Arc 显卡
+- Windows 或 Linux + Intel Arc 显卡
 - PyTorch `xpu`
 - Intel oneAPI DPC++/C++
 - 可本地编译并加载 `anna_gated_delta_fused` 自定义算子
 
-如果你准备在 Arc A770 / A750 上跑本地 Qwen3.5，这个 README 就是按这条路径写的。
+如果你准备在 Arc A770 / A750 上跑本地 Qwen3.5，这个 README 就是按这条路径写的。Windows 仍是当前主要开发环境；Linux 走同一套运行时，但 fused-op 需要按 Linux 的方式构建。
 
 ## 分支特性
 
@@ -31,13 +31,13 @@
 
 当前 `main` 分支默认按下面的环境准备：
 
-- Windows 11
+- Windows 11 或较新的 Linux 发行版
 - Python 3.11 或 3.12
 - Intel Arc A770 / A750
 - 已正确安装 Intel GPU 驱动
 - 已正确安装带 `xpu` 的 PyTorch
 - Intel oneAPI DPC++/C++ Compiler
-- Visual Studio 2022 Build Tools
+- Windows 下额外需要 Visual Studio 2022 Build Tools
 
 ## 环境配置
 
@@ -48,13 +48,21 @@ git clone -b main <your-repo-url> Anna
 cd Anna
 ```
 
-### 2. 创建 Conda 环境
+### 2. 创建 Python 环境
 
-推荐使用 Miniforge/Conda 管理 Python 环境：
+Windows 下可继续使用 Conda/Miniforge：
 
 ```powershell
 conda create -n anna python=3.12 -y
 conda activate anna
+python -m pip install -U pip
+```
+
+Linux 下可直接使用 `venv`：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -U pip
 ```
 
@@ -82,34 +90,52 @@ pip install -e .
 注意：
 
 - `pip install -e .` 只会安装 Python 包，不会自动编译 SYCL fused op
-- 安装完成后必须继续执行下面的 `python tools\build_gated_delta_fused_op.py`
+- 安装完成后必须继续执行下面的 `python tools/build_gated_delta_fused_op.py`
 
 ### 5. 准备编译器环境
 
-当前构建脚本默认使用下面两个路径：
+构建脚本现在会按平台自动选择默认值，也支持通过环境变量覆盖。
 
-- oneAPI 编译器：`D:\Intel\oneAPI\compiler\2025.3\bin\dpcpp.exe`
-- MSVC 环境脚本：`C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat`
+Windows 下：
 
-如果你的安装路径不同，需要修改 `tools/build_gated_delta_fused_op.py` 里的这两个路径。
+- 最好先把 `dpcpp.exe` 放到 `PATH` 中
+- 如果 `PATH` 里没有，构建脚本还会自动搜索 `Program Files` 下的标准 oneAPI 安装目录
+- 对 MSVC 环境脚本，构建脚本会搜索标准的 Visual Studio Build Tools / IDE 安装位置；如果你用了非标准安装目录，再设置 `ANNA_VCVARS64`
+- 也可以直接用 `ANNA_DPCPP` 显式指定编译器路径
+
+```powershell
+$env:ANNA_DPCPP = "C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin\dpcpp.exe"
+$env:ANNA_VCVARS64 = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+```
+
+Linux 下：
+
+- 确保 `dpcpp` 已在 `PATH` 中；如果没有，就把绝对路径写到 `ANNA_DPCPP`
+- 如果 oneAPI 运行时库不在编译器相邻的 `lib` 目录里，可用 `ANNA_ONEAPI_RUNTIME_PATHS` 指定，多个目录用 `:` 分隔
+
+```bash
+export ANNA_DPCPP=/opt/intel/oneapi/compiler/latest/bin/dpcpp
+export ANNA_ONEAPI_RUNTIME_PATHS=/opt/intel/oneapi/compiler/latest/lib:/opt/intel/oneapi/compiler/latest/lib/x64
+```
 
 ### 6. 编译 SYCL fused op
 
 这是当前 `main` 分支在 Intel Arc `xpu` 环境下的必需步骤：
 
 ```powershell
-python tools\build_gated_delta_fused_op.py
+python tools/build_gated_delta_fused_op.py
 ```
 
 成功后会在下面目录生成动态库：
 
-- `.build\anna_gated_delta_fused\anna_gated_delta_fused.pyd`
+- Windows：`.build\anna_gated_delta_fused\anna_gated_delta_fused.pyd`
+- Linux：`.build/anna_gated_delta_fused/anna_gated_delta_fused.so`
 
 终端通常会看到类似输出：
 
 ```text
 Compiling Anna fused XPU/SYCL ops...
-library_path=D:\Projects\Anna\.build\anna_gated_delta_fused\anna_gated_delta_fused.pyd
+library_path=<repo>/.build/anna_gated_delta_fused/anna_gated_delta_fused.<pyd|so>
 gated_delta_registered=True
 causal_conv1d_registered=True
 ```
@@ -117,7 +143,7 @@ causal_conv1d_registered=True
 ### 7. 可选验证
 
 ```powershell
-pytest tests\test_fused_op_xpu.py -q
+pytest tests/test_fused_op_xpu.py -q
 ```
 
 如果只是做一次完整回归：
@@ -135,6 +161,8 @@ pytest -q
 - **Chocolatey**（管理员 PowerShell）：`choco install sox`
 - **Scoop**：`scoop install sox`
 - **手动安装**：安装包含 `sox.exe` 的版本（参见 [SoX](http://sox.sourceforge.net/)），将其所在目录加入用户或系统 `PATH`。
+
+Linux 下请通过发行版自带的软件包管理器安装 `sox`，然后在新 shell 中确认 `sox --version` 正常。
 
 打开**新的**终端验证：
 
@@ -191,6 +219,18 @@ D:\Projects\Anna\models\Qwen\Qwen3-TTS-12Hz-1___7B-Base
 
 ```powershell
 anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16
+```
+
+Linux/bash 示例：
+
+```bash
+anna-serve \
+  --model-dir /path/to/model \
+  --model-name Qwen3.5-2B \
+  --device xpu \
+  --dtype bfloat16 \
+  --host 127.0.0.1 \
+  --port 8000
 ```
 
 与你当前 `main` 分支/环境一致的示例：
@@ -403,9 +443,10 @@ curl.exe http://127.0.0.1:8000/healthz
 
 优先检查：
 
-- `dpcpp.exe` 路径是否正确
-- `vcvars64.bat` 路径是否正确
-- oneAPI 与 MSVC 是否都已安装
+- `ANNA_DPCPP` 是否指向正确编译器，或者 `dpcpp` 是否已在 `PATH` 中
+- Windows 下 `ANNA_VCVARS64` 或 `vcvars64.bat` 路径是否正确
+- oneAPI 运行时库是否能被找到；Linux 下如果自动探测不完整，可设置 `ANNA_ONEAPI_RUNTIME_PATHS`
+- Windows 下 oneAPI 与 MSVC 是否都已安装
 - 当前激活环境里的 `torch` 是否包含头文件和 `torch_xpu` 相关库
 
 ### 3. 服务能启动，但生成时报 fused-op 相关错误
@@ -413,7 +454,7 @@ curl.exe http://127.0.0.1:8000/healthz
 先重建一次自定义算子：
 
 ```powershell
-python tools\build_gated_delta_fused_op.py
+python tools/build_gated_delta_fused_op.py
 ```
 
 然后重启服务。
@@ -428,6 +469,6 @@ anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16 --metrics-
 
 ## 开发建议
 
-- 改了 SYCL 源码后，先重新执行 `python tools\build_gated_delta_fused_op.py`
-- 再执行 `pytest tests\test_fused_op_xpu.py -q`
+- 改了 SYCL 源码后，先重新执行 `python tools/build_gated_delta_fused_op.py`
+- 再执行 `pytest tests/test_fused_op_xpu.py -q`
 - 最后再重启 `anna-serve`

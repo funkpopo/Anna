@@ -327,6 +327,30 @@ def test_dynamic_cache_reserve_sequence_capacity_preallocates_pages_and_visible_
     assert visible_value.shape[-2] == 1
 
 
+def test_dynamic_cache_update_can_skip_dense_full_attention_materialization() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config, maintain_full_attention_mirror=False)
+    cache = Qwen3DynamicCache(config, allocator=allocator)
+    key = torch.randn(1, 2, 5, 16)
+    value = torch.randn(1, 2, 5, 16)
+
+    visible_key, visible_value, past_lengths = cache.update(key, value, layer_idx=1, require_dense_cache=False)
+    paged_state = cache.paged_attention_state(1)
+
+    assert visible_key is None
+    assert visible_value is None
+    assert tuple(int(length) for length in past_lengths.tolist()) == (0,)
+    assert paged_state is not None
+    key_pages, value_pages, page_table, visible_lengths = paged_state
+    assert key_pages.shape[1:] == (2, config.cache_block_size, 16)
+    assert value_pages.shape[1:] == (2, config.cache_block_size, 16)
+    assert page_table.shape == (1, 1)
+    assert page_table.dtype == torch.int32
+    assert tuple(int(length) for length in visible_lengths.tolist()) == (5,)
+    assert torch.equal(cache.visible_key_cache(1), key)
+    assert torch.equal(cache.visible_value_cache(1), value)
+
+
 def test_page_allocator_trim_releases_idle_page_storage() -> None:
     config = _tiny_config()
     allocator = Qwen3PageAllocator(config)
