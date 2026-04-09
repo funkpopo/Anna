@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Iterator
 
 import torch
 
-from anna.mm.qwen3_5_text_processor import PreparedInputs
+from anna.mm.prepared_inputs import PreparedInputsLike
 from anna.runtime.streaming import IncrementalTextAssembler
 from anna.sampling.sampler import sample_next_token
 
@@ -28,7 +28,7 @@ _DONE = object()
 
 @dataclass(slots=True)
 class SchedulerRequest:
-    prepared: PreparedInputs
+    prepared: PreparedInputsLike
     config: "GenerationConfig"
     stream: bool
     prompt_ids: list[int] = field(default_factory=list)
@@ -72,7 +72,7 @@ class AnnaScheduler:
             self._condition.notify_all()
         self._worker.join(timeout=5.0)
 
-    def generate(self, prepared: PreparedInputs, *, config: "GenerationConfig") -> "TextGenerationResult":
+    def generate(self, prepared: PreparedInputsLike, *, config: "GenerationConfig") -> "TextGenerationResult":
         request = self._submit(prepared, config=config, stream=False)
         request.done.wait()
         if request.error is not None:
@@ -81,7 +81,7 @@ class AnnaScheduler:
             raise RuntimeError("Scheduler request completed without a result.")
         return request.result
 
-    def stream(self, prepared: PreparedInputs, *, config: "GenerationConfig") -> Iterator["StreamEvent"]:
+    def stream(self, prepared: PreparedInputsLike, *, config: "GenerationConfig") -> Iterator["StreamEvent"]:
         request = self._submit(prepared, config=config, stream=True)
         while True:
             item = request.events.get()
@@ -91,7 +91,7 @@ class AnnaScheduler:
                 raise item
             yield item
 
-    def _submit(self, prepared: PreparedInputs, *, config: "GenerationConfig", stream: bool) -> SchedulerRequest:
+    def _submit(self, prepared: PreparedInputsLike, *, config: "GenerationConfig", stream: bool) -> SchedulerRequest:
         if self._fatal_error is not None:
             raise self._fatal_error
         request = SchedulerRequest(prepared=prepared, config=config, stream=stream)
@@ -194,7 +194,7 @@ class AnnaScheduler:
                 past_key_values = self.engine._reserve_prefill_cache(batched)
                 for start_idx in range(0, prompt_length, configured_chunk_size):
                     end_idx = min(prompt_length, start_idx + configured_chunk_size)
-                    chunk = PreparedInputs(
+                    chunk = type(batched)(
                         prompt="",
                         input_ids=batched.input_ids[:, start_idx:end_idx],
                         attention_mask=batched.attention_mask[:, :end_idx] if start_idx == 0 else None,
@@ -207,7 +207,7 @@ class AnnaScheduler:
                             input_ids=chunk.input_ids,
                             attention_mask=chunk.attention_mask,
                             past_key_values=past_key_values,
-                            mm_token_type_ids=chunk.mm_token_type_ids,
+                            model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=True),
                             use_cache=True,
                             logits_to_keep=1,
                         )
@@ -224,7 +224,7 @@ class AnnaScheduler:
                         stage="scheduler_prefill",
                         input_ids=batched.input_ids,
                         attention_mask=batched.attention_mask,
-                        mm_token_type_ids=batched.mm_token_type_ids,
+                        model_kwargs=self.engine._build_prefill_model_kwargs(batched, include_media=True),
                         use_cache=True,
                         logits_to_keep=1,
                     )
@@ -351,11 +351,12 @@ class AnnaScheduler:
             next_active.append(request)
         return next_active
 
-    def _batch_text_inputs(self, requests: list[SchedulerRequest]) -> PreparedInputs:
+    def _batch_text_inputs(self, requests: list[SchedulerRequest]) -> PreparedInputsLike:
         max_prompt_length = max(request.prompt_length for request in requests)
         text_config = self.engine.config.text_config
         pad_token_id = text_config.pad_token_id if 0 <= text_config.pad_token_id < text_config.vocab_size else 0
         input_device = requests[0].prepared.input_ids.device
+        prepared_type = type(requests[0].prepared)
         input_ids = torch.full((len(requests), max_prompt_length), pad_token_id, dtype=torch.long, device=input_device)
         attention_mask = torch.zeros((len(requests), max_prompt_length), dtype=torch.long, device=input_device)
         mm_token_type_ids = torch.zeros((len(requests), max_prompt_length), dtype=torch.int32, device=input_device)
@@ -366,7 +367,7 @@ class AnnaScheduler:
             attention_mask[batch_idx, :length] = request.prepared.attention_mask[0, :length]
             mm_token_type_ids[batch_idx, :length] = request.prepared.mm_token_type_ids[0, :length]
 
-        return PreparedInputs(
+        return prepared_type(
             prompt="",
             input_ids=input_ids,
             attention_mask=attention_mask,
