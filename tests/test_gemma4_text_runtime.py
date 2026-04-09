@@ -9,7 +9,9 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 
+from anna.mm.gemma4_text_processor import PreparedInputs
 from anna.runtime.model_runtime_loader import load_model_runtime_from_model_dir
+from anna.runtime.gemma4_text_engine import AnnaGemma4TextEngine
 from anna.model.gemma4_config import Gemma4Config
 from anna.model.gemma4_text_model import Gemma4ForConditionalGeneration
 from anna.weights.gemma4_tokenizer import Gemma4Tokenizer
@@ -394,3 +396,62 @@ def test_gemma4_runtime_loader_builds_standalone_multimodal_engine(tmp_path) -> 
     assert health["vision_enabled"] is True
     assert health["audio_enabled"] is True
     assert health["weight_quant"] == "none"
+
+
+def test_gemma4_runtime_forwards_gemma_only_multimodal_kwargs() -> None:
+    class _FakeModel:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.kwargs: dict[str, object] | None = None
+
+        def forward_text_only(self, **_kwargs):
+            self.calls.append("text")
+            return object()
+
+        def __call__(self, **kwargs):
+            self.calls.append("full")
+            self.kwargs = kwargs
+            return object()
+
+    engine = object.__new__(AnnaGemma4TextEngine)
+    engine.model = _FakeModel()
+
+    prepared = PreparedInputs(
+        prompt="gemma multimodal",
+        input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
+        attention_mask=torch.ones((1, 3), dtype=torch.long),
+        mm_token_type_ids=torch.tensor([[0, 1, 1]], dtype=torch.int32),
+        pixel_values=torch.randn(4, 8),
+        image_position_ids=torch.tensor([[0, 1]], dtype=torch.long),
+        pixel_values_videos=torch.randn(2, 8),
+        video_position_ids=torch.tensor([[0]], dtype=torch.long),
+        input_features=torch.randn(1, 2, 4),
+        input_features_mask=torch.ones((1, 2), dtype=torch.bool),
+    )
+
+    model_kwargs = engine._build_prefill_model_kwargs(prepared, include_media=True)
+
+    assert "image_position_ids" in model_kwargs
+    assert "video_position_ids" in model_kwargs
+    assert "input_features" in model_kwargs
+    assert "input_features_mask" in model_kwargs
+    assert "image_grid_thw" not in model_kwargs
+    assert "video_grid_thw" not in model_kwargs
+
+    engine._forward_generation_model(
+        input_ids=prepared.input_ids,
+        attention_mask=prepared.attention_mask,
+        past_key_values=None,
+        model_kwargs=model_kwargs,
+        use_cache=True,
+        logits_to_keep=1,
+    )
+
+    assert engine.model.calls == ["full"]
+    assert engine.model.kwargs is not None
+    assert "image_position_ids" in engine.model.kwargs
+    assert "video_position_ids" in engine.model.kwargs
+    assert "input_features" in engine.model.kwargs
+    assert "input_features_mask" in engine.model.kwargs
+    assert "image_grid_thw" not in engine.model.kwargs
+    assert "video_grid_thw" not in engine.model.kwargs

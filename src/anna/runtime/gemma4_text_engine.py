@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 
-from anna.mm.gemma4_text_processor import Gemma4TextProcessor
+from anna.mm.gemma4_text_processor import Gemma4TextProcessor, PreparedInputs
 from anna.model.gemma4_text_model import Gemma4DynamicCache, Gemma4ForConditionalGeneration
 from anna.model.quantization import convert_module_linears_to_xpu_int4
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
@@ -41,6 +41,29 @@ class _NullCacheAllocator:
 
 class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
     model_family = "gemma4"
+
+    def _build_prefill_model_kwargs(
+        self,
+        prepared: PreparedInputs,
+        *,
+        token_slice: slice | None = None,
+        include_media: bool = True,
+    ) -> dict[str, object]:
+        mm_token_type_ids = prepared.mm_token_type_ids
+        if token_slice is not None and mm_token_type_ids is not None:
+            mm_token_type_ids = mm_token_type_ids[:, token_slice]
+        return {
+            "pixel_values": prepared.pixel_values if include_media else None,
+            "image_position_ids": prepared.image_position_ids if include_media else None,
+            "pixel_values_videos": prepared.pixel_values_videos if include_media else None,
+            "video_position_ids": prepared.video_position_ids if include_media else None,
+            "input_features": prepared.input_features if include_media else None,
+            "input_features_mask": prepared.input_features_mask if include_media else None,
+            "mm_token_type_ids": mm_token_type_ids,
+        }
+
+    def _forward_multimodal_input_keys(self) -> tuple[str, ...]:
+        return ("pixel_values", "pixel_values_videos", "input_features")
 
     def __init__(
         self,
