@@ -79,6 +79,33 @@ def _reference_moe_router(
     return routing_weights, selected_experts, usage
 
 
+def _pack_paged_kv(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, num_kv_heads, key_len, head_dim = key.shape
+    pages_per_batch = (key_len + block_size - 1) // block_size
+    total_pages = batch_size * pages_per_batch
+    key_pages = key.new_zeros((total_pages, num_kv_heads, block_size, head_dim))
+    value_pages = value.new_zeros((total_pages, num_kv_heads, block_size, head_dim))
+    page_table = torch.full((batch_size, pages_per_batch), -1, device=key.device, dtype=torch.int32)
+
+    for batch_idx in range(batch_size):
+        for block_idx in range(pages_per_batch):
+            page_id = batch_idx * pages_per_batch + block_idx
+            start = block_idx * block_size
+            take = min(block_size, key_len - start)
+            if take <= 0:
+                continue
+            key_pages[page_id, :, :take, :].copy_(key[batch_idx, :, start : start + take, :])
+            value_pages[page_id, :, :take, :].copy_(value[batch_idx, :, start : start + take, :])
+            page_table[batch_idx, block_idx] = page_id
+
+    return key_pages, value_pages, page_table
+
+
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
 def test_causal_conv1d_fused_xpu_matches_reference() -> None:
     if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "causal_conv1d_fused"):
@@ -142,6 +169,43 @@ def test_gqa_decode_fused_xpu_long_qwen35_shape_matches_reference() -> None:
     visible_lengths = torch.tensor([key_len], device=device, dtype=torch.long)
 
     fused_output = torch.ops.anna.gqa_decode_fused(query, key, value, visible_lengths, head_dim**-0.5)
+    visible_mask = torch.arange(key.shape[2], device=device)[None, :] < visible_lengths[:, None]
+    reference = grouped_query_attention(
+        query,
+        key,
+        value,
+        scaling=head_dim**-0.5,
+        visible_mask=visible_mask,
+    )
+
+    torch.xpu.synchronize()
+    assert torch.allclose(fused_output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_paged_gqa_decode_fused_xpu_long_qwen35_shape_matches_reference() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "paged_gqa_decode_fused"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(0)
+    device = "xpu"
+    head_dim = 256
+    key_len = 4096
+    block_size = 32
+    query = torch.randn(1, 16, 1, head_dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(1, 4, key_len, head_dim, device=device, dtype=torch.bfloat16)
+    value = torch.randn(1, 4, key_len, head_dim, device=device, dtype=torch.bfloat16)
+    key_pages, value_pages, page_table = _pack_paged_kv(key, value, block_size=block_size)
+    visible_lengths = torch.tensor([key_len], device=device, dtype=torch.long)
+
+    fused_output = torch.ops.anna.paged_gqa_decode_fused(
+        query,
+        key_pages,
+        value_pages,
+        page_table,
+        visible_lengths,
+        head_dim**-0.5,
+    )
     visible_mask = torch.arange(key.shape[2], device=device)[None, :] < visible_lengths[:, None]
     reference = grouped_query_attention(
         query,
@@ -449,41 +513,45 @@ def test_rmsnorm_fused_ex_xpu_matches_reference_without_unit_offset() -> None:
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
-def test_qwen3_attention_xpu_single_token_decode_uses_materialized_kv_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "qk_norm_rotary_fused"):
+def test_qwen3_attention_xpu_single_token_decode_uses_paged_kv_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    if (
+        not maybe_load_gated_delta_library()
+        or not hasattr(torch.ops.anna, "qk_norm_rotary_fused")
+        or not hasattr(torch.ops.anna, "paged_gqa_decode_fused")
+    ):
         pytest.skip("Anna fused-op library is not built")
 
     torch.manual_seed(0)
-    calls: list[tuple[torch.Size, torch.Size, int, tuple[int, ...]]] = []
-    materialized_impl = model_ops.materialized_kv_single_token_decode_attention
+    calls: list[tuple[torch.Size, torch.Size, torch.Size, tuple[int, ...]]] = []
+    paged_impl = model_ops.paged_kv_single_token_decode_attention
 
-    def _stub_materialized_decode(
+    def _stub_paged_decode(
         query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        key_pages: torch.Tensor,
+        value_pages: torch.Tensor,
+        page_table: torch.Tensor,
         *,
         scaling: float,
-        num_key_value_groups: int,
         visible_lengths: torch.Tensor,
     ) -> torch.Tensor:
         calls.append(
             (
                 query.shape,
-                key.shape,
-                num_key_value_groups,
+                key_pages.shape,
+                page_table.shape,
                 tuple(int(item) for item in visible_lengths.cpu().tolist()),
             )
         )
-        return materialized_impl(
+        return paged_impl(
             query,
-            key,
-            value,
+            key_pages,
+            value_pages,
+            page_table,
             scaling=scaling,
-            num_key_value_groups=num_key_value_groups,
             visible_lengths=visible_lengths,
         )
 
-    monkeypatch.setattr(model_ops, "materialized_kv_single_token_decode_attention", _stub_materialized_decode)
+    monkeypatch.setattr(model_ops, "paged_kv_single_token_decode_attention", _stub_paged_decode)
     config = Qwen3_5TextConfig(
         hidden_size=128,
         intermediate_size=256,
@@ -509,8 +577,8 @@ def test_qwen3_attention_xpu_single_token_decode_uses_materialized_kv_path(monke
     assert calls == [
         (
             torch.Size([1, config.num_attention_heads, 1, config.head_dim]),
-            torch.Size([1, config.num_key_value_heads, 7, config.head_dim]),
-            config.num_attention_heads // config.num_key_value_heads,
+            torch.Size([16, config.num_key_value_heads, config.cache_block_size, config.head_dim]),
+            torch.Size([1, 1]),
             (7,),
         )
     ]
