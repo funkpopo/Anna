@@ -12,6 +12,7 @@ from typing import Any, Iterator, Literal, cast
 import torch
 
 from anna.mm.qwen3_5_text_processor import PreparedInputs, Qwen3_5TextMultimodalProcessor
+from anna.model.fused_ops import maybe_load_gated_delta_library, paged_gqa_decode_fused_is_available
 from anna.model.quantization import convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
@@ -276,8 +277,17 @@ class AnnaQwen3_5TextEngine:
         self.resident_expert_layers = len(self.resident_expert_layer_indices)
         self.cached_experts_per_layer = max(0, int(cached_experts_per_layer))
         self.optimization_config = self._normalize_optimization_config(optimization_config)
-        self.cache_allocator = Qwen3PageAllocator(self.config.text_config)
-        self.full_attention_cache_mirror = bool(self.cache_allocator.full_attention_layer_indices)
+        use_paged_full_attention_decode = False
+        if self.device_context.device.type == "xpu":
+            maybe_load_gated_delta_library()
+            use_paged_full_attention_decode = paged_gqa_decode_fused_is_available()
+        self.cache_allocator = Qwen3PageAllocator(
+            self.config.text_config,
+            maintain_full_attention_mirror=not use_paged_full_attention_decode,
+        )
+        self.full_attention_cache_mirror = (
+            self.cache_allocator.maintain_full_attention_mirror and bool(self.cache_allocator.full_attention_layer_indices)
+        )
         self.optimization_config = replace(
             self.optimization_config,
             prefill_chunk_size=self._resolve_prefill_chunk_size(self.optimization_config.prefill_chunk_size),
@@ -1215,13 +1225,29 @@ class AnnaQwen3_5TextEngine:
             and prepared.input_features is None
         )
 
-    @staticmethod
-    def _has_multimodal_inputs(prepared: PreparedInputs) -> bool:
-        return (
-            prepared.pixel_values is not None
-            or prepared.pixel_values_videos is not None
-            or prepared.input_features is not None
-        )
+    def _has_multimodal_inputs(self, prepared: PreparedInputs) -> bool:
+        return any(getattr(prepared, key) is not None for key in self._forward_multimodal_input_keys())
+
+    def _build_prefill_model_kwargs(
+        self,
+        prepared: PreparedInputs,
+        *,
+        token_slice: slice | None = None,
+        include_media: bool = True,
+    ) -> dict[str, object]:
+        mm_token_type_ids = prepared.mm_token_type_ids
+        if token_slice is not None and mm_token_type_ids is not None:
+            mm_token_type_ids = mm_token_type_ids[:, token_slice]
+        return {
+            "pixel_values": prepared.pixel_values if include_media else None,
+            "pixel_values_videos": prepared.pixel_values_videos if include_media else None,
+            "image_grid_thw": prepared.image_grid_thw if include_media else None,
+            "video_grid_thw": prepared.video_grid_thw if include_media else None,
+            "mm_token_type_ids": mm_token_type_ids,
+        }
+
+    def _forward_multimodal_input_keys(self) -> tuple[str, ...]:
+        return ("pixel_values", "pixel_values_videos")
 
     @staticmethod
     def _profile_memory_stats_snapshot(memory_stats: dict[str, int | float] | None) -> dict[str, int | float] | None:
@@ -1273,15 +1299,7 @@ class AnnaQwen3_5TextEngine:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         past_key_values: object | None = None,
-        pixel_values: torch.Tensor | None = None,
-        image_position_ids: torch.Tensor | None = None,
-        pixel_values_videos: torch.Tensor | None = None,
-        input_features: torch.Tensor | None = None,
-        input_features_mask: torch.Tensor | None = None,
-        image_grid_thw: torch.Tensor | None = None,
-        video_position_ids: torch.Tensor | None = None,
-        video_grid_thw: torch.Tensor | None = None,
-        mm_token_type_ids: torch.Tensor | None = None,
+        model_kwargs: dict[str, object] | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
     ):
@@ -1290,15 +1308,7 @@ class AnnaQwen3_5TextEngine:
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
-                pixel_values=pixel_values,
-                image_position_ids=image_position_ids,
-                pixel_values_videos=pixel_values_videos,
-                input_features=input_features,
-                input_features_mask=input_features_mask,
-                image_grid_thw=image_grid_thw,
-                video_position_ids=video_position_ids,
-                video_grid_thw=video_grid_thw,
-                mm_token_type_ids=mm_token_type_ids,
+                model_kwargs=model_kwargs,
                 use_cache=use_cache,
                 logits_to_keep=logits_to_keep,
             )
@@ -1311,15 +1321,7 @@ class AnnaQwen3_5TextEngine:
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
-            pixel_values=pixel_values,
-            image_position_ids=image_position_ids,
-            pixel_values_videos=pixel_values_videos,
-            input_features=input_features,
-            input_features_mask=input_features_mask,
-            image_grid_thw=image_grid_thw,
-            video_position_ids=video_position_ids,
-            video_grid_thw=video_grid_thw,
-            mm_token_type_ids=mm_token_type_ids,
+            model_kwargs=model_kwargs,
             use_cache=use_cache,
             logits_to_keep=logits_to_keep,
         )
@@ -1429,15 +1431,6 @@ class AnnaQwen3_5TextEngine:
 
         input_ids = prepared.input_ids
         attention_mask = prepared.attention_mask
-        mm_token_type_ids = prepared.mm_token_type_ids
-        pixel_values = prepared.pixel_values
-        image_position_ids = prepared.image_position_ids
-        image_grid_thw = prepared.image_grid_thw
-        pixel_values_videos = prepared.pixel_values_videos
-        video_position_ids = prepared.video_position_ids
-        video_grid_thw = prepared.video_grid_thw
-        input_features = prepared.input_features
-        input_features_mask = prepared.input_features_mask
         past_key_values = None
         outputs = None
         chunk_size = self.optimization_config.prefill_chunk_size
@@ -1454,15 +1447,11 @@ class AnnaQwen3_5TextEngine:
                         input_ids=input_ids[:, start_idx:end_idx],
                         attention_mask=attention_mask[:, :end_idx] if start_idx == 0 else None,
                         past_key_values=past_key_values,
-                        pixel_values=pixel_values,
-                        image_position_ids=image_position_ids,
-                        pixel_values_videos=pixel_values_videos,
-                        input_features=input_features,
-                        input_features_mask=input_features_mask,
-                        image_grid_thw=image_grid_thw,
-                        video_position_ids=video_position_ids,
-                        video_grid_thw=video_grid_thw,
-                        mm_token_type_ids=mm_token_type_ids[:, start_idx:end_idx] if mm_token_type_ids is not None else None,
+                        model_kwargs=self._build_prefill_model_kwargs(
+                            prepared,
+                            token_slice=slice(start_idx, end_idx),
+                            include_media=start_idx == 0,
+                        ),
                         use_cache=True,
                         logits_to_keep=1,
                     )
@@ -1472,29 +1461,13 @@ class AnnaQwen3_5TextEngine:
                         if chunk_tokens > 0:
                             metrics.record_prompt_tokens(chunk_tokens)
                             prompt_tokens_recorded += chunk_tokens
-                    pixel_values = None
-                    image_position_ids = None
-                    image_grid_thw = None
-                    pixel_values_videos = None
-                    input_features = None
-                    input_features_mask = None
-                    video_position_ids = None
-                    video_grid_thw = None
             else:
                 outputs = self._profiled_forward_generation_model(
                     stage="prefill",
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     past_key_values=None,
-                    pixel_values=pixel_values,
-                    image_position_ids=image_position_ids,
-                    pixel_values_videos=pixel_values_videos,
-                    input_features=input_features,
-                    input_features_mask=input_features_mask,
-                    image_grid_thw=image_grid_thw,
-                    video_position_ids=video_position_ids,
-                    video_grid_thw=video_grid_thw,
-                    mm_token_type_ids=mm_token_type_ids,
+                    model_kwargs=self._build_prefill_model_kwargs(prepared, include_media=True),
                     use_cache=True,
                     logits_to_keep=1,
                 )
@@ -1530,23 +1503,18 @@ class AnnaQwen3_5TextEngine:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         past_key_values: object | None = None,
-        pixel_values: torch.Tensor | None = None,
-        image_position_ids: torch.Tensor | None = None,
-        pixel_values_videos: torch.Tensor | None = None,
-        input_features: torch.Tensor | None = None,
-        input_features_mask: torch.Tensor | None = None,
-        image_grid_thw: torch.Tensor | None = None,
-        video_position_ids: torch.Tensor | None = None,
-        video_grid_thw: torch.Tensor | None = None,
-        mm_token_type_ids: torch.Tensor | None = None,
+        model_kwargs: dict[str, object] | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
     ):
         attention_mask = self._prune_trivial_attention_mask(attention_mask)
+        model_kwargs = {} if model_kwargs is None else dict(model_kwargs)
+        has_multimodal_inputs = any(
+            model_kwargs.get(key) is not None
+            for key in self._forward_multimodal_input_keys()
+        )
         if (
-            pixel_values is None
-            and pixel_values_videos is None
-            and input_features is None
+            not has_multimodal_inputs
             and hasattr(self.model, "forward_text_only")
         ):
             forward_text_only = getattr(self, "_compiled_text_forward", None) or self.model.forward_text_only
@@ -1561,17 +1529,9 @@ class AnnaQwen3_5TextEngine:
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
-            pixel_values=pixel_values,
-            image_position_ids=image_position_ids,
-            pixel_values_videos=pixel_values_videos,
-            input_features=input_features,
-            input_features_mask=input_features_mask,
-            image_grid_thw=image_grid_thw,
-            video_position_ids=video_position_ids,
-            video_grid_thw=video_grid_thw,
-            mm_token_type_ids=mm_token_type_ids,
             use_cache=use_cache,
             logits_to_keep=logits_to_keep,
+            **model_kwargs,
         )
 
     @staticmethod
@@ -2086,11 +2046,6 @@ class AnnaQwen3_5TextEngine:
                                 input_ids=input_ids,
                                 attention_mask=None,
                                 past_key_values=past_key_values,
-                                pixel_values=None,
-                                pixel_values_videos=None,
-                                image_grid_thw=None,
-                                video_grid_thw=None,
-                                mm_token_type_ids=None,
                                 use_cache=True,
                                 logits_to_keep=1,
                             )
@@ -2203,11 +2158,6 @@ class AnnaQwen3_5TextEngine:
                                 input_ids=input_ids,
                                 attention_mask=None,
                                 past_key_values=past_key_values,
-                                pixel_values=None,
-                                pixel_values_videos=None,
-                                image_grid_thw=None,
-                                video_grid_thw=None,
-                                mm_token_type_ids=None,
                                 use_cache=True,
                                 logits_to_keep=1,
                             )

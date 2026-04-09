@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import torch
 
+from anna.mm.gemma4_text_processor import PreparedInputs as GemmaPreparedInputs
 from anna.mm.qwen3_5_text_processor import PreparedInputs
 from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig, Qwen3_5TextConfig
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
 from anna.runtime.device import RuntimeSafetyPolicy
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, EngineOptimizationConfig, GenerationConfig
-from anna.runtime.scheduler import AnnaScheduler
+from anna.runtime.scheduler import AnnaScheduler, SchedulerRequest
 
 
 class _FakeTokenizer:
@@ -343,3 +344,33 @@ def test_scheduler_batches_mixed_length_requests_during_decode() -> None:
         assert snapshot.waiting_requests == 0
     finally:
         scheduler.shutdown()
+
+
+def test_scheduler_batching_preserves_gemma_prepared_input_type() -> None:
+    scheduler = object.__new__(AnnaScheduler)
+    scheduler.engine = type(
+        "Engine",
+        (),
+        {
+            "config": type(
+                "Config",
+                (),
+                {
+                    "text_config": type("TextConfig", (), {"pad_token_id": 0, "vocab_size": 32})(),
+                },
+            )(),
+        },
+    )()
+
+    prepared = GemmaPreparedInputs(
+        prompt="",
+        input_ids=torch.tensor([[4, 5, 6]], dtype=torch.long),
+        attention_mask=torch.ones((1, 3), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 3), dtype=torch.int32),
+    )
+    request = SchedulerRequest(prepared=prepared, config=None, stream=False, prompt_length=3)
+
+    batched = scheduler._batch_text_inputs([request])
+
+    assert isinstance(batched, GemmaPreparedInputs)
+    assert batched.__class__.__module__ == "anna.mm.gemma4_text_processor"

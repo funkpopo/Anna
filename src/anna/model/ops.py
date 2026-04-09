@@ -12,9 +12,11 @@ from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.model.fused_ops import (
     run_causal_conv1d_fused,
     run_gated_delta_fused,
+    run_paged_gqa_decode_fused,
     run_moe_router_fused,
     run_qk_norm_rotary_fused,
     run_rmsnorm_fused,
+    paged_gqa_decode_fused_is_available,
 )
 from anna.model.quantization import convert_module_linears_to_xpu_int4
 
@@ -154,14 +156,18 @@ class Qwen3PagedLayerAllocator:
 
 
 class Qwen3PageAllocator:
-    def __init__(self, config: Qwen3_5TextConfig):
+    def __init__(self, config: Qwen3_5TextConfig, *, maintain_full_attention_mirror: bool = True):
         self.config = config
         self.block_size = max(1, int(config.cache_block_size))
         self.layers = [Qwen3PagedLayerAllocator(self.block_size) for _ in range(config.num_hidden_layers)]
+        self.maintain_full_attention_mirror = bool(maintain_full_attention_mirror)
         self.full_attention_layer_indices = tuple(
             layer_idx for layer_idx, layer_type in enumerate(config.layer_types) if layer_type == "full_attention"
         )
-        self._full_attention_layer_index_set = set(self.full_attention_layer_indices)
+        self.mirrored_full_attention_layer_indices = (
+            self.full_attention_layer_indices if self.maintain_full_attention_mirror else ()
+        )
+        self._mirrored_full_attention_layer_index_set = set(self.mirrored_full_attention_layer_indices)
 
     def allocate(
         self,
@@ -209,7 +215,7 @@ class Qwen3PageAllocator:
         return self
 
     def uses_contiguous_full_attention_mirror(self, layer_idx: int) -> bool:
-        return layer_idx in self._full_attention_layer_index_set
+        return layer_idx in self._mirrored_full_attention_layer_index_set
 
 
 class Qwen3DynamicCache:
@@ -236,6 +242,8 @@ class Qwen3DynamicCache:
         self.visible_key_caches: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
         self.visible_value_caches: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
         self.visible_cache_capacities: list[int] = [0 for _ in range(config.num_hidden_layers)]
+        self.page_table_caches: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
+        self.page_table_capacities: list[int] = [0 for _ in range(config.num_hidden_layers)]
         self.seen_tokens = 0
         self.rope_deltas: torch.Tensor | None = None
         self.reserved_seq_capacity = 0
@@ -265,6 +273,13 @@ class Qwen3DynamicCache:
             return current_capacity
         growth_target = max(self.block_size, current_capacity * 2)
         return max(required_length, growth_target)
+
+    def _next_page_table_capacity(self, layer_idx: int, required_blocks: int) -> int:
+        current_capacity = self.page_table_capacities[layer_idx]
+        if current_capacity >= required_blocks:
+            return current_capacity
+        growth_target = max(1, current_capacity * 2)
+        return max(required_blocks, growth_target)
 
     def _ensure_visible_layer_buffers(
         self,
@@ -328,6 +343,64 @@ class Qwen3DynamicCache:
         self.visible_cache_capacities[layer_idx] = required_capacity
         return new_key_buffer, new_value_buffer
 
+    def _ensure_page_table_layer_buffer(
+        self,
+        layer_idx: int,
+        *,
+        batch_size: int,
+        required_blocks: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        page_table_buffer = self.page_table_caches[layer_idx]
+        required_capacity = self._next_page_table_capacity(layer_idx, required_blocks)
+        compatible = (
+            page_table_buffer is not None
+            and page_table_buffer.shape[0] == batch_size
+            and page_table_buffer.device == device
+            and page_table_buffer.shape[1] >= required_capacity
+        )
+        if compatible:
+            return page_table_buffer
+
+        new_page_table = torch.full((batch_size, required_capacity), -1, device=device, dtype=torch.int32)
+        can_copy_existing = (
+            page_table_buffer is not None
+            and page_table_buffer.shape[0] == batch_size
+            and page_table_buffer.device == device
+        )
+        if can_copy_existing and page_table_buffer.shape[1] > 0:
+            copy_blocks = min(page_table_buffer.shape[1], new_page_table.shape[1])
+            new_page_table[:, :copy_blocks].copy_(page_table_buffer[:, :copy_blocks])
+        self.page_table_caches[layer_idx] = new_page_table
+        self.page_table_capacities[layer_idx] = required_capacity
+        return new_page_table
+
+    def _sync_page_table_layer_buffer(
+        self,
+        layer_idx: int,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        required_blocks = max((len(page_ids) for page_ids in self.page_tables[layer_idx]), default=0)
+        if required_blocks <= 0:
+            self.page_table_caches[layer_idx] = None
+            self.page_table_capacities[layer_idx] = 0
+            return None
+
+        page_table_buffer = self._ensure_page_table_layer_buffer(
+            layer_idx,
+            batch_size=batch_size,
+            required_blocks=required_blocks,
+            device=device,
+        )
+        for batch_idx, page_ids in enumerate(self.page_tables[layer_idx]):
+            if not page_ids:
+                continue
+            page_ids_tensor = torch.tensor(page_ids, device=device, dtype=page_table_buffer.dtype)
+            page_table_buffer[batch_idx, : page_ids_tensor.shape[0]].copy_(page_ids_tensor)
+        return page_table_buffer[:, :required_blocks]
+
     def _update_visible_layer_cache(
         self,
         layer_idx: int,
@@ -361,7 +434,9 @@ class Qwen3DynamicCache:
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         layer_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        *,
+        require_dense_cache: bool = True,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
         batch_size, _, append_length, _ = key_states.shape
         self._ensure_batch_size(batch_size)
         past_lengths = torch.tensor(self.layer_lengths[layer_idx], device=key_states.device, dtype=torch.long)
@@ -401,6 +476,7 @@ class Qwen3DynamicCache:
             self.layer_lengths[layer_idx][batch_idx] = required_length
 
         self.seen_tokens = max(self.get_seq_lengths().tolist(), default=0)
+        self._sync_page_table_layer_buffer(layer_idx, batch_size=batch_size, device=key_states.device)
         if self._uses_contiguous_full_attention_mirror(layer_idx):
             mirrored_key, mirrored_value = self._update_visible_layer_cache(
                 layer_idx,
@@ -408,7 +484,11 @@ class Qwen3DynamicCache:
                 value_states=value_states,
                 past_lengths=past_lengths,
             )
-            return mirrored_key, mirrored_value, past_lengths
+            if require_dense_cache:
+                return mirrored_key, mirrored_value, past_lengths
+            return None, None, past_lengths
+        if not require_dense_cache:
+            return None, None, past_lengths
         gathered_key, gathered_value, _ = self._gather_layer_cache(layer_idx)
         return gathered_key, gathered_value, past_lengths
 
@@ -482,6 +562,35 @@ class Qwen3DynamicCache:
     def visible_value_cache(self, layer_idx: int) -> torch.Tensor | None:
         _, value_tensor, _ = self._gather_layer_cache(layer_idx)
         return value_tensor
+
+    def paged_attention_state(
+        self,
+        layer_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        batch_size = self.get_batch_size()
+        if batch_size == 0:
+            return None
+
+        layer = self.allocator.layers[layer_idx]
+        if layer.key_pages is None or layer.value_pages is None:
+            return None
+
+        visible_lengths = torch.tensor(self.layer_lengths[layer_idx], dtype=torch.long, device=layer.key_pages.device)
+        if visible_lengths.numel() == 0:
+            return None
+
+        required_blocks = max((len(page_ids) for page_ids in self.page_tables[layer_idx]), default=0)
+        if required_blocks <= 0 or int(visible_lengths.max().item()) <= 0:
+            return None
+
+        page_table = self._sync_page_table_layer_buffer(
+            layer_idx,
+            batch_size=batch_size,
+            device=layer.key_pages.device,
+        )
+        if page_table is None:
+            return None
+        return layer.key_pages, layer.value_pages, page_table, visible_lengths
 
     def _gather_layer_cache(self, layer_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
         batch_size = self.get_batch_size()
@@ -702,6 +811,8 @@ class Qwen3DynamicCache:
             self.visible_key_caches[layer_idx] = None
             self.visible_value_caches[layer_idx] = None
             self.visible_cache_capacities[layer_idx] = 0
+            self.page_table_caches[layer_idx] = None
+            self.page_table_capacities[layer_idx] = 0
 
         self.seen_tokens = 0
         self.rope_deltas = None
@@ -728,6 +839,7 @@ class Qwen3DynamicCache:
         self.recurrent_states = [_move_tensor(tensor) for tensor in self.recurrent_states]
         self.visible_key_caches = [_move_tensor(tensor) for tensor in self.visible_key_caches]
         self.visible_value_caches = [_move_tensor(tensor) for tensor in self.visible_value_caches]
+        self.page_table_caches = [_move_tensor(tensor) for tensor in self.page_table_caches]
         self.rope_deltas = _move_tensor(self.rope_deltas)
         self.allocator.to(device=device, dtype=dtype)
         return self
@@ -882,6 +994,25 @@ def materialized_kv_single_token_decode_attention(
     attn_scores = attn_scores.masked_fill(~visible_mask[:, None, None, :], float("-inf"))
     attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
     return torch.matmul(attn_probs, repeated_value_states)
+
+
+def paged_kv_single_token_decode_attention(
+    query_states: torch.Tensor,
+    key_pages: torch.Tensor,
+    value_pages: torch.Tensor,
+    page_table: torch.Tensor,
+    *,
+    scaling: float,
+    visible_lengths: torch.Tensor,
+) -> torch.Tensor:
+    return run_paged_gqa_decode_fused(
+        query=query_states,
+        key_pages=key_pages,
+        value_pages=value_pages,
+        page_table=page_table,
+        visible_lengths=visible_lengths,
+        scaling=scaling,
+    )
 
 
 def apply_mask_to_padding_states(hidden_states: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
@@ -1120,8 +1251,20 @@ class Qwen3Attention(nn.Module):
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         past_lengths = torch.zeros(batch_size, device=hidden_states.device, dtype=torch.long)
+        prefer_paged_decode = (
+            hidden_states.device.type == "xpu"
+            and seq_len == 1
+            and attention_mask is None
+            and past_key_values is not None
+            and paged_gqa_decode_fused_is_available()
+        )
         if past_key_values is not None:
-            key_states, value_states, past_lengths = past_key_values.update(key_states, value_states, self.layer_idx)
+            key_states, value_states, past_lengths = past_key_values.update(
+                key_states,
+                value_states,
+                self.layer_idx,
+                require_dense_cache=not prefer_paged_decode,
+            )
 
         if past_key_values is None and attention_mask is None:
             attn_output = F.scaled_dot_product_attention(
@@ -1136,7 +1279,27 @@ class Qwen3Attention(nn.Module):
             causal_mask = None
             visible_mask = None
             key_padding_mask = None
+            if prefer_paged_decode and past_key_values is not None:
+                visible_lengths = past_lengths + seq_len
+                paged_state = past_key_values.paged_attention_state(self.layer_idx)
+                if paged_state is not None:
+                    key_pages, value_pages, page_table, _ = paged_state
+                    attn_output = paged_kv_single_token_decode_attention(
+                        query_states,
+                        key_pages,
+                        value_pages,
+                        page_table,
+                        scaling=self.scaling,
+                        visible_lengths=visible_lengths,
+                    )
+                    attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
+                    attn_output = attn_output * torch.sigmoid(gate)
+                    return self.o_proj(attn_output)
             if attention_mask is None and past_key_values is not None and seq_len == 1 and hidden_states.device.type == "xpu":
+                if key_states is None or value_states is None:
+                    key_states, value_states, _ = past_key_values._gather_layer_cache(self.layer_idx)
+                    if key_states is None or value_states is None:
+                        raise RuntimeError("Failed to materialize KV cache for Qwen single-token decode.")
                 visible_lengths = past_lengths + seq_len
                 attn_output = materialized_kv_single_token_decode_attention(
                     query_states,

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import inspect
+
 import imageio.v3 as iio
 import numpy as np
 import torch
 
 from anna.mm.qwen3_5_text_processor import Qwen3_5TextMultimodalProcessor
+from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig, Qwen3_5TextConfig, Qwen3_5TextVisionConfig, VisionPreprocessorConfig
 from anna.weights.qwen3_5_text_tokenizer import Qwen3_5TextTokenizer
 
@@ -281,3 +284,47 @@ def test_processor_loads_local_video_file(tmp_path) -> None:
     assert len(decoded_frames) == 3
     assert round(fps, 2) == 2.0
     assert decoded_frames[0].size == (64, 64)
+
+
+def test_qwen3_conditional_generation_signature_uses_grid_metadata_only() -> None:
+    signature = inspect.signature(Qwen3_5TextForConditionalGeneration.forward)
+
+    assert "image_grid_thw" in signature.parameters
+    assert "video_grid_thw" in signature.parameters
+    assert "image_position_ids" not in signature.parameters
+    assert "video_position_ids" not in signature.parameters
+    assert "input_features" not in signature.parameters
+    assert "input_features_mask" not in signature.parameters
+
+
+def test_qwen3_conditional_generation_uses_qwen_multimodal_grid_metadata() -> None:
+    config = _config()
+    config.text_config.layer_types = ["full_attention"] * config.text_config.num_hidden_layers
+    config.image_token_id = 101
+    config.video_token_id = 102
+    config.vision_start_token_id = 103
+    config.vision_end_token_id = 104
+    model = Qwen3_5TextForConditionalGeneration(config).eval()
+    model.tie_weights()
+    model.configure_runtime(torch.device("cpu"), offload_vision=False)
+
+    input_ids = torch.tensor([[11, 12, config.image_token_id, config.image_token_id, config.image_token_id, config.image_token_id, 13]])
+    attention_mask = torch.ones_like(input_ids)
+    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int32)
+    mm_token_type_ids[:, 2:6] = 1
+    pixel_values = torch.randn(16, 24)
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            pixel_values_videos=None,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=None,
+            mm_token_type_ids=mm_token_type_ids,
+            use_cache=False,
+        )
+
+    assert outputs.logits.shape == (1, input_ids.shape[1], config.text_config.vocab_size)

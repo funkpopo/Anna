@@ -434,24 +434,11 @@ def test_forward_generation_model_uses_text_fast_path_for_text_only_requests() -
     engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.model = _FakeModel()
 
-    prepared = type(
-        "Prepared",
-        (),
-        {
-            "pixel_values": None,
-            "pixel_values_videos": None,
-        },
-    )()
-
     engine._forward_generation_model(
         input_ids=object(),
         attention_mask=None,
         past_key_values=None,
-        pixel_values=prepared.pixel_values,
-        pixel_values_videos=prepared.pixel_values_videos,
-        image_grid_thw=None,
-        video_grid_thw=None,
-        mm_token_type_ids=None,
+        model_kwargs={"mm_token_type_ids": None},
         use_cache=True,
         logits_to_keep=1,
     )
@@ -481,11 +468,7 @@ def test_forward_generation_model_prefers_compiled_text_fast_path_when_available
         input_ids=object(),
         attention_mask=None,
         past_key_values=None,
-        pixel_values=None,
-        pixel_values_videos=None,
-        image_grid_thw=None,
-        video_grid_thw=None,
-        mm_token_type_ids=None,
+        model_kwargs={"mm_token_type_ids": None},
         use_cache=True,
         logits_to_keep=1,
     )
@@ -498,13 +481,15 @@ def test_forward_generation_model_keeps_full_path_for_multimodal_requests() -> N
     class _FakeModel:
         def __init__(self) -> None:
             self.calls: list[str] = []
+            self.kwargs: dict[str, object] | None = None
 
         def forward_text_only(self, **_kwargs):
             self.calls.append("text")
             return object()
 
-        def __call__(self, **_kwargs):
+        def __call__(self, **kwargs):
             self.calls.append("full")
+            self.kwargs = kwargs
             return object()
 
     engine = object.__new__(AnnaQwen3_5TextEngine)
@@ -514,16 +499,25 @@ def test_forward_generation_model_keeps_full_path_for_multimodal_requests() -> N
         input_ids=object(),
         attention_mask=None,
         past_key_values=None,
-        pixel_values=object(),
-        pixel_values_videos=None,
-        image_grid_thw=object(),
-        video_grid_thw=None,
-        mm_token_type_ids=object(),
+        model_kwargs={
+            "pixel_values": object(),
+            "pixel_values_videos": None,
+            "image_grid_thw": object(),
+            "video_grid_thw": None,
+            "mm_token_type_ids": object(),
+        },
         use_cache=True,
         logits_to_keep=1,
     )
 
     assert engine.model.calls == ["full"]
+    assert engine.model.kwargs is not None
+    assert "image_grid_thw" in engine.model.kwargs
+    assert "video_grid_thw" in engine.model.kwargs
+    assert "image_position_ids" not in engine.model.kwargs
+    assert "video_position_ids" not in engine.model.kwargs
+    assert "input_features" not in engine.model.kwargs
+    assert "input_features_mask" not in engine.model.kwargs
 
 
 def test_prefill_generation_chunks_long_text_prompts() -> None:

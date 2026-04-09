@@ -17,11 +17,26 @@ import soundfile as sf
 import torch
 from PIL import Image
 
-from anna.mm.qwen3_5_text_processor import PreparedInputs
 from anna.weights.gemma4_tokenizer import Gemma4Tokenizer
 
 
 _SUPPORTED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
+
+
+@dataclass(slots=True)
+class PreparedInputs:
+    prompt: str
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    mm_token_type_ids: torch.Tensor
+    pixel_values: torch.Tensor | None = None
+    image_position_ids: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
+    pixel_values_videos: torch.Tensor | None = None
+    video_position_ids: torch.Tensor | None = None
+    video_grid_thw: torch.Tensor | None = None
+    input_features: torch.Tensor | None = None
+    input_features_mask: torch.Tensor | None = None
 
 
 def _unfold_audio(array: np.ndarray, size: int, step: int) -> np.ndarray:

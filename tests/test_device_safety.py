@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from anna.mm.gemma4_text_processor import PreparedInputs as GemmaPreparedInputs
 from anna.runtime.device import DeviceContext
 from anna.mm.qwen3_5_text_processor import PreparedInputs
 
@@ -33,3 +34,20 @@ def test_move_prepared_inputs_returns_same_object_when_tensors_already_match_tar
     moved = context.move_prepared_inputs(prepared)
 
     assert moved is prepared
+
+
+def test_move_prepared_inputs_preserves_gemma_prepared_input_type() -> None:
+    context = DeviceContext.resolve(device="cpu", dtype="fp32", model_dtype="float32")
+    prepared = GemmaPreparedInputs(
+        prompt="gemma",
+        input_ids=torch.ones((1, 3), dtype=torch.long),
+        attention_mask=torch.ones((1, 3), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 3), dtype=torch.int32),
+        input_features=torch.randn((1, 2, 4), dtype=torch.float32),
+        input_features_mask=torch.ones((1, 2), dtype=torch.bool),
+    )
+
+    moved = context.move_prepared_inputs(prepared)
+
+    assert isinstance(moved, GemmaPreparedInputs)
+    assert moved.__class__.__module__ == "anna.mm.gemma4_text_processor"

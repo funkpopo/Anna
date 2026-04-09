@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from anna.mm.qwen3_5_text_processor import PreparedInputs
+from anna.mm.prepared_inputs import PreparedInputsT, replace_prepared_inputs
 from anna.model.ops import Qwen3DynamicCache
 
 
@@ -172,7 +172,7 @@ class DeviceContext:
             return tensor.to(device=self.device, non_blocking=self.migration_policy.non_blocking)
         return tensor.to(device=self.device, dtype=target_dtype, non_blocking=self.migration_policy.non_blocking)
 
-    def move_prepared_inputs(self, prepared: PreparedInputs) -> PreparedInputs:
+    def move_prepared_inputs(self, prepared: PreparedInputsT) -> PreparedInputsT:
         input_ids = self._move_tensor(prepared.input_ids, dtype=torch.long)
         attention_mask = self._move_tensor(prepared.attention_mask, dtype=torch.long)
         mm_token_type_ids = self._move_tensor(prepared.mm_token_type_ids, dtype=torch.int32)
@@ -198,8 +198,8 @@ class DeviceContext:
             and input_features_mask is prepared.input_features_mask
         ):
             return prepared
-        return PreparedInputs(
-            prompt=prepared.prompt,
+        return replace_prepared_inputs(
+            prepared,
             input_ids=input_ids,
             attention_mask=attention_mask,
             mm_token_type_ids=mm_token_type_ids,

@@ -225,6 +225,51 @@ void validate_gqa_decode_xpu_inputs(
   TORCH_CHECK(visible_lengths.device() == device, "visible_lengths must be on the same device as query");
 }
 
+void validate_paged_gqa_decode_inputs(
+    const at::Tensor& query,
+    const at::Tensor& key_pages,
+    const at::Tensor& value_pages,
+    const at::Tensor& page_table,
+    const at::Tensor& visible_lengths) {
+  TORCH_CHECK(query.dim() == 4, "query must be [batch, heads, 1, head_dim]");
+  TORCH_CHECK(key_pages.dim() == 4, "key_pages must be [pages, kv_heads, block_size, head_dim]");
+  TORCH_CHECK(value_pages.dim() == 4, "value_pages must be [pages, kv_heads, block_size, head_dim]");
+  TORCH_CHECK(page_table.dim() == 2, "page_table must be [batch, max_blocks]");
+  TORCH_CHECK(visible_lengths.dim() == 1, "visible_lengths must be [batch]");
+  TORCH_CHECK(query.size(2) == 1, "paged_gqa_decode_fused only supports single-token query");
+  TORCH_CHECK(key_pages.sizes() == value_pages.sizes(), "key_pages and value_pages must share the same shape");
+  TORCH_CHECK(query.size(0) == page_table.size(0), "query/page_table batch size mismatch");
+  TORCH_CHECK(query.size(0) == visible_lengths.size(0), "query/visible_lengths batch size mismatch");
+  TORCH_CHECK(key_pages.size(0) >= 1, "number of pages must be positive");
+  TORCH_CHECK(key_pages.size(1) >= 1, "kv_heads must be positive");
+  TORCH_CHECK(key_pages.size(2) >= 1, "block_size must be positive");
+  TORCH_CHECK(query.size(1) % key_pages.size(1) == 0, "query heads must be divisible by kv_heads");
+  TORCH_CHECK(query.size(3) == key_pages.size(3), "query/key_pages head_dim mismatch");
+  TORCH_CHECK(
+      query.scalar_type() == key_pages.scalar_type() && query.scalar_type() == value_pages.scalar_type(),
+      "query, key_pages, and value_pages must share the same dtype");
+  TORCH_CHECK(page_table.scalar_type() == at::kInt, "page_table must be int32");
+  TORCH_CHECK(visible_lengths.scalar_type() == at::kLong, "visible_lengths must be int64");
+  TORCH_CHECK(
+      query.scalar_type() == at::kHalf || query.scalar_type() == at::kBFloat16 ||
+          query.scalar_type() == at::kFloat,
+      "paged_gqa_decode_fused XPU kernel supports float16, bfloat16, and float32 inputs");
+}
+
+void validate_paged_gqa_decode_xpu_inputs(
+    const at::Tensor& query,
+    const at::Tensor& key_pages,
+    const at::Tensor& value_pages,
+    const at::Tensor& page_table,
+    const at::Tensor& visible_lengths) {
+  auto device = query.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "query must be an XPU tensor");
+  TORCH_CHECK(key_pages.device() == device, "key_pages must be on the same device as query");
+  TORCH_CHECK(value_pages.device() == device, "value_pages must be on the same device as query");
+  TORCH_CHECK(page_table.device() == device, "page_table must be on the same device as query");
+  TORCH_CHECK(visible_lengths.device() == device, "visible_lengths must be on the same device as query");
+}
+
 void validate_causal_conv_inputs(
     const at::Tensor& hidden_states,
     const at::Tensor& conv_state,
@@ -968,6 +1013,146 @@ at::Tensor gqa_decode_fused_xpu(
   return output;
 }
 
+at::Tensor paged_gqa_decode_fused_meta(
+    const at::Tensor& query,
+    const at::Tensor& key_pages,
+    const at::Tensor& value_pages,
+    const at::Tensor& page_table,
+    const at::Tensor& visible_lengths,
+    double /*scaling*/) {
+  validate_paged_gqa_decode_inputs(query, key_pages, value_pages, page_table, visible_lengths);
+  auto meta_options = query.options().device(c10::Device(c10::DeviceType::Meta));
+  return at::empty(query.sizes(), meta_options);
+}
+
+at::Tensor paged_gqa_decode_fused_xpu(
+    const at::Tensor& query_in,
+    const at::Tensor& key_pages_in,
+    const at::Tensor& value_pages_in,
+    const at::Tensor& page_table_in,
+    const at::Tensor& visible_lengths_in,
+    double scaling) {
+  validate_paged_gqa_decode_inputs(query_in, key_pages_in, value_pages_in, page_table_in, visible_lengths_in);
+  validate_paged_gqa_decode_xpu_inputs(query_in, key_pages_in, value_pages_in, page_table_in, visible_lengths_in);
+
+  auto query = query_in.contiguous();
+  auto key_pages = key_pages_in.contiguous();
+  auto value_pages = value_pages_in.contiguous();
+  auto page_table = page_table_in.contiguous();
+  auto visible_lengths = visible_lengths_in.contiguous();
+  auto output = at::empty(query.sizes(), query.options());
+
+  const auto batch_size = query.size(0);
+  const auto num_heads = query.size(1);
+  const auto num_kv_heads = key_pages.size(1);
+  const auto block_size = key_pages.size(2);
+  const auto head_dim = query.size(3);
+  const auto max_blocks = page_table.size(1);
+  const auto max_visible_len = max_blocks * block_size;
+  const auto total_pages = key_pages.size(0);
+  const auto groups_per_kv_head = num_heads / num_kv_heads;
+  const int64_t local_size =
+      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(head_dim, 128))), 128);
+  constexpr int64_t kMaxAccumSlots = 8;
+  TORCH_CHECK(
+      ((head_dim + local_size - 1) / local_size) <= kMaxAccumSlots,
+      "paged_gqa_decode_fused_xpu head_dim is too large for the current accumulator configuration");
+  const float scaling_f = static_cast<float>(scaling);
+  auto stream = c10::xpu::getCurrentXPUStream(query.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      query.scalar_type(),
+      "paged_gqa_decode_fused_xpu",
+      [&] {
+        const scalar_t* query_ptr = query.const_data_ptr<scalar_t>();
+        const scalar_t* key_pages_ptr = key_pages.const_data_ptr<scalar_t>();
+        const scalar_t* value_pages_ptr = value_pages.const_data_ptr<scalar_t>();
+        const int32_t* page_table_ptr = page_table.const_data_ptr<int32_t>();
+        const int64_t* visible_lengths_ptr = visible_lengths.const_data_ptr<int64_t>();
+        scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
+        const size_t group_count = static_cast<size_t>(batch_size * num_heads);
+
+        stream.queue().submit([&](sycl::handler& cgh) {
+          sycl::local_accessor<float, 1> partial_dot(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
+          cgh.parallel_for(
+              sycl::nd_range<2>(
+                  sycl::range<2>(group_count, static_cast<size_t>(local_size)),
+                  sycl::range<2>(1, static_cast<size_t>(local_size))),
+              [=](sycl::nd_item<2> item) {
+                const int64_t bh = static_cast<int64_t>(item.get_group(0));
+                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+                const int64_t batch_idx = bh / num_heads;
+                const int64_t head_idx = bh % num_heads;
+                const int64_t kv_head_idx = head_idx / groups_per_kv_head;
+                const int64_t query_base = ((batch_idx * num_heads + head_idx) * head_dim);
+                const int64_t output_base = query_base;
+
+                int64_t visible_len = visible_lengths_ptr[batch_idx];
+                visible_len = sycl::max<int64_t>(0, sycl::min<int64_t>(visible_len, max_visible_len));
+                float running_max = -std::numeric_limits<float>::infinity();
+                float denom = 0.0f;
+                float accumulators[kMaxAccumSlots];
+                for (int64_t slot = 0; slot < kMaxAccumSlots; ++slot) {
+                  accumulators[slot] = 0.0f;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int64_t key_idx = 0; key_idx < visible_len; ++key_idx) {
+                  const int64_t block_idx = key_idx / block_size;
+                  const int64_t block_offset = key_idx % block_size;
+                  const int32_t page_id = page_table_ptr[batch_idx * max_blocks + block_idx];
+                  if (page_id < 0 || page_id >= total_pages) {
+                    continue;
+                  }
+
+                  const int64_t page_base =
+                      (((static_cast<int64_t>(page_id) * num_kv_heads) + kv_head_idx) * block_size + block_offset) *
+                      head_dim;
+                  float local_dot = 0.0f;
+                  for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size) {
+                    local_dot +=
+                        load_as_float(query_ptr, query_base + dim_idx) *
+                        load_as_float(key_pages_ptr, page_base + dim_idx);
+                  }
+                  partial_dot[lane] = local_dot;
+                  item.barrier(sycl::access::fence_space::local_space);
+
+                  for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
+                    if (lane < stride) {
+                      partial_dot[lane] += partial_dot[lane + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                  }
+
+                  const float score = partial_dot[0] * scaling_f;
+                  const float new_max = sycl::fmax(running_max, score);
+                  const float old_scale = denom == 0.0f ? 0.0f : sycl::exp(running_max - new_max);
+                  const float score_scale = sycl::exp(score - new_max);
+                  int64_t slot = 0;
+                  for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size, ++slot) {
+                    accumulators[slot] =
+                        accumulators[slot] * old_scale +
+                        score_scale * load_as_float(value_pages_ptr, page_base + dim_idx);
+                  }
+                  denom = denom * old_scale + score_scale;
+                  running_max = new_max;
+                  item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                int64_t slot = 0;
+                for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size, ++slot) {
+                  const float out_value = denom > 0.0f ? accumulators[slot] / denom : 0.0f;
+                  output_ptr[output_base + dim_idx] = static_cast<scalar_t>(out_value);
+                }
+              });
+        });
+      });
+
+  return output;
+}
+
 std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_meta(
     const at::Tensor& query_in,
     const at::Tensor& key_in,
@@ -1207,6 +1392,15 @@ TORCH_LIBRARY(anna, m) {
       "float scaling"
       ") -> Tensor");
   m.def(
+      "paged_gqa_decode_fused("
+      "Tensor query, "
+      "Tensor key_pages, "
+      "Tensor value_pages, "
+      "Tensor page_table, "
+      "Tensor visible_lengths, "
+      "float scaling"
+      ") -> Tensor");
+  m.def(
       "moe_router_fused("
       "Tensor router_logits, "
       "int top_k, "
@@ -1272,6 +1466,7 @@ TORCH_LIBRARY(anna, m) {
 
 TORCH_LIBRARY_IMPL(anna, Meta, m) {
   m.impl("gqa_decode_fused", anna::gqa_decode_fused_meta);
+  m.impl("paged_gqa_decode_fused", anna::paged_gqa_decode_fused_meta);
   m.impl("moe_router_fused", anna::moe_router_fused_meta);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_meta);
   m.impl("rmsnorm_fused_ex", anna::rmsnorm_fused_ex_meta);
@@ -1283,6 +1478,7 @@ TORCH_LIBRARY_IMPL(anna, Meta, m) {
 
 TORCH_LIBRARY_IMPL(anna, XPU, m) {
   m.impl("gqa_decode_fused", anna::gqa_decode_fused_xpu);
+  m.impl("paged_gqa_decode_fused", anna::paged_gqa_decode_fused_xpu);
   m.impl("moe_router_fused", anna::moe_router_fused_xpu);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_xpu);
   m.impl("rmsnorm_fused_ex", anna::rmsnorm_fused_ex_xpu);
