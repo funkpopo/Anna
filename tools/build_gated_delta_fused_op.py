@@ -103,6 +103,7 @@ def main() -> None:
         gqa_decode_fused_is_available,
         maybe_load_gated_delta_library,
         moe_router_fused_is_available,
+        paged_gqa_decode_fused_is_available,
         qk_norm_rotary_fused_ex_is_available,
         qk_norm_rotary_fused_is_available,
         rmsnorm_fused_ex_is_available,
@@ -114,6 +115,7 @@ def main() -> None:
 
     print(f"library_path={output}")
     print(f"gqa_decode_registered={gqa_decode_fused_is_available()}")
+    print(f"paged_gqa_decode_registered={paged_gqa_decode_fused_is_available()}")
     print(f"moe_router_registered={moe_router_fused_is_available()}")
     print(f"rmsnorm_registered={rmsnorm_fused_is_available()}")
     print(f"rmsnorm_ex_registered={rmsnorm_fused_ex_is_available()}")

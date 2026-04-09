@@ -72,6 +72,13 @@ def _gqa_decode_op():
     return getattr(namespace, "gqa_decode_fused", None)
 
 
+def _paged_gqa_decode_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "paged_gqa_decode_fused", None)
+
+
 def _moe_router_op():
     namespace = getattr(torch.ops, "anna", None)
     if namespace is None:
@@ -116,6 +123,10 @@ def _causal_conv1d_op():
 
 def gqa_decode_fused_is_available() -> bool:
     return _gqa_decode_op() is not None
+
+
+def paged_gqa_decode_fused_is_available() -> bool:
+    return _paged_gqa_decode_op() is not None
 
 
 def moe_router_fused_is_available() -> bool:
@@ -201,6 +212,27 @@ def run_gqa_decode_fused(
             "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
         )
     return op(query, key, value, visible_lengths, float(scaling))
+
+
+def run_paged_gqa_decode_fused(
+    *,
+    query: torch.Tensor,
+    key_pages: torch.Tensor,
+    value_pages: torch.Tensor,
+    page_table: torch.Tensor,
+    visible_lengths: torch.Tensor,
+    scaling: float,
+) -> torch.Tensor:
+    op = _paged_gqa_decode_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _paged_gqa_decode_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna paged_gqa_decode_fused op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(query, key_pages, value_pages, page_table, visible_lengths, float(scaling))
 
 
 def run_moe_router_fused(

@@ -12,6 +12,7 @@ from typing import Any, Iterator, Literal, cast
 import torch
 
 from anna.mm.qwen3_5_text_processor import PreparedInputs, Qwen3_5TextMultimodalProcessor
+from anna.model.fused_ops import maybe_load_gated_delta_library, paged_gqa_decode_fused_is_available
 from anna.model.quantization import convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
@@ -276,8 +277,17 @@ class AnnaQwen3_5TextEngine:
         self.resident_expert_layers = len(self.resident_expert_layer_indices)
         self.cached_experts_per_layer = max(0, int(cached_experts_per_layer))
         self.optimization_config = self._normalize_optimization_config(optimization_config)
-        self.cache_allocator = Qwen3PageAllocator(self.config.text_config)
-        self.full_attention_cache_mirror = bool(self.cache_allocator.full_attention_layer_indices)
+        use_paged_full_attention_decode = False
+        if self.device_context.device.type == "xpu":
+            maybe_load_gated_delta_library()
+            use_paged_full_attention_decode = paged_gqa_decode_fused_is_available()
+        self.cache_allocator = Qwen3PageAllocator(
+            self.config.text_config,
+            maintain_full_attention_mirror=not use_paged_full_attention_decode,
+        )
+        self.full_attention_cache_mirror = (
+            self.cache_allocator.maintain_full_attention_mirror and bool(self.cache_allocator.full_attention_layer_indices)
+        )
         self.optimization_config = replace(
             self.optimization_config,
             prefill_chunk_size=self._resolve_prefill_chunk_size(self.optimization_config.prefill_chunk_size),
