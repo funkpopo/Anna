@@ -594,6 +594,43 @@ def test_prefill_generation_reuses_prompt_cache_for_exact_prompt_matches() -> No
     assert first.prompt_cache_hit is False
     assert second.prompt_cache_hit is True
     assert second.logits.item() == 11.0
+    cached_entry = engine._prompt_cache[tuple(int(token) for token in prepared.input_ids[0].tolist())]
+    assert second.logits.data_ptr() == cached_entry.logits.data_ptr()
+
+
+def test_prefill_generation_skips_prompt_cache_when_prompt_is_over_token_threshold() -> None:
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.optimization_config = EngineOptimizationConfig(
+        prompt_cache_size=4,
+        prompt_cache_max_tokens=3,
+    )
+    engine._prompt_cache = OrderedDict()
+    engine._compiled_text_forward = None
+    forward_calls: list[int] = []
+
+    def _fake_forward(self, **_kwargs):
+        forward_calls.append(1)
+        return SimpleNamespace(
+            logits=torch.tensor([[[17.0]]]),
+            past_key_values=SimpleNamespace(clone=lambda: SimpleNamespace(), release=lambda: None),
+        )
+
+    engine._forward_generation_model = MethodType(_fake_forward, engine)
+
+    prepared = PreparedInputs(
+        prompt="do not cache long prompt",
+        input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        attention_mask=torch.ones((1, 4), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 4), dtype=torch.int32),
+    )
+
+    first = engine._prefill_generation_prompt(prepared)
+    second = engine._prefill_generation_prompt(prepared)
+
+    assert len(forward_calls) == 2
+    assert first.prompt_cache_hit is False
+    assert second.prompt_cache_hit is False
+    assert len(engine._prompt_cache) == 0
 
 
 def test_incremental_text_assembler_handles_unstable_unicode_suffix() -> None:

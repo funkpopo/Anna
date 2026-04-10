@@ -155,6 +155,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep up to N text-only prompt KV caches resident for exact prompt reuse. Set 0 to disable.",
     )
     parser.add_argument(
+        "--prompt-cache-max-tokens",
+        type=_non_negative_int,
+        default=0,
+        help="Only cache prompts up to N tokens. Set 0 to disable this token threshold.",
+    )
+    parser.add_argument(
         "--profile-runtime",
         action="store_true",
         help="Log synchronized XPU forward timings and memory stats for prefill/decode profiling.",
@@ -276,6 +282,7 @@ def main() -> None:
         compile_fullgraph=args.compile_fullgraph,
         prefill_chunk_size=args.prefill_chunk_size,
         prompt_cache_size=args.prompt_cache_size,
+        prompt_cache_max_tokens=args.prompt_cache_max_tokens,
         profile_runtime=args.profile_runtime,
         default_max_completion_tokens=args.max_completion_tokens,
         default_enable_thinking=args.default_enable_thinking,
@@ -309,6 +316,7 @@ def main() -> None:
         compile_fullgraph=settings.compile_fullgraph,
         prefill_chunk_size=settings.prefill_chunk_size,
         prompt_cache_size=settings.prompt_cache_size,
+        prompt_cache_max_tokens=settings.prompt_cache_max_tokens,
         profile_runtime=settings.profile_runtime,
         safety_policy=_build_safety_policy(settings),
         default_max_completion_tokens=settings.default_max_completion_tokens,
