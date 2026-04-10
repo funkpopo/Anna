@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from collections import OrderedDict
@@ -18,7 +19,7 @@ from anna.model.fused_ops import (
     run_rmsnorm_fused,
     paged_gqa_decode_fused_is_available,
 )
-from anna.model.quantization import convert_module_linears_to_xpu_int4
+from anna.model.quantization import AWQLinear, AutoRoundGPTQLinear, convert_module_linears_to_xpu_int4
 
 logger = logging.getLogger(__name__)
 
@@ -1552,6 +1553,10 @@ class Qwen3SparseMoeBlock(nn.Module):
         return Qwen3MLP(self._config, intermediate_size=self._expert_intermediate_size)
 
     @staticmethod
+    def _has_quantized_linear_payload(module: nn.Module) -> bool:
+        return any(isinstance(child, (AutoRoundGPTQLinear, AWQLinear)) for child in module.modules())
+
+    @staticmethod
     def _copy_module_state_(
         source: nn.Module,
         target: nn.Module,
@@ -1585,7 +1590,20 @@ class Qwen3SparseMoeBlock(nn.Module):
 
         source = self.experts[expert_idx]
         started_at = time.perf_counter()
-        if self._should_use_xpu_int4():
+        if self._has_quantized_linear_payload(source):
+            cached = copy.deepcopy(source)
+            if self._should_use_xpu_int4():
+                convert_module_linears_to_xpu_int4(
+                    cached,
+                    group_size=self.expert_quant_group_size,
+                    device=self.execution_device,
+                )
+            else:
+                cached = cached.to(
+                    device=self.execution_device,
+                    dtype=_module_dtype(source),
+                )
+        elif self._should_use_xpu_int4():
             cached = self._new_expert_module()
             self._copy_module_state_(source, cached, non_blocking=False)
             convert_module_linears_to_xpu_int4(

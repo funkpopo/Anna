@@ -505,6 +505,7 @@ def test_gemma4_runtime_loader_builds_standalone_multimodal_engine(tmp_path) -> 
     assert health["vision_enabled"] is True
     assert health["audio_enabled"] is True
     assert health["weight_quant"] == "none"
+    assert "float8_available" not in health
 
 
 def test_gemma4_runtime_forwards_gemma_only_multimodal_kwargs() -> None:
