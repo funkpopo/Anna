@@ -84,6 +84,7 @@ class AnnaQwen3TTSEngine:
         compile_fullgraph: bool = False,
         prefill_chunk_size: int = 0,
         prompt_cache_size: int = 0,
+        prompt_cache_max_tokens: int = 0,
         profile_runtime: bool = False,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
@@ -123,6 +124,8 @@ class AnnaQwen3TTSEngine:
             ignored_options.append(f"prefill_chunk_size={prefill_chunk_size}")
         if prompt_cache_size:
             ignored_options.append(f"prompt_cache_size={prompt_cache_size}")
+        if prompt_cache_max_tokens:
+            ignored_options.append(f"prompt_cache_max_tokens={prompt_cache_max_tokens}")
         if profile_runtime:
             ignored_options.append("profile_runtime=True")
         if offload_mode != "auto":

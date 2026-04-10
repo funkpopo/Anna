@@ -87,6 +87,7 @@ class EngineOptimizationConfig:
     compile_fullgraph: bool = False
     prefill_chunk_size: int = 0
     prompt_cache_size: int = 0
+    prompt_cache_max_tokens: int = 0
     profile_runtime: bool = False
 
 
@@ -309,6 +310,7 @@ class AnnaQwen3_5TextEngine:
             compile_fullgraph=bool(config.compile_fullgraph),
             prefill_chunk_size=max(0, int(config.prefill_chunk_size)),
             prompt_cache_size=max(0, int(config.prompt_cache_size)),
+            prompt_cache_max_tokens=max(0, int(config.prompt_cache_max_tokens)),
             profile_runtime=bool(config.profile_runtime),
         )
 
@@ -410,6 +412,7 @@ class AnnaQwen3_5TextEngine:
         compile_fullgraph: bool = False,
         prefill_chunk_size: int = 0,
         prompt_cache_size: int = 0,
+        prompt_cache_max_tokens: int = 0,
         profile_runtime: bool = False,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
@@ -599,6 +602,7 @@ class AnnaQwen3_5TextEngine:
                 compile_fullgraph=compile_fullgraph,
                 prefill_chunk_size=prefill_chunk_size,
                 prompt_cache_size=prompt_cache_size,
+                prompt_cache_max_tokens=prompt_cache_max_tokens,
                 profile_runtime=profile_runtime,
             ),
         )
@@ -1071,6 +1075,7 @@ class AnnaQwen3_5TextEngine:
                 "compiled_text_forward": self._compiled_text_forward is not None,
                 "prefill_chunk_size": self.optimization_config.prefill_chunk_size,
                 "prompt_cache_size": self.optimization_config.prompt_cache_size,
+                "prompt_cache_max_tokens": self.optimization_config.prompt_cache_max_tokens,
                 "prompt_cache_entries": len(self._prompt_cache),
                 "profile_runtime": self.optimization_config.profile_runtime,
             },
@@ -1346,6 +1351,9 @@ class AnnaQwen3_5TextEngine:
             return None
         if self._has_multimodal_inputs(prepared):
             return None
+        prompt_cache_max_tokens = self.optimization_config.prompt_cache_max_tokens
+        if prompt_cache_max_tokens > 0 and int(prepared.input_ids.shape[1]) > prompt_cache_max_tokens:
+            return None
         return tuple(int(token_id) for token_id in prepared.input_ids[0].tolist())
 
     def _evict_prompt_cache_entry(self, key: tuple[int, ...], entry: PromptCacheEntry) -> None:
@@ -1371,7 +1379,7 @@ class AnnaQwen3_5TextEngine:
             self._evict_prompt_cache_entry(key, entry)
             return None
         return PromptPrefillResult(
-            logits=entry.logits.clone(),
+            logits=entry.logits,
             past_key_values=cached_past,
             prefill_seconds=time.perf_counter() - started_at,
             prompt_cache_hit=True,
@@ -1403,7 +1411,7 @@ class AnnaQwen3_5TextEngine:
                 release()
 
         self._prompt_cache[key] = PromptCacheEntry(
-            logits=logits.detach().clone(),
+            logits=logits.detach(),
             past_key_values=cached_past,
             prompt_tokens=prompt_tokens,
         )

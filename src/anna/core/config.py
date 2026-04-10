@@ -31,6 +31,7 @@ class ServeSettings:
     compile_fullgraph: bool = False
     prefill_chunk_size: int = 0
     prompt_cache_size: int = 0
+    prompt_cache_max_tokens: int = 0
     profile_runtime: bool = False
     default_max_completion_tokens: int | None = None
     default_enable_thinking: bool = True
@@ -65,6 +66,7 @@ class GenerateSettings:
     compile_fullgraph: bool = False
     prefill_chunk_size: int = 0
     prompt_cache_size: int = 0
+    prompt_cache_max_tokens: int = 0
     profile_runtime: bool = False
     offload_mode: str = "auto"
     offload_vision: bool = False
@@ -121,6 +123,7 @@ class BenchmarkSettings:
     compile_fullgraph: bool = False
     prefill_chunk_size: int = 0
     prompt_cache_size: int = 0
+    prompt_cache_max_tokens: int = 0
     profile_runtime: bool = False
     offload_mode: str = "auto"
     offload_vision: bool = False
