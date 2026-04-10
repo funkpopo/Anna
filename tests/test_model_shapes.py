@@ -46,6 +46,7 @@ def _stub_run_gated_delta_fused(
     norm_eps: float,
     initial_state: torch.Tensor | None,
     output_final_state: bool,
+    state_buffer: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if initial_state is None:
         core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(

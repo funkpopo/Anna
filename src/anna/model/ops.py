@@ -1422,6 +1422,15 @@ class Qwen3GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(repeat_factor, dim=2)
             key = key.repeat_interleave(repeat_factor, dim=2)
         output_final_state = cache_params is not None
+        state_buffer = None
+        if output_final_state:
+            state_buffer = recurrent_state
+            if state_buffer is None:
+                state_buffer = torch.empty(
+                    (batch_size, query.shape[2], query.shape[3], value.shape[3]),
+                    device=query.device,
+                    dtype=torch.float32,
+                )
         core_attn_out, last_recurrent_state = run_gated_delta_fused(
             query=query,
             key=key,
@@ -1433,6 +1442,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             norm_eps=self.norm.eps,
             initial_state=recurrent_state if use_precomputed_states else None,
             output_final_state=output_final_state,
+            state_buffer=state_buffer,
         )
 
         if cache_params is not None:

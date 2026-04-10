@@ -389,6 +389,7 @@ def run_gated_delta_fused(
     norm_eps: float,
     initial_state: torch.Tensor | None,
     output_final_state: bool,
+    state_buffer: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     op = _gated_delta_op()
     if op is None:
@@ -410,4 +411,5 @@ def run_gated_delta_fused(
         float(norm_eps),
         initial_state,
         bool(output_final_state),
+        state_buffer,
     )
