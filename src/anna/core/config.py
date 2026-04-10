@@ -40,6 +40,7 @@ class ServeSettings:
     offload_vision: bool = False
     expert_quant: str = "auto"
     weight_quant: str = "auto"
+    weight_gpu_memory_ratio: float | None = None
     resident_expert_layers: int | None = None
     resident_expert_layer_indices: tuple[int, ...] | None = None
     cached_experts_per_layer: int | None = None
@@ -72,6 +73,7 @@ class GenerateSettings:
     offload_vision: bool = False
     expert_quant: str = "auto"
     weight_quant: str = "auto"
+    weight_gpu_memory_ratio: float | None = None
     resident_expert_layers: int | None = None
     resident_expert_layer_indices: tuple[int, ...] | None = None
     cached_experts_per_layer: int | None = None
@@ -129,6 +131,7 @@ class BenchmarkSettings:
     offload_vision: bool = False
     expert_quant: str = "auto"
     weight_quant: str = "auto"
+    weight_gpu_memory_ratio: float | None = None
     resident_expert_layers: int | None = None
     resident_expert_layer_indices: tuple[int, ...] | None = None
     cached_experts_per_layer: int | None = None

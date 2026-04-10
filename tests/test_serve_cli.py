@@ -42,6 +42,8 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "--offload-vision",
             "--weight-quant",
             "int4",
+            "--weight-gpu-memory-ratio",
+            "0.8",
             "--min-free-memory-mib",
             "256",
             "--reserve-memory-mib",
@@ -60,6 +62,7 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.reasoning_format == "deepseek"
     assert args.offload_vision is True
     assert args.weight_quant == "int4"
+    assert args.weight_gpu_memory_ratio == 0.8
     assert args.min_free_memory_mib == 256
     assert args.reserve_memory_mib == 128
     assert args.max_estimated_usage_ratio == 0.95

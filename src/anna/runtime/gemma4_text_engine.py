@@ -140,6 +140,7 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         offload_vision: bool = False,
         expert_quant: str = "auto",
         weight_quant: str = "auto",
+        weight_gpu_memory_ratio: float | None = None,
         resident_expert_layers: int | None = None,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         cached_experts_per_layer: int | None = None,
@@ -156,6 +157,8 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             raise ValueError("Gemma4 text runtime does not use resident expert layers.")
         if cached_experts_per_layer not in {None, 0}:
             raise ValueError("Gemma4 text runtime does not use expert caching.")
+        if weight_gpu_memory_ratio not in {None, 0.0}:
+            raise ValueError("Gemma4 text runtime does not use MoE weight GPU memory ratio.")
 
         model_path = Path(model_dir)
         config = load_gemma4_text_model_config(model_path)

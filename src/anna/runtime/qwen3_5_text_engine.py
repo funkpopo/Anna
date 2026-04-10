@@ -422,6 +422,7 @@ class AnnaQwen3_5TextEngine:
         offload_vision: bool = False,
         expert_quant: str = "auto",
         weight_quant: str = "auto",
+        weight_gpu_memory_ratio: float | None = None,
         resident_expert_layers: int | None = None,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         cached_experts_per_layer: int | None = None,
@@ -457,6 +458,11 @@ class AnnaQwen3_5TextEngine:
             resolved_offload_mode=resolved_offload_mode,
             model_path=model_path,
             config=config,
+            device_context=device_context,
+        )
+        resolved_weight_gpu_memory_ratio = cls._resolve_weight_gpu_memory_ratio(
+            requested_ratio=weight_gpu_memory_ratio,
+            resolved_offload_mode=resolved_offload_mode,
             device_context=device_context,
         )
         resolved_resident_expert_layer_indices = cls._resolve_resident_expert_layer_indices(
@@ -510,6 +516,7 @@ class AnnaQwen3_5TextEngine:
                     model=model,
                     device_context=device_context,
                     expert_quant=resolved_expert_quant,
+                    weight_gpu_memory_ratio=resolved_weight_gpu_memory_ratio,
                 )
                 model.configure_runtime(
                     device_context.device,
@@ -526,6 +533,7 @@ class AnnaQwen3_5TextEngine:
                     model=model,
                     device_context=device_context,
                     expert_quant=resolved_expert_quant,
+                    weight_gpu_memory_ratio=resolved_weight_gpu_memory_ratio,
                 )
                 model.configure_runtime(
                     device_context.device,
@@ -559,7 +567,7 @@ class AnnaQwen3_5TextEngine:
             resolved_default_max_completion_tokens = max(1, int(resolved_default_max_completion_tokens))
 
         logger.info(
-            "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, default_enable_thinking=%s, reasoning_format=%s, offload=%s, offload_vision=%s, expert_quant=%s, weight_quant=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, full_attention_cache_mirror=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
+            "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, default_enable_thinking=%s, reasoning_format=%s, offload=%s, offload_vision=%s, expert_quant=%s, weight_quant=%s, weight_gpu_memory_ratio=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, full_attention_cache_mirror=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
             resolved_model_id,
             device_context.device,
             device_context.dtype,
@@ -571,6 +579,7 @@ class AnnaQwen3_5TextEngine:
             resolved_offload_vision,
             resolved_expert_quant,
             resolved_weight_quant,
+            resolved_weight_gpu_memory_ratio,
             len(resolved_resident_expert_layer_indices or ()),
             list(resolved_resident_expert_layer_indices or ()),
             resolved_cached_experts_per_layer,
@@ -690,6 +699,22 @@ class AnnaQwen3_5TextEngine:
         if weight_bytes > int(memory_info.total_bytes * usage_threshold):
             return "int4"
         return "none"
+
+    @staticmethod
+    def _resolve_weight_gpu_memory_ratio(
+        *,
+        requested_ratio: float | None,
+        resolved_offload_mode: str,
+        device_context: DeviceContext,
+    ) -> float:
+        if device_context.device.type != "xpu" or resolved_offload_mode != "experts":
+            return 0.0
+        if requested_ratio is None:
+            return 0.85
+        ratio = float(requested_ratio)
+        if not 0.0 < ratio <= 1.0:
+            raise ValueError(f"Unsupported weight GPU memory ratio: {requested_ratio}. Expected a value in (0, 1].")
+        return ratio
 
     @classmethod
     def _apply_runtime_weight_quantization(
@@ -838,7 +863,13 @@ class AnnaQwen3_5TextEngine:
         memory_info: object,
         safety: object,
         expert_quant: str,
+        weight_gpu_memory_ratio: float,
     ) -> tuple[int, int, float]:
+        if weight_gpu_memory_ratio > 0.0:
+            used_bytes = max(0, int(memory_info.total_bytes) - int(memory_info.free_bytes))
+            target_used_bytes = int(int(memory_info.total_bytes) * weight_gpu_memory_ratio)
+            budget_bytes = max(0, target_used_bytes - used_bytes)
+            return budget_bytes, target_used_bytes, 1.0
         if expert_quant == "int4":
             target_free_bytes = max(2304 << 20, int(memory_info.total_bytes * 0.16))
             budget_factor = 1.10
@@ -861,6 +892,7 @@ class AnnaQwen3_5TextEngine:
         model: Qwen3_5TextForConditionalGeneration,
         device_context: DeviceContext,
         expert_quant: str,
+        weight_gpu_memory_ratio: float = 0.0,
     ) -> tuple[int, ...]:
         if device_context.device.type != "xpu":
             return ()
@@ -879,14 +911,16 @@ class AnnaQwen3_5TextEngine:
             memory_info=memory_info,
             safety=safety,
             expert_quant=expert_quant,
+            weight_gpu_memory_ratio=weight_gpu_memory_ratio,
         )
         if budget_bytes <= 0:
             logger.info(
-                "Auto resident expert placement skipped: expert_quant=%s free=%s reserve=%s budget_factor=%.2f budget=%s",
+                "Auto resident expert placement skipped: expert_quant=%s free=%s reserve=%s budget_factor=%.2f ratio=%.2f budget=%s",
                 expert_quant,
                 _format_bytes(memory_info.free_bytes),
                 _format_bytes(reserve_bytes),
                 budget_factor,
+                weight_gpu_memory_ratio,
                 _format_bytes(budget_bytes),
             )
             return ()
@@ -909,11 +943,12 @@ class AnnaQwen3_5TextEngine:
             consumed_bytes += layer_bytes
 
         logger.info(
-            "Auto resident expert placement: expert_quant=%s free=%s reserve=%s budget_factor=%.2f budget=%s selected_layers=%s selected_bytes=%s candidate_layer_bytes=%s",
+            "Auto resident expert placement: expert_quant=%s free=%s reserve=%s budget_factor=%.2f ratio=%.2f budget=%s selected_layers=%s selected_bytes=%s candidate_layer_bytes=%s",
             expert_quant,
             _format_bytes(memory_info.free_bytes),
             _format_bytes(reserve_bytes),
             budget_factor,
+            weight_gpu_memory_ratio,
             _format_bytes(budget_bytes),
             selected_indices,
             _format_bytes(consumed_bytes),
@@ -928,6 +963,7 @@ class AnnaQwen3_5TextEngine:
         model: Qwen3_5TextForConditionalGeneration,
         device_context: DeviceContext,
         expert_quant: str,
+        weight_gpu_memory_ratio: float = 0.0,
     ) -> int:
         if device_context.device.type != "xpu":
             return 0
@@ -951,9 +987,16 @@ class AnnaQwen3_5TextEngine:
         if per_expert_bytes <= 0:
             return max(exemplar_block.top_k, 0)
 
-        cache_target_free_bytes = max(768 << 20, int(memory_info.total_bytes * 0.06))
-        cache_budget_fraction = 0.65 if expert_quant == "int4" else 0.35
-        cache_budget_bytes = int(max(0, int(memory_info.free_bytes) - cache_target_free_bytes) * cache_budget_fraction)
+        if weight_gpu_memory_ratio > 0.0:
+            used_bytes = max(0, int(memory_info.total_bytes) - int(memory_info.free_bytes))
+            target_used_bytes = int(int(memory_info.total_bytes) * weight_gpu_memory_ratio)
+            cache_budget_bytes = max(0, target_used_bytes - used_bytes)
+            cache_target_free_bytes = max(0, int(memory_info.total_bytes) - target_used_bytes)
+            cache_budget_fraction = 1.0
+        else:
+            cache_target_free_bytes = max(768 << 20, int(memory_info.total_bytes * 0.06))
+            cache_budget_fraction = 0.65 if expert_quant == "int4" else 0.35
+            cache_budget_bytes = int(max(0, int(memory_info.free_bytes) - cache_target_free_bytes) * cache_budget_fraction)
         auto_cached = cache_budget_bytes // max(1, per_expert_bytes * len(offloaded_blocks))
 
         minimum_cache = exemplar_block.top_k
@@ -965,10 +1008,11 @@ class AnnaQwen3_5TextEngine:
             resolved = max(minimum_cache, min(max_cache, auto_cached))
 
         logger.info(
-            "Auto expert cache sizing: expert_quant=%s free=%s target_free=%s cache_budget_fraction=%.2f cache_budget=%s offloaded_layers=%s per_expert=%s cached_experts_per_layer=%s",
+            "Auto expert cache sizing: expert_quant=%s free=%s target_free=%s ratio=%.2f cache_budget_fraction=%.2f cache_budget=%s offloaded_layers=%s per_expert=%s cached_experts_per_layer=%s",
             expert_quant,
             _format_bytes(memory_info.free_bytes),
             _format_bytes(cache_target_free_bytes),
+            weight_gpu_memory_ratio,
             cache_budget_fraction,
             _format_bytes(cache_budget_bytes),
             len(offloaded_blocks),

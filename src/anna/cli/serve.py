@@ -210,6 +210,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Quantization used for dense language-model linear weights executed on XPU. 'auto' enables int4 when the model is oversized for available XPU memory.",
     )
     parser.add_argument(
+        "--weight-gpu-memory-ratio",
+        type=_ratio,
+        default=None,
+        help="Target fraction of total XPU memory used for model weights in MoE experts offload mode. Anna prioritizes placing weights on XPU up to this ratio, then keeps the remainder on CPU RAM.",
+    )
+    parser.add_argument(
         "--resident-expert-layers",
         type=int,
         default=None,
@@ -291,6 +297,7 @@ def main() -> None:
         offload_vision=args.offload_vision,
         expert_quant=args.expert_quant,
         weight_quant=args.weight_quant,
+        weight_gpu_memory_ratio=args.weight_gpu_memory_ratio,
         resident_expert_layers=args.resident_expert_layers,
         resident_expert_layer_indices=parse_resident_expert_layer_indices(args.resident_expert_layer_indices),
         cached_experts_per_layer=args.cached_experts_per_layer,
@@ -326,6 +333,7 @@ def main() -> None:
         offload_vision=settings.offload_vision,
         expert_quant=settings.expert_quant,
         weight_quant=settings.weight_quant,
+        weight_gpu_memory_ratio=settings.weight_gpu_memory_ratio,
         resident_expert_layers=settings.resident_expert_layers,
         resident_expert_layer_indices=settings.resident_expert_layer_indices,
         cached_experts_per_layer=settings.cached_experts_per_layer,
