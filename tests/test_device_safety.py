@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
+import anna.runtime.device as runtime_device
 from anna.mm.gemma4_text_processor import PreparedInputs as GemmaPreparedInputs
 from anna.runtime.device import DeviceContext
 from anna.mm.qwen3_5_text_processor import PreparedInputs
@@ -51,3 +53,14 @@ def test_move_prepared_inputs_preserves_gemma_prepared_input_type() -> None:
 
     assert isinstance(moved, GemmaPreparedInputs)
     assert moved.__class__.__module__ == "anna.mm.gemma4_text_processor"
+
+
+def test_device_context_rejects_fp8_dtype_alias() -> None:
+    with pytest.raises(ValueError, match="Unsupported dtype alias"):
+        DeviceContext.resolve(device="cpu", dtype="fp8", model_dtype="bfloat16")
+
+
+def test_device_context_rejects_float8_model_dtype_in_auto_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runtime_device, "has_xpu", lambda: True)
+    with pytest.raises(ValueError, match="Unsupported dtype alias"):
+        DeviceContext.resolve(device="xpu", dtype="auto", model_dtype="float8_e4m3fn")

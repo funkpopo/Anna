@@ -47,10 +47,12 @@ class QuantizationConfig:
     bits: int | None = None
     group_size: int | None = None
     zero_point: bool = False
-    activation_scheme: str = "dynamic"
-    weight_per_tensor: bool = False
-    act_per_tensor: bool = False
-    weight_block_size: tuple[int, int] | None = None
+    data_type: str | None = None
+    sym: bool | None = None
+    packing_format: str | None = None
+    autoround_version: str | None = None
+    block_name_to_quantize: tuple[str, ...] = ()
+    extra_config: dict[str, dict[str, Any]] = field(default_factory=dict)
     modules_to_not_convert: list[str] = field(default_factory=list)
     version: str | None = None
 
@@ -62,16 +64,29 @@ class QuantizationConfig:
     def from_dict(cls, data: dict[str, Any] | None) -> "QuantizationConfig":
         if not data:
             return cls()
-        block_size = data.get("weight_block_size")
+        raw_blocks = data.get("block_name_to_quantize")
+        if raw_blocks is None:
+            block_names: tuple[str, ...] = ()
+        elif isinstance(raw_blocks, str):
+            block_names = (raw_blocks,)
+        else:
+            block_names = tuple(str(value) for value in raw_blocks)
+        raw_extra = data.get("extra_config") or {}
         return cls(
             quant_method=data.get("quant_method"),
             bits=data.get("bits"),
             group_size=data.get("group_size"),
             zero_point=bool(data.get("zero_point", False)),
-            activation_scheme=data.get("activation_scheme", "dynamic"),
-            weight_per_tensor=bool(data.get("weight_per_tensor", False)),
-            act_per_tensor=bool(data.get("act_per_tensor", False)),
-            weight_block_size=None if block_size is None else tuple(block_size),
+            data_type=data.get("data_type"),
+            sym=None if data.get("sym") is None else bool(data.get("sym")),
+            packing_format=data.get("packing_format"),
+            autoround_version=data.get("autoround_version"),
+            block_name_to_quantize=block_names,
+            extra_config={
+                str(module_name): dict(module_config)
+                for module_name, module_config in raw_extra.items()
+                if isinstance(module_config, dict)
+            },
             modules_to_not_convert=list(data.get("modules_to_not_convert", [])),
             version=data.get("version"),
         )
@@ -310,6 +325,9 @@ class Qwen3_5TextModelConfig:
     def from_model_dir(cls, model_dir: str | Path) -> "Qwen3_5TextModelConfig":
         model_path = Path(model_dir)
         config_data = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+        quantization_config_path = model_path / "quantization_config.json"
+        if quantization_config_path.exists():
+            config_data["quantization_config"] = json.loads(quantization_config_path.read_text(encoding="utf-8"))
         preprocessor_data = None
         preprocessor_path = model_path / "preprocessor_config.json"
         if preprocessor_path.exists():

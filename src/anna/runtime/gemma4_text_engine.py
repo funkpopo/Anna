@@ -450,7 +450,6 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             "default_max_completion_tokens": self.default_max_completion_tokens,
             "default_enable_thinking": self.default_enable_thinking,
             "reasoning_format": self.reasoning_format,
-            "float8_available": self.device_context.float8_available,
             "quantization": "dense",
             "weight_quant": self.weight_quant,
             "quantized_replacements": self.quantized_replacements,

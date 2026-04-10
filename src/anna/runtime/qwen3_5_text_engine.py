@@ -14,7 +14,7 @@ import torch
 from anna.core.function_calling import ThinkingStreamParser, ToolCallDelta
 from anna.mm.qwen3_5_text_processor import PreparedInputs, Qwen3_5TextMultimodalProcessor
 from anna.model.fused_ops import maybe_load_gated_delta_library, paged_gqa_decode_fused_is_available
-from anna.model.quantization import convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
+from anna.model.quantization import AutoRoundGPTQLinear, convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
@@ -430,6 +430,11 @@ class AnnaQwen3_5TextEngine:
                 expert_quant=resolved_expert_quant,
                 cached_experts_per_layer=initial_cached_experts_per_layer,
             )
+            cls._prepare_loaded_quantized_modules_for_execution(
+                model=model,
+                config=config,
+                device=device_context.device,
+            )
             if auto_resident_indices:
                 resolved_resident_expert_layer_indices = cls._estimate_resident_expert_layer_indices(
                     model=model,
@@ -446,6 +451,11 @@ class AnnaQwen3_5TextEngine:
                     expert_quant=resolved_expert_quant,
                     cached_experts_per_layer=initial_cached_experts_per_layer,
                 )
+                cls._prepare_loaded_quantized_modules_for_execution(
+                    model=model,
+                    config=config,
+                    device=device_context.device,
+                )
             if auto_cached_experts_per_layer:
                 resolved_cached_experts_per_layer = cls._estimate_cached_experts_per_layer(
                     model=model,
@@ -461,6 +471,11 @@ class AnnaQwen3_5TextEngine:
                     resident_expert_layer_indices=resolved_resident_expert_layer_indices,
                     expert_quant=resolved_expert_quant,
                     cached_experts_per_layer=resolved_cached_experts_per_layer,
+                )
+                cls._prepare_loaded_quantized_modules_for_execution(
+                    model=model,
+                    config=config,
+                    device=device_context.device,
                 )
             resolved_cached_experts_per_layer = cls._effective_cached_experts_per_layer(model)
             model.eval()
@@ -645,6 +660,41 @@ class AnnaQwen3_5TextEngine:
             device,
             compute_dtype,
         )
+        return replacements
+
+    @classmethod
+    def _prepare_loaded_quantized_modules_for_execution(
+        cls,
+        *,
+        model: Qwen3_5TextForConditionalGeneration,
+        config: object,
+        device: torch.device,
+    ) -> int:
+        quantization_config = getattr(config, "quantization_config", None)
+        quant_method = (getattr(quantization_config, "quant_method", None) or "").strip().lower()
+        if device.type != "xpu" or quant_method not in {"auto-round", "auto_round"}:
+            return 0
+
+        packing_format = (getattr(quantization_config, "packing_format", None) or "").strip().lower()
+        if packing_format != "auto_round:auto_gptq":
+            raise ValueError(
+                f"Unsupported AutoRound packing format at runtime: {getattr(quantization_config, 'packing_format', None)!r}"
+            )
+
+        replacements = convert_module_linears_to_xpu_int4(
+            model,
+            device=device,
+            include_predicate=lambda _module_name, module: (
+                isinstance(module, AutoRoundGPTQLinear) and module.qweight.device.type == "xpu"
+            ),
+        )
+        if replacements > 0:
+            logger.info(
+                "Prepared AutoRound modules for XPU execution: replacements=%s device=%s packing_format=%s",
+                replacements,
+                device,
+                packing_format,
+            )
         return replacements
 
     @staticmethod
@@ -983,7 +1033,6 @@ class AnnaQwen3_5TextEngine:
             "default_max_completion_tokens": self.default_max_completion_tokens,
             "default_enable_thinking": self.default_enable_thinking,
             "reasoning_format": self.reasoning_format,
-            "float8_available": self.device_context.float8_available,
             "quantization": quant_method,
             "weight_quant": self.weight_quant,
             "quantized_replacements": self.quantized_replacements,

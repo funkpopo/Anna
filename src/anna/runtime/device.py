@@ -16,9 +16,6 @@ _DTYPE_ALIASES: dict[str, str] = {
     "half": "float16",
     "bfloat16": "bfloat16",
     "bf16": "bfloat16",
-    "float8": "float8_e4m3fn",
-    "fp8": "float8_e4m3fn",
-    "float8_e4m3fn": "float8_e4m3fn",
 }
 
 _COMPUTE_DTYPES: dict[str, torch.dtype] = {
@@ -30,10 +27,6 @@ _COMPUTE_DTYPES: dict[str, torch.dtype] = {
 
 def _xpu_module():
     return getattr(torch, "xpu", None)
-
-
-def _float8_dtype() -> torch.dtype | None:
-    return getattr(torch, "float8_e4m3fn", None)
 
 
 def has_xpu() -> bool:
@@ -50,10 +43,8 @@ def _normalize_dtype_name(dtype: str | None) -> str:
     return normalized
 
 
-def _resolve_compute_dtype(dtype: str, *, fallback: str = "bfloat16") -> torch.dtype:
+def _resolve_compute_dtype(dtype: str) -> torch.dtype:
     normalized = _normalize_dtype_name(dtype)
-    if normalized == "float8_e4m3fn":
-        normalized = _normalize_dtype_name(fallback)
     resolved = _COMPUTE_DTYPES.get(normalized)
     if resolved is None:
         raise ValueError(f"Unsupported compute dtype: {dtype}")
@@ -93,7 +84,6 @@ class DeviceContext:
     requested_device: str
     requested_dtype: str
     reported_dtype: str
-    float8_available: bool
     migration_policy: TensorMigrationPolicy
     safety_policy: RuntimeSafetyPolicy
 
@@ -124,14 +114,11 @@ class DeviceContext:
                 resolved_dtype = torch.float32
                 reported_dtype = "float32"
             else:
-                resolved_dtype = _resolve_compute_dtype(model_dtype, fallback="bfloat16")
+                resolved_dtype = _resolve_compute_dtype(model_dtype)
                 reported_dtype = _normalize_dtype_name(model_dtype)
         else:
             normalized_dtype = _normalize_dtype_name(dtype)
-            if normalized_dtype == "float8_e4m3fn":
-                resolved_dtype = _resolve_compute_dtype(model_dtype, fallback="bfloat16")
-            else:
-                resolved_dtype = _resolve_compute_dtype(dtype, fallback=model_dtype)
+            resolved_dtype = _resolve_compute_dtype(dtype)
             reported_dtype = normalized_dtype
 
         if resolved_device.type == "cpu" and resolved_dtype == torch.bfloat16:
@@ -150,7 +137,6 @@ class DeviceContext:
             requested_device=requested_device,
             requested_dtype=requested_dtype,
             reported_dtype=reported_dtype,
-            float8_available=_float8_dtype() is not None,
             migration_policy=migration_policy,
             safety_policy=RuntimeSafetyPolicy(),
         )

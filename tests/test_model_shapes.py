@@ -6,8 +6,8 @@ import pytest
 import torch
 
 import anna.model.ops as model_ops
-from anna.model.quantization import XPUInt4Linear
-from anna.model.qwen3_5_text_config import Qwen3_5TextConfig, RopeParameters
+from anna.model.quantization import AutoRoundGPTQLinear, XPUInt4Linear, replace_linear_modules
+from anna.model.qwen3_5_text_config import QuantizationConfig, Qwen3_5TextConfig, RopeParameters
 from anna.model.ops import (
     Qwen3Attention,
     Qwen3DynamicCache,
@@ -652,6 +652,38 @@ def test_sparse_moe_cached_expert_materialization_copies_weights_without_aliasin
     for source_parameter, cached_parameter in zip(source.parameters(), cached.parameters()):
         assert torch.equal(source_parameter, cached_parameter)
         assert source_parameter.data_ptr() != cached_parameter.data_ptr()
+
+
+@pytest.mark.skipif(not hasattr(torch, "xpu") or not torch.xpu.is_available(), reason="XPU is required for AutoRound MoE staging")
+def test_sparse_moe_cached_expert_materialization_supports_autoround_payloads() -> None:
+    block = Qwen3SparseMoeBlock(_tiny_moe_config())
+    replace_linear_modules(
+        block,
+        QuantizationConfig(
+            quant_method="auto-round",
+            bits=4,
+            group_size=128,
+            data_type="int",
+            sym=True,
+            packing_format="auto_round:auto_gptq",
+            block_name_to_quantize=("experts",),
+        ),
+        compute_dtype=torch.bfloat16,
+    )
+    block.configure_runtime(
+        torch.device("xpu"),
+        offload_experts=True,
+        expert_quant="int4",
+        cached_experts_per_layer=1,
+    )
+
+    cached = block._get_cached_expert(0)
+
+    assert cached is not None
+    assert isinstance(block.experts[0].gate_proj, AutoRoundGPTQLinear)
+    assert isinstance(cached.gate_proj, XPUInt4Linear)
+    assert isinstance(cached.up_proj, XPUInt4Linear)
+    assert isinstance(cached.down_proj, XPUInt4Linear)
 
 
 def test_engine_resolves_explicit_resident_expert_indices() -> None:

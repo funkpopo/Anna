@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 
 import imageio.v3 as iio
 import numpy as np
@@ -159,6 +160,56 @@ def test_qwen3_config_leaves_default_max_completion_tokens_unset_when_missing() 
     )
 
     assert config.default_max_completion_tokens is None
+
+
+def test_qwen3_model_config_prefers_quantization_config_json_when_present(tmp_path) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5_moe",
+                "text_config": {
+                    "hidden_size": 64,
+                    "intermediate_size": 128,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 16,
+                    "linear_key_head_dim": 8,
+                    "linear_value_head_dim": 8,
+                    "linear_num_key_heads": 4,
+                    "linear_num_value_heads": 4,
+                    "vocab_size": 256,
+                    "layer_types": ["linear_attention", "full_attention"],
+                },
+                "quantization_config": {
+                    "quant_method": "awq",
+                    "bits": 4,
+                    "group_size": 128,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "quantization_config.json").write_text(
+        json.dumps(
+            {
+                "quant_method": "auto-round",
+                "bits": 4,
+                "group_size": 128,
+                "data_type": "int",
+                "sym": True,
+                "packing_format": "auto_round:auto_gptq",
+                "block_name_to_quantize": "model.language_model.layers",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = Qwen3_5TextModelConfig.from_model_dir(tmp_path)
+
+    assert config.quantization_config.quant_method == "auto-round"
+    assert config.quantization_config.packing_format == "auto_round:auto_gptq"
+    assert config.quantization_config.block_name_to_quantize == ("model.language_model.layers",)
 
 
 def test_qwen3_config_uses_top_level_pad_token_when_text_config_value_is_null() -> None:
