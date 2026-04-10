@@ -5,10 +5,59 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
+from anna.core.function_calling import ParsedToolCall
 from anna.mm.qwen3_5_text_processor import PreparedInputs
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, GenerationConfig, ThinkingStreamParser
 from anna.runtime.qwen3_5_text_engine import EngineOptimizationConfig, StreamEvent, TextGenerationResult
 from anna.runtime.streaming import IncrementalTextAssembler
+
+
+class _PassThroughToolCallStreamParser:
+    saw_tool_calls = False
+
+    def feed(self, text: str) -> list[tuple[str, str]]:
+        return [("content", text)] if text else []
+
+    def flush(self) -> list[tuple[str, str]]:
+        return []
+
+
+class _EngineChatTokenizer:
+    def split_assistant_reasoning(self, text: str, *, enable_thinking: bool) -> tuple[str | None, str]:
+        normalized = text
+        explicit_open = normalized.startswith("<think>")
+        if explicit_open:
+            normalized = normalized[len("<think>") :].lstrip("\r\n")
+            enable_thinking = True
+        close_index = normalized.find("</think>")
+        if close_index != -1:
+            reasoning = normalized[:close_index].strip()
+            content = normalized[close_index + len("</think>") :].lstrip("\r\n")
+            return reasoning or None, content
+        if explicit_open or enable_thinking:
+            reasoning = normalized.strip()
+            return reasoning or None, ""
+        return None, text
+
+    def extract_tool_calls(self, text: str):
+        return text, []
+
+    def create_reasoning_parser(self, *, enable_thinking: bool) -> ThinkingStreamParser:
+        return ThinkingStreamParser(enable_thinking=enable_thinking)
+
+    def create_tool_call_stream_parser(self) -> _PassThroughToolCallStreamParser:
+        return _PassThroughToolCallStreamParser()
+
+
+class _ToolCallingTokenizer(_EngineChatTokenizer):
+    def extract_tool_calls(self, text: str):
+        marker = "<tool_call>weather</tool_call>"
+        if marker not in text:
+            return text, []
+        return (
+            text.replace(marker, "").strip(),
+            [ParsedToolCall(name="get_weather", arguments="{\"location\":\"Shanghai\"}", id="call_123")],
+        )
 
 
 def test_stable_decode_delta_avoids_repeated_prefix_output() -> None:
@@ -78,6 +127,7 @@ def test_stable_decode_skips_unstable_replacement_suffix() -> None:
 
 def test_split_chat_output_separates_reasoning_and_content() -> None:
     engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.tokenizer = _EngineChatTokenizer()
     reasoning, content = engine._split_chat_output(
         "先分析问题。</think>\n\n最终答案。",
         enable_thinking=True,
@@ -239,6 +289,7 @@ def test_trim_runtime_cache_if_idle_skips_when_requests_are_active() -> None:
 def test_generate_chat_keeps_raw_think_tags_when_reasoning_format_is_none() -> None:
     engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
+    engine.tokenizer = _EngineChatTokenizer()
     engine._generate = MethodType(
         lambda self, prepared, *, config: TextGenerationResult(
             text="先分析问题。\n</think>\n\n最终答案。",
@@ -263,6 +314,7 @@ def test_generate_chat_keeps_raw_think_tags_when_reasoning_format_is_none() -> N
 def test_generate_chat_projects_reasoning_into_deepseek_format() -> None:
     engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
+    engine.tokenizer = _EngineChatTokenizer()
     engine._generate = MethodType(
         lambda self, prepared, *, config: TextGenerationResult(
             text="先分析问题。\n</think>\n\n最终答案。",
@@ -284,9 +336,46 @@ def test_generate_chat_projects_reasoning_into_deepseek_format() -> None:
     assert result.reasoning_text == "先分析问题。"
 
 
+def test_generate_chat_projects_tool_calls_into_openai_shape() -> None:
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.tokenizer = _ToolCallingTokenizer()
+    engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
+    engine._generate = MethodType(
+        lambda self, prepared, *, config: TextGenerationResult(
+            text="先分析问题。\n</think>\n\n准备调用工具。<tool_call>weather</tool_call>",
+            reasoning_text=None,
+            finish_reason="stop",
+            prompt_tokens=7,
+            completion_tokens=5,
+        ),
+        engine,
+    )
+
+    result = engine.generate_chat(
+        [{"role": "user", "content": "你好"}],
+        config=GenerationConfig(),
+        reasoning_format="deepseek",
+    )
+
+    assert result.text == "准备调用工具。"
+    assert result.reasoning_text == "先分析问题。"
+    assert result.finish_reason == "tool_calls"
+    assert result.tool_calls == [
+        {
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": "{\"location\":\"Shanghai\"}",
+            },
+        }
+    ]
+
+
 def test_generate_chat_leaves_thoughts_inline_when_reasoning_format_is_none() -> None:
     engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
+    engine.tokenizer = _EngineChatTokenizer()
     engine._generate = MethodType(
         lambda self, prepared, *, config: TextGenerationResult(
             text="先分析问题。\n</think>\n\n最终答案。",
@@ -311,6 +400,7 @@ def test_generate_chat_leaves_thoughts_inline_when_reasoning_format_is_none() ->
 def test_stream_chat_keeps_inline_think_chunks_when_reasoning_format_is_none() -> None:
     engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
+    engine.tokenizer = _EngineChatTokenizer()
     engine._stream = MethodType(
         lambda self, prepared, *, config: iter(
             [
@@ -341,6 +431,7 @@ def test_stream_chat_keeps_inline_think_chunks_when_reasoning_format_is_none() -
 def test_stream_chat_separates_reasoning_and_content_in_deepseek_format() -> None:
     engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
+    engine.tokenizer = _EngineChatTokenizer()
     engine._stream = MethodType(
         lambda self, prepared, *, config: iter(
             [
@@ -371,6 +462,7 @@ def test_stream_chat_separates_reasoning_and_content_in_deepseek_format() -> Non
 def test_generate_chat_keeps_incomplete_think_block_when_length_limited() -> None:
     engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
+    engine.tokenizer = _EngineChatTokenizer()
     engine._generate = MethodType(
         lambda self, prepared, *, config: TextGenerationResult(
             text="用户希望我写一段关于夏天的帖子。",
@@ -396,6 +488,7 @@ def test_generate_chat_keeps_incomplete_think_block_when_length_limited() -> Non
 def test_generate_chat_keeps_incomplete_think_block_inline_when_reasoning_format_is_none() -> None:
     engine = object.__new__(AnnaQwen3_5TextEngine)
     engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
+    engine.tokenizer = _EngineChatTokenizer()
     engine._generate = MethodType(
         lambda self, prepared, *, config: TextGenerationResult(
             text="用户希望我写一段关于夏天的帖子。",

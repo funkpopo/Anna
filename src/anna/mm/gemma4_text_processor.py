@@ -528,14 +528,25 @@ class Gemma4TextProcessor:
         messages: list[Any],
         *,
         enable_thinking: bool = False,
+        tools: list[Any] | None = None,
+        tool_choice: Any = None,
+        parallel_tool_calls: bool | None = None,
         tensor_device: torch.device | str | None = None,
         tensor_dtype: torch.dtype | None = None,
     ) -> PreparedInputs:
-        prompt = self.tokenizer.render_messages(
-            messages,
-            add_generation_prompt=True,
-            enable_thinking=enable_thinking,
-        )
+        render_kwargs: dict[str, Any] = {
+            "add_generation_prompt": True,
+            "enable_thinking": enable_thinking,
+        }
+        if tools is not None or tool_choice is not None or parallel_tool_calls is not None:
+            render_kwargs.update(
+                {
+                    "tools": tools,
+                    "tool_choice": tool_choice,
+                    "parallel_tool_calls": parallel_tool_calls,
+                }
+            )
+        prompt = self.tokenizer.render_messages(messages, **render_kwargs)
 
         images = self._collect_media(messages, "image_url")
         videos = self._collect_media(messages, "video_url")

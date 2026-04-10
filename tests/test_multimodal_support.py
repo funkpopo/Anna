@@ -251,6 +251,63 @@ def test_tokenizer_renders_raw_assistant_output_with_reasoning_content_without_d
     assert rendered.count("先写夏天的氛围。") == 1
 
 
+def test_tokenizer_renders_qwen_function_calling_prompt_and_history() -> None:
+    tokenizer = _tokenizer()
+    rendered = tokenizer.render_messages(
+        [
+            {"role": "system", "content": "You are a tool-using assistant."},
+            {"role": "user", "content": "查一下上海天气。"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"location\":\"Shanghai\",\"unit\":\"celsius\"}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_123",
+                "content": "{\"temperature\":28}",
+            },
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Fetch weather.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"},
+                            "unit": {"type": "string"},
+                        },
+                        "required": ["location"],
+                    },
+                },
+            }
+        ],
+        tool_choice={"type": "function", "function": {"name": "get_weather"}},
+        parallel_tool_calls=False,
+        add_generation_prompt=False,
+        enable_thinking=False,
+    )
+
+    assert "# Tools" in rendered
+    assert '"name": "get_weather"' in rendered
+    assert "You are a tool-using assistant." in rendered
+    assert "<tool_call>\n<function=get_weather>\n<parameter=location>\nShanghai\n</parameter>" in rendered
+    assert "<parameter=unit>\ncelsius\n</parameter>" in rendered
+    assert "<tool_response>\n{\"temperature\":28}\n</tool_response>" in rendered
+
+
 def test_processor_expands_qwen3_native_placeholders() -> None:
     processor = Qwen3_5TextMultimodalProcessor(_config(), _tokenizer())
     image_prompt = "<|vision_start|><|image_pad|><|vision_end|>"

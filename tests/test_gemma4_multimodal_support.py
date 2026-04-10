@@ -116,7 +116,11 @@ class _FakeGemmaTokenizer:
         *,
         add_generation_prompt: bool = True,
         enable_thinking: bool = False,
+        tools=None,
+        tool_choice=None,
+        parallel_tool_calls=None,
     ) -> str:
+        del tools, tool_choice, parallel_tool_calls
         del enable_thinking
         parts: list[str] = [self.bos_token]
         for message in messages:

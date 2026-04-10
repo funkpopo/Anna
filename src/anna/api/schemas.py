@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class MessageContentPart(BaseModel):
@@ -13,12 +13,50 @@ class MessageContentPart(BaseModel):
     audio_url: Any | None = None
 
 
+class ChatToolCallFunction(BaseModel):
+    name: str
+    arguments: str | dict[str, Any] | None = None
+
+
+class ChatToolCall(BaseModel):
+    id: str | None = None
+    type: Literal["function"] = "function"
+    function: ChatToolCallFunction
+
+
+class ChatToolFunctionDefinition(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = None
+    strict: bool | None = None
+    response: dict[str, Any] | None = None
+
+
+class ChatCompletionTool(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["function"] = "function"
+    function: ChatToolFunctionDefinition
+
+
+class NamedToolChoiceFunction(BaseModel):
+    name: str
+
+
+class NamedToolChoice(BaseModel):
+    type: Literal["function"] = "function"
+    function: NamedToolChoiceFunction
+
+
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant", "tool"]
+    role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | list[MessageContentPart] | None = None
     reasoning_content: str | None = None
     name: str | None = None
     tool_call_id: str | None = None
+    tool_calls: list[ChatToolCall] | None = None
 
 
 class ChatTemplateKwargs(BaseModel):
@@ -28,6 +66,9 @@ class ChatTemplateKwargs(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[ChatMessage]
+    tools: list[ChatCompletionTool] | None = None
+    tool_choice: Literal["none", "auto", "required"] | NamedToolChoice | None = None
+    parallel_tool_calls: bool | None = None
     enable_thinking: bool | None = None
     chat_template_kwargs: ChatTemplateKwargs | None = None
     reasoning_format: Literal["none", "deepseek"] | None = None
