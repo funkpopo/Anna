@@ -105,6 +105,115 @@ def test_gemma4_tokenizer_renders_chat_and_eos_ids() -> None:
     assert tokenizer.eos_token_ids == {1, 106}
 
 
+def test_gemma4_tokenizer_renders_and_parses_function_calling() -> None:
+    vocab = {
+        "<bos>": 2,
+        "<eos>": 1,
+        "<|turn>": 105,
+        "<turn|>": 106,
+        "<|channel>": 100,
+        "<channel|>": 101,
+        "<|think|>": 98,
+        "<|tool_call>": 48,
+        "<tool_call|>": 49,
+        "<|tool_response>": 50,
+        "<tool_response|>": 51,
+        "<|tool>": 52,
+        "<tool|>": 53,
+        "hello": 10,
+    }
+    backend = Tokenizer(WordLevel(vocab=vocab, unk_token="<eos>"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = Gemma4Tokenizer(
+        backend,
+        metadata={
+            "bos_token": "<bos>",
+            "eos_token": "<eos>",
+            "sot_token": "<|turn>",
+            "eot_token": "<turn|>",
+            "soc_token": "<|channel>",
+            "eoc_token": "<channel|>",
+            "think_token": "<|think|>",
+            "stc_token": "<|tool_call>",
+            "etc_token": "<tool_call|>",
+            "str_token": "<|tool_response>",
+            "etr_token": "<tool_response|>",
+            "std_token": "<|tool>",
+            "etd_token": "<tool|>",
+        },
+    )
+
+    rendered = tokenizer.render_messages(
+        [
+            {"role": "system", "content": "hello"},
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"location\":\"Shanghai\",\"days\":3}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "get_weather",
+                "tool_call_id": "call_123",
+                "content": "{\"temperature\":28}",
+            },
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Fetch weather.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"},
+                            "days": {"type": "integer"},
+                        },
+                        "required": ["location"],
+                    },
+                },
+            }
+        ],
+        tool_choice={"type": "function", "function": {"name": "get_weather"}},
+        parallel_tool_calls=False,
+        add_generation_prompt=False,
+        enable_thinking=True,
+    )
+
+    assert rendered.startswith("<bos><|turn>system\n<|think|>hello")
+    assert "<|tool>declaration:get_weather{" in rendered
+    assert "<|tool_call>call:get_weather{days:3,location:<|\"|>Shanghai<|\"|>}<tool_call|>" in rendered
+    assert "<|tool_response>response:get_weather{temperature:28}<tool_response|>" in rendered
+
+    reasoning, content = tokenizer.split_assistant_reasoning(
+        "<|channel>thought\n先分析一下。<channel|>最终答案。",
+        enable_thinking=True,
+    )
+    assert reasoning == "先分析一下。"
+    assert content == "最终答案。"
+
+    cleaned, tool_calls = tokenizer.extract_tool_calls(
+        "先查天气。<|tool_call>call:get_weather{location:<|\"|>Shanghai<|\"|>,days:3}<tool_call|>"
+    )
+    assert cleaned == "先查天气。"
+    assert len(tool_calls) == 1
+    assert json.loads(tool_calls[0].to_openai_dict()["function"]["arguments"]) == {
+        "location": "Shanghai",
+        "days": 3,
+    }
+
+
 def test_gemma4_text_model_decode_cache_matches_full_forward() -> None:
     config = Gemma4Config.from_dict(
         {

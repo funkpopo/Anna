@@ -50,6 +50,9 @@ class _CapturingEngine:
         self.last_completion_config = None
         self.last_enable_thinking = None
         self.last_reasoning_format = None
+        self.last_tools = None
+        self.last_tool_choice = None
+        self.last_parallel_tool_calls = None
 
     def health(self) -> dict[str, str]:
         return {"status": "ok"}
@@ -57,10 +60,23 @@ class _CapturingEngine:
     def list_models(self) -> list[str]:
         return [self.default_model_id]
 
-    def generate_chat(self, _messages, *, config, enable_thinking: bool = False, reasoning_format: str | None = None):
+    def generate_chat(
+        self,
+        _messages,
+        *,
+        config,
+        enable_thinking: bool = False,
+        reasoning_format: str | None = None,
+        tools=None,
+        tool_choice=None,
+        parallel_tool_calls=None,
+    ):
         self.last_chat_config = config
         self.last_enable_thinking = enable_thinking
         self.last_reasoning_format = reasoning_format
+        self.last_tools = tools
+        self.last_tool_choice = tool_choice
+        self.last_parallel_tool_calls = parallel_tool_calls
         return TextGenerationResult(
             text="ok",
             reasoning_text=None,
@@ -142,6 +158,42 @@ def test_chat_completion_request_max_completion_tokens_overrides_engine_default(
     assert response.status_code == 200
     assert engine.last_chat_config is not None
     assert engine.last_chat_config.max_new_tokens == 64
+
+
+def test_chat_completion_forwards_function_calling_request_fields() -> None:
+    engine = _CapturingEngine()
+    client = TestClient(create_app(engine))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Fetch weather.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"],
+                        },
+                    },
+                }
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+            "parallel_tool_calls": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert engine.last_tools is not None
+    assert engine.last_tools[0].function.name == "get_weather"
+    assert engine.last_tool_choice is not None
+    assert engine.last_tool_choice.function.name == "get_weather"
+    assert engine.last_parallel_tool_calls is False
 
 
 def test_chat_completion_uses_engine_default_enable_thinking_when_request_omits_it() -> None:
@@ -403,12 +455,127 @@ def test_chat_completion_request_reasoning_format_overrides_engine_default() -> 
     assert engine.last_reasoning_format == "deepseek"
 
 
-def test_chat_completion_logs_prefill_and_decode_metrics(caplog) -> None:
-    class _ProfilingEngine(_CapturingEngine):
-        def generate_chat(self, _messages, *, config, enable_thinking: bool = False, reasoning_format: str | None = None):
+def test_chat_completion_returns_openai_tool_calls_payload() -> None:
+    class _ToolCallingEngine(_CapturingEngine):
+        def generate_chat(
+            self,
+            _messages,
+            *,
+            config,
+            enable_thinking: bool = False,
+            reasoning_format: str | None = None,
+            tools=None,
+            tool_choice=None,
+            parallel_tool_calls=None,
+        ):
             self.last_chat_config = config
             self.last_enable_thinking = enable_thinking
             self.last_reasoning_format = reasoning_format
+            self.last_tools = tools
+            self.last_tool_choice = tool_choice
+            self.last_parallel_tool_calls = parallel_tool_calls
+            return TextGenerationResult(
+                text="",
+                reasoning_text="先查天气。",
+                tool_calls=[
+                    {
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"location\":\"Shanghai\"}",
+                        },
+                    }
+                ],
+                finish_reason="tool_calls",
+                prompt_tokens=4,
+                completion_tokens=2,
+            )
+
+    client = TestClient(create_app(_ToolCallingEngine()))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    choice = payload["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] is None
+    assert choice["message"]["reasoning_content"] == "先查天气。"
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
+
+
+def test_streaming_chat_emits_tool_call_deltas_and_tool_calls_finish_reason() -> None:
+    class _ToolCallingStreamEngine:
+        default_model_id = "fake-model"
+        default_max_completion_tokens = None
+        reasoning_format = "deepseek"
+
+        def health(self) -> dict[str, str]:
+            return {"status": "ok"}
+
+        def list_models(self) -> list[str]:
+            return [self.default_model_id]
+
+        def stream_chat(self, *_args, **_kwargs):
+            from anna.core.function_calling import ToolCallDelta
+            from anna.runtime.qwen3_5_text_engine import StreamEvent
+
+            yield StreamEvent(
+                text="",
+                tool_calls=[
+                    ToolCallDelta(
+                        index=0,
+                        id="call_123",
+                        name="get_weather",
+                        arguments="{\"location\":\"Shanghai\"}",
+                    )
+                ],
+                finish_reason=None,
+            )
+            yield StreamEvent(text="", finish_reason="tool_calls")
+
+    client = TestClient(create_app(_ToolCallingStreamEngine()))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert '"tool_calls": [{"index": 0, "id": "call_123", "type": "function"' in response.text
+    assert '"finish_reason": "tool_calls"' in response.text
+
+
+def test_chat_completion_logs_prefill_and_decode_metrics(caplog) -> None:
+    class _ProfilingEngine(_CapturingEngine):
+        def generate_chat(
+            self,
+            _messages,
+            *,
+            config,
+            enable_thinking: bool = False,
+            reasoning_format: str | None = None,
+            tools=None,
+            tool_choice=None,
+            parallel_tool_calls=None,
+        ):
+            self.last_chat_config = config
+            self.last_enable_thinking = enable_thinking
+            self.last_reasoning_format = reasoning_format
+            self.last_tools = tools
+            self.last_tool_choice = tool_choice
+            self.last_parallel_tool_calls = parallel_tool_calls
             return TextGenerationResult(
                 text="ok",
                 reasoning_text=None,

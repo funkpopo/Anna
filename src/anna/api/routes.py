@@ -150,9 +150,14 @@ def _chat_response_payload(
     model: str,
     result: TextGenerationResult,
 ) -> dict:
-    message = {"role": "assistant", "content": result.text}
+    message: dict[str, object] = {
+        "role": "assistant",
+        "content": None if result.tool_calls and not result.text else result.text,
+    }
     if result.reasoning_text is not None:
         message["reasoning_content"] = result.reasoning_text
+    if result.tool_calls:
+        message["tool_calls"] = result.tool_calls
     return {
         "id": response_id,
         "object": "chat.completion",
@@ -240,13 +245,16 @@ def _chat_chunk_payload(
     model: str,
     content: str,
     reasoning: str,
+    tool_calls: list[dict[str, object]] | None,
     finish_reason: str | None,
 ) -> dict:
-    delta: dict[str, str] = {}
+    delta: dict[str, object] = {}
     if reasoning:
         delta["reasoning_content"] = reasoning
     if content:
         delta["content"] = content
+    if tool_calls:
+        delta["tool_calls"] = tool_calls
     return {
         "id": response_id,
         "object": "chat.completion.chunk",
@@ -280,7 +288,7 @@ def _stream_sse_chat(
 
     try:
         for event in events:
-            if not event.text and not event.reasoning_text and event.finish_reason is None:
+            if not event.text and not event.reasoning_text and not event.tool_calls and event.finish_reason is None:
                 continue
             payload = _chat_chunk_payload(
                 response_id=response_id,
@@ -288,6 +296,7 @@ def _stream_sse_chat(
                 model=model,
                 content=event.text or "",
                 reasoning=event.reasoning_text or "",
+                tool_calls=None if event.tool_calls is None else [tool_call.to_openai_dict() for tool_call in event.tool_calls],
                 finish_reason=event.finish_reason,
             )
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -395,6 +404,9 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
                 config=config,
                 enable_thinking=enable_thinking,
                 reasoning_format=reasoning_format,
+                tools=payload.tools,
+                tool_choice=payload.tool_choice,
+                parallel_tool_calls=payload.parallel_tool_calls,
             )
             return StreamingResponse(
                 _stream_sse_chat(
@@ -417,6 +429,9 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
             config=config,
             enable_thinking=enable_thinking,
             reasoning_format=reasoning_format,
+            tools=payload.tools,
+            tool_choice=payload.tool_choice,
+            parallel_tool_calls=payload.parallel_tool_calls,
         )
     except AnnaEngineError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc

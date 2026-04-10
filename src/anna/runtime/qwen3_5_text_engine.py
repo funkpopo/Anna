@@ -11,6 +11,7 @@ from typing import Any, Iterator, Literal, cast
 
 import torch
 
+from anna.core.function_calling import ThinkingStreamParser, ToolCallDelta
 from anna.mm.qwen3_5_text_processor import PreparedInputs, Qwen3_5TextMultimodalProcessor
 from anna.model.fused_ops import maybe_load_gated_delta_library, paged_gqa_decode_fused_is_available
 from anna.model.quantization import convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
@@ -47,14 +48,6 @@ def _format_bytes(num_bytes: int) -> str:
             return f"{value:.2f} {unit}"
         value /= 1024.0
     return f"{num_bytes} B"
-
-
-def _strip_think_open_tag(text: str) -> str:
-    normalized = text
-    if normalized.startswith("<think>"):
-        normalized = normalized[len("<think>") :]
-        normalized = normalized.lstrip("\r\n")
-    return normalized
 
 
 def _strip_unstable_replacement_suffix(text: str) -> str:
@@ -106,76 +99,6 @@ class PromptPrefillResult:
     prompt_cache_hit: bool = False
 
 
-class ThinkingStreamParser:
-    CLOSE_TAG = "</think>"
-
-    def __init__(self, *, enable_thinking: bool) -> None:
-        self.enable_thinking = enable_thinking
-        self.state = "reasoning" if enable_thinking else "content"
-        self.buffer = ""
-
-    def _emit_reasoning_prefix(self) -> list[tuple[str, str]]:
-        if self.state != "reasoning":
-            return []
-        self.buffer = _strip_think_open_tag(self.buffer)
-        hold_back = 0
-        max_suffix = min(len(self.buffer), len(self.CLOSE_TAG) - 1)
-        for suffix_length in range(max_suffix, 0, -1):
-            if self.buffer.endswith(self.CLOSE_TAG[:suffix_length]):
-                hold_back = suffix_length
-                break
-        safe_length = max(0, len(self.buffer) - hold_back)
-        if safe_length <= 0:
-            return []
-        reasoning = self.buffer[:safe_length]
-        self.buffer = self.buffer[safe_length:]
-        return [("reasoning", reasoning)]
-
-    def feed(self, text: str) -> list[tuple[str, str]]:
-        outputs: list[tuple[str, str]] = []
-        self.buffer += text
-
-        while True:
-            if self.state == "content":
-                stripped = self.buffer.lstrip()
-                if stripped.startswith("<think>"):
-                    self.buffer = stripped
-                    self.state = "reasoning"
-                    continue
-
-            if self.state == "reasoning":
-                self.buffer = _strip_think_open_tag(self.buffer)
-                close_index = self.buffer.find(self.CLOSE_TAG)
-                if close_index == -1:
-                    outputs.extend(self._emit_reasoning_prefix())
-                    break
-                reasoning = self.buffer[:close_index].rstrip("\r\n")
-                if reasoning:
-                    outputs.append(("reasoning", reasoning))
-                self.buffer = self.buffer[close_index + len(self.CLOSE_TAG) :].lstrip("\r\n")
-                self.state = "content"
-                continue
-
-            if self.buffer:
-                outputs.append(("content", self.buffer))
-                self.buffer = ""
-            break
-
-        return outputs
-
-    def flush(self) -> list[tuple[str, str]]:
-        outputs: list[tuple[str, str]] = []
-        if self.state == "reasoning":
-            self.buffer = _strip_think_open_tag(self.buffer)
-            reasoning = self.buffer.rstrip("\r\n")
-            if reasoning:
-                outputs.append(("reasoning", reasoning))
-        elif self.buffer:
-            outputs.append(("content", self.buffer))
-        self.buffer = ""
-        return outputs
-
-
 class AnnaEngineError(RuntimeError):
     def __init__(
         self,
@@ -219,6 +142,7 @@ class GenerationPerfStats:
 class StreamEvent:
     text: str
     reasoning_text: str | None = None
+    tool_calls: list[ToolCallDelta] | None = None
     finish_reason: str | None = None
 
 
@@ -229,6 +153,7 @@ class TextGenerationResult:
     prompt_tokens: int
     completion_tokens: int
     reasoning_text: str | None = None
+    tool_calls: list[dict[str, object]] | None = None
     perf: GenerationPerfStats | None = None
 
 
@@ -1147,19 +1072,33 @@ class AnnaQwen3_5TextEngine:
         config: GenerationConfig,
         enable_thinking: bool = True,
         reasoning_format: ReasoningFormat | str | None = None,
+        tools: list[object] | None = None,
+        tool_choice: object = None,
+        parallel_tool_calls: bool | None = None,
     ) -> TextGenerationResult:
-        prepared = self._prepare_messages(messages, enable_thinking=enable_thinking)
+        prepare_kwargs: dict[str, object] = {"enable_thinking": enable_thinking}
+        if tools is not None or tool_choice is not None or parallel_tool_calls is not None:
+            prepare_kwargs.update(
+                {
+                    "tools": tools,
+                    "tool_choice": tool_choice,
+                    "parallel_tool_calls": parallel_tool_calls,
+                }
+            )
+        prepared = self._prepare_messages(messages, **prepare_kwargs)
         raw = self._generate(prepared, config=config)
-        text, reasoning_text = self._project_chat_output(
+        text, reasoning_text, tool_calls = self._project_chat_output(
             raw_text=raw.text,
             raw_reasoning_text=raw.reasoning_text,
             enable_thinking=enable_thinking,
             reasoning_format=reasoning_format,
         )
+        finish_reason = "tool_calls" if raw.finish_reason == "stop" and tool_calls else raw.finish_reason
         return TextGenerationResult(
             text=text,
             reasoning_text=reasoning_text,
-            finish_reason=raw.finish_reason,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
             prompt_tokens=raw.prompt_tokens,
             completion_tokens=raw.completion_tokens,
             perf=raw.perf,
@@ -1172,39 +1111,100 @@ class AnnaQwen3_5TextEngine:
         config: GenerationConfig,
         enable_thinking: bool = True,
         reasoning_format: ReasoningFormat | str | None = None,
+        tools: list[object] | None = None,
+        tool_choice: object = None,
+        parallel_tool_calls: bool | None = None,
     ) -> Iterator[StreamEvent]:
-        prepared = self._prepare_messages(messages, enable_thinking=enable_thinking)
+        prepare_kwargs: dict[str, object] = {"enable_thinking": enable_thinking}
+        if tools is not None or tool_choice is not None or parallel_tool_calls is not None:
+            prepare_kwargs.update(
+                {
+                    "tools": tools,
+                    "tool_choice": tool_choice,
+                    "parallel_tool_calls": parallel_tool_calls,
+                }
+            )
+        prepared = self._prepare_messages(messages, **prepare_kwargs)
         resolved_reasoning_format = self._resolve_reasoning_format(reasoning_format)
-        if resolved_reasoning_format == "none":
-            yield from self._stream(prepared, config=config)
-            return
-
-        parser = ThinkingStreamParser(enable_thinking=enable_thinking)
+        reasoning_parser = None
+        if resolved_reasoning_format != "none":
+            reasoning_parser = self.tokenizer.create_reasoning_parser(enable_thinking=enable_thinking)
+        tool_call_parser = self.tokenizer.create_tool_call_stream_parser()
         for event in self._stream(prepared, config=config):
-            parsed_chunks = self._parse_chat_stream_event(parser, event)
-            if not parsed_chunks:
-                yield StreamEvent(
-                    text="",
-                    reasoning_text=event.reasoning_text,
-                    finish_reason=event.finish_reason,
+            outputs: list[StreamEvent] = []
+            if event.reasoning_text:
+                outputs.append(StreamEvent(text="", reasoning_text=event.reasoning_text))
+
+            if reasoning_parser is None:
+                if event.text:
+                    outputs.extend(self._project_tool_stream_outputs(tool_call_parser.feed(event.text)))
+            else:
+                if event.text:
+                    for kind, chunk in reasoning_parser.feed(event.text):
+                        if kind == "reasoning":
+                            outputs.append(StreamEvent(text="", reasoning_text=chunk))
+                        elif chunk:
+                            outputs.extend(self._project_tool_stream_outputs(tool_call_parser.feed(chunk)))
+                if event.finish_reason is not None:
+                    for kind, chunk in reasoning_parser.flush():
+                        if kind == "reasoning":
+                            outputs.append(StreamEvent(text="", reasoning_text=chunk))
+                        elif chunk:
+                            outputs.extend(self._project_tool_stream_outputs(tool_call_parser.feed(chunk)))
+
+            if event.finish_reason is not None:
+                outputs.extend(self._project_tool_stream_outputs(tool_call_parser.flush()))
+                for output in outputs:
+                    yield output
+                finish_reason = (
+                    "tool_calls" if event.finish_reason == "stop" and tool_call_parser.saw_tool_calls else event.finish_reason
                 )
+                yield StreamEvent(text="", finish_reason=finish_reason)
                 continue
 
-            last_index = len(parsed_chunks) - 1
-            for index, (kind, chunk) in enumerate(parsed_chunks):
-                yield StreamEvent(
-                    text=chunk if kind == "content" else "",
-                    reasoning_text=chunk if kind == "reasoning" else None,
-                    finish_reason=event.finish_reason if index == last_index else None,
-                )
+            for output in outputs:
+                yield output
 
-    def _prepare_messages(self, messages: list[object], *, enable_thinking: bool = True) -> PreparedInputs:
+    def _project_tool_stream_outputs(
+        self,
+        outputs: list[tuple[str, str | ToolCallDelta]],
+    ) -> list[StreamEvent]:
+        events: list[StreamEvent] = []
+        for kind, value in outputs:
+            if kind == "content":
+                text = cast(str, value)
+                if text:
+                    events.append(StreamEvent(text=text))
+                continue
+            events.append(StreamEvent(text="", tool_calls=[cast(ToolCallDelta, value)]))
+        return events
+
+    def _prepare_messages(
+        self,
+        messages: list[object],
+        *,
+        enable_thinking: bool = True,
+        tools: list[object] | None = None,
+        tool_choice: object = None,
+        parallel_tool_calls: bool | None = None,
+    ) -> PreparedInputs:
         try:
+            prepare_kwargs: dict[str, object] = {
+                "enable_thinking": enable_thinking,
+                "tensor_device": self._preprocess_device(),
+                "tensor_dtype": self.device_context.dtype,
+            }
+            if tools is not None or tool_choice is not None or parallel_tool_calls is not None:
+                prepare_kwargs.update(
+                    {
+                        "tools": tools,
+                        "tool_choice": tool_choice,
+                        "parallel_tool_calls": parallel_tool_calls,
+                    }
+                )
             return self.processor.prepare_messages(
                 messages,
-                enable_thinking=enable_thinking,
-                tensor_device=self._preprocess_device(),
-                tensor_dtype=self.device_context.dtype,
+                **prepare_kwargs,
             )
         except FileNotFoundError as exc:
             raise AnnaEngineError(str(exc), status_code=400, code="invalid_media_reference") from exc
@@ -1822,49 +1822,19 @@ class AnnaQwen3_5TextEngine:
         raw_reasoning_text: str | None,
         enable_thinking: bool,
         reasoning_format: ReasoningFormat | str | None,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, list[dict[str, object]] | None]:
         resolved_reasoning_format = self._resolve_reasoning_format(reasoning_format)
         if resolved_reasoning_format == "none":
-            return raw_text, None
+            text, tool_calls = self.tokenizer.extract_tool_calls(raw_text)
+            return text, None, [tool_call.to_openai_dict() for tool_call in tool_calls] or None
 
-        parsed_reasoning, parsed_content = self._split_chat_output(
-            raw_text,
-            enable_thinking=enable_thinking,
-        )
+        parsed_reasoning, parsed_content = self._split_chat_output(raw_text, enable_thinking=enable_thinking)
+        text, tool_calls = self.tokenizer.extract_tool_calls(parsed_content)
         reasoning_text = raw_reasoning_text if raw_reasoning_text is not None else parsed_reasoning
-        if reasoning_text is not None:
-            return parsed_content, reasoning_text
-        return raw_text, None
-
-    def _parse_chat_stream_event(
-        self,
-        parser: ThinkingStreamParser,
-        event: StreamEvent,
-    ) -> list[tuple[str, str]]:
-        outputs: list[tuple[str, str]] = []
-        if event.text:
-            outputs.extend(parser.feed(event.text))
-        if event.finish_reason is not None:
-            outputs.extend(parser.flush())
-        return outputs
+        return text, reasoning_text, [tool_call.to_openai_dict() for tool_call in tool_calls] or None
 
     def _split_chat_output(self, raw_text: str, *, enable_thinking: bool) -> tuple[str | None, str]:
-        normalized = raw_text
-        explicit_open = normalized.startswith("<think>")
-        if explicit_open:
-            normalized = normalized[len("<think>") :].lstrip("\r\n")
-            enable_thinking = True
-
-        closing_tag = "</think>"
-        close_index = normalized.find(closing_tag)
-        if close_index != -1:
-            reasoning = normalized[:close_index].strip()
-            content = normalized[close_index + len(closing_tag) :].lstrip("\r\n")
-            return (reasoning or None), content
-        if explicit_open or enable_thinking:
-            reasoning = normalized.strip()
-            return (reasoning or None), ""
-        return None, raw_text
+        return self.tokenizer.split_assistant_reasoning(raw_text, enable_thinking=enable_thinking)
 
     def _generate(self, prepared: PreparedInputs, *, config: GenerationConfig) -> TextGenerationResult:
         if self._can_use_scheduler(prepared):
