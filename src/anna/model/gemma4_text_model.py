@@ -67,7 +67,7 @@ def _apply_rotary_pos_emb_single(
     sin = sin.unsqueeze(1)
     rotary_dim = cos.shape[-1]
     hidden_rot, hidden_pass = hidden_states[..., :rotary_dim], hidden_states[..., rotary_dim:]
-    hidden_rot = (hidden_rot * cos) + (rotate_half(hidden_rot) * sin)
+    hidden_rot = ((hidden_rot * cos) + (rotate_half(hidden_rot) * sin)).to(dtype=hidden_states.dtype)
     return torch.cat((hidden_rot, hidden_pass), dim=-1)
 
 
@@ -513,7 +513,7 @@ class Gemma4TextRotaryEmbedding(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos() * scaling
         sin = emb.sin() * scaling
-        return cos.to(dtype=hidden_states.dtype), sin.to(dtype=hidden_states.dtype)
+        return cos, sin
 
     def reset_runtime_buffers(self) -> None:
         for layer_type in self.layer_types:

@@ -3,6 +3,8 @@ import torch
 
 import anna.model.ops as model_ops
 from anna.model.fused_ops import maybe_load_gated_delta_library
+from anna.model.gemma4_config import Gemma4RopeParameters, Gemma4TextConfig
+from anna.model.gemma4_text_model import Gemma4TextRotaryEmbedding
 from anna.model.ops import (
     Qwen3Attention,
     Qwen3DynamicCache,
@@ -63,6 +65,92 @@ def _reference_rope_cos_sin(
     cos = emb.cos().unsqueeze(0).expand(batch_size, -1, -1).contiguous()
     sin = emb.sin().unsqueeze(0).expand(batch_size, -1, -1).contiguous()
     return cos.to(dtype=dtype), sin.to(dtype=dtype)
+
+
+def test_apply_rotary_pos_emb_preserves_input_dtype_with_float_trig() -> None:
+    torch.manual_seed(0)
+    query = torch.randn(2, 4, 5, 16, dtype=torch.bfloat16)
+    key = torch.randn(2, 2, 5, 16, dtype=torch.bfloat16)
+    cos = torch.randn(2, 5, 8, dtype=torch.float32)
+    sin = torch.randn(2, 5, 8, dtype=torch.float32)
+
+    rotated_query, rotated_key = apply_rotary_pos_emb(query, key, cos, sin)
+
+    rotary_dim = cos.shape[-1]
+    reference_query = torch.cat(
+        [
+            ((query[..., :rotary_dim] * cos.unsqueeze(1)) + (rotate_half(query[..., :rotary_dim]) * sin.unsqueeze(1))).to(
+                dtype=query.dtype
+            ),
+            query[..., rotary_dim:],
+        ],
+        dim=-1,
+    )
+    reference_key = torch.cat(
+        [
+            ((key[..., :rotary_dim] * cos.unsqueeze(1)) + (rotate_half(key[..., :rotary_dim]) * sin.unsqueeze(1))).to(
+                dtype=key.dtype
+            ),
+            key[..., rotary_dim:],
+        ],
+        dim=-1,
+    )
+
+    assert rotated_query.dtype == query.dtype
+    assert rotated_key.dtype == key.dtype
+    assert torch.equal(rotated_query, reference_query)
+    assert torch.equal(rotated_key, reference_key)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the rotary dtype test")
+def test_qwen3_rotary_embedding_xpu_keeps_trig_float32() -> None:
+    config = Qwen3_5TextConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        layer_types=["full_attention"],
+    )
+    rotary = Qwen3TextRotaryEmbedding(config).to("xpu")
+    hidden_states = torch.randn(2, 5, config.hidden_size, device="xpu", dtype=torch.bfloat16)
+    position_ids = torch.arange(hidden_states.shape[1], device="xpu").view(1, -1).expand(hidden_states.shape[0], -1)
+
+    cos, sin = rotary(hidden_states, position_ids)
+
+    assert cos.device.type == "xpu"
+    assert sin.device.type == "xpu"
+    assert cos.dtype == torch.float32
+    assert sin.dtype == torch.float32
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the rotary dtype test")
+def test_gemma4_rotary_embedding_xpu_keeps_trig_float32() -> None:
+    config = Gemma4TextConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        global_head_dim=16,
+        layer_types=["sliding_attention", "full_attention"],
+        rope_parameters={
+            "sliding_attention": Gemma4RopeParameters(rope_type="default", rope_theta=10_000.0, partial_rotary_factor=1.0),
+            "full_attention": Gemma4RopeParameters(rope_type="default", rope_theta=1_000_000.0, partial_rotary_factor=0.25),
+        },
+    )
+    rotary = Gemma4TextRotaryEmbedding(config).to("xpu")
+    hidden_states = torch.randn(2, 5, config.hidden_size, device="xpu", dtype=torch.bfloat16)
+    position_ids = torch.arange(hidden_states.shape[1], device="xpu").view(1, -1).expand(hidden_states.shape[0], -1)
+
+    for layer_type in ("sliding_attention", "full_attention"):
+        cos, sin = rotary(hidden_states, position_ids, layer_type)
+        assert cos.device.type == "xpu"
+        assert sin.device.type == "xpu"
+        assert cos.dtype == torch.float32
+        assert sin.dtype == torch.float32
 
 
 def _reference_moe_router(

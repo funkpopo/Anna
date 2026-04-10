@@ -591,6 +591,9 @@ std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_xpu_impl(
   const auto batch_size = query.size(0);
   const auto sequence_length = query.size(2);
   const auto head_dim = query.size(3);
+  const auto query_num_heads = query.size(1);
+  const auto key_num_heads = key.size(1);
+  const auto total_num_heads = query_num_heads + key_num_heads;
   const auto rotary_dim = cos.size(2);
   const int64_t local_size =
       std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(head_dim, 256))), 256);
@@ -604,90 +607,80 @@ std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_xpu_impl(
       query.scalar_type(),
       "qk_norm_rotary_fused_xpu",
       [&] {
+        const scalar_t* query_ptr = query.const_data_ptr<scalar_t>();
+        const scalar_t* key_ptr = key.const_data_ptr<scalar_t>();
+        const float* query_weight_ptr = query_norm_weight.const_data_ptr<float>();
+        const float* key_weight_ptr = key_norm_weight.const_data_ptr<float>();
         const float* cos_ptr = cos.const_data_ptr<float>();
         const float* sin_ptr = sin.const_data_ptr<float>();
+        scalar_t* query_output_ptr = query_output.mutable_data_ptr<scalar_t>();
+        scalar_t* key_output_ptr = key_output.mutable_data_ptr<scalar_t>();
+        const size_t group_count =
+            static_cast<size_t>(batch_size) * static_cast<size_t>(total_num_heads) * static_cast<size_t>(sequence_length);
 
-        const auto launch_norm_rotary = [&](
-                                            const at::Tensor& input,
-                                            const at::Tensor& norm_weight,
-                                            at::Tensor& output,
-                                            int64_t num_heads,
-                                            float norm_eps_f) {
-          const scalar_t* input_ptr = input.const_data_ptr<scalar_t>();
-          const float* weight_ptr = norm_weight.const_data_ptr<float>();
-          scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
-          const size_t group_count = static_cast<size_t>(batch_size * num_heads * sequence_length);
+        stream.queue().submit([&](sycl::handler& cgh) {
+          sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
+          sycl::local_accessor<float, 1> normalized_values(sycl::range<1>(static_cast<size_t>(head_dim)), cgh);
+          cgh.parallel_for(
+              sycl::nd_range<2>(
+                  sycl::range<2>(group_count, static_cast<size_t>(local_size)),
+                  sycl::range<2>(1, static_cast<size_t>(local_size))),
+              [=](sycl::nd_item<2> item) {
+                const int64_t row = static_cast<int64_t>(item.get_group(0));
+                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+                const int64_t sequence_idx = row % sequence_length;
+                const int64_t batch_head = row / sequence_length;
+                const int64_t combined_head_idx = batch_head % total_num_heads;
+                const int64_t batch_idx = batch_head / total_num_heads;
+                const bool is_query = combined_head_idx < query_num_heads;
+                const int64_t head_idx = is_query ? combined_head_idx : (combined_head_idx - query_num_heads);
+                const int64_t num_heads = is_query ? query_num_heads : key_num_heads;
+                const scalar_t* input_ptr = is_query ? query_ptr : key_ptr;
+                const float* weight_ptr = is_query ? query_weight_ptr : key_weight_ptr;
+                scalar_t* output_ptr = is_query ? query_output_ptr : key_output_ptr;
+                const float norm_eps_f = is_query ? query_norm_eps_f : key_norm_eps_f;
+                const int64_t row_base =
+                    (((batch_idx * num_heads) + head_idx) * sequence_length + sequence_idx) * head_dim;
+                const int64_t trig_base = (batch_idx * sequence_length + sequence_idx) * rotary_dim;
 
-          stream.queue().submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
-            sycl::local_accessor<float, 1> normalized_values(sycl::range<1>(static_cast<size_t>(head_dim)), cgh);
-            cgh.parallel_for(
-                sycl::nd_range<2>(
-                    sycl::range<2>(group_count, static_cast<size_t>(local_size)),
-                    sycl::range<2>(1, static_cast<size_t>(local_size))),
-                [=](sycl::nd_item<2> item) {
-                  const int64_t row = static_cast<int64_t>(item.get_group(0));
-                  const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
-                  const int64_t sequence_idx = row % sequence_length;
-                  const int64_t batch_head = row / sequence_length;
-                  const int64_t head_idx = batch_head % num_heads;
-                  const int64_t batch_idx = batch_head / num_heads;
-                  const int64_t row_base =
-                      (((batch_idx * num_heads) + head_idx) * sequence_length + sequence_idx) * head_dim;
-                  const int64_t trig_base = (batch_idx * sequence_length + sequence_idx) * rotary_dim;
+                float local_sum_sq = 0.0f;
+                for (int64_t idx = lane; idx < head_dim; idx += local_size) {
+                  const float value = load_as_float(input_ptr, row_base + idx);
+                  local_sum_sq += value * value;
+                }
 
-                  float local_sum_sq = 0.0f;
-                  for (int64_t idx = lane; idx < head_dim; idx += local_size) {
-                    const float value = load_as_float(input_ptr, row_base + idx);
-                    local_sum_sq += value * value;
-                  }
+                partial_sum[lane] = local_sum_sq;
+                item.barrier(sycl::access::fence_space::local_space);
 
-                  partial_sum[lane] = local_sum_sq;
-                  item.barrier(sycl::access::fence_space::local_space);
-
-                  for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
-                    if (lane < stride) {
-                      partial_sum[lane] += partial_sum[lane + stride];
-                    }
-                    item.barrier(sycl::access::fence_space::local_space);
-                  }
-
-                  const float inv_rms = sycl::rsqrt(partial_sum[0] / static_cast<float>(head_dim) + norm_eps_f);
-                  for (int64_t idx = lane; idx < head_dim; idx += local_size) {
-                    const float value = load_as_float(input_ptr, row_base + idx);
-                    const float weight_value = AddUnitOffset ? (1.0f + weight_ptr[idx]) : weight_ptr[idx];
-                    normalized_values[idx] = value * inv_rms * weight_value;
+                for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
+                  if (lane < stride) {
+                    partial_sum[lane] += partial_sum[lane + stride];
                   }
                   item.barrier(sycl::access::fence_space::local_space);
+                }
 
-                  const int64_t half_rotary_dim = rotary_dim / 2;
-                  for (int64_t idx = lane; idx < head_dim; idx += local_size) {
-                    float output_value = normalized_values[idx];
-                    if (idx < rotary_dim) {
-                      const float rotated = idx < half_rotary_dim
-                          ? -normalized_values[idx + half_rotary_dim]
-                          : normalized_values[idx - half_rotary_dim];
-                      output_value =
-                          normalized_values[idx] * cos_ptr[trig_base + idx] + rotated * sin_ptr[trig_base + idx];
-                    }
-                    output_ptr[row_base + idx] = static_cast<scalar_t>(output_value);
+                const float inv_rms = sycl::rsqrt(partial_sum[0] / static_cast<float>(head_dim) + norm_eps_f);
+                for (int64_t idx = lane; idx < head_dim; idx += local_size) {
+                  const float value = load_as_float(input_ptr, row_base + idx);
+                  const float weight_value = AddUnitOffset ? (1.0f + weight_ptr[idx]) : weight_ptr[idx];
+                  normalized_values[idx] = value * inv_rms * weight_value;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                const int64_t half_rotary_dim = rotary_dim / 2;
+                for (int64_t idx = lane; idx < head_dim; idx += local_size) {
+                  float output_value = normalized_values[idx];
+                  if (idx < rotary_dim) {
+                    const float rotated = idx < half_rotary_dim
+                        ? -normalized_values[idx + half_rotary_dim]
+                        : normalized_values[idx - half_rotary_dim];
+                    output_value =
+                        normalized_values[idx] * cos_ptr[trig_base + idx] + rotated * sin_ptr[trig_base + idx];
                   }
-                });
-          });
-        };
-
-        launch_norm_rotary(
-            query,
-            query_norm_weight,
-            query_output,
-            query.size(1),
-            query_norm_eps_f);
-        launch_norm_rotary(
-            key,
-            key_norm_weight,
-            key_output,
-            key.size(1),
-            key_norm_eps_f);
+                  output_ptr[row_base + idx] = static_cast<scalar_t>(output_value);
+                }
+              });
+        });
       });
 
   return {query_output, key_output};

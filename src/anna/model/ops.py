@@ -914,7 +914,7 @@ class Qwen3TextRotaryEmbedding(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos() * self.attention_scaling
         sin = emb.sin() * self.attention_scaling
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        return cos, sin
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -935,8 +935,8 @@ def apply_rotary_pos_emb(
     rotary_dim = cos.shape[-1]
     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    q_embed = ((q_rot * cos) + (rotate_half(q_rot) * sin)).to(dtype=q.dtype)
+    k_embed = ((k_rot * cos) + (rotate_half(k_rot) * sin)).to(dtype=k.dtype)
     return torch.cat([q_embed, q_pass], dim=-1), torch.cat([k_embed, k_pass], dim=-1)
 
 
