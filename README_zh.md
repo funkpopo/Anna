@@ -472,3 +472,7 @@ anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16 --metrics-
 - 改了 SYCL 源码后，先重新执行 `python tools/build_gated_delta_fused_op.py`
 - 再执行 `pytest tests/test_fused_op_xpu.py -q`
 - 最后再重启 `anna-serve`
+
+---
+
+# 感谢[LinuxDO](https://linux.do/)社区
