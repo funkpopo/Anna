@@ -474,3 +474,7 @@ anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16 --metrics-
 - After changing the SYCL source, rerun `python tools/build_gated_delta_fused_op.py`
 - Then run `pytest tests/test_fused_op_xpu.py -q`
 - Restart `anna-serve` after that
+
+---
+
+# Thanks to [LinuxDO](https://linux.do/) community.
