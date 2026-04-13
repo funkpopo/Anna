@@ -461,8 +461,11 @@ at::Tensor rmsnorm_fused_xpu_impl(
 
   const auto hidden_size = input.size(-1);
   const auto row_count = input.numel() / hidden_size;
+  constexpr int64_t kMaxRmsNormWorkgroupSize = 128;
   const int64_t local_size =
-      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(hidden_size, 256))), 256);
+      std::min<int64_t>(
+          next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(hidden_size, kMaxRmsNormWorkgroupSize))),
+          kMaxRmsNormWorkgroupSize);
   const float eps_f = static_cast<float>(eps);
   auto stream = c10::xpu::getCurrentXPUStream(input.device().index());
 

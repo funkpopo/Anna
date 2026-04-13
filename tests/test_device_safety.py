@@ -12,6 +12,11 @@ def test_classify_runtime_error_out_of_memory() -> None:
     assert DeviceContext.classify_runtime_error(exc) == "out_of_memory"
 
 
+def test_classify_runtime_error_level_zero_out_of_device_memory() -> None:
+    exc = RuntimeError("level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)")
+    assert DeviceContext.classify_runtime_error(exc) == "out_of_memory"
+
+
 def test_classify_runtime_error_device_lost() -> None:
     exc = RuntimeError("level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)")
     assert DeviceContext.classify_runtime_error(exc) == "device_lost"

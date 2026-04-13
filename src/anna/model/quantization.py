@@ -246,11 +246,11 @@ class XPUInt4Linear(nn.Module):
         )
         qweight, qscale, qzeros = cls._quantize_weight(weight, group_size=group_size, padded_in_features=padded_in_features)
         with torch.no_grad():
-            quantized.qweight.copy_(qweight.to(device=quantized.qweight.device))
-            quantized.qscale.copy_(qscale.to(device=quantized.qscale.device))
-            quantized.qzeros.copy_(qzeros.to(device=quantized.qzeros.device))
+            quantized.qweight.copy_(qweight)
+            quantized.qscale.copy_(qscale)
+            quantized.qzeros.copy_(qzeros)
             if bias is not None and quantized.bias is not None:
-                quantized.bias.copy_(bias.to(device=quantized.bias.device, dtype=quantized.bias.dtype))
+                quantized.bias.copy_(bias.to(dtype=quantized.bias.dtype))
         return quantized
 
     @staticmethod
@@ -355,6 +355,13 @@ def _set_submodule(model: nn.Module, module_name: str, replacement: nn.Module) -
     setattr(parent, parts[-1], replacement)
 
 
+def _get_submodule(model: nn.Module, module_name: str) -> nn.Module:
+    current = model
+    for part in module_name.split("."):
+        current = getattr(current, part)
+    return current
+
+
 def _extract_dense_weight_bias(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor | None]:
     if isinstance(module, FP8Linear):
         weight = module._dequantize_weight()
@@ -429,7 +436,7 @@ def convert_module_linears_to_xpu_int4(
     device: torch.device | str = torch.device("xpu"),
     include_predicate: Callable[[str, nn.Module], bool] | None = None,
 ) -> int:
-    replacements: list[tuple[str, XPUInt4Linear]] = []
+    candidate_module_names: list[str] = []
     for module_name, child in list(module.named_modules()):
         if not module_name:
             continue
@@ -438,6 +445,15 @@ def convert_module_linears_to_xpu_int4(
         if not isinstance(child, (FP8Linear, AWQLinear, DenseLinear, nn.Linear)):
             continue
         if include_predicate is not None and not include_predicate(module_name, child):
+            continue
+        candidate_module_names.append(module_name)
+
+    replacements = 0
+    for module_name in candidate_module_names:
+        child = _get_submodule(module, module_name)
+        if isinstance(child, XPUInt4Linear):
+            continue
+        if not isinstance(child, (AutoRoundGPTQLinear, AWQLinear, DenseLinear, nn.Linear)):
             continue
         replacements.append(
             (
@@ -450,10 +466,9 @@ def convert_module_linears_to_xpu_int4(
                 ),
             )
         )
-
-    for module_name, replacement in replacements:
         _set_submodule(module, module_name, replacement)
-    return len(replacements)
+        replacements += 1
+    return replacements
 
 
 def replace_linear_modules(

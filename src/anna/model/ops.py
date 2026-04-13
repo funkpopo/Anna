@@ -882,6 +882,7 @@ class Qwen3TextRotaryEmbedding(nn.Module):
         inv_freq, attention_scaling = self.compute_default_rope_parameters(config)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+        self.cpu_inv_freq: torch.Tensor | None = None if inv_freq.is_meta else inv_freq.detach().cpu()
         self.attention_scaling = attention_scaling
         self.mrope_section = tuple(config.rope_parameters.mrope_section)
 
@@ -890,7 +891,7 @@ class Qwen3TextRotaryEmbedding(nn.Module):
         base = config.rope_parameters.rope_theta
         dim = int(config.head_dim * config.rope_parameters.partial_rotary_factor)
         dim = max(2, dim - (dim % 2))
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device="cpu") / dim))
         return inv_freq, 1.0
 
     def apply_interleaved_mrope(self, freqs: torch.Tensor) -> torch.Tensor:
@@ -907,13 +908,24 @@ class Qwen3TextRotaryEmbedding(nn.Module):
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
+        inv_freq = self.inv_freq
+        if x.device.type == "xpu" and position_ids.device.type == "cpu":
+            if self.cpu_inv_freq is None:
+                source_inv_freq = self.original_inv_freq if not self.original_inv_freq.is_meta else self.inv_freq
+                if source_inv_freq.is_meta:
+                    raise RuntimeError("Qwen3 rotary inverse frequencies are still on meta device.")
+                self.cpu_inv_freq = source_inv_freq.detach().cpu()
+            inv_freq = self.cpu_inv_freq
+        inv_freq_expanded = inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
         position_ids_expanded = position_ids[:, :, None, :].float()
         freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
         freqs = self.apply_interleaved_mrope(freqs)
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos() * self.attention_scaling
         sin = emb.sin() * self.attention_scaling
+        if x.device.type == "xpu" and cos.device != x.device:
+            cos = cos.to(device=x.device)
+            sin = sin.to(device=x.device)
         return cos, sin
 
 
@@ -1504,7 +1516,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.expert_quant_group_size = expert_quant_group_size
         if cached_experts_per_layer is not None:
             self.cached_experts_per_layer = max(0, min(int(cached_experts_per_layer), self.num_experts))
-        self._expert_cache.clear()
+        self._clear_expert_cache()
         self.host_experts_pinned = False
 
         if resident_experts and self._should_use_xpu_int4():
@@ -1550,6 +1562,20 @@ class Qwen3SparseMoeBlock(nn.Module):
 
     def _new_expert_module(self) -> Qwen3MLP:
         return Qwen3MLP(self._config, intermediate_size=self._expert_intermediate_size)
+
+    def _release_xpu_expert_cache(self) -> None:
+        if self.execution_device is None or self.execution_device.type != "xpu":
+            return
+        xpu = getattr(torch, "xpu", None)
+        empty_cache = None if xpu is None else getattr(xpu, "empty_cache", None)
+        if callable(empty_cache):
+            empty_cache()
+
+    def _clear_expert_cache(self) -> None:
+        if not self._expert_cache:
+            return
+        self._expert_cache.clear()
+        self._release_xpu_expert_cache()
 
     @staticmethod
     def _copy_module_state_(
@@ -1621,6 +1647,7 @@ class Qwen3SparseMoeBlock(nn.Module):
 
         if len(self._expert_cache) >= self.cached_experts_per_layer:
             self._expert_cache.popitem(last=False)
+            self._release_xpu_expert_cache()
         cached = self._materialize_cached_expert(expert_idx)
         self._expert_cache[expert_idx] = cached
         return cached

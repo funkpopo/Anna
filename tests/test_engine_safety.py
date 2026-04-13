@@ -60,6 +60,40 @@ def test_guard_generation_memory_rejects_oversized_request() -> None:
         raise AssertionError("Expected memory guard to reject the oversized request.")
 
 
+def test_guard_generation_memory_rejects_when_projected_total_exceeds_usage_ratio() -> None:
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.device_context = SimpleNamespace(
+        safety_policy=RuntimeSafetyPolicy(
+            min_free_bytes=64 << 20,
+            reserve_margin_bytes=32 << 20,
+            max_estimated_usage_ratio=0.9,
+            generation_memory_safety_factor=1.0,
+        ),
+        get_memory_info=lambda: DeviceMemoryInfo(
+            free_bytes=300 << 20,
+            total_bytes=1024 << 20,
+            allocated_bytes=724 << 20,
+            reserved_bytes=0,
+        ),
+    )
+    engine._estimate_generation_memory_bytes = lambda prepared, config: 250 << 20
+
+    prepared = PreparedInputs(
+        prompt="test",
+        input_ids=torch.ones((1, 8), dtype=torch.long),
+        attention_mask=torch.ones((1, 8), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 8), dtype=torch.int32),
+    )
+
+    try:
+        engine._guard_generation_memory(prepared, config=GenerationConfig(max_new_tokens=16))
+    except AnnaEngineError as exc:
+        assert exc.code == "estimated_device_oom"
+        assert "projected_total" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("Expected projected-total memory guard to reject the request.")
+
+
 def test_validate_generation_request_uses_remaining_context_when_no_memory_info_is_available() -> None:
     engine = object.__new__(AnnaQwen3_5TextEngine)
     engine.config = SimpleNamespace(
@@ -84,6 +118,27 @@ def test_validate_generation_request_uses_remaining_context_when_no_memory_info_
     assert len(prompt_ids) == 8
     assert prompt_length == 8
     assert resolved.max_new_tokens == 24
+
+
+def test_move_prepared_for_generation_prunes_trivial_attention_mask_before_device_transfer() -> None:
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    seen_attention_masks: list[torch.Tensor | None] = []
+    engine._guard_generation_memory = lambda prepared, config: None
+    engine.device_context = SimpleNamespace(
+        move_prepared_inputs=lambda prepared: seen_attention_masks.append(prepared.attention_mask) or prepared,
+    )
+
+    prepared = PreparedInputs(
+        prompt="test",
+        input_ids=torch.ones((1, 4), dtype=torch.long),
+        attention_mask=torch.ones((1, 4), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 4), dtype=torch.int32),
+    )
+
+    moved = engine._move_prepared_for_generation(prepared, config=GenerationConfig(max_new_tokens=8))
+
+    assert moved.attention_mask is None
+    assert seen_attention_masks == [None]
 
 
 def test_validate_generation_request_auto_resolves_memory_bounded_limit() -> None:
@@ -316,10 +371,17 @@ def test_auto_cached_experts_per_layer_scales_with_available_xpu_budget() -> Non
 
     exemplar_expert_bytes = estimate_module_xpu_int4_bytes(model.model.layers[0].mlp.experts[0])
     offloaded_layer_count = 2
-    target_free_bytes = 768 << 20
+    total_bytes = 16 << 30
+    target_free_bytes = max(
+        1024 << 20,
+        512 << 20,
+        int(total_bytes * 0.1),
+        1536 << 20,
+        int(total_bytes * 0.12),
+    )
     desired_cached = 3
     cache_budget_bytes = exemplar_expert_bytes * offloaded_layer_count * desired_cached
-    free_bytes = int((cache_budget_bytes + exemplar_expert_bytes * offloaded_layer_count) / 0.65) + target_free_bytes
+    free_bytes = int((cache_budget_bytes + exemplar_expert_bytes * offloaded_layer_count) / 0.25) + target_free_bytes
 
     fake_device_context = SimpleNamespace(
         device=torch.device("xpu"),
@@ -327,7 +389,7 @@ def test_auto_cached_experts_per_layer_scales_with_available_xpu_budget() -> Non
         synchronize=lambda: None,
         get_memory_info=lambda: DeviceMemoryInfo(
             free_bytes=free_bytes,
-            total_bytes=max(free_bytes + 1024, 16 << 20),
+            total_bytes=total_bytes,
             allocated_bytes=0,
             reserved_bytes=0,
         ),
@@ -341,6 +403,68 @@ def test_auto_cached_experts_per_layer_scales_with_available_xpu_budget() -> Non
 
     assert estimated >= desired_cached
     assert estimated <= config.num_experts
+
+
+def test_auto_cached_experts_per_layer_caps_large_moe_working_set() -> None:
+    config = Qwen3_5TextConfig(
+        hidden_size=2048,
+        intermediate_size=2048,
+        num_hidden_layers=40,
+        num_attention_heads=16,
+        num_key_value_heads=2,
+        head_dim=256,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        vocab_size=256,
+        max_position_embeddings=4096,
+        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 10,
+        rope_parameters=RopeParameters(
+            rope_type="default",
+            rope_theta=10000.0,
+            partial_rotary_factor=0.25,
+            mrope_section=(1, 1, 0),
+        ),
+        decoder_sparse_step=1,
+        moe_intermediate_size=512,
+        shared_expert_intermediate_size=512,
+        num_experts=256,
+        num_experts_per_tok=8,
+    )
+    model = Qwen3_5TextForCausalLM(config)
+    model.configure_runtime(
+        torch.device("cpu"),
+        offload_experts=True,
+        resident_expert_layer_indices=(),
+        expert_quant="int4",
+        cached_experts_per_layer=0,
+    )
+
+    fake_device_context = SimpleNamespace(
+        device=torch.device("xpu"),
+        safety_policy=RuntimeSafetyPolicy(
+            min_free_bytes=256 << 20,
+            reserve_margin_bytes=128 << 20,
+            max_estimated_usage_ratio=0.95,
+            generation_memory_safety_factor=1.25,
+        ),
+        synchronize=lambda: None,
+        get_memory_info=lambda: DeviceMemoryInfo(
+            free_bytes=12 << 30,
+            total_bytes=16 << 30,
+            allocated_bytes=0,
+            reserved_bytes=0,
+        ),
+    )
+
+    estimated = AnnaQwen3_5TextEngine._estimate_cached_experts_per_layer(
+        model=model,
+        device_context=fake_device_context,
+        expert_quant="int4",
+    )
+
+    assert estimated <= config.num_experts_per_tok * 2
 
 
 def test_auto_weight_quantization_promotes_oversized_dense_xpu_models(monkeypatch) -> None:

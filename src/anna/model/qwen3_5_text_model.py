@@ -143,18 +143,23 @@ class Qwen3TextModel(nn.Module):
             inputs_embeds = inputs_embeds.to(device=execution_device)
         if attention_mask is not None and attention_mask.device != execution_device:
             attention_mask = attention_mask.to(device=execution_device)
-        if position_ids is not None and position_ids.device != execution_device:
+        if position_ids is not None and execution_device.type == "xpu" and position_ids.device.type != "cpu":
+            position_ids = position_ids.to(device="cpu")
+        if position_ids is not None and execution_device.type != "xpu" and position_ids.device != execution_device:
             position_ids = position_ids.to(device=execution_device)
 
         if position_ids is None:
             seq_len = inputs_embeds.shape[1]
             batch_size = inputs_embeds.shape[0]
+            metadata_device = torch.device("cpu") if execution_device.type == "xpu" else inputs_embeds.device
             if past_key_values is None or past_key_values.get_batch_size() == 0:
-                past_seen_tokens = torch.zeros(batch_size, device=inputs_embeds.device, dtype=torch.long)
+                past_seen_tokens = torch.zeros(batch_size, device=metadata_device, dtype=torch.long)
             else:
-                past_seen_tokens = past_key_values.get_seq_lengths(device=inputs_embeds.device)
-            position_ids = torch.arange(seq_len, device=inputs_embeds.device).view(1, -1)
+                past_seen_tokens = past_key_values.get_seq_lengths(device=metadata_device)
+            position_ids = torch.arange(seq_len, device=metadata_device, dtype=torch.long).view(1, -1)
             position_ids = position_ids + past_seen_tokens.view(-1, 1)
+            if execution_device.type != "xpu" and position_ids.device != execution_device:
+                position_ids = position_ids.to(device=execution_device)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

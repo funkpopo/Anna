@@ -871,10 +871,16 @@ class AnnaQwen3_5TextEngine:
             budget_bytes = max(0, target_used_bytes - used_bytes)
             return budget_bytes, target_used_bytes, 1.0
         if expert_quant == "int4":
-            target_free_bytes = max(2304 << 20, int(memory_info.total_bytes * 0.16))
-            budget_factor = 1.10
-            budget_bytes = int(max(0, int(memory_info.free_bytes) - target_free_bytes) / budget_factor)
-            return budget_bytes, target_free_bytes, budget_factor
+            reserve_bytes = max(
+                int(safety.min_free_bytes),
+                int(safety.reserve_margin_bytes),
+                int(memory_info.total_bytes * (1.0 - safety.max_estimated_usage_ratio)),
+                1536 << 20,
+                int(memory_info.total_bytes * 0.25),
+            )
+            budget_factor = max(1.25, float(safety.generation_memory_safety_factor))
+            budget_bytes = int(max(0, int(memory_info.free_bytes) - reserve_bytes) / budget_factor)
+            return budget_bytes, reserve_bytes, budget_factor
 
         reserve_bytes = max(
             int(safety.min_free_bytes),
@@ -884,6 +890,29 @@ class AnnaQwen3_5TextEngine:
         budget_factor = max(1.0, float(safety.generation_memory_safety_factor))
         budget_bytes = int(max(0, int(memory_info.free_bytes) - reserve_bytes) / budget_factor)
         return budget_bytes, reserve_bytes, budget_factor
+
+    @classmethod
+    def _resident_budget_cap_bytes(
+        cls,
+        *,
+        memory_info: object,
+        expert_quant: str,
+    ) -> int:
+        if expert_quant == "int4":
+            return max(
+                0,
+                min(
+                    int(memory_info.total_bytes * 0.12),
+                    int(memory_info.free_bytes * 0.20),
+                ),
+            )
+        return max(
+            0,
+            min(
+                int(memory_info.total_bytes * 0.08),
+                int(memory_info.free_bytes * 0.15),
+            ),
+        )
 
     @classmethod
     def _estimate_resident_expert_layer_indices(
@@ -911,7 +940,6 @@ class AnnaQwen3_5TextEngine:
             memory_info=memory_info,
             safety=safety,
             expert_quant=expert_quant,
-            weight_gpu_memory_ratio=weight_gpu_memory_ratio,
         )
         if budget_bytes <= 0:
             logger.info(
@@ -922,6 +950,7 @@ class AnnaQwen3_5TextEngine:
                 budget_factor,
                 weight_gpu_memory_ratio,
                 _format_bytes(budget_bytes),
+                _format_bytes(budget_cap_bytes),
             )
             return ()
 
@@ -950,11 +979,35 @@ class AnnaQwen3_5TextEngine:
             budget_factor,
             weight_gpu_memory_ratio,
             _format_bytes(budget_bytes),
+            _format_bytes(budget_cap_bytes),
             selected_indices,
             _format_bytes(consumed_bytes),
             {layer_idx: _format_bytes(layer_bytes) for layer_idx, layer_bytes in layer_sizes[:8]},
         )
         return tuple(selected_indices)
+
+    @classmethod
+    def _expert_cache_cap_bytes(
+        cls,
+        *,
+        memory_info: object,
+        expert_quant: str,
+    ) -> int:
+        if expert_quant == "int4":
+            return max(
+                0,
+                min(
+                    int(memory_info.total_bytes * 0.05),
+                    int(memory_info.free_bytes * 0.10),
+                ),
+            )
+        return max(
+            0,
+            min(
+                int(memory_info.total_bytes * 0.03),
+                int(memory_info.free_bytes * 0.08),
+            ),
+        )
 
     @classmethod
     def _estimate_cached_experts_per_layer(
@@ -977,6 +1030,7 @@ class AnnaQwen3_5TextEngine:
         if memory_info is None:
             return 0
 
+        safety = device_context.safety_policy
         exemplar_block = offloaded_blocks[0][1]
         exemplar_expert = exemplar_block.experts[0]
         per_expert_bytes = (
@@ -1007,6 +1061,20 @@ class AnnaQwen3_5TextEngine:
         else:
             resolved = max(minimum_cache, min(max_cache, auto_cached))
 
+        working_set_cap = max(minimum_cache, min(max_cache, exemplar_block.top_k * 2))
+        cache_cap_bytes = cls._expert_cache_cap_bytes(
+            memory_info=memory_info,
+            expert_quant=expert_quant,
+        )
+        cache_cap = (
+            max(0, min(max_cache, cache_cap_bytes // max(1, per_expert_bytes * len(offloaded_blocks))))
+            if cache_cap_bytes > 0
+            else 0
+        )
+        resolved = min(resolved, working_set_cap)
+        if cache_cap > 0:
+            resolved = min(resolved, cache_cap)
+
         logger.info(
             "Auto expert cache sizing: expert_quant=%s free=%s target_free=%s ratio=%.2f cache_budget_fraction=%.2f cache_budget=%s offloaded_layers=%s per_expert=%s cached_experts_per_layer=%s",
             expert_quant,
@@ -1015,6 +1083,8 @@ class AnnaQwen3_5TextEngine:
             weight_gpu_memory_ratio,
             cache_budget_fraction,
             _format_bytes(cache_budget_bytes),
+            _format_bytes(cache_cap_bytes),
+            working_set_cap,
             len(offloaded_blocks),
             _format_bytes(per_expert_bytes),
             resolved,
@@ -1690,7 +1760,9 @@ class AnnaQwen3_5TextEngine:
 
         available_budget = max(0, memory_info.free_bytes - policy.reserve_margin_bytes)
         max_allowed = int(memory_info.total_bytes * policy.max_estimated_usage_ratio)
-        memory_budget = min(available_budget, max_allowed)
+        used_bytes = max(0, int(memory_info.total_bytes) - int(memory_info.free_bytes))
+        ratio_budget = max(0, max_allowed - used_bytes)
+        memory_budget = min(available_budget, ratio_budget)
         if memory_budget <= 0:
             raise AnnaEngineError(
                 "No XPU memory budget remains for generation after applying safety margins.",
@@ -1734,10 +1806,39 @@ class AnnaQwen3_5TextEngine:
         config: GenerationConfig,
     ) -> PreparedInputs:
         self._guard_generation_memory(prepared, config=config)
+        prepared = replace_prepared_inputs(
+            prepared,
+            attention_mask=self._prune_trivial_attention_mask(prepared.attention_mask),
+        )
         try:
             return self.device_context.move_prepared_inputs(prepared)
         except RuntimeError as exc:
             raise self._handle_runtime_failure(exc) from exc
+
+    @classmethod
+    def _estimate_cached_expert_growth_bytes(
+        cls,
+        *,
+        model: Qwen3_5TextForConditionalGeneration,
+        expert_quant: str,
+    ) -> int:
+        total = 0
+        for _layer_idx, block in cls._offloaded_sparse_moe_blocks(model):
+            cached_capacity = max(0, int(getattr(block, "cached_experts_per_layer", 0)))
+            if cached_capacity <= 0:
+                continue
+            current_cache = len(getattr(block, "_expert_cache", {}))
+            additional_capacity = max(0, cached_capacity - current_cache)
+            if additional_capacity <= 0:
+                continue
+            exemplar_expert = block.experts[0]
+            per_expert_bytes = (
+                estimate_module_xpu_int4_bytes(exemplar_expert)
+                if expert_quant == "int4"
+                else cls._module_nbytes(exemplar_expert)
+            )
+            total += additional_capacity * per_expert_bytes
+        return total
 
     def _estimate_generation_memory_bytes(
         self,
@@ -1781,7 +1882,22 @@ class AnnaQwen3_5TextEngine:
         if getattr(self, "full_attention_cache_mirror", False):
             kv_cache_bytes *= 2
 
-        estimated = kv_cache_bytes + conv_cache_bytes + recurrent_bytes + hidden_working_bytes + media_bytes
+        expert_cache_growth_bytes = 0
+        model = getattr(self, "model", None)
+        if model is not None:
+            expert_cache_growth_bytes = self._estimate_cached_expert_growth_bytes(
+                model=model,
+                expert_quant=getattr(self, "expert_quant", "none"),
+            )
+
+        estimated = (
+            kv_cache_bytes
+            + conv_cache_bytes
+            + recurrent_bytes
+            + hidden_working_bytes
+            + media_bytes
+            + expert_cache_growth_bytes
+        )
         return int(estimated * self.device_context.safety_policy.generation_memory_safety_factor)
 
     def _guard_generation_memory(
@@ -1798,6 +1914,8 @@ class AnnaQwen3_5TextEngine:
         policy = self.device_context.safety_policy
         available_budget = max(0, memory_info.free_bytes - policy.reserve_margin_bytes)
         max_allowed = int(memory_info.total_bytes * policy.max_estimated_usage_ratio)
+        used_bytes = max(0, int(memory_info.total_bytes) - int(memory_info.free_bytes))
+        projected_bytes = used_bytes + estimated_bytes
 
         if memory_info.free_bytes < policy.min_free_bytes:
             raise AnnaEngineError(
@@ -1808,10 +1926,11 @@ class AnnaQwen3_5TextEngine:
                 code="insufficient_device_memory",
             )
 
-        if estimated_bytes > available_budget or estimated_bytes > max_allowed:
+        if estimated_bytes > available_budget or projected_bytes > max_allowed:
             raise AnnaEngineError(
                 f"Request rejected by memory guard: estimated={_format_bytes(estimated_bytes)}, "
-                f"free={_format_bytes(memory_info.free_bytes)}, reserve={_format_bytes(policy.reserve_margin_bytes)}. "
+                f"free={_format_bytes(memory_info.free_bytes)}, reserve={_format_bytes(policy.reserve_margin_bytes)}, "
+                f"projected_total={_format_bytes(projected_bytes)}. "
                 "Reduce prompt length, image/video size, or max_completion_tokens.",
                 status_code=400,
                 error_type="invalid_request_error",

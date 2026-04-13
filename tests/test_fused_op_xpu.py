@@ -125,6 +125,35 @@ def test_qwen3_rotary_embedding_xpu_keeps_trig_float32() -> None:
     assert sin.dtype == torch.float32
 
 
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the rotary CPU-position-id test")
+def test_qwen3_rotary_embedding_xpu_accepts_cpu_position_ids() -> None:
+    config = Qwen3_5TextConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        layer_types=["full_attention"],
+    )
+    rotary_cpu = Qwen3TextRotaryEmbedding(config)
+    rotary_xpu = Qwen3TextRotaryEmbedding(config).to("xpu")
+    hidden_states_cpu = torch.randn(2, 5, config.hidden_size, dtype=torch.float32)
+    hidden_states_xpu = hidden_states_cpu.to("xpu", dtype=torch.bfloat16)
+    position_ids_cpu = torch.arange(hidden_states_cpu.shape[1]).view(1, -1).expand(hidden_states_cpu.shape[0], -1)
+
+    with torch.no_grad():
+        expected_cos, expected_sin = rotary_cpu(hidden_states_cpu, position_ids_cpu)
+        actual_cos, actual_sin = rotary_xpu(hidden_states_xpu, position_ids_cpu)
+
+    assert actual_cos.device.type == "xpu"
+    assert actual_sin.device.type == "xpu"
+    assert actual_cos.dtype == torch.float32
+    assert actual_sin.dtype == torch.float32
+    assert torch.allclose(actual_cos.cpu(), expected_cos, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(actual_sin.cpu(), expected_sin, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the rotary dtype test")
 def test_gemma4_rotary_embedding_xpu_keeps_trig_float32() -> None:
     config = Gemma4TextConfig(
@@ -400,6 +429,24 @@ def test_rmsnorm_fused_xpu_matches_reference() -> None:
     device = "xpu"
     hidden_states = torch.randn(3, 5, 32, device=device, dtype=torch.bfloat16)
     weight = torch.randn(32, device=device, dtype=torch.float32)
+    eps = 1e-6
+
+    output = torch.ops.anna.rmsnorm_fused(hidden_states, weight, eps)
+    reference = _reference_rmsnorm(hidden_states, weight, eps)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the realistic RMSNorm SYCL custom op test")
+def test_rmsnorm_fused_xpu_matches_reference_on_qwen35_hidden_size() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "rmsnorm_fused"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(0)
+    device = "xpu"
+    hidden_states = torch.randn(1, 13, 2048, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(2048, device=device, dtype=torch.float32)
     eps = 1e-6
 
     output = torch.ops.anna.rmsnorm_fused(hidden_states, weight, eps)

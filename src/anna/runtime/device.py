@@ -270,7 +270,12 @@ class DeviceContext:
     @staticmethod
     def classify_runtime_error(exc: BaseException) -> str:
         message = str(exc).lower()
-        if "out of memory" in message or "memory" in message and "allocation" in message:
+        if (
+            "out of memory" in message
+            or "memory" in message and "allocation" in message
+            or "ur_result_error_out_of_device_memory" in message
+            or "out_of_device_memory" in message
+        ):
             return "out_of_memory"
         if "device lost" in message or "ur_result_error_device_lost" in message:
             return "device_lost"
