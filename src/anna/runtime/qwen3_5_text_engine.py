@@ -866,10 +866,14 @@ class AnnaQwen3_5TextEngine:
         weight_gpu_memory_ratio: float,
     ) -> tuple[int, int, float]:
         if weight_gpu_memory_ratio > 0.0:
-            used_bytes = max(0, int(memory_info.total_bytes) - int(memory_info.free_bytes))
-            target_used_bytes = int(int(memory_info.total_bytes) * weight_gpu_memory_ratio)
-            budget_bytes = max(0, target_used_bytes - used_bytes)
-            return budget_bytes, target_used_bytes, 1.0
+            reserve_bytes = max(
+                int(memory_info.total_bytes * (1.0 - weight_gpu_memory_ratio)),
+                int(safety.min_free_bytes),
+                int(safety.reserve_margin_bytes),
+                int(memory_info.total_bytes * (1.0 - safety.max_estimated_usage_ratio)),
+            )
+            budget_bytes = max(0, int(memory_info.free_bytes) - reserve_bytes)
+            return budget_bytes, reserve_bytes, 1.0
         if expert_quant == "int4":
             reserve_bytes = max(
                 int(safety.min_free_bytes),
@@ -940,10 +944,17 @@ class AnnaQwen3_5TextEngine:
             memory_info=memory_info,
             safety=safety,
             expert_quant=expert_quant,
+            weight_gpu_memory_ratio=weight_gpu_memory_ratio,
         )
+        budget_cap_bytes = cls._resident_budget_cap_bytes(
+            memory_info=memory_info,
+            expert_quant=expert_quant,
+        )
+        if budget_cap_bytes > 0:
+            budget_bytes = min(budget_bytes, budget_cap_bytes)
         if budget_bytes <= 0:
             logger.info(
-                "Auto resident expert placement skipped: expert_quant=%s free=%s reserve=%s budget_factor=%.2f ratio=%.2f budget=%s",
+                "Auto resident expert placement skipped: expert_quant=%s free=%s reserve=%s budget_factor=%.2f ratio=%.2f budget=%s budget_cap=%s",
                 expert_quant,
                 _format_bytes(memory_info.free_bytes),
                 _format_bytes(reserve_bytes),
@@ -972,7 +983,7 @@ class AnnaQwen3_5TextEngine:
             consumed_bytes += layer_bytes
 
         logger.info(
-            "Auto resident expert placement: expert_quant=%s free=%s reserve=%s budget_factor=%.2f ratio=%.2f budget=%s selected_layers=%s selected_bytes=%s candidate_layer_bytes=%s",
+            "Auto resident expert placement: expert_quant=%s free=%s reserve=%s budget_factor=%.2f ratio=%.2f budget=%s budget_cap=%s selected_layers=%s selected_bytes=%s candidate_layer_bytes=%s",
             expert_quant,
             _format_bytes(memory_info.free_bytes),
             _format_bytes(reserve_bytes),
@@ -1042,13 +1053,22 @@ class AnnaQwen3_5TextEngine:
             return max(exemplar_block.top_k, 0)
 
         if weight_gpu_memory_ratio > 0.0:
-            used_bytes = max(0, int(memory_info.total_bytes) - int(memory_info.free_bytes))
-            target_used_bytes = int(int(memory_info.total_bytes) * weight_gpu_memory_ratio)
-            cache_budget_bytes = max(0, target_used_bytes - used_bytes)
-            cache_target_free_bytes = max(0, int(memory_info.total_bytes) - target_used_bytes)
+            cache_target_free_bytes = max(
+                int(memory_info.total_bytes * (1.0 - weight_gpu_memory_ratio)),
+                int(safety.min_free_bytes),
+                int(safety.reserve_margin_bytes),
+                int(memory_info.total_bytes * (1.0 - safety.max_estimated_usage_ratio)),
+            )
+            cache_budget_bytes = max(0, int(memory_info.free_bytes) - cache_target_free_bytes)
             cache_budget_fraction = 1.0
         else:
-            cache_target_free_bytes = max(768 << 20, int(memory_info.total_bytes * 0.06))
+            cache_target_free_bytes = max(
+                768 << 20,
+                int(memory_info.total_bytes * 0.06),
+                int(safety.min_free_bytes),
+                int(safety.reserve_margin_bytes),
+                int(memory_info.total_bytes * (1.0 - safety.max_estimated_usage_ratio)),
+            )
             cache_budget_fraction = 0.65 if expert_quant == "int4" else 0.35
             cache_budget_bytes = int(max(0, int(memory_info.free_bytes) - cache_target_free_bytes) * cache_budget_fraction)
         auto_cached = cache_budget_bytes // max(1, per_expert_bytes * len(offloaded_blocks))
@@ -1076,7 +1096,7 @@ class AnnaQwen3_5TextEngine:
             resolved = min(resolved, cache_cap)
 
         logger.info(
-            "Auto expert cache sizing: expert_quant=%s free=%s target_free=%s ratio=%.2f cache_budget_fraction=%.2f cache_budget=%s offloaded_layers=%s per_expert=%s cached_experts_per_layer=%s",
+            "Auto expert cache sizing: expert_quant=%s free=%s target_free=%s ratio=%.2f cache_budget_fraction=%.2f cache_budget=%s cache_cap=%s working_set_cap=%s offloaded_layers=%s per_expert=%s cached_experts_per_layer=%s",
             expert_quant,
             _format_bytes(memory_info.free_bytes),
             _format_bytes(cache_target_free_bytes),

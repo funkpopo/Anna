@@ -47,11 +47,15 @@ class QuantizationConfig:
     bits: int | None = None
     group_size: int | None = None
     zero_point: bool = False
+    sym: bool = False
     activation_scheme: str = "dynamic"
     weight_per_tensor: bool = False
     act_per_tensor: bool = False
     weight_block_size: tuple[int, int] | None = None
+    block_name_to_quantize: tuple[str, ...] = ()
     modules_to_not_convert: list[str] = field(default_factory=list)
+    extra_config: dict[str, dict[str, Any]] = field(default_factory=dict)
+    packing_format: str | None = None
     version: str | None = None
 
     @property
@@ -63,16 +67,28 @@ class QuantizationConfig:
         if not data:
             return cls()
         block_size = data.get("weight_block_size")
+        block_name_to_quantize = data.get("block_name_to_quantize")
+        if isinstance(block_name_to_quantize, str):
+            block_name_to_quantize = (block_name_to_quantize,)
+        elif isinstance(block_name_to_quantize, list):
+            block_name_to_quantize = tuple(str(item) for item in block_name_to_quantize)
+        else:
+            block_name_to_quantize = ()
+        extra_config = data.get("extra_config") or {}
         return cls(
             quant_method=data.get("quant_method"),
             bits=data.get("bits"),
             group_size=data.get("group_size"),
             zero_point=bool(data.get("zero_point", False)),
+            sym=bool(data.get("sym", False)),
             activation_scheme=data.get("activation_scheme", "dynamic"),
             weight_per_tensor=bool(data.get("weight_per_tensor", False)),
             act_per_tensor=bool(data.get("act_per_tensor", False)),
             weight_block_size=None if block_size is None else tuple(block_size),
+            block_name_to_quantize=block_name_to_quantize,
             modules_to_not_convert=list(data.get("modules_to_not_convert", [])),
+            extra_config={str(key): dict(value) for key, value in extra_config.items()},
+            packing_format=data.get("packing_format"),
             version=data.get("version"),
         )
 
@@ -276,6 +292,7 @@ class Qwen3_5TextModelConfig:
         *,
         preprocessor_data: dict[str, Any] | None = None,
         generation_config_data: dict[str, Any] | None = None,
+        quantization_config_data: dict[str, Any] | None = None,
     ) -> "Qwen3_5TextModelConfig":
         text_config_data = config_data.get("text_config", {})
         default_max_completion_tokens_value = _first_non_null(
@@ -292,12 +309,19 @@ class Qwen3_5TextModelConfig:
         default_max_completion_tokens = (
             None if default_max_completion_tokens_value is None else int(default_max_completion_tokens_value)
         )
+        merged_quantization_config = dict(config_data.get("quantization_config") or {})
+        if quantization_config_data:
+            merged_quantization_config.update(quantization_config_data)
+            merged_extra_config = dict(config_data.get("quantization_config", {}).get("extra_config") or {})
+            merged_extra_config.update(quantization_config_data.get("extra_config") or {})
+            if merged_extra_config:
+                merged_quantization_config["extra_config"] = merged_extra_config
         return cls(
             model_type=config_data.get("model_type", "qwen3_5"),
             text_config=Qwen3_5TextConfig.from_dict(config_data),
             vision_config=Qwen3_5TextVisionConfig.from_dict(config_data.get("vision_config")),
             preprocessor_config=VisionPreprocessorConfig.from_dict(preprocessor_data),
-            quantization_config=QuantizationConfig.from_dict(config_data.get("quantization_config")),
+            quantization_config=QuantizationConfig.from_dict(merged_quantization_config),
             default_max_completion_tokens=default_max_completion_tokens,
             tie_word_embeddings=bool(_first_non_null(config_data.get("tie_word_embeddings"), True)),
             image_token_id=_int_from_candidates(config_data.get("image_token_id"), 248056),
@@ -318,8 +342,13 @@ class Qwen3_5TextModelConfig:
         generation_config_path = model_path / "generation_config.json"
         if generation_config_path.exists():
             generation_config_data = json.loads(generation_config_path.read_text(encoding="utf-8"))
+        quantization_config_data = None
+        quantization_config_path = model_path / "quantization_config.json"
+        if quantization_config_path.exists():
+            quantization_config_data = json.loads(quantization_config_path.read_text(encoding="utf-8"))
         return cls.from_dict(
             config_data,
             preprocessor_data=preprocessor_data,
             generation_config_data=generation_config_data,
+            quantization_config_data=quantization_config_data,
         )

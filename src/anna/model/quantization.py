@@ -1,6 +1,8 @@
 from __future__ import annotations
+
 from collections.abc import Callable
 from dataclasses import dataclass
+import re
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +23,22 @@ def _empty_parameter(
 ) -> nn.Parameter:
     dtype = dtype or torch.float32
     return nn.Parameter(torch.empty(*shape, dtype=dtype, device=device), requires_grad=False)
+
+
+_AUTO_ROUND_METHODS = frozenset({"auto-round", "autoround", "auto_round", "gptq", "auto_gptq"})
+
+
+def _unpack_int4_last_dim(packed: torch.Tensor) -> torch.Tensor:
+    shifts = torch.arange(0, 32, 4, device=packed.device, dtype=torch.int32)
+    return ((packed.unsqueeze(-1).to(torch.int32) >> shifts) & 0xF).reshape(*packed.shape[:-1], packed.shape[-1] * 8)
+
+
+def _unpack_int4_first_dim(packed: torch.Tensor) -> torch.Tensor:
+    if packed.ndim != 2:
+        raise ValueError(f"Expected a rank-2 AutoRound packed tensor, got shape {tuple(packed.shape)}")
+    shifts = torch.arange(0, 32, 4, device=packed.device, dtype=torch.int32).view(1, 8, 1)
+    unpacked = (packed.to(torch.int32).unsqueeze(1) >> shifts) & 0xF
+    return unpacked.reshape(packed.shape[0] * 8, packed.shape[1])
 
 
 class DenseLinear(nn.Module):
@@ -137,9 +155,7 @@ class AWQLinear(nn.Module):
 
     @staticmethod
     def _unpack_int4(packed: torch.Tensor) -> torch.Tensor:
-        shifts = torch.arange(0, 32, 4, device=packed.device, dtype=torch.int32)
-        unpacked = ((packed.unsqueeze(-1).to(torch.int32) >> shifts) & 0xF).reshape(*packed.shape[:-1], packed.shape[-1] * 8)
-        return unpacked
+        return _unpack_int4_last_dim(packed)
 
     def _dequantize_awq(self) -> torch.Tensor:
         if self.qweight.numel() == 0:
@@ -182,6 +198,83 @@ class AWQLinear(nn.Module):
             weight = self.weight.to(dtype=self.compute_dtype)
         else:
             weight = self._dequantize_awq().to(dtype=self.compute_dtype)
+        bias = None if self.bias is None else self.bias.to(dtype=self.compute_dtype)
+        return F.linear(x.to(dtype=self.compute_dtype), weight, bias).to(dtype=x.dtype)
+
+
+class AutoRoundGPTQLinear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        bits: int = 4,
+        group_size: int = 128,
+        zero_point: bool = True,
+        compute_dtype: torch.dtype = torch.float16,
+        device: torch.device | str | None = None,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if bits != 4:
+            raise ValueError("The current AutoRound GPTQ implementation only supports 4-bit weights.")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bits = bits
+        self.group_size = group_size
+        self.zero_point = zero_point
+        self.compute_dtype = compute_dtype
+
+        self.register_parameter("weight", None)
+        self.register_buffer("qweight", torch.empty(0, dtype=torch.int32, device=device), persistent=True)
+        self.register_buffer("qzeros", torch.empty(0, dtype=torch.int32, device=device), persistent=True)
+        self.register_buffer("scales", torch.empty(0, dtype=torch.float16, device=device), persistent=True)
+        if bias:
+            self.bias = _empty_parameter((out_features,), dtype=compute_dtype, device=device)
+        else:
+            self.register_parameter("bias", None)
+
+    def _dequantize_autoround(self) -> torch.Tensor:
+        if self.qweight.numel() == 0:
+            raise RuntimeError("AutoRoundGPTQLinear has no quantized weight payload.")
+        if self.group_size <= 0:
+            raise ValueError("AutoRoundGPTQLinear requires a positive group_size.")
+
+        weight_int = _unpack_int4_first_dim(self.qweight)
+        if weight_int.shape[0] < self.in_features or weight_int.shape[1] < self.out_features:
+            raise ValueError(
+                f"Unsupported AutoRound qweight shape {tuple(self.qweight.shape)} for target {(self.out_features, self.in_features)}"
+            )
+        weight_int = weight_int[: self.in_features, : self.out_features]
+        scales = self.scales.to(dtype=torch.float32)
+        if scales.ndim != 2 or scales.shape[1] < self.out_features:
+            raise ValueError(
+                f"Unsupported AutoRound scales shape {tuple(self.scales.shape)} for target {(self.out_features, self.in_features)}"
+            )
+        group_count = scales.shape[0]
+        group_ids = torch.arange(self.in_features, device=weight_int.device) // self.group_size
+        group_ids = torch.clamp(group_ids, max=max(0, group_count - 1))
+        expanded_scales = scales[:, : self.out_features][group_ids]
+
+        expanded_zeros: torch.Tensor | float
+        if self.zero_point and self.qzeros.numel() > 0:
+            zeros_int = _unpack_int4_last_dim(self.qzeros)
+            if zeros_int.ndim != 2 or zeros_int.shape[0] < group_count or zeros_int.shape[1] < self.out_features:
+                raise ValueError(
+                    f"Unsupported AutoRound qzeros shape {tuple(self.qzeros.shape)} for target {(self.out_features, self.in_features)}"
+                )
+            expanded_zeros = zeros_int[:group_count, : self.out_features].to(dtype=torch.float32)[group_ids]
+        else:
+            expanded_zeros = 8.0
+
+        dequantized = (weight_int.to(torch.float32) - expanded_zeros) * expanded_scales
+        return dequantized.transpose(0, 1).contiguous()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.weight is not None:
+            weight = self.weight.to(dtype=self.compute_dtype)
+        else:
+            weight = self._dequantize_autoround().to(dtype=self.compute_dtype)
         bias = None if self.bias is None else self.bias.to(dtype=self.compute_dtype)
         return F.linear(x.to(dtype=self.compute_dtype), weight, bias).to(dtype=x.dtype)
 
@@ -367,6 +460,10 @@ def _extract_dense_weight_bias(module: nn.Module) -> tuple[torch.Tensor, torch.T
         weight = module._dequantize_weight()
         bias = None if module.bias is None else module.bias.detach().to(dtype=torch.float32)
         return weight.detach(), bias
+    if isinstance(module, AutoRoundGPTQLinear):
+        weight = module._dequantize_autoround()
+        bias = None if module.bias is None else module.bias.detach().to(dtype=torch.float32)
+        return weight.detach(), bias
     if isinstance(module, AWQLinear):
         weight = module._dequantize_awq()
         bias = None if module.bias is None else module.bias.detach().to(dtype=torch.float32)
@@ -417,7 +514,7 @@ def estimate_module_xpu_int4_bytes(
             )
             if child.bias is not None:
                 total += child.bias.nelement() * child.bias.element_size()
-        elif isinstance(child, (FP8Linear, AWQLinear, DenseLinear, nn.Linear)):
+        elif isinstance(child, (FP8Linear, AutoRoundGPTQLinear, AWQLinear, DenseLinear, nn.Linear)):
             total += estimate_xpu_int4_linear_bytes(
                 child.in_features,
                 child.out_features,
@@ -442,18 +539,18 @@ def convert_module_linears_to_xpu_int4(
             continue
         if isinstance(child, XPUInt4Linear):
             continue
-        if not isinstance(child, (FP8Linear, AWQLinear, DenseLinear, nn.Linear)):
+        if not isinstance(child, (FP8Linear, AutoRoundGPTQLinear, AWQLinear, DenseLinear, nn.Linear)):
             continue
         if include_predicate is not None and not include_predicate(module_name, child):
             continue
         candidate_module_names.append(module_name)
 
-    replacements = 0
+    replacements: list[tuple[str, XPUInt4Linear]] = []
     for module_name in candidate_module_names:
         child = _get_submodule(module, module_name)
         if isinstance(child, XPUInt4Linear):
             continue
-        if not isinstance(child, (AutoRoundGPTQLinear, AWQLinear, DenseLinear, nn.Linear)):
+        if not isinstance(child, (FP8Linear, AutoRoundGPTQLinear, AWQLinear, DenseLinear, nn.Linear)):
             continue
         replacements.append(
             (
@@ -466,9 +563,74 @@ def convert_module_linears_to_xpu_int4(
                 ),
             )
         )
+
+    for module_name, replacement in replacements:
         _set_submodule(module, module_name, replacement)
-        replacements += 1
-    return replacements
+    return len(replacements)
+
+
+def _normalized_quant_method(quantization_config: QuantizationConfig) -> str:
+    return (quantization_config.quant_method or "").strip().lower()
+
+
+def _module_within_quantized_blocks(module_name: str, quantization_config: QuantizationConfig) -> bool:
+    blocks = tuple(getattr(quantization_config, "block_name_to_quantize", ()) or ())
+    if not blocks:
+        return True
+    normalized_module_name = _normalize_exclusion(module_name)
+    for block_name in blocks:
+        normalized_block_name = _normalize_exclusion(block_name)
+        if (
+            module_name == block_name
+            or module_name.startswith(block_name + ".")
+            or normalized_module_name == normalized_block_name
+            or normalized_module_name.startswith(normalized_block_name + ".")
+        ):
+            return True
+    return False
+
+
+def _pattern_matches_module_name(module_name: str, pattern: str) -> bool:
+    if not pattern:
+        return False
+    if any(ch in pattern for ch in "*+?[]{}()|\\^$"):
+        return re.fullmatch(pattern, module_name) is not None
+    return module_name == pattern
+
+
+def _module_quantization_override(module_name: str, quantization_config: QuantizationConfig) -> dict[str, object] | None:
+    extra_config = getattr(quantization_config, "extra_config", {}) or {}
+    if not extra_config:
+        return None
+    normalized_module_name = _normalize_exclusion(module_name)
+
+    direct_match: dict[str, object] | None = None
+    regex_match: dict[str, object] | None = None
+    for pattern, override in extra_config.items():
+        normalized_pattern = _normalize_exclusion(pattern)
+        if module_name == pattern or normalized_module_name == normalized_pattern:
+            direct_match = dict(override)
+        elif (
+            _pattern_matches_module_name(module_name, pattern)
+            or _pattern_matches_module_name(normalized_module_name, normalized_pattern)
+        ):
+            regex_match = dict(override)
+    return direct_match or regex_match
+
+
+def _should_quantize_auto_round_module(module_name: str, quantization_config: QuantizationConfig) -> bool:
+    if not _module_within_quantized_blocks(module_name, quantization_config):
+        return False
+    override = _module_quantization_override(module_name, quantization_config)
+    if not override:
+        return True
+    bits = override.get("bits")
+    if bits is not None and int(bits) >= 16:
+        return False
+    data_type = str(override.get("data_type", "int")).strip().lower()
+    if data_type in {"fp", "float", "float16", "float32", "bfloat16", "bf16", "fp16", "fp32"}:
+        return False
+    return True
 
 
 def replace_linear_modules(
@@ -482,7 +644,7 @@ def replace_linear_modules(
 
     replacements: list[tuple[str, nn.Module]] = []
     specs: list[QuantizedModuleSpec] = []
-    quant_method = (quantization_config.quant_method or "").lower()
+    quant_method = _normalized_quant_method(quantization_config)
 
     for module_name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
@@ -507,6 +669,19 @@ def replace_linear_modules(
                 bits=quantization_config.bits or 4,
                 group_size=quantization_config.group_size or 128,
                 zero_point=quantization_config.zero_point,
+                bias=module.bias is not None,
+                compute_dtype=compute_dtype,
+                device=module_device,
+            )
+        elif quant_method in _AUTO_ROUND_METHODS:
+            if not _should_quantize_auto_round_module(module_name, quantization_config):
+                continue
+            replacement = AutoRoundGPTQLinear(
+                module.in_features,
+                module.out_features,
+                bits=quantization_config.bits or 4,
+                group_size=quantization_config.group_size or 128,
+                zero_point=quantization_config.zero_point or bool(getattr(quantization_config, "sym", False)),
                 bias=module.bias is not None,
                 compute_dtype=compute_dtype,
                 device=module_device,
