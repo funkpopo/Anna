@@ -30,6 +30,7 @@ ReasoningFormat = Literal["none", "deepseek"]
 _REASONING_FORMAT_VALUES = frozenset({"none", "deepseek"})
 _DEFAULT_REASONING_FORMAT: ReasoningFormat = "deepseek"
 _COMPILE_MODE_VALUES = frozenset({"none", "default", "reduce-overhead", "max-autotune"})
+_KV_CACHE_QUANTIZATION_VALUES = frozenset({"none", "turboquant"})
 
 
 def _common_prefix_length(left: str, right: str) -> int:
@@ -74,6 +75,16 @@ def normalize_compile_mode(value: str | None) -> str:
     return normalized
 
 
+def normalize_kv_cache_quantization(value: str | None) -> str:
+    if value is None:
+        return "none"
+    normalized = value.strip().lower()
+    if normalized not in _KV_CACHE_QUANTIZATION_VALUES:
+        allowed = ", ".join(sorted(_KV_CACHE_QUANTIZATION_VALUES))
+        raise ValueError(f"Unsupported KV-cache quantization mode: {value}. Expected one of: {allowed}.")
+    return normalized
+
+
 @dataclass(slots=True)
 class EngineOptimizationConfig:
     compile_mode: str = "none"
@@ -82,6 +93,9 @@ class EngineOptimizationConfig:
     prompt_cache_size: int = 0
     prompt_cache_max_tokens: int = 0
     profile_runtime: bool = False
+    kv_cache_quantization: str = "none"
+    kv_cache_quant_bits: int = 4
+    kv_cache_residual_len: int = 128
 
 
 @dataclass(slots=True)
@@ -230,6 +244,9 @@ class AnnaQwen3_5TextEngine:
     def _normalize_optimization_config(config: EngineOptimizationConfig | None) -> EngineOptimizationConfig:
         if config is None:
             return EngineOptimizationConfig()
+        kv_cache_quant_bits = int(config.kv_cache_quant_bits)
+        if kv_cache_quant_bits not in {3, 4}:
+            raise ValueError(f"Unsupported TurboQuant KV-cache bit-width: {config.kv_cache_quant_bits}. Expected 3 or 4.")
         return EngineOptimizationConfig(
             compile_mode=normalize_compile_mode(config.compile_mode),
             compile_fullgraph=bool(config.compile_fullgraph),
@@ -237,6 +254,9 @@ class AnnaQwen3_5TextEngine:
             prompt_cache_size=max(0, int(config.prompt_cache_size)),
             prompt_cache_max_tokens=max(0, int(config.prompt_cache_max_tokens)),
             profile_runtime=bool(config.profile_runtime),
+            kv_cache_quantization=normalize_kv_cache_quantization(config.kv_cache_quantization),
+            kv_cache_quant_bits=kv_cache_quant_bits,
+            kv_cache_residual_len=max(1, int(config.kv_cache_residual_len)),
         )
 
     def _resolve_prefill_chunk_size(self, requested_chunk_size: int) -> int:
@@ -339,6 +359,9 @@ class AnnaQwen3_5TextEngine:
         prompt_cache_size: int = 0,
         prompt_cache_max_tokens: int = 0,
         profile_runtime: bool = False,
+        kv_cache_quantization: str = "none",
+        kv_cache_quant_bits: int = 4,
+        kv_cache_residual_len: int = 128,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
         default_enable_thinking: bool = True,
@@ -360,6 +383,10 @@ class AnnaQwen3_5TextEngine:
         )
         if safety_policy is not None:
             device_context.safety_policy = safety_policy
+        resolved_kv_cache_quantization = cls._resolve_kv_cache_quantization(
+            requested_mode=kv_cache_quantization,
+            device_context=device_context,
+        )
         resolved_offload_mode = cls._resolve_offload_mode(
             requested_mode=offload_mode,
             model_path=model_path,
@@ -544,6 +571,9 @@ class AnnaQwen3_5TextEngine:
                 prompt_cache_size=prompt_cache_size,
                 prompt_cache_max_tokens=prompt_cache_max_tokens,
                 profile_runtime=profile_runtime,
+                kv_cache_quantization=resolved_kv_cache_quantization,
+                kv_cache_quant_bits=kv_cache_quant_bits,
+                kv_cache_residual_len=kv_cache_residual_len,
             ),
         )
 
@@ -571,6 +601,21 @@ class AnnaQwen3_5TextEngine:
         if config.text_config.is_moe_model and weight_bytes > int(memory_info.total_bytes * 0.85):
             return "experts"
         return "none"
+
+    @staticmethod
+    def _resolve_kv_cache_quantization(
+        *,
+        requested_mode: str,
+        device_context: DeviceContext,
+    ) -> str:
+        del device_context
+        normalized = normalize_kv_cache_quantization(requested_mode)
+        if normalized == "none":
+            return normalized
+        raise ValueError(
+            "TurboQuant KV-cache compression is not supported for the qwen3_5_text runtime. "
+            "Anna's Qwen backend uses a paged hybrid cache and fused decode path instead."
+        )
 
     @staticmethod
     def _resolve_offload_vision(
@@ -1052,6 +1097,9 @@ class AnnaQwen3_5TextEngine:
                 "prompt_cache_max_tokens": self.optimization_config.prompt_cache_max_tokens,
                 "prompt_cache_entries": len(self._prompt_cache),
                 "profile_runtime": self.optimization_config.profile_runtime,
+                "kv_cache_quantization": self.optimization_config.kv_cache_quantization,
+                "kv_cache_quant_bits": self.optimization_config.kv_cache_quant_bits,
+                "kv_cache_residual_len": self.optimization_config.kv_cache_residual_len,
             },
             "vision_enabled": self.config.vision_config is not None,
             "cache_device": str(self.device_context.migration_policy.execution_device),

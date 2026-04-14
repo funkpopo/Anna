@@ -165,6 +165,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Log synchronized XPU forward timings and memory stats for prefill/decode profiling.",
     )
+    parser.add_argument(
+        "--kv-cache-quantization",
+        choices=("none", "turboquant"),
+        default="none",
+        help="Quantize compatible KV caches. TurboQuant is currently supported by the Gemma4 runtime only.",
+    )
+    parser.add_argument(
+        "--kv-cache-quant-bits",
+        type=int,
+        choices=(3, 4),
+        default=4,
+        help="TurboQuant KV-cache bit-width for compatible runtimes.",
+    )
+    parser.add_argument(
+        "--kv-cache-residual-len",
+        type=_positive_int,
+        default=128,
+        help="Keep the newest N KV tokens in full precision before TurboQuant compresses older entries.",
+    )
     thinking_group = parser.add_mutually_exclusive_group()
     thinking_group.add_argument(
         "--enable-thinking",
@@ -284,6 +303,9 @@ def main() -> None:
         prompt_cache_size=args.prompt_cache_size,
         prompt_cache_max_tokens=args.prompt_cache_max_tokens,
         profile_runtime=args.profile_runtime,
+        kv_cache_quantization=args.kv_cache_quantization,
+        kv_cache_quant_bits=args.kv_cache_quant_bits,
+        kv_cache_residual_len=args.kv_cache_residual_len,
         default_max_completion_tokens=args.max_completion_tokens,
         default_enable_thinking=args.default_enable_thinking,
         reasoning_format=args.reasoning_format,
@@ -318,6 +340,9 @@ def main() -> None:
         prompt_cache_size=settings.prompt_cache_size,
         prompt_cache_max_tokens=settings.prompt_cache_max_tokens,
         profile_runtime=settings.profile_runtime,
+        kv_cache_quantization=settings.kv_cache_quantization,
+        kv_cache_quant_bits=settings.kv_cache_quant_bits,
+        kv_cache_residual_len=settings.kv_cache_residual_len,
         safety_policy=_build_safety_policy(settings),
         default_max_completion_tokens=settings.default_max_completion_tokens,
         default_enable_thinking=settings.default_enable_thinking,

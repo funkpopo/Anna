@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from types import MethodType, SimpleNamespace
 
+import pytest
 import torch
 
 from anna.core.function_calling import ParsedToolCall
@@ -284,6 +285,14 @@ def test_trim_runtime_cache_if_idle_skips_when_requests_are_active() -> None:
 
     assert engine.cache_allocator.trim_calls == 0
     assert engine.device_context.release_calls == 0
+
+
+def test_qwen_runtime_rejects_turboquant_kv_cache_quantization() -> None:
+    with pytest.raises(ValueError, match="TurboQuant KV-cache compression is not supported"):
+        AnnaQwen3_5TextEngine._resolve_kv_cache_quantization(
+            requested_mode="turboquant",
+            device_context=SimpleNamespace(),
+        )
 
 
 def test_generate_chat_keeps_raw_think_tags_when_reasoning_format_is_none() -> None:

@@ -13,7 +13,8 @@ from anna.mm.gemma4_text_processor import PreparedInputs
 from anna.runtime.model_runtime_loader import load_model_runtime_from_model_dir
 from anna.runtime.gemma4_text_engine import AnnaGemma4TextEngine
 from anna.model.gemma4_config import Gemma4Config
-from anna.model.gemma4_text_model import Gemma4ForConditionalGeneration
+from anna.model.gemma4_text_model import Gemma4DynamicCache, Gemma4ForConditionalGeneration
+from anna.model.turboquant import TurboQuantTensorRow
 from anna.weights.gemma4_tokenizer import Gemma4Tokenizer
 from anna.weights.gemma4_text_weight_loader import build_gemma4_text_model
 
@@ -279,6 +280,133 @@ def test_gemma4_text_model_decode_cache_matches_full_forward() -> None:
     )
 
 
+def test_gemma4_dynamic_cache_can_store_full_attention_rows_with_turboquant() -> None:
+    config = Gemma4Config.from_dict(
+        {
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "vocab_size": 128,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "global_head_dim": 16,
+                "hidden_size_per_layer_input": 4,
+                "vocab_size_per_layer_input": 128,
+                "sliding_window": 8,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "rope_parameters": {
+                    "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                    "full_attention": {
+                        "rope_type": "proportional",
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 1000000.0,
+                        "original_max_position_embeddings": 8,
+                        "factor": 2.0,
+                    },
+                },
+            },
+        }
+    )
+    cache = Gemma4DynamicCache(
+        config.text_config,
+        batch_size=1,
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+    key_a = torch.randn(1, 2, 3, 16)
+    value_a = torch.randn(1, 2, 3, 16)
+    key_b = torch.randn(1, 2, 1, 16)
+    value_b = torch.randn(1, 2, 1, 16)
+
+    first_key, first_value, _, first_visible = cache.update(key_a, value_a, layer_idx=1)
+    second_key, second_value, past_visible, second_visible = cache.update(key_b, value_b, layer_idx=1)
+
+    assert isinstance(cache.key_rows[1][0], TurboQuantTensorRow)
+    assert isinstance(cache.value_rows[1][0], TurboQuantTensorRow)
+    assert first_key.shape == (1, 2, 3, 16)
+    assert first_value.shape == (1, 2, 3, 16)
+    assert torch.equal(first_visible, torch.tensor([3], dtype=torch.long))
+    assert torch.equal(past_visible, torch.tensor([3], dtype=torch.long))
+    assert torch.equal(second_visible, torch.tensor([4], dtype=torch.long))
+    assert torch.allclose(second_key[:, :, -1:, :], key_b, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(second_value[:, :, -1:, :], value_b, atol=1e-5, rtol=1e-5)
+    assert ((second_key[:, :, :3, :] - key_a).float() ** 2).mean().item() < 0.5
+    assert ((second_value[:, :, :3, :] - value_a).float() ** 2).mean().item() < 0.5
+
+
+def test_gemma4_text_model_decode_cache_with_turboquant_stays_numerically_close() -> None:
+    config = Gemma4Config.from_dict(
+        {
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "vocab_size": 128,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "global_head_dim": 16,
+                "hidden_size_per_layer_input": 4,
+                "vocab_size_per_layer_input": 128,
+                "num_kv_shared_layers": 2,
+                "sliding_window": 8,
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "rope_parameters": {
+                    "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                    "full_attention": {
+                        "rope_type": "proportional",
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 1000000.0,
+                        "original_max_position_embeddings": 8,
+                        "factor": 2.0,
+                    },
+                },
+            },
+        }
+    )
+    model = Gemma4ForConditionalGeneration(config).eval()
+    model.tie_weights()
+    model.configure_runtime(
+        torch.device("cpu"),
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+
+    input_ids = torch.tensor([[5, 7, 9, 11]], dtype=torch.long)
+    prompt_ids = input_ids[:, :-1]
+    append_ids = input_ids[:, -1:]
+
+    with torch.no_grad():
+        full_output = model.forward_text_only(input_ids=input_ids, use_cache=False)
+        cache_output = model.forward_text_only(input_ids=prompt_ids, use_cache=True)
+        assert cache_output.past_key_values is not None
+        assert isinstance(cache_output.past_key_values.key_rows[1][0], TurboQuantTensorRow)
+        decode_output = model.forward_text_only(
+            input_ids=append_ids,
+            past_key_values=cache_output.past_key_values,
+            use_cache=True,
+        )
+
+    assert decode_output.past_key_values is not None
+    assert decode_output.past_key_values.get_seq_length() == input_ids.shape[1]
+    assert torch.isfinite(decode_output.logits).all()
+    diff = (decode_output.logits[:, -1].float() - full_output.logits[:, -1].float()).abs().max().item()
+    assert diff < 1.0
+
+
 def test_gemma4_build_restores_runtime_buffers_after_to_empty() -> None:
     config = Gemma4Config.from_dict(
         {
@@ -497,7 +625,15 @@ def test_gemma4_runtime_loader_builds_standalone_multimodal_engine(tmp_path) -> 
     model.tie_weights()
     save_file(model.state_dict(), str(model_dir / "model.safetensors"))
 
-    engine = load_model_runtime_from_model_dir(model_dir, model_id="gemma4-test", device="cpu", dtype="float32")
+    engine = load_model_runtime_from_model_dir(
+        model_dir,
+        model_id="gemma4-test",
+        device="cpu",
+        dtype="float32",
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=32,
+    )
     health = engine.health()
 
     assert engine.model_family == "gemma4"
@@ -505,7 +641,9 @@ def test_gemma4_runtime_loader_builds_standalone_multimodal_engine(tmp_path) -> 
     assert health["vision_enabled"] is True
     assert health["audio_enabled"] is True
     assert health["weight_quant"] == "none"
-    assert "float8_available" not in health
+    assert health["runtime_optimizations"]["kv_cache_quantization"] == "turboquant"
+    assert health["runtime_optimizations"]["kv_cache_quant_bits"] == 4
+    assert health["runtime_optimizations"]["kv_cache_residual_len"] == 32
 
 
 def test_gemma4_runtime_forwards_gemma_only_multimodal_kwargs() -> None:

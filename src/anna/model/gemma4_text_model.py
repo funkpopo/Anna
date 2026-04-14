@@ -16,6 +16,7 @@ from anna.model.ops import (
     grouped_query_attention,
     rotate_half,
 )
+from anna.model.turboquant import TurboQuantTensorRow
 
 
 @dataclass(slots=True)
@@ -71,17 +72,158 @@ def _apply_rotary_pos_emb_single(
     return torch.cat((hidden_rot, hidden_pass), dim=-1)
 
 
+Gemma4CacheRow = torch.Tensor | TurboQuantTensorRow
+
+
+def _cache_row_length(row: Gemma4CacheRow | None) -> int:
+    if row is None:
+        return 0
+    if isinstance(row, TurboQuantTensorRow):
+        return row.length
+    return int(row.shape[1])
+
+
+def _materialize_cache_row(
+    row: Gemma4CacheRow | None,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if row is None:
+        return None
+    if isinstance(row, TurboQuantTensorRow):
+        return row.materialize(device=device, dtype=dtype)
+    if row.device != device or row.dtype != dtype:
+        return row.to(device=device, dtype=dtype)
+    return row
+
+
+def _clone_cache_row(row: Gemma4CacheRow | None) -> Gemma4CacheRow | None:
+    if row is None:
+        return None
+    if isinstance(row, TurboQuantTensorRow):
+        return row.clone()
+    return row.clone()
+
+
+class _Gemma4SharedLayerState:
+    def __init__(
+        self,
+        *,
+        key_rows: list[Gemma4CacheRow],
+        value_rows: list[Gemma4CacheRow],
+        visible_lengths: list[int],
+    ) -> None:
+        self.key_rows = key_rows
+        self.value_rows = value_rows
+        self.visible_lengths = [int(length) for length in visible_lengths]
+
+    def clone(self) -> "_Gemma4SharedLayerState":
+        return _Gemma4SharedLayerState(
+            key_rows=[_clone_cache_row(row) for row in self.key_rows],
+            value_rows=[_clone_cache_row(row) for row in self.value_rows],
+            visible_lengths=list(self.visible_lengths),
+        )
+
+    def select_batch(self, batch_idx: int) -> "_Gemma4SharedLayerState":
+        return _Gemma4SharedLayerState(
+            key_rows=[_clone_cache_row(self.key_rows[batch_idx])],
+            value_rows=[_clone_cache_row(self.value_rows[batch_idx])],
+            visible_lengths=[self.visible_lengths[batch_idx]],
+        )
+
+    def materialize(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.key_rows or not self.value_rows:
+            raise ValueError("Gemma4 shared-layer state is empty.")
+        materialized_keys = [
+            _materialize_cache_row(
+                row,
+                device=row.device if isinstance(row, torch.Tensor) else row.device or torch.device("cpu"),
+                dtype=row.dtype if isinstance(row, torch.Tensor) else row.dtype or torch.float32,
+            )
+            for row in self.key_rows
+        ]
+        materialized_values = [
+            _materialize_cache_row(
+                row,
+                device=row.device if isinstance(row, torch.Tensor) else row.device or torch.device("cpu"),
+                dtype=row.dtype if isinstance(row, torch.Tensor) else row.dtype or torch.float32,
+            )
+            for row in self.value_rows
+        ]
+        assert all(row is not None for row in materialized_keys)
+        assert all(row is not None for row in materialized_values)
+        key_rows = [row for row in materialized_keys if row is not None]
+        value_rows = [row for row in materialized_values if row is not None]
+        device = key_rows[0].device
+        key_dtype = key_rows[0].dtype
+        value_dtype = value_rows[0].dtype
+        padded_key = Gemma4DynamicCache._pad_rows(key_rows, device=device, dtype=key_dtype)
+        padded_value = Gemma4DynamicCache._pad_rows(value_rows, device=device, dtype=value_dtype)
+        visible_lengths = torch.tensor(self.visible_lengths, dtype=torch.long, device=device)
+        return padded_key, padded_value, visible_lengths
+
+    def to(
+        self,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> "_Gemma4SharedLayerState":
+        moved_key_rows: list[Gemma4CacheRow] = []
+        moved_value_rows: list[Gemma4CacheRow] = []
+        for row in self.key_rows:
+            if isinstance(row, TurboQuantTensorRow):
+                moved_key_rows.append(row.clone().to(device=device, dtype=dtype))
+            else:
+                kwargs: dict[str, object] = {}
+                if device is not None:
+                    kwargs["device"] = device
+                if dtype is not None:
+                    kwargs["dtype"] = dtype
+                moved_key_rows.append(row.to(**kwargs) if kwargs else row)
+        for row in self.value_rows:
+            if isinstance(row, TurboQuantTensorRow):
+                moved_value_rows.append(row.clone().to(device=device, dtype=dtype))
+            else:
+                kwargs = {}
+                if device is not None:
+                    kwargs["device"] = device
+                if dtype is not None:
+                    kwargs["dtype"] = dtype
+                moved_value_rows.append(row.to(**kwargs) if kwargs else row)
+        return _Gemma4SharedLayerState(
+            key_rows=moved_key_rows,
+            value_rows=moved_value_rows,
+            visible_lengths=list(self.visible_lengths),
+        )
+
+
 class Gemma4DynamicCache:
-    def __init__(self, config: Gemma4TextConfig, *, batch_size: int = 0):
+    def __init__(
+        self,
+        config: Gemma4TextConfig,
+        *,
+        batch_size: int = 0,
+        kv_cache_quantization: str = "none",
+        kv_cache_quant_bits: int = 4,
+        kv_cache_residual_len: int = 128,
+    ):
         self.config = config
+        self.kv_cache_quantization = kv_cache_quantization.strip().lower()
+        if self.kv_cache_quantization not in {"none", "turboquant"}:
+            raise ValueError(f"Unsupported Gemma4 KV-cache quantization mode: {kv_cache_quantization}")
+        self.kv_cache_quant_bits = int(kv_cache_quant_bits)
+        if self.kv_cache_quant_bits not in {3, 4}:
+            raise ValueError(f"Unsupported Gemma4 TurboQuant bit-width: {kv_cache_quant_bits}")
+        self.kv_cache_residual_len = max(1, int(kv_cache_residual_len))
         self.request_lengths: list[int] = [0 for _ in range(batch_size)]
-        self.key_rows: list[list[torch.Tensor | None]] = [
+        self.key_rows: list[list[Gemma4CacheRow | None]] = [
             [None for _ in range(batch_size)] for _ in range(config.num_hidden_layers)
         ]
-        self.value_rows: list[list[torch.Tensor | None]] = [
+        self.value_rows: list[list[Gemma4CacheRow | None]] = [
             [None for _ in range(batch_size)] for _ in range(config.num_hidden_layers)
         ]
-        self.shared_layers: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self.shared_layers: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor] | _Gemma4SharedLayerState] = {}
         self.reserved_seq_capacity = 0
         self._released = False
 
@@ -96,6 +238,20 @@ class Gemma4DynamicCache:
             return
         if len(self.request_lengths) != batch_size:
             raise ValueError(f"Gemma4 cache batch size mismatch: expected {len(self.request_lengths)}, got {batch_size}")
+
+    def _use_turboquant_for_layer(self, layer_idx: int) -> bool:
+        return self.kv_cache_quantization == "turboquant" and self.config.layer_types[layer_idx] == "full_attention"
+
+    def _new_turboquant_row(self) -> TurboQuantTensorRow:
+        return TurboQuantTensorRow(bits=self.kv_cache_quant_bits, residual_len=self.kv_cache_residual_len)
+
+    def _ensure_turboquant_row(self, row: Gemma4CacheRow | None) -> TurboQuantTensorRow:
+        if isinstance(row, TurboQuantTensorRow):
+            return row
+        quantized = self._new_turboquant_row()
+        if isinstance(row, torch.Tensor) and row.numel() > 0:
+            quantized.append(row)
+        return quantized
 
     def get_batch_size(self) -> int:
         return len(self.request_lengths)
@@ -143,23 +299,40 @@ class Gemma4DynamicCache:
         current_visible_lengths: list[int] = []
         output_keys: list[torch.Tensor] = []
         output_values: list[torch.Tensor] = []
+        use_turboquant = self._use_turboquant_for_layer(layer_idx)
 
         for batch_idx in range(batch_size):
-            existing_key = self.key_rows[layer_idx][batch_idx]
-            existing_value = self.value_rows[layer_idx][batch_idx]
-            if existing_key is None or existing_value is None:
-                combined_key = key_states[batch_idx]
-                combined_value = value_states[batch_idx]
-                past_visible = 0
+            existing_key_row = self.key_rows[layer_idx][batch_idx]
+            existing_value_row = self.value_rows[layer_idx][batch_idx]
+            if use_turboquant:
+                key_row = self._ensure_turboquant_row(existing_key_row)
+                value_row = self._ensure_turboquant_row(existing_value_row)
+                past_visible = _cache_row_length(existing_key_row)
+                key_row.append(key_states[batch_idx])
+                value_row.append(value_states[batch_idx])
+                combined_key = key_row.materialize(device=device, dtype=dtype)
+                combined_value = value_row.materialize(device=device, dtype=value_states.dtype)
+                self.key_rows[layer_idx][batch_idx] = key_row
+                self.value_rows[layer_idx][batch_idx] = value_row
             else:
-                combined_key = torch.cat((existing_key, key_states[batch_idx]), dim=1)
-                combined_value = torch.cat((existing_value, value_states[batch_idx]), dim=1)
-                past_visible = int(existing_key.shape[1])
+                existing_key = _materialize_cache_row(existing_key_row, device=device, dtype=dtype)
+                existing_value = _materialize_cache_row(existing_value_row, device=device, dtype=value_states.dtype)
+                if existing_key is None or existing_value is None:
+                    combined_key = key_states[batch_idx]
+                    combined_value = value_states[batch_idx]
+                    past_visible = 0
+                else:
+                    combined_key = torch.cat((existing_key, key_states[batch_idx]), dim=1)
+                    combined_value = torch.cat((existing_value, value_states[batch_idx]), dim=1)
+                    past_visible = int(existing_key.shape[1])
 
             output_keys.append(combined_key)
             output_values.append(combined_value)
             past_visible_lengths.append(past_visible)
             current_visible_lengths.append(int(combined_key.shape[1]))
+
+            if use_turboquant:
+                continue
 
             if is_sliding and int(combined_key.shape[1]) > sliding_window:
                 stored_key = combined_key[:, -sliding_window:, :].contiguous()
@@ -186,6 +359,30 @@ class Gemma4DynamicCache:
         value_states: torch.Tensor,
         visible_lengths: torch.Tensor,
     ) -> None:
+        if self._use_turboquant_for_layer(layer_idx):
+            key_rows: list[Gemma4CacheRow] = []
+            value_rows: list[Gemma4CacheRow] = []
+            lengths: list[int] = []
+            for batch_idx in range(int(key_states.shape[0])):
+                visible = int(visible_lengths[batch_idx].item())
+                if visible > 0:
+                    key_row = self._new_turboquant_row()
+                    value_row = self._new_turboquant_row()
+                    key_row.append(key_states[batch_idx, :, :visible, :].detach().contiguous())
+                    value_row.append(value_states[batch_idx, :, :visible, :].detach().contiguous())
+                else:
+                    key_row = key_states[batch_idx, :, :0, :].detach().contiguous()
+                    value_row = value_states[batch_idx, :, :0, :].detach().contiguous()
+                key_rows.append(key_row)
+                value_rows.append(value_row)
+                lengths.append(visible)
+            self.shared_layers[layer_idx] = _Gemma4SharedLayerState(
+                key_rows=key_rows,
+                value_rows=value_rows,
+                visible_lengths=lengths,
+            )
+            return
+
         self.shared_layers[layer_idx] = (
             key_states.detach(),
             value_states.detach(),
@@ -193,10 +390,21 @@ class Gemma4DynamicCache:
         )
 
     def get_shared_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        return self.shared_layers.get(layer_idx)
+        shared = self.shared_layers.get(layer_idx)
+        if shared is None:
+            return None
+        if isinstance(shared, _Gemma4SharedLayerState):
+            return shared.materialize()
+        return shared
 
     def clone(self) -> "Gemma4DynamicCache":
-        cloned = Gemma4DynamicCache(self.config, batch_size=self.get_batch_size())
+        cloned = Gemma4DynamicCache(
+            self.config,
+            batch_size=self.get_batch_size(),
+            kv_cache_quantization=self.kv_cache_quantization,
+            kv_cache_quant_bits=self.kv_cache_quant_bits,
+            kv_cache_residual_len=self.kv_cache_residual_len,
+        )
         cloned.request_lengths = list(self.request_lengths)
         cloned.reserved_seq_capacity = self.reserved_seq_capacity
         for layer_idx in range(self.config.num_hidden_layers):
@@ -204,11 +412,15 @@ class Gemma4DynamicCache:
                 key_row = self.key_rows[layer_idx][batch_idx]
                 value_row = self.value_rows[layer_idx][batch_idx]
                 if key_row is not None:
-                    cloned.key_rows[layer_idx][batch_idx] = key_row.clone()
+                    cloned.key_rows[layer_idx][batch_idx] = _clone_cache_row(key_row)
                 if value_row is not None:
-                    cloned.value_rows[layer_idx][batch_idx] = value_row.clone()
-        for layer_idx, (key_states, value_states, visible_lengths) in self.shared_layers.items():
-            cloned.shared_layers[layer_idx] = (key_states.clone(), value_states.clone(), visible_lengths.clone())
+                    cloned.value_rows[layer_idx][batch_idx] = _clone_cache_row(value_row)
+        for layer_idx, shared in self.shared_layers.items():
+            if isinstance(shared, _Gemma4SharedLayerState):
+                cloned.shared_layers[layer_idx] = shared.clone()
+            else:
+                key_states, value_states, visible_lengths = shared
+                cloned.shared_layers[layer_idx] = (key_states.clone(), value_states.clone(), visible_lengths.clone())
         return cloned
 
     def split_batch(self) -> list["Gemma4DynamicCache"]:
@@ -217,22 +429,32 @@ class Gemma4DynamicCache:
             return []
         rows: list[Gemma4DynamicCache] = []
         for batch_idx in range(batch_size):
-            row = Gemma4DynamicCache(self.config, batch_size=1)
+            row = Gemma4DynamicCache(
+                self.config,
+                batch_size=1,
+                kv_cache_quantization=self.kv_cache_quantization,
+                kv_cache_quant_bits=self.kv_cache_quant_bits,
+                kv_cache_residual_len=self.kv_cache_residual_len,
+            )
             row.request_lengths[0] = self.request_lengths[batch_idx]
             row.reserved_seq_capacity = self.reserved_seq_capacity
             for layer_idx in range(self.config.num_hidden_layers):
                 key_row = self.key_rows[layer_idx][batch_idx]
                 value_row = self.value_rows[layer_idx][batch_idx]
                 if key_row is not None:
-                    row.key_rows[layer_idx][0] = key_row.clone()
+                    row.key_rows[layer_idx][0] = _clone_cache_row(key_row)
                 if value_row is not None:
-                    row.value_rows[layer_idx][0] = value_row.clone()
-            for layer_idx, (key_states, value_states, visible_lengths) in self.shared_layers.items():
-                row.shared_layers[layer_idx] = (
-                    key_states[batch_idx : batch_idx + 1].clone(),
-                    value_states[batch_idx : batch_idx + 1].clone(),
-                    visible_lengths[batch_idx : batch_idx + 1].clone(),
-                )
+                    row.value_rows[layer_idx][0] = _clone_cache_row(value_row)
+            for layer_idx, shared in self.shared_layers.items():
+                if isinstance(shared, _Gemma4SharedLayerState):
+                    row.shared_layers[layer_idx] = shared.select_batch(batch_idx)
+                else:
+                    key_states, value_states, visible_lengths = shared
+                    row.shared_layers[layer_idx] = (
+                        key_states[batch_idx : batch_idx + 1].clone(),
+                        value_states[batch_idx : batch_idx + 1].clone(),
+                        visible_lengths[batch_idx : batch_idx + 1].clone(),
+                    )
             rows.append(row)
         return rows
 
@@ -247,8 +469,23 @@ class Gemma4DynamicCache:
                 rows.append(cache)
             else:
                 rows.extend(cache.split_batch())
+        if not rows:
+            prototype = caches[0]
+            return cls(
+                config,
+                kv_cache_quantization=prototype.kv_cache_quantization,
+                kv_cache_quant_bits=prototype.kv_cache_quant_bits,
+                kv_cache_residual_len=prototype.kv_cache_residual_len,
+            )
 
-        stacked = cls(config, batch_size=len(rows))
+        prototype = rows[0]
+        stacked = cls(
+            config,
+            batch_size=len(rows),
+            kv_cache_quantization=prototype.kv_cache_quantization,
+            kv_cache_quant_bits=prototype.kv_cache_quant_bits,
+            kv_cache_residual_len=prototype.kv_cache_residual_len,
+        )
         stacked.request_lengths = [row.request_lengths[0] for row in rows]
         stacked.reserved_seq_capacity = max((row.reserved_seq_capacity for row in rows), default=0)
 
@@ -257,9 +494,9 @@ class Gemma4DynamicCache:
                 key_row = row.key_rows[layer_idx][0]
                 value_row = row.value_rows[layer_idx][0]
                 if key_row is not None:
-                    stacked.key_rows[layer_idx][batch_idx] = key_row.clone()
+                    stacked.key_rows[layer_idx][batch_idx] = _clone_cache_row(key_row)
                 if value_row is not None:
-                    stacked.value_rows[layer_idx][batch_idx] = value_row.clone()
+                    stacked.value_rows[layer_idx][batch_idx] = _clone_cache_row(value_row)
 
         shared_layer_indices = set()
         for row in rows:
@@ -269,14 +506,15 @@ class Gemma4DynamicCache:
             value_parts: list[torch.Tensor] = []
             visible_parts: list[torch.Tensor] = []
             for row in rows:
-                shared = row.shared_layers.get(layer_idx)
+                shared = row.get_shared_layer(layer_idx)
                 if shared is None:
                     raise ValueError(f"Gemma4 cache stack mismatch: missing shared layer {layer_idx}.")
                 key_states, value_states, visible_lengths = shared
                 key_parts.append(key_states)
                 value_parts.append(value_states)
                 visible_parts.append(visible_lengths)
-            stacked.shared_layers[layer_idx] = (
+            stacked.set_shared_layer(
+                layer_idx,
                 torch.cat(key_parts, dim=0),
                 torch.cat(value_parts, dim=0),
                 torch.cat(visible_parts, dim=0),
@@ -304,21 +542,33 @@ class Gemma4DynamicCache:
                 key_row = self.key_rows[layer_idx][batch_idx]
                 value_row = self.value_rows[layer_idx][batch_idx]
                 if key_row is not None:
-                    kwargs: dict[str, object] = {}
-                    if device is not None:
-                        kwargs["device"] = device
-                    if dtype is not None:
-                        kwargs["dtype"] = dtype
-                    self.key_rows[layer_idx][batch_idx] = key_row.to(**kwargs)
+                    if isinstance(key_row, TurboQuantTensorRow):
+                        self.key_rows[layer_idx][batch_idx] = key_row.to(device=device, dtype=dtype)
+                    else:
+                        kwargs: dict[str, object] = {}
+                        if device is not None:
+                            kwargs["device"] = device
+                        if dtype is not None:
+                            kwargs["dtype"] = dtype
+                        if kwargs:
+                            self.key_rows[layer_idx][batch_idx] = key_row.to(**kwargs)
                 if value_row is not None:
-                    kwargs = {}
-                    if device is not None:
-                        kwargs["device"] = device
-                    if dtype is not None:
-                        kwargs["dtype"] = dtype
-                    self.value_rows[layer_idx][batch_idx] = value_row.to(**kwargs)
-        moved_shared_layers: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-        for layer_idx, (key_states, value_states, visible_lengths) in self.shared_layers.items():
+                    if isinstance(value_row, TurboQuantTensorRow):
+                        self.value_rows[layer_idx][batch_idx] = value_row.to(device=device, dtype=dtype)
+                    else:
+                        kwargs = {}
+                        if device is not None:
+                            kwargs["device"] = device
+                        if dtype is not None:
+                            kwargs["dtype"] = dtype
+                        if kwargs:
+                            self.value_rows[layer_idx][batch_idx] = value_row.to(**kwargs)
+        moved_shared_layers: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor] | _Gemma4SharedLayerState] = {}
+        for layer_idx, shared in self.shared_layers.items():
+            if isinstance(shared, _Gemma4SharedLayerState):
+                moved_shared_layers[layer_idx] = shared.to(device=device, dtype=dtype)
+                continue
+            key_states, value_states, visible_lengths = shared
             kwargs: dict[str, object] = {}
             if device is not None:
                 kwargs["device"] = device
@@ -861,6 +1111,9 @@ class Gemma4TextModel(nn.Module):
         super().__init__()
         self.config = config
         self.execution_device: torch.device | None = None
+        self.kv_cache_quantization = "none"
+        self.kv_cache_quant_bits = 4
+        self.kv_cache_residual_len = 128
         padding_idx = config.pad_token_id if 0 <= config.pad_token_id < config.vocab_size else 0
         self.embed_tokens = Gemma4TextScaledWordEmbedding(
             config.vocab_size,
@@ -899,8 +1152,14 @@ class Gemma4TextModel(nn.Module):
         *,
         offload_token_io: bool = False,
         offload_per_layer_input_embeddings: bool = False,
+        kv_cache_quantization: str = "none",
+        kv_cache_quant_bits: int = 4,
+        kv_cache_residual_len: int = 128,
     ) -> None:
         self.execution_device = execution_device
+        self.kv_cache_quantization = kv_cache_quantization
+        self.kv_cache_quant_bits = int(kv_cache_quant_bits)
+        self.kv_cache_residual_len = max(1, int(kv_cache_residual_len))
         token_device = torch.device("cpu") if offload_token_io else execution_device
         self.embed_tokens.to(token_device)
         if self.hidden_size_per_layer_input > 0:
@@ -1012,7 +1271,13 @@ class Gemma4TextModel(nn.Module):
             per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
 
         if use_cache and past_key_values is None:
-            past_key_values = Gemma4DynamicCache(self.config, batch_size=int(inputs_embeds.shape[0]))
+            past_key_values = Gemma4DynamicCache(
+                self.config,
+                batch_size=int(inputs_embeds.shape[0]),
+                kv_cache_quantization=self.kv_cache_quantization,
+                kv_cache_quant_bits=self.kv_cache_quant_bits,
+                kv_cache_residual_len=self.kv_cache_residual_len,
+            )
 
         execution_device = self.execution_device or _module_device(self.norm)
         if inputs_embeds.device != execution_device:
@@ -1092,11 +1357,17 @@ class Gemma4Model(nn.Module):
         offload_vision: bool = False,
         offload_token_io: bool = False,
         offload_per_layer_input_embeddings: bool = False,
+        kv_cache_quantization: str = "none",
+        kv_cache_quant_bits: int = 4,
+        kv_cache_residual_len: int = 128,
     ) -> None:
         self.language_model.configure_runtime(
             execution_device,
             offload_token_io=offload_token_io,
             offload_per_layer_input_embeddings=offload_per_layer_input_embeddings,
+            kv_cache_quantization=kv_cache_quantization,
+            kv_cache_quant_bits=kv_cache_quant_bits,
+            kv_cache_residual_len=kv_cache_residual_len,
         )
         vision_device = torch.device("cpu") if offload_vision else execution_device
         if self.vision_tower is not None:
@@ -1186,12 +1457,18 @@ class Gemma4ForConditionalGeneration(nn.Module):
         offload_vision: bool = False,
         offload_token_io: bool = False,
         offload_per_layer_input_embeddings: bool = False,
+        kv_cache_quantization: str = "none",
+        kv_cache_quant_bits: int = 4,
+        kv_cache_residual_len: int = 128,
     ) -> None:
         self.model.configure_runtime(
             execution_device,
             offload_vision=offload_vision,
             offload_token_io=offload_token_io,
             offload_per_layer_input_embeddings=offload_per_layer_input_embeddings,
+            kv_cache_quantization=kv_cache_quantization,
+            kv_cache_quant_bits=kv_cache_quant_bits,
+            kv_cache_residual_len=kv_cache_residual_len,
         )
         if self.lm_head is not None:
             self.lm_head.to(torch.device("cpu") if offload_token_io else execution_device)
