@@ -11,6 +11,7 @@ from typing import Any, Iterator, Literal, cast
 
 import torch
 
+from anna.mm.prepared_inputs import replace_prepared_inputs
 from anna.mm.qwen3_5_text_processor import PreparedInputs, Qwen3_5TextMultimodalProcessor
 from anna.model.fused_ops import maybe_load_gated_delta_library, paged_gqa_decode_fused_is_available
 from anna.model.quantization import convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
@@ -252,6 +253,7 @@ class AnnaQwen3_5TextEngine:
         reasoning_format: ReasoningFormat | str = _DEFAULT_REASONING_FORMAT,
         offload_mode: str = "none",
         offload_vision: bool = False,
+        offload_token_io: bool = False,
         expert_quant: str = "none",
         weight_quant: str = "none",
         resident_expert_layer_indices: tuple[int, ...] = (),
@@ -272,6 +274,7 @@ class AnnaQwen3_5TextEngine:
         self.reasoning_format = normalize_reasoning_format(reasoning_format)
         self.offload_mode = offload_mode
         self.offload_vision = offload_vision
+        self.offload_token_io = offload_token_io
         self.expert_quant = expert_quant
         self.weight_quant = weight_quant
         self.resident_expert_layer_indices = tuple(resident_expert_layer_indices)
@@ -460,6 +463,12 @@ class AnnaQwen3_5TextEngine:
             config=config,
             device_context=device_context,
         )
+        resolved_offload_token_io = cls._resolve_offload_token_io(
+            config=config,
+            resolved_offload_mode=resolved_offload_mode,
+            resolved_weight_quant=resolved_weight_quant,
+            device_context=device_context,
+        )
         resolved_weight_gpu_memory_ratio = cls._resolve_weight_gpu_memory_ratio(
             requested_ratio=weight_gpu_memory_ratio,
             resolved_offload_mode=resolved_offload_mode,
@@ -505,7 +514,7 @@ class AnnaQwen3_5TextEngine:
                 device_context.device,
                 offload_experts=resolved_offload_mode == "experts",
                 offload_vision=resolved_offload_vision,
-                offload_token_io=False,
+                offload_token_io=resolved_offload_token_io,
                 resident_expert_layers=0,
                 resident_expert_layer_indices=initial_resident_expert_layer_indices,
                 expert_quant=resolved_expert_quant,
@@ -522,7 +531,7 @@ class AnnaQwen3_5TextEngine:
                     device_context.device,
                     offload_experts=resolved_offload_mode == "experts",
                     offload_vision=resolved_offload_vision,
-                    offload_token_io=False,
+                    offload_token_io=resolved_offload_token_io,
                     resident_expert_layers=0,
                     resident_expert_layer_indices=resolved_resident_expert_layer_indices,
                     expert_quant=resolved_expert_quant,
@@ -539,7 +548,7 @@ class AnnaQwen3_5TextEngine:
                     device_context.device,
                     offload_experts=resolved_offload_mode == "experts",
                     offload_vision=resolved_offload_vision,
-                    offload_token_io=False,
+                    offload_token_io=resolved_offload_token_io,
                     resident_expert_layers=0,
                     resident_expert_layer_indices=resolved_resident_expert_layer_indices,
                     expert_quant=resolved_expert_quant,
@@ -567,7 +576,7 @@ class AnnaQwen3_5TextEngine:
             resolved_default_max_completion_tokens = max(1, int(resolved_default_max_completion_tokens))
 
         logger.info(
-            "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, default_enable_thinking=%s, reasoning_format=%s, offload=%s, offload_vision=%s, expert_quant=%s, weight_quant=%s, weight_gpu_memory_ratio=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, full_attention_cache_mirror=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
+            "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, default_enable_thinking=%s, reasoning_format=%s, offload=%s, offload_vision=%s, offload_token_io=%s, expert_quant=%s, weight_quant=%s, weight_gpu_memory_ratio=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, full_attention_cache_mirror=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
             resolved_model_id,
             device_context.device,
             device_context.dtype,
@@ -577,6 +586,7 @@ class AnnaQwen3_5TextEngine:
             normalize_reasoning_format(reasoning_format),
             resolved_offload_mode,
             resolved_offload_vision,
+            resolved_offload_token_io,
             resolved_expert_quant,
             resolved_weight_quant,
             resolved_weight_gpu_memory_ratio,
@@ -602,6 +612,7 @@ class AnnaQwen3_5TextEngine:
             reasoning_format=reasoning_format,
             offload_mode=resolved_offload_mode,
             offload_vision=resolved_offload_vision,
+            offload_token_io=resolved_offload_token_io,
             expert_quant=resolved_expert_quant,
             weight_quant=resolved_weight_quant,
             resident_expert_layer_indices=tuple(resolved_resident_expert_layer_indices or ()),
@@ -688,6 +699,11 @@ class AnnaQwen3_5TextEngine:
         if normalized != "auto":
             return normalized
         if getattr(config, "quantization_config", None) is not None and config.quantization_config.is_enabled:
+            quant_method = (config.quantization_config.quant_method or "").strip().lower()
+            if quant_method in {"auto-round", "autoround", "auto_round", "gptq", "auto_gptq"} and (
+                resolved_offload_mode == "experts" or config.text_config.is_moe_model
+            ):
+                return "int4"
             return "none"
 
         memory_info = device_context.get_memory_info()
@@ -699,6 +715,25 @@ class AnnaQwen3_5TextEngine:
         if weight_bytes > int(memory_info.total_bytes * usage_threshold):
             return "int4"
         return "none"
+
+    @staticmethod
+    def _resolve_offload_token_io(
+        *,
+        config: object,
+        resolved_offload_mode: str,
+        resolved_weight_quant: str,
+        device_context: DeviceContext,
+    ) -> bool:
+        if device_context.device.type != "xpu":
+            return False
+        if resolved_offload_mode != "experts":
+            return False
+        text_config = getattr(config, "text_config", None)
+        if text_config is None or not getattr(text_config, "is_moe_model", False):
+            return False
+        if getattr(text_config, "num_experts", 0) >= 128:
+            return True
+        return resolved_weight_quant == "int4"
 
     @staticmethod
     def _resolve_weight_gpu_memory_ratio(
@@ -857,6 +892,34 @@ class AnnaQwen3_5TextEngine:
                 return int(layer.mlp.cached_experts_per_layer)
         return 0
 
+    @classmethod
+    def _effective_resident_experts_per_layer(cls, model: Qwen3_5TextForConditionalGeneration) -> int:
+        offloaded_blocks = cls._offloaded_sparse_moe_blocks(model)
+        if offloaded_blocks:
+            return int(getattr(offloaded_blocks[0][1], "resident_experts_per_layer", 0))
+
+        text_model = cls._text_model(model)
+        if text_model is None or not hasattr(text_model, "layers"):
+            return 0
+        for layer in text_model.layers:
+            if isinstance(getattr(layer, "mlp", None), Qwen3SparseMoeBlock):
+                return int(getattr(layer.mlp, "resident_experts_per_layer", 0))
+        return 0
+
+    @classmethod
+    def _effective_staged_experts_per_layer(cls, model: Qwen3_5TextForConditionalGeneration) -> int:
+        offloaded_blocks = cls._offloaded_sparse_moe_blocks(model)
+        if offloaded_blocks:
+            return int(getattr(offloaded_blocks[0][1], "staged_experts_per_layer", 0))
+
+        text_model = cls._text_model(model)
+        if text_model is None or not hasattr(text_model, "layers"):
+            return 0
+        for layer in text_model.layers:
+            if isinstance(getattr(layer, "mlp", None), Qwen3SparseMoeBlock):
+                return int(getattr(layer.mlp, "staged_experts_per_layer", 0))
+        return 0
+
     @staticmethod
     def _estimate_resident_budget_bytes(
         *,
@@ -938,6 +1001,18 @@ class AnnaQwen3_5TextEngine:
         text_model = cls._text_model(model)
         if text_model is None or not hasattr(text_model, "layers"):
             return ()
+        if (
+            expert_quant == "int4"
+            and getattr(text_model, "config", None) is not None
+            and getattr(text_model.config, "num_experts", 0) >= 128
+        ):
+            logger.info(
+                "Auto resident expert placement disabled for large Arc MoE working sets: "
+                "expert_quant=%s num_experts=%s. Using staged CPU-GPU hybrid execution instead.",
+                expert_quant,
+                getattr(text_model.config, "num_experts", 0),
+            )
+            return ()
 
         safety = device_context.safety_policy
         budget_bytes, reserve_bytes, budget_factor = cls._estimate_resident_budget_bytes(
@@ -1003,7 +1078,16 @@ class AnnaQwen3_5TextEngine:
         *,
         memory_info: object,
         expert_quant: str,
+        num_experts: int,
     ) -> int:
+        if expert_quant == "int4" and num_experts >= 128:
+            return max(
+                0,
+                min(
+                    int(memory_info.total_bytes * 0.45),
+                    int(memory_info.free_bytes * 0.55),
+                ),
+            )
         if expert_quant == "int4":
             return max(
                 0,
@@ -1044,6 +1128,7 @@ class AnnaQwen3_5TextEngine:
         safety = device_context.safety_policy
         exemplar_block = offloaded_blocks[0][1]
         exemplar_expert = exemplar_block.experts[0]
+        large_arc_working_set = expert_quant == "int4" and exemplar_block.num_experts >= 128
         per_expert_bytes = (
             estimate_module_xpu_int4_bytes(exemplar_expert)
             if expert_quant == "int4"
@@ -1062,14 +1147,24 @@ class AnnaQwen3_5TextEngine:
             cache_budget_bytes = max(0, int(memory_info.free_bytes) - cache_target_free_bytes)
             cache_budget_fraction = 1.0
         else:
-            cache_target_free_bytes = max(
-                768 << 20,
-                int(memory_info.total_bytes * 0.06),
-                int(safety.min_free_bytes),
-                int(safety.reserve_margin_bytes),
-                int(memory_info.total_bytes * (1.0 - safety.max_estimated_usage_ratio)),
-            )
-            cache_budget_fraction = 0.65 if expert_quant == "int4" else 0.35
+            if large_arc_working_set:
+                cache_target_free_bytes = max(
+                    768 << 20,
+                    int(memory_info.total_bytes * 0.05),
+                    int(safety.min_free_bytes),
+                    int(safety.reserve_margin_bytes),
+                    int(memory_info.total_bytes * (1.0 - safety.max_estimated_usage_ratio)),
+                )
+                cache_budget_fraction = 0.80
+            else:
+                cache_target_free_bytes = max(
+                    768 << 20,
+                    int(memory_info.total_bytes * 0.06),
+                    int(safety.min_free_bytes),
+                    int(safety.reserve_margin_bytes),
+                    int(memory_info.total_bytes * (1.0 - safety.max_estimated_usage_ratio)),
+                )
+                cache_budget_fraction = 0.65 if expert_quant == "int4" else 0.35
             cache_budget_bytes = int(max(0, int(memory_info.free_bytes) - cache_target_free_bytes) * cache_budget_fraction)
         auto_cached = cache_budget_bytes // max(1, per_expert_bytes * len(offloaded_blocks))
 
@@ -1081,10 +1176,17 @@ class AnnaQwen3_5TextEngine:
         else:
             resolved = max(minimum_cache, min(max_cache, auto_cached))
 
-        working_set_cap = max(minimum_cache, min(max_cache, exemplar_block.top_k * 2))
+        if large_arc_working_set:
+            working_set_cap = max(
+                minimum_cache,
+                min(max_cache, max(exemplar_block.top_k * 12, 96)),
+            )
+        else:
+            working_set_cap = max(minimum_cache, min(max_cache, exemplar_block.top_k * 2))
         cache_cap_bytes = cls._expert_cache_cap_bytes(
             memory_info=memory_info,
             expert_quant=expert_quant,
+            num_experts=exemplar_block.num_experts,
         )
         cache_cap = (
             max(0, min(max_cache, cache_cap_bytes // max(1, per_expert_bytes * len(offloaded_blocks))))
@@ -1198,10 +1300,13 @@ class AnnaQwen3_5TextEngine:
             "quantized_replacements": self.quantized_replacements,
             "offload_mode": self.offload_mode,
             "offload_vision": self.offload_vision,
+            "offload_token_io": self.offload_token_io,
             "expert_quant": self.expert_quant,
             "resident_expert_layers": self.resident_expert_layers,
             "resident_expert_layer_indices": self._resident_expert_layer_indices(),
             "cached_experts_per_layer": self.cached_experts_per_layer,
+            "resident_experts_per_layer": self._effective_resident_experts_per_layer(self.model),
+            "staged_experts_per_layer": self._effective_staged_experts_per_layer(self.model),
             "full_attention_cache_mirror": self.full_attention_cache_mirror,
             "runtime_optimizations": {
                 "compile_mode": self.optimization_config.compile_mode,
@@ -1844,11 +1949,14 @@ class AnnaQwen3_5TextEngine:
     ) -> int:
         total = 0
         for _layer_idx, block in cls._offloaded_sparse_moe_blocks(model):
-            cached_capacity = max(0, int(getattr(block, "cached_experts_per_layer", 0)))
-            if cached_capacity <= 0:
+            staged_capacity = max(
+                0,
+                int(getattr(block, "staged_experts_per_layer", getattr(block, "cached_experts_per_layer", 0))),
+            )
+            if staged_capacity <= 0:
                 continue
-            current_cache = len(getattr(block, "_expert_cache", {}))
-            additional_capacity = max(0, cached_capacity - current_cache)
+            current_slots = len(getattr(block, "_staging_modules", ()))
+            additional_capacity = max(0, staged_capacity - current_slots)
             if additional_capacity <= 0:
                 continue
             exemplar_expert = block.experts[0]

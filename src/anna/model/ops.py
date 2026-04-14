@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -18,7 +19,12 @@ from anna.model.fused_ops import (
     run_rmsnorm_fused,
     paged_gqa_decode_fused_is_available,
 )
-from anna.model.quantization import convert_module_linears_to_xpu_int4
+from anna.model.quantization import (
+    AutoRoundGPTQLinear,
+    XPUInt4Linear,
+    convert_module_linears_to_xpu_int4,
+    extract_linear_weight_bias_cpu,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +44,21 @@ def _module_dtype(module: nn.Module) -> torch.dtype:
         if buffer.is_floating_point():
             return buffer.dtype
     return torch.float32
+
+
+@dataclass(slots=True)
+class _MoEExpertSlice:
+    expert_idx: int
+    start_idx: int
+    end_idx: int
+    expert_layer: "Qwen3MLP"
+    placement: str
+
+
+@dataclass(slots=True)
+class _MoEExecutionPlan:
+    xpu_experts: tuple[_MoEExpertSlice, ...]
+    cpu_experts: tuple[_MoEExpertSlice, ...]
 
 
 class Qwen3PagedLayerAllocator:
@@ -1489,9 +1510,15 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.expert_quant: str = "none"
         self.expert_quant_group_size: int = 128
         self.cached_experts_per_layer: int = max(self.top_k, 8)
+        self.staged_experts_per_layer: int = self.cached_experts_per_layer
+        self.resident_experts_per_layer: int = 0
         self.profile_runtime = False
         self.host_experts_pinned = False
+        self._resident_expert_indices: tuple[int, ...] = ()
+        self._resident_expert_index_set: set[int] = set()
         self._expert_cache: OrderedDict[int, Qwen3MLP] = OrderedDict()
+        self._staging_modules: list[Qwen3MLP] = []
+        self._free_staging_modules: list[Qwen3MLP] = []
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList(
             [Qwen3MLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
@@ -1516,8 +1543,13 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.expert_quant_group_size = expert_quant_group_size
         if cached_experts_per_layer is not None:
             self.cached_experts_per_layer = max(0, min(int(cached_experts_per_layer), self.num_experts))
+        self.staged_experts_per_layer = self.cached_experts_per_layer
+        self.resident_experts_per_layer = 0
+        self._resident_expert_indices = ()
+        self._resident_expert_index_set.clear()
         self._clear_expert_cache()
         self.host_experts_pinned = False
+        ranked_expert_indices: tuple[int, ...] = ()
 
         if resident_experts and self._should_use_xpu_int4():
             for expert in self.experts:
@@ -1526,12 +1558,57 @@ class Qwen3SparseMoeBlock(nn.Module):
                     group_size=self.expert_quant_group_size,
                     device=execution_device,
                 )
+            self.resident_experts_per_layer = self.num_experts
+            self._resident_expert_indices = tuple(range(self.num_experts))
+            self._resident_expert_index_set = set(self._resident_expert_indices)
+            self.staged_experts_per_layer = 0
         else:
             expert_device = execution_device if resident_experts or not offload_experts else torch.device("cpu")
             for expert in self.experts:
                 expert.to(expert_device)
-                if self.offload_experts and expert_device.type == "cpu":
-                    self.host_experts_pinned = self._pin_module_host_memory(expert) or self.host_experts_pinned
+            if resident_experts:
+                self.resident_experts_per_layer = self.num_experts
+                self._resident_expert_indices = tuple(range(self.num_experts))
+                self._resident_expert_index_set = set(self._resident_expert_indices)
+                self.staged_experts_per_layer = 0
+            if self._should_use_arc_resident_working_set():
+                ranked_expert_indices = self._rank_expert_indices()
+                resident_budget = self._resolve_resident_expert_budget()
+                resident_indices = tuple(ranked_expert_indices[:resident_budget])
+                for expert_idx in resident_indices:
+                    self._materialize_resident_expert(expert_idx)
+                self._resident_expert_indices = resident_indices
+                self._resident_expert_index_set = set(resident_indices)
+                self.resident_experts_per_layer = len(resident_indices)
+                self.staged_experts_per_layer = max(0, self.cached_experts_per_layer - self.resident_experts_per_layer)
+                logger.info(
+                    "Arc MoE XPU working set configured: experts=%s top_k=%s resident=%s staged=%s quant=%s",
+                    self.num_experts,
+                    self.top_k,
+                    self.resident_experts_per_layer,
+                    self.staged_experts_per_layer,
+                    self.expert_quant,
+                )
+            if self.offload_experts and expert_device.type == "cpu" and execution_device.type != "cpu":
+                if not self._should_use_arc_resident_working_set():
+                    for expert_idx, expert in enumerate(self.experts):
+                        if expert_idx in self._resident_expert_index_set:
+                            continue
+                        self.host_experts_pinned = self._pin_module_host_memory(expert) or self.host_experts_pinned
+            if self._should_use_arc_resident_working_set() and self.staged_experts_per_layer > 0:
+                if not ranked_expert_indices:
+                    ranked_expert_indices = self._rank_expert_indices()
+                staged_indices = self._select_staging_expert_indices(
+                    ranked_expert_indices,
+                    count=self.staged_experts_per_layer,
+                )
+                self._prime_staging_expert_slots(staged_indices)
+                logger.info(
+                    "Arc MoE XPU staging slots reserved: staged=%s reserved=%s candidates=%s",
+                    self.staged_experts_per_layer,
+                    len(self._staging_modules),
+                    list(staged_indices),
+                )
 
     def _should_use_xpu_int4(self) -> bool:
         return (
@@ -1539,6 +1616,106 @@ class Qwen3SparseMoeBlock(nn.Module):
             and self.execution_device.type == "xpu"
             and self.expert_quant == "int4"
         )
+
+    def _should_use_arc_resident_working_set(self) -> bool:
+        return (
+            self.offload_experts
+            and self._should_use_xpu_int4()
+            and self.num_experts >= 128
+            and self.cached_experts_per_layer > self.top_k
+        )
+
+    def _resolve_resident_expert_budget(self) -> int:
+        if not self._should_use_arc_resident_working_set():
+            return 0
+        if self.num_experts >= 128:
+            minimum_stage_slots = min(max(self.top_k * 2, 16), self.cached_experts_per_layer)
+        else:
+            minimum_stage_slots = min(self.top_k, self.cached_experts_per_layer)
+        return max(0, min(self.num_experts, self.cached_experts_per_layer - minimum_stage_slots))
+
+    def _expert_residency_scores(self) -> torch.Tensor:
+        gate_weight: torch.Tensor | None = None
+        gate_bias: torch.Tensor | None = None
+        try:
+            gate_weight, gate_bias = extract_linear_weight_bias_cpu(self.gate)
+        except TypeError:
+            gate_weight = None
+        if gate_weight is None or gate_weight.ndim != 2:
+            return torch.arange(self.num_experts, dtype=torch.float32)
+
+        gate_weight = gate_weight.detach().to(device=torch.device("cpu"), dtype=torch.float32)
+        if gate_weight.shape[0] == self.num_experts:
+            scores = gate_weight.square().mean(dim=1)
+        elif gate_weight.shape[1] == self.num_experts:
+            scores = gate_weight.square().mean(dim=0)
+        else:
+            return torch.arange(self.num_experts, dtype=torch.float32)
+
+        if gate_bias is not None:
+            scores = scores + gate_bias.detach().to(device=torch.device("cpu"), dtype=torch.float32).abs()
+        return scores
+
+    def _rank_expert_indices(self) -> tuple[int, ...]:
+        scores = self._expert_residency_scores()
+        if scores.numel() != self.num_experts:
+            return tuple(range(self.num_experts))
+        ranked = torch.argsort(scores, descending=True)
+        return tuple(int(idx) for idx in ranked.tolist())
+
+    def _select_staging_expert_indices(
+        self,
+        ranked_expert_indices: tuple[int, ...],
+        *,
+        count: int,
+    ) -> tuple[int, ...]:
+        if count <= 0:
+            return ()
+        staged: list[int] = []
+        for expert_idx in ranked_expert_indices:
+            if expert_idx in self._resident_expert_index_set:
+                continue
+            staged.append(int(expert_idx))
+            if len(staged) >= count:
+                break
+        return tuple(staged)
+
+    @staticmethod
+    def _expert_uses_autoround_packed_weights(expert: Qwen3MLP) -> bool:
+        return all(
+            isinstance(linear, AutoRoundGPTQLinear)
+            for linear in (expert.gate_proj, expert.up_proj, expert.down_proj)
+        )
+
+    def _materialize_resident_expert(self, expert_idx: int) -> None:
+        if self.execution_device is None:
+            raise RuntimeError("Cannot materialize resident expert without an execution device.")
+        expert = self.experts[expert_idx]
+        if _module_device(expert).type != "cpu":
+            return
+        if self._should_use_xpu_int4() and self._expert_uses_autoround_packed_weights(expert):
+            expert.to(self.execution_device)
+            return
+        if self._should_use_xpu_int4():
+            convert_module_linears_to_xpu_int4(
+                expert,
+                group_size=self.expert_quant_group_size,
+                device=self.execution_device,
+            )
+            return
+        expert.to(self.execution_device)
+
+    def _prime_staging_expert_slots(self, expert_indices: tuple[int, ...]) -> None:
+        if self.execution_device is None or self.staged_experts_per_layer <= 0:
+            return
+        for expert_idx in expert_indices[: self.staged_experts_per_layer]:
+            if expert_idx in self._resident_expert_index_set:
+                continue
+            if len(self._staging_modules) >= self.staged_experts_per_layer:
+                break
+            slot = self._allocate_staging_module(self.experts[expert_idx])
+            self._staging_modules.append(slot)
+            self._free_staging_modules.append(slot)
 
     @staticmethod
     def _pin_module_host_memory(module: nn.Module) -> bool:
@@ -1572,9 +1749,11 @@ class Qwen3SparseMoeBlock(nn.Module):
             empty_cache()
 
     def _clear_expert_cache(self) -> None:
-        if not self._expert_cache:
+        if not self._expert_cache and not self._staging_modules and not self._free_staging_modules:
             return
         self._expert_cache.clear()
+        self._staging_modules.clear()
+        self._free_staging_modules.clear()
         self._release_xpu_expert_cache()
 
     @staticmethod
@@ -1605,25 +1784,72 @@ class Qwen3SparseMoeBlock(nn.Module):
                 )
                 target_buffer.copy_(copied)
 
-    def _materialize_cached_expert(self, expert_idx: int) -> Qwen3MLP:
+    def _allocate_xpu_int4_expert_slot(self, source: Qwen3MLP) -> Qwen3MLP:
+        if self.execution_device is None:
+            raise RuntimeError("Cannot build an XPU int4 expert without an execution device.")
+        compute_dtype = getattr(source.gate_proj, "compute_dtype", torch.bfloat16)
+        target = self._new_expert_module()
+        target.gate_proj = XPUInt4Linear(
+            source.gate_proj.in_features,
+            source.gate_proj.out_features,
+            group_size=self.expert_quant_group_size,
+            bias=getattr(source.gate_proj, "bias", None) is not None,
+            compute_dtype=compute_dtype,
+            device=self.execution_device,
+        )
+        target.up_proj = XPUInt4Linear(
+            source.up_proj.in_features,
+            source.up_proj.out_features,
+            group_size=self.expert_quant_group_size,
+            bias=getattr(source.up_proj, "bias", None) is not None,
+            compute_dtype=compute_dtype,
+            device=self.execution_device,
+        )
+        target.down_proj = XPUInt4Linear(
+            source.down_proj.in_features,
+            source.down_proj.out_features,
+            group_size=self.expert_quant_group_size,
+            bias=getattr(source.down_proj, "bias", None) is not None,
+            compute_dtype=compute_dtype,
+            device=self.execution_device,
+        )
+        return target
+
+    def _allocate_staging_module(self, source: Qwen3MLP) -> Qwen3MLP:
+        if self.execution_device is None:
+            raise RuntimeError("Cannot allocate staging module without an execution device.")
+        if self._should_use_xpu_int4():
+            return self._allocate_xpu_int4_expert_slot(source)
+        return self._new_expert_module().to(
+            device=self.execution_device,
+            dtype=_module_dtype(source),
+        )
+
+    def _refresh_xpu_int4_expert(self, source: Qwen3MLP, target: Qwen3MLP) -> None:
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            target_linear = getattr(target, name)
+            if not isinstance(target_linear, XPUInt4Linear):
+                raise TypeError(f"Expected {name} to be XPUInt4Linear, got {type(target_linear)!r}")
+            target_linear.copy_from_linear(getattr(source, name))
+
+    def _materialize_cached_expert(self, expert_idx: int, *, reuse_module: Qwen3MLP | None = None) -> Qwen3MLP:
         if self.execution_device is None:
             raise RuntimeError("Cannot materialize cached expert without an execution device.")
 
         source = self.experts[expert_idx]
         started_at = time.perf_counter()
         if self._should_use_xpu_int4():
-            cached = self._new_expert_module()
-            self._copy_module_state_(source, cached, non_blocking=False)
-            convert_module_linears_to_xpu_int4(
-                cached,
-                group_size=self.expert_quant_group_size,
-                device=self.execution_device,
-            )
+            if reuse_module is None:
+                cached = self._allocate_xpu_int4_expert_slot(source)
+            else:
+                cached = reuse_module
+            self._refresh_xpu_int4_expert(source, cached)
         else:
-            cached = self._new_expert_module().to(
-                device=self.execution_device,
-                dtype=_module_dtype(source),
-            )
+            cached = reuse_module
+            if cached is None:
+                cached = self._allocate_staging_module(source)
+            elif _module_device(cached) != self.execution_device:
+                cached.to(device=self.execution_device, dtype=_module_dtype(source))
             self._copy_module_state_(source, cached, non_blocking=self.host_experts_pinned)
 
         if self.profile_runtime and self.execution_device.type == "xpu" and hasattr(torch, "xpu"):
@@ -1638,19 +1864,32 @@ class Qwen3SparseMoeBlock(nn.Module):
         return cached
 
     def _get_cached_expert(self, expert_idx: int) -> Qwen3MLP | None:
-        if not self.offload_experts or self.execution_device is None or self.cached_experts_per_layer <= 0:
+        if expert_idx in self._resident_expert_index_set:
+            return self.experts[expert_idx]
+        if not self.offload_experts or self.execution_device is None or self.staged_experts_per_layer <= 0:
             return None
         cached = self._expert_cache.get(expert_idx)
         if cached is not None:
             self._expert_cache.move_to_end(expert_idx)
             return cached
 
-        if len(self._expert_cache) >= self.cached_experts_per_layer:
-            self._expert_cache.popitem(last=False)
-            self._release_xpu_expert_cache()
-        cached = self._materialize_cached_expert(expert_idx)
+        reusable_module: Qwen3MLP | None = None
+        if self._free_staging_modules:
+            reusable_module = self._free_staging_modules.pop()
+        elif len(self._staging_modules) >= self.staged_experts_per_layer and self._expert_cache:
+            _evicted_idx, reusable_module = self._expert_cache.popitem(last=False)
+        elif len(self._staging_modules) < self.staged_experts_per_layer:
+            reusable_module = self._allocate_staging_module(self.experts[expert_idx])
+            self._staging_modules.append(reusable_module)
+        cached = self._materialize_cached_expert(expert_idx, reuse_module=reusable_module)
         self._expert_cache[expert_idx] = cached
         return cached
+
+    def _prefetch_cached_experts(self, expert_indices: list[int]) -> None:
+        for expert_idx in expert_indices:
+            if expert_idx in self._resident_expert_index_set:
+                continue
+            self._get_cached_expert(expert_idx)
 
     def _route_tokens(
         self,
@@ -1706,6 +1945,125 @@ class Qwen3SparseMoeBlock(nn.Module):
         compact_routing_weights = routing_weights.index_select(0, sorted_token_idx).gather(1, sorted_route_idx[:, None])
         return compact_hidden_states, compact_routing_weights
 
+    def _plan_execution(
+        self,
+        *,
+        hit_experts: torch.Tensor,
+        usage: torch.Tensor,
+        expert_offsets: torch.Tensor,
+    ) -> _MoEExecutionPlan:
+        gpu_candidates: set[int] = set()
+        if self.offload_experts and self.execution_device is not None and hit_experts.numel() > 0:
+            cold_hit_experts = [
+                int(expert_idx)
+                for expert_idx in hit_experts.tolist()
+                if int(expert_idx) not in self._resident_expert_index_set
+            ]
+            gpu_count = min(len(cold_hit_experts), self.staged_experts_per_layer)
+            if gpu_count > 0:
+                candidate_tensor = torch.tensor(cold_hit_experts, dtype=torch.long, device=usage.device)
+                candidate_usage = usage.index_select(0, candidate_tensor)
+                _, candidate_idx = torch.topk(candidate_usage, k=gpu_count)
+                gpu_candidates = {
+                    cold_hit_experts[int(local_idx)]
+                    for local_idx in candidate_idx.tolist()
+                    if int(candidate_usage[int(local_idx)].item()) > 0
+                }
+                self._prefetch_cached_experts(sorted(gpu_candidates))
+
+        xpu_experts: list[_MoEExpertSlice] = []
+        cpu_experts: list[_MoEExpertSlice] = []
+        for expert_idx in hit_experts.tolist():
+            expert_layer = self.experts[expert_idx]
+            placement = "resident"
+            if _module_device(expert_layer).type != "cpu":
+                placement = "resident"
+            elif expert_idx in gpu_candidates:
+                cached = self._get_cached_expert(expert_idx)
+                if cached is not None:
+                    expert_layer = cached
+                    placement = "staged"
+            elif _module_device(expert_layer).type == "cpu":
+                placement = "cpu"
+            spec = _MoEExpertSlice(
+                expert_idx=expert_idx,
+                start_idx=int(expert_offsets[expert_idx].item()),
+                end_idx=int(expert_offsets[expert_idx + 1].item()),
+                expert_layer=expert_layer,
+                placement=placement,
+            )
+            if _module_device(expert_layer).type == "cpu":
+                cpu_experts.append(spec)
+            else:
+                xpu_experts.append(spec)
+        return _MoEExecutionPlan(xpu_experts=tuple(xpu_experts), cpu_experts=tuple(cpu_experts))
+
+    @staticmethod
+    def _execute_xpu_experts(
+        expert_slices: tuple[_MoEExpertSlice, ...],
+        *,
+        compact_hidden_states: torch.Tensor,
+        compact_routing_weights: torch.Tensor,
+        compact_outputs: torch.Tensor,
+        hidden_dtype: torch.dtype,
+    ) -> None:
+        for spec in expert_slices:
+            current_hidden_states = spec.expert_layer(compact_hidden_states[spec.start_idx : spec.end_idx])
+            current_hidden_states = current_hidden_states * compact_routing_weights[spec.start_idx : spec.end_idx]
+            compact_outputs[spec.start_idx : spec.end_idx] = current_hidden_states.to(dtype=hidden_dtype)
+
+    def _execute_cpu_experts(
+        self,
+        expert_slices: tuple[_MoEExpertSlice, ...],
+        *,
+        compact_hidden_states: torch.Tensor,
+        compact_routing_weights: torch.Tensor,
+        execution_device: torch.device,
+        hidden_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not expert_slices:
+            empty_indices = torch.empty((0,), dtype=torch.long, device=execution_device)
+            empty_outputs = torch.empty(
+                (0, compact_hidden_states.shape[-1]),
+                dtype=hidden_dtype,
+                device=execution_device,
+            )
+            return empty_indices, empty_outputs
+
+        cpu_hidden_states = compact_hidden_states.to(device=torch.device("cpu"))
+        cpu_routing_weights = compact_routing_weights.to(device=torch.device("cpu"))
+        total_tokens = sum(max(0, spec.end_idx - spec.start_idx) for spec in expert_slices)
+        cpu_indices = torch.empty((total_tokens,), dtype=torch.long, device=torch.device("cpu"))
+        cpu_outputs = torch.empty(
+            (total_tokens, compact_hidden_states.shape[-1]),
+            dtype=cpu_hidden_states.dtype,
+            device=torch.device("cpu"),
+        )
+
+        cursor = 0
+        for spec in expert_slices:
+            token_count = max(0, spec.end_idx - spec.start_idx)
+            if token_count <= 0:
+                continue
+            current_hidden_states = spec.expert_layer(cpu_hidden_states[spec.start_idx : spec.end_idx])
+            current_hidden_states = current_hidden_states * cpu_routing_weights[spec.start_idx : spec.end_idx]
+            cpu_outputs[cursor : cursor + token_count] = current_hidden_states.to(dtype=cpu_hidden_states.dtype)
+            cpu_indices[cursor : cursor + token_count] = torch.arange(
+                spec.start_idx,
+                spec.end_idx,
+                dtype=torch.long,
+                device=torch.device("cpu"),
+            )
+            cursor += token_count
+
+        if cursor != total_tokens:
+            cpu_indices = cpu_indices[:cursor]
+            cpu_outputs = cpu_outputs[:cursor]
+        return (
+            cpu_indices.to(device=execution_device),
+            cpu_outputs.to(device=execution_device, dtype=hidden_dtype),
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         execution_device = hidden_states.device
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -1717,13 +2075,6 @@ class Qwen3SparseMoeBlock(nn.Module):
         final_hidden_states = hidden_states.new_zeros((batch_size * sequence_length, hidden_dim))
         usage = usage.to(device=selected_experts.device)
         hit_experts = usage.nonzero(as_tuple=False).flatten()
-        gpu_candidates: set[int] = set()
-        if self.offload_experts and self.execution_device is not None and hit_experts.numel() > 0:
-            gpu_count = min(int(hit_experts.numel()), self.cached_experts_per_layer)
-            if gpu_count > 0:
-                _, candidate_idx = torch.topk(usage, k=gpu_count)
-                gpu_candidates = {int(idx) for idx in candidate_idx.tolist() if int(usage[idx].item()) > 0}
-
         sorted_token_idx, sorted_route_idx, expert_offsets = self._sorted_routing_assignments(selected_experts, usage)
         compact_hidden_states, compact_routing_weights = self._compact_routing_inputs(
             hidden_states,
@@ -1731,26 +2082,30 @@ class Qwen3SparseMoeBlock(nn.Module):
             sorted_token_idx,
             sorted_route_idx,
         )
+        execution_plan = self._plan_execution(
+            hit_experts=hit_experts,
+            usage=usage,
+            expert_offsets=expert_offsets,
+        )
         compact_outputs = hidden_states.new_empty((compact_hidden_states.shape[0], hidden_dim))
-        for expert_idx in hit_experts.tolist():
-            expert_layer = self.experts[expert_idx]
-            if expert_idx in gpu_candidates:
-                cached = self._get_cached_expert(expert_idx)
-                if cached is not None:
-                    expert_layer = cached
-            start_idx = int(expert_offsets[expert_idx].item())
-            end_idx = int(expert_offsets[expert_idx + 1].item())
-            expert_device = _module_device(expert_layer)
-            current_state = compact_hidden_states[start_idx:end_idx]
-            current_routing_weights = compact_routing_weights[start_idx:end_idx]
-            if current_state.device != expert_device:
-                current_state = current_state.to(device=expert_device)
-            if current_routing_weights.device != expert_device:
-                current_routing_weights = current_routing_weights.to(device=expert_device)
-            current_hidden_states = expert_layer(current_state) * current_routing_weights
-            if current_hidden_states.device != execution_device:
-                current_hidden_states = current_hidden_states.to(device=execution_device, dtype=hidden_states.dtype)
-            compact_outputs[start_idx:end_idx] = current_hidden_states.to(dtype=hidden_states.dtype)
+        if execution_plan.xpu_experts:
+            self._execute_xpu_experts(
+                execution_plan.xpu_experts,
+                compact_hidden_states=compact_hidden_states,
+                compact_routing_weights=compact_routing_weights,
+                compact_outputs=compact_outputs,
+                hidden_dtype=hidden_states.dtype,
+            )
+        if execution_plan.cpu_experts:
+            cpu_indices, cpu_outputs = self._execute_cpu_experts(
+                execution_plan.cpu_experts,
+                compact_hidden_states=compact_hidden_states,
+                compact_routing_weights=compact_routing_weights,
+                execution_device=execution_device,
+                hidden_dtype=hidden_states.dtype,
+            )
+            if cpu_indices.numel() > 0:
+                compact_outputs.index_copy_(0, cpu_indices, cpu_outputs)
 
         if compact_outputs.numel() > 0:
             final_hidden_states.index_add_(0, sorted_token_idx, compact_outputs)

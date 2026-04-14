@@ -94,13 +94,17 @@ def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, 
 
                 source = handle.get_tensor(key)
                 target = tensor_targets[key]
+                target_storage = target.data if isinstance(target, torch.nn.Parameter) else target
                 if tuple(source.shape) != tuple(target.shape):
-                    raise ValueError(
-                        f"Shape mismatch for {key}: expected {tuple(target.shape)}, got {tuple(source.shape)}"
-                    )
+                    if target.numel() != 0:
+                        raise ValueError(
+                            f"Shape mismatch for {key}: expected {tuple(target.shape)}, got {tuple(source.shape)}"
+                        )
+                    with torch.no_grad():
+                        target_storage.resize_(source.shape)
 
                 with torch.no_grad():
-                    target.copy_(source.to(device=target.device, dtype=target.dtype))
+                    target_storage.copy_(source.to(device=target_storage.device, dtype=target_storage.dtype))
                 loaded += 1
 
     model.tie_weights()

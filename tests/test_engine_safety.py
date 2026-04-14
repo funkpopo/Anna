@@ -332,6 +332,54 @@ def test_auto_resident_expert_estimation_accounts_for_int4_expert_storage() -> N
     assert len(selected_int4) >= 2
 
 
+def test_auto_resident_expert_estimation_disables_large_arc_moe_working_sets() -> None:
+    config = Qwen3_5TextConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=8,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        vocab_size=256,
+        max_position_embeddings=128,
+        layer_types=["linear_attention"],
+        decoder_sparse_step=1,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        num_experts=128,
+        num_experts_per_tok=8,
+    )
+    model = Qwen3_5TextForCausalLM(config)
+    fake_device_context = SimpleNamespace(
+        device=torch.device("xpu"),
+        safety_policy=RuntimeSafetyPolicy(
+            min_free_bytes=0,
+            reserve_margin_bytes=0,
+            max_estimated_usage_ratio=1.0,
+            generation_memory_safety_factor=2.0,
+        ),
+        synchronize=lambda: None,
+        get_memory_info=lambda: DeviceMemoryInfo(
+            free_bytes=8 << 30,
+            total_bytes=16 << 30,
+            allocated_bytes=0,
+            reserved_bytes=0,
+        ),
+    )
+
+    selected = AnnaQwen3_5TextEngine._estimate_resident_expert_layer_indices(
+        model=model,
+        device_context=fake_device_context,
+        expert_quant="int4",
+    )
+
+    assert selected == ()
+
+
 def test_auto_cached_experts_per_layer_scales_with_available_xpu_budget() -> None:
     config = Qwen3_5TextConfig(
         hidden_size=64,
@@ -464,7 +512,7 @@ def test_auto_cached_experts_per_layer_caps_large_moe_working_set() -> None:
         expert_quant="int4",
     )
 
-    assert estimated <= config.num_experts_per_tok * 2
+    assert estimated == 96
 
 
 def test_auto_weight_quantization_promotes_oversized_dense_xpu_models(monkeypatch) -> None:
@@ -566,3 +614,94 @@ def test_auto_weight_quantization_can_promote_oversized_expert_offload_models(mo
     )
 
     assert resolved == "int4"
+
+
+def test_prequantized_arc_moe_models_use_runtime_xpu_int4_backend_adaptation() -> None:
+    config = SimpleNamespace(
+        text_config=Qwen3_5TextConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            vocab_size=256,
+            max_position_embeddings=128,
+            layer_types=["linear_attention", "full_attention", "linear_attention", "full_attention"],
+            decoder_sparse_step=1,
+            moe_intermediate_size=96,
+            shared_expert_intermediate_size=128,
+            num_experts=128,
+            num_experts_per_tok=8,
+        ),
+        quantization_config=QuantizationConfig(
+            quant_method="auto-round",
+            bits=4,
+            group_size=128,
+        ),
+        vision_config=None,
+    )
+    fake_device_context = SimpleNamespace(
+        device=torch.device("xpu"),
+        get_memory_info=lambda: DeviceMemoryInfo(
+            free_bytes=16 << 30,
+            total_bytes=16 << 30,
+            allocated_bytes=0,
+            reserved_bytes=0,
+        ),
+    )
+
+    resolved = AnnaQwen3_5TextEngine._resolve_weight_quant(
+        requested_quant="auto",
+        resolved_offload_mode="experts",
+        model_path=SimpleNamespace(),
+        config=config,
+        device_context=fake_device_context,
+    )
+
+    assert resolved == "int4"
+
+
+def test_large_arc_moe_runtime_enables_token_io_offload() -> None:
+    config = SimpleNamespace(
+        text_config=Qwen3_5TextConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            vocab_size=256,
+            max_position_embeddings=128,
+            layer_types=["linear_attention", "full_attention", "linear_attention", "full_attention"],
+            decoder_sparse_step=1,
+            moe_intermediate_size=96,
+            shared_expert_intermediate_size=128,
+            num_experts=128,
+            num_experts_per_tok=8,
+        ),
+        quantization_config=QuantizationConfig(
+            quant_method="auto-round",
+            bits=4,
+            group_size=128,
+        ),
+        vision_config=None,
+    )
+    fake_device_context = SimpleNamespace(device=torch.device("xpu"))
+
+    resolved = AnnaQwen3_5TextEngine._resolve_offload_token_io(
+        config=config,
+        resolved_offload_mode="experts",
+        resolved_weight_quant="int4",
+        device_context=fake_device_context,
+    )
+
+    assert resolved is True

@@ -41,6 +41,116 @@ def _unpack_int4_first_dim(packed: torch.Tensor) -> torch.Tensor:
     return unpacked.reshape(packed.shape[0] * 8, packed.shape[1])
 
 
+def _pack_int4_last_dim(values: torch.Tensor) -> torch.Tensor:
+    if values.ndim < 1:
+        raise ValueError("Expected at least one dimension when packing int4 values.")
+    if values.shape[-1] % 8 != 0:
+        raise ValueError(f"Expected the last dimension to be divisible by 8, got shape {tuple(values.shape)}")
+    packed_shape = (*values.shape[:-1], values.shape[-1] // 8, 8)
+    reshaped = values.to(torch.int32).reshape(packed_shape)
+    shifts = (torch.arange(8, dtype=torch.int32).view(*([1] * (reshaped.ndim - 1)), 8) * 4)
+    return torch.bitwise_left_shift(reshaped & 0xF, shifts).sum(dim=-1, dtype=torch.int32).contiguous()
+
+
+def _dequantize_fp8_to_cpu(module: "FP8Linear") -> torch.Tensor:
+    weight = module.weight.detach().to(device=torch.device("cpu"), dtype=torch.float32)
+    scale = module.weight_scale_inv.detach().to(device=torch.device("cpu"), dtype=torch.float32)
+    if scale.ndim == 0:
+        return weight * scale
+
+    block_m, block_n = module.block_size or (module.out_features, module.in_features)
+    rows, cols = module.out_features, module.in_features
+    row_tiles = (rows + block_m - 1) // block_m
+    col_tiles = (cols + block_n - 1) // block_n
+    padded_rows = row_tiles * block_m
+    padded_cols = col_tiles * block_n
+
+    padded_weight = torch.zeros((padded_rows, padded_cols), device=weight.device, dtype=weight.dtype)
+    padded_weight[:rows, :cols] = weight
+    reshaped = padded_weight.reshape(row_tiles, block_m, col_tiles, block_n)
+    expanded_scale = scale.reshape(row_tiles, col_tiles).unsqueeze(1).unsqueeze(-1)
+    dequantized = (reshaped * expanded_scale).reshape(padded_rows, padded_cols)
+    return dequantized[:rows, :cols]
+
+
+def _dequantize_awq_to_cpu(module: "AWQLinear") -> torch.Tensor:
+    if module.qweight.numel() == 0:
+        raise RuntimeError("AWQLinear has no quantized weight payload.")
+
+    qweight = module.qweight.detach().to(device=torch.device("cpu"), dtype=torch.int32)
+    qzeros = module.qzeros.detach().to(device=torch.device("cpu"), dtype=torch.int32) if module.qzeros.numel() else None
+    scales = module.scales.detach().to(device=torch.device("cpu"), dtype=torch.float32)
+    weight_int = _unpack_int4_last_dim(qweight)
+    zeros_int = _unpack_int4_last_dim(qzeros) if qzeros is not None else None
+
+    if weight_int.shape[0] == module.in_features and weight_int.shape[1] >= module.out_features:
+        weight_int = weight_int[:, : module.out_features]
+        if zeros_int is not None:
+            zeros_int = zeros_int[:, : module.out_features]
+        group_count = scales.shape[0]
+        group_ids = torch.arange(module.in_features, device=torch.device("cpu")) // module.group_size
+        group_ids = torch.clamp(group_ids, max=group_count - 1)
+        expanded_scales = scales[group_ids]
+        expanded_zeros = 8.0 if zeros_int is None else zeros_int[group_ids].to(torch.float32)
+        dequantized = (weight_int.to(torch.float32) - expanded_zeros) * expanded_scales
+        return dequantized.transpose(0, 1).contiguous()
+
+    if weight_int.shape[0] == module.out_features and weight_int.shape[1] >= module.in_features:
+        weight_int = weight_int[:, : module.in_features]
+        group_count = scales.shape[0]
+        group_ids = torch.arange(module.in_features, device=torch.device("cpu")) // module.group_size
+        group_ids = torch.clamp(group_ids, max=group_count - 1)
+        expanded_scales = scales[group_ids].transpose(0, 1)
+        if zeros_int is None:
+            expanded_zeros = 8.0
+        else:
+            expanded_zeros = zeros_int[:, : module.in_features].to(torch.float32)
+        return (weight_int.to(torch.float32) - expanded_zeros) * expanded_scales
+
+    raise ValueError(
+        f"Unsupported AWQ packed weight shape {tuple(module.qweight.shape)} for target {(module.out_features, module.in_features)}"
+    )
+
+
+def _dequantize_autoround_to_cpu(module: "AutoRoundGPTQLinear") -> torch.Tensor:
+    if module.qweight.numel() == 0:
+        raise RuntimeError("AutoRoundGPTQLinear has no quantized weight payload.")
+    if module.group_size <= 0:
+        raise ValueError("AutoRoundGPTQLinear requires a positive group_size.")
+
+    qweight = module.qweight.detach().to(device=torch.device("cpu"), dtype=torch.int32)
+    weight_int = _unpack_int4_first_dim(qweight)
+    if weight_int.shape[0] < module.in_features or weight_int.shape[1] < module.out_features:
+        raise ValueError(
+            f"Unsupported AutoRound qweight shape {tuple(module.qweight.shape)} for target {(module.out_features, module.in_features)}"
+        )
+    weight_int = weight_int[: module.in_features, : module.out_features]
+    scales = module.scales.detach().to(device=torch.device("cpu"), dtype=torch.float32)
+    if scales.ndim != 2 or scales.shape[1] < module.out_features:
+        raise ValueError(
+            f"Unsupported AutoRound scales shape {tuple(module.scales.shape)} for target {(module.out_features, module.in_features)}"
+        )
+    group_count = scales.shape[0]
+    group_ids = torch.arange(module.in_features, device=torch.device("cpu")) // module.group_size
+    group_ids = torch.clamp(group_ids, max=max(0, group_count - 1))
+    expanded_scales = scales[:, : module.out_features][group_ids]
+
+    expanded_zeros: torch.Tensor | float
+    if module.zero_point and module.qzeros.numel() > 0:
+        qzeros = module.qzeros.detach().to(device=torch.device("cpu"), dtype=torch.int32)
+        zeros_int = _unpack_int4_last_dim(qzeros)
+        if zeros_int.ndim != 2 or zeros_int.shape[0] < group_count or zeros_int.shape[1] < module.out_features:
+            raise ValueError(
+                f"Unsupported AutoRound qzeros shape {tuple(module.qzeros.shape)} for target {(module.out_features, module.in_features)}"
+            )
+        expanded_zeros = zeros_int[:group_count, : module.out_features].to(dtype=torch.float32)[group_ids]
+    else:
+        expanded_zeros = 8.0
+
+    dequantized = (weight_int.to(torch.float32) - expanded_zeros) * expanded_scales
+    return dequantized.transpose(0, 1).contiguous()
+
+
 class DenseLinear(nn.Module):
     def __init__(
         self,
@@ -226,9 +336,20 @@ class AutoRoundGPTQLinear(nn.Module):
         self.compute_dtype = compute_dtype
 
         self.register_parameter("weight", None)
-        self.register_buffer("qweight", torch.empty(0, dtype=torch.int32, device=device), persistent=True)
-        self.register_buffer("qzeros", torch.empty(0, dtype=torch.int32, device=device), persistent=True)
-        self.register_buffer("scales", torch.empty(0, dtype=torch.float16, device=device), persistent=True)
+        packed_rows = (self.in_features + 7) // 8
+        group_count = max(1, (self.in_features + self.group_size - 1) // self.group_size)
+        packed_zero_cols = (self.out_features + 7) // 8
+        self.register_buffer("qweight", torch.empty((packed_rows, self.out_features), dtype=torch.int32, device=device), persistent=True)
+        self.register_buffer(
+            "qzeros",
+            torch.empty((group_count, packed_zero_cols), dtype=torch.int32, device=device),
+            persistent=True,
+        )
+        self.register_buffer(
+            "scales",
+            torch.empty((group_count, self.out_features), dtype=torch.float16, device=device),
+            persistent=True,
+        )
         if bias:
             self.bias = _empty_parameter((out_features,), dtype=compute_dtype, device=device)
         else:
@@ -324,27 +445,87 @@ class XPUInt4Linear(nn.Module):
         compute_dtype: torch.dtype = torch.bfloat16,
         device: torch.device | str | None = None,
     ) -> "XPUInt4Linear":
-        weight, bias = _extract_dense_weight_bias(module)
-        in_features = int(weight.shape[1])
-        out_features = int(weight.shape[0])
+        in_features = int(module.in_features)
+        out_features = int(module.out_features)
+        has_bias = getattr(module, "bias", None) is not None
         padded_in_features = cls._padded_in_features(in_features, group_size)
         quantized = cls(
             in_features,
             out_features,
             group_size=group_size,
-            bias=bias is not None,
+            bias=has_bias,
             compute_dtype=compute_dtype,
             device=device,
             padded_in_features=padded_in_features,
         )
-        qweight, qscale, qzeros = cls._quantize_weight(weight, group_size=group_size, padded_in_features=padded_in_features)
-        with torch.no_grad():
-            quantized.qweight.copy_(qweight)
-            quantized.qscale.copy_(qscale)
-            quantized.qzeros.copy_(qzeros)
-            if bias is not None and quantized.bias is not None:
-                quantized.bias.copy_(bias.to(dtype=quantized.bias.dtype))
+        quantized.copy_from_linear(module)
         return quantized
+
+    def copy_from_linear(self, module: nn.Module) -> None:
+        if int(module.in_features) != self.in_features or int(module.out_features) != self.out_features:
+            raise ValueError(
+                "Source linear shape does not match the target XPUInt4Linear: "
+                f"expected {(self.out_features, self.in_features)}, "
+                f"got {(int(module.out_features), int(module.in_features))}"
+            )
+        if isinstance(module, AutoRoundGPTQLinear):
+            self._copy_from_autoround(module)
+            return
+
+        weight, bias = _extract_dense_weight_bias(module)
+        qweight, qscale, qzeros = self._quantize_weight(
+            weight,
+            group_size=self.group_size,
+            padded_in_features=self.padded_in_features,
+        )
+        with torch.no_grad():
+            self.qweight.copy_(qweight.to(device=self.qweight.device, dtype=self.qweight.dtype))
+            self.qscale.copy_(qscale.to(device=self.qscale.device, dtype=self.qscale.dtype))
+            self.qzeros.copy_(qzeros.to(device=self.qzeros.device, dtype=self.qzeros.dtype))
+            if bias is not None and self.bias is not None:
+                self.bias.copy_(bias.to(device=self.bias.device, dtype=self.bias.dtype))
+
+    def _copy_from_autoround(self, module: AutoRoundGPTQLinear) -> None:
+        if module.qweight.numel() == 0 or module.scales.numel() == 0:
+            raise RuntimeError("AutoRoundGPTQLinear has no quantized weight payload.")
+
+        group_count = self.padded_in_features // self.group_size
+        unpacked_weight = _unpack_int4_first_dim(module.qweight)
+        if unpacked_weight.shape[0] < self.in_features or unpacked_weight.shape[1] < self.out_features:
+            raise ValueError(
+                f"Unsupported AutoRound qweight shape {tuple(module.qweight.shape)} "
+                f"for target {(self.out_features, self.in_features)}"
+            )
+        weight_int = unpacked_weight[: self.in_features, : self.out_features].transpose(0, 1).contiguous()
+        padded_weight = torch.full((self.out_features, self.padded_in_features), 8, dtype=torch.int32)
+        padded_weight[:, : self.in_features] = weight_int.to(dtype=torch.int32)
+        qweight = _pack_int4_last_dim(padded_weight)
+
+        scales = module.scales.to(dtype=torch.float32)
+        if scales.shape[0] < group_count or scales.shape[1] < self.out_features:
+            raise ValueError(
+                f"Unsupported AutoRound scales shape {tuple(module.scales.shape)} "
+                f"for target {(self.out_features, self.in_features)}"
+            )
+        qscale = scales[:group_count, : self.out_features].contiguous()
+
+        if module.zero_point and module.qzeros.numel() > 0:
+            zeros_int = _unpack_int4_last_dim(module.qzeros)
+            if zeros_int.shape[0] < group_count or zeros_int.shape[1] < self.out_features:
+                raise ValueError(
+                    f"Unsupported AutoRound qzeros shape {tuple(module.qzeros.shape)} "
+                    f"for target {(self.out_features, self.in_features)}"
+                )
+            qzeros = zeros_int[:group_count, : self.out_features].to(dtype=torch.int8).contiguous()
+        else:
+            qzeros = torch.full((group_count, self.out_features), 8, dtype=torch.int8)
+
+        with torch.no_grad():
+            self.qweight.copy_(qweight.to(device=self.qweight.device, dtype=self.qweight.dtype))
+            self.qscale.copy_(qscale.to(device=self.qscale.device, dtype=self.qscale.dtype))
+            self.qzeros.copy_(qzeros.to(device=self.qzeros.device, dtype=self.qzeros.dtype))
+            if module.bias is not None and self.bias is not None:
+                self.bias.copy_(module.bias.to(device=self.bias.device, dtype=self.bias.dtype))
 
     @staticmethod
     def _quantize_weight(
@@ -368,11 +549,8 @@ class XPUInt4Linear(nn.Module):
         q = q.reshape(out_features, padded_in_features)
         qzeros = torch.full((group_count, out_features), 8, dtype=torch.int8)
         qscale = scale.transpose(0, 1).contiguous().to(dtype=torch.float32)
-
-        q_reshaped = q.reshape(out_features, padded_in_features // 8, 8)
-        shifts = (torch.arange(8, dtype=torch.int32).view(1, 1, 8) * 4)
-        packed = torch.bitwise_left_shift(q_reshaped & 0xF, shifts).sum(dim=-1, dtype=torch.int32)
-        return packed.contiguous(), qscale, qzeros
+        packed = _pack_int4_last_dim(q)
+        return packed, qscale, qzeros
 
     def _dequantize_weight(self) -> torch.Tensor:
         packed = self.qweight.to(device="cpu", dtype=torch.int32)
@@ -457,26 +635,30 @@ def _get_submodule(model: nn.Module, module_name: str) -> nn.Module:
 
 def _extract_dense_weight_bias(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor | None]:
     if isinstance(module, FP8Linear):
-        weight = module._dequantize_weight()
-        bias = None if module.bias is None else module.bias.detach().to(dtype=torch.float32)
+        weight = _dequantize_fp8_to_cpu(module)
+        bias = None if module.bias is None else module.bias.detach().to(device=torch.device("cpu"), dtype=torch.float32)
         return weight.detach(), bias
     if isinstance(module, AutoRoundGPTQLinear):
-        weight = module._dequantize_autoround()
-        bias = None if module.bias is None else module.bias.detach().to(dtype=torch.float32)
+        weight = _dequantize_autoround_to_cpu(module)
+        bias = None if module.bias is None else module.bias.detach().to(device=torch.device("cpu"), dtype=torch.float32)
         return weight.detach(), bias
     if isinstance(module, AWQLinear):
-        weight = module._dequantize_awq()
-        bias = None if module.bias is None else module.bias.detach().to(dtype=torch.float32)
+        weight = _dequantize_awq_to_cpu(module)
+        bias = None if module.bias is None else module.bias.detach().to(device=torch.device("cpu"), dtype=torch.float32)
         return weight.detach(), bias
     if isinstance(module, DenseLinear) or isinstance(module, nn.Linear):
-        weight = module.weight.detach().to(dtype=torch.float32)
-        bias = None if module.bias is None else module.bias.detach().to(dtype=torch.float32)
+        weight = module.weight.detach().to(device=torch.device("cpu"), dtype=torch.float32)
+        bias = None if module.bias is None else module.bias.detach().to(device=torch.device("cpu"), dtype=torch.float32)
         return weight, bias
     if isinstance(module, XPUInt4Linear):
         weight = module._dequantize_weight()
-        bias = None if module.bias is None else module.bias.detach().to(dtype=torch.float32)
+        bias = None if module.bias is None else module.bias.detach().to(device=torch.device("cpu"), dtype=torch.float32)
         return weight, bias
     raise TypeError(f"Unsupported linear module for XPU int4 conversion: {type(module)!r}")
+
+
+def extract_linear_weight_bias_cpu(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor | None]:
+    return _extract_dense_weight_bias(module)
 
 
 def estimate_xpu_int4_linear_bytes(
