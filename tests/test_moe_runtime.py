@@ -4,6 +4,7 @@ import torch
 
 from anna.model.ops import Qwen3SparseMoeBlock
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
+from anna.model.quantization import AutoRoundGPTQLinear
 
 
 class _FakeXPUDevice:
@@ -144,3 +145,68 @@ def test_sparse_moe_large_arc_budget_prefers_resident_experts(monkeypatch) -> No
     assert staged_materialized == [103]
     assert list(block._expert_cache.keys()) == [103]
     assert len(block._free_staging_modules) == 15
+
+
+def test_sparse_moe_resident_arc_path_converts_autoround_experts_to_xpu_int4(monkeypatch) -> None:
+    block = Qwen3SparseMoeBlock(_tiny_moe_config())
+    expert = block.experts[0]
+    expert.gate_proj = AutoRoundGPTQLinear(16, 8, compute_dtype=torch.bfloat16)
+    expert.up_proj = AutoRoundGPTQLinear(16, 8, compute_dtype=torch.bfloat16)
+    expert.down_proj = AutoRoundGPTQLinear(8, 16, compute_dtype=torch.bfloat16)
+
+    converted: list[tuple[object, dict[str, object]]] = []
+
+    def _record_convert(module, **kwargs):
+        converted.append((module, kwargs))
+        return 3
+
+    monkeypatch.setattr("anna.model.ops.convert_module_linears_to_xpu_int4", _record_convert)
+
+    block.execution_device = _FakeXPUDevice()  # type: ignore[assignment]
+    block.expert_quant = "int4"
+    block._materialize_resident_expert(0)
+
+    assert len(converted) == 1
+    assert converted[0][0] is expert
+    assert converted[0][1]["device"] is block.execution_device
+
+
+def test_sparse_moe_large_arc_plan_defers_staged_materialization_until_execution(monkeypatch) -> None:
+    block = Qwen3SparseMoeBlock(_large_arc_moe_config())
+    block.offload_experts = True
+    block.execution_device = _FakeXPUDevice()  # type: ignore[assignment]
+    block.expert_quant = "int4"
+    block.cached_experts_per_layer = 40
+    block.staged_experts_per_layer = 16
+
+    staged_materialized: list[int] = []
+    monkeypatch.setattr(block, "_get_cached_expert", lambda expert_idx: staged_materialized.append(expert_idx) or block.experts[expert_idx])
+
+    usage = torch.zeros(block.num_experts, dtype=torch.long)
+    usage[1] = 5
+    usage[2] = 4
+    hit_experts = usage.nonzero(as_tuple=False).flatten()
+    expert_offsets = torch.zeros(block.num_experts + 1, dtype=torch.long)
+    expert_offsets[1:] = usage.cumsum(dim=0)
+
+    plan = block._plan_execution(
+        hit_experts=hit_experts,
+        usage=usage,
+        expert_offsets=expert_offsets,
+    )
+
+    assert staged_materialized == []
+    assert [spec.placement for spec in plan.xpu_experts] == ["staged", "staged"]
+
+    compact_hidden_states = torch.randn(9, 16)
+    compact_routing_weights = torch.ones((9, 1), dtype=compact_hidden_states.dtype)
+    compact_outputs = torch.empty_like(compact_hidden_states)
+    block._execute_xpu_experts(
+        plan.xpu_experts,
+        compact_hidden_states=compact_hidden_states,
+        compact_routing_weights=compact_routing_weights,
+        compact_outputs=compact_outputs,
+        hidden_dtype=compact_hidden_states.dtype,
+    )
+
+    assert staged_materialized == [1, 2]

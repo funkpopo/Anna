@@ -431,6 +431,18 @@ class XPUInt4Linear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+    def prime_device_storage_(self) -> None:
+        if self.qweight.device.type != "xpu":
+            return
+        with torch.no_grad():
+            # Touch the full backing storage so Level Zero commits the slot into
+            # dedicated VRAM during runtime setup instead of on the first expert fill.
+            self.qweight.zero_()
+            self.qscale.fill_(1.0)
+            self.qzeros.fill_(8)
+            if self.bias is not None:
+                self.bias.zero_()
+
     @staticmethod
     def _padded_in_features(in_features: int, group_size: int) -> int:
         padded = ((in_features + group_size - 1) // group_size) * group_size
@@ -479,11 +491,11 @@ class XPUInt4Linear(nn.Module):
             padded_in_features=self.padded_in_features,
         )
         with torch.no_grad():
-            self.qweight.copy_(qweight.to(device=self.qweight.device, dtype=self.qweight.dtype))
-            self.qscale.copy_(qscale.to(device=self.qscale.device, dtype=self.qscale.dtype))
-            self.qzeros.copy_(qzeros.to(device=self.qzeros.device, dtype=self.qzeros.dtype))
+            self.qweight.copy_(qweight.to(dtype=self.qweight.dtype))
+            self.qscale.copy_(qscale.to(dtype=self.qscale.dtype))
+            self.qzeros.copy_(qzeros.to(dtype=self.qzeros.dtype))
             if bias is not None and self.bias is not None:
-                self.bias.copy_(bias.to(device=self.bias.device, dtype=self.bias.dtype))
+                self.bias.copy_(bias.to(dtype=self.bias.dtype))
 
     def _copy_from_autoround(self, module: AutoRoundGPTQLinear) -> None:
         if module.qweight.numel() == 0 or module.scales.numel() == 0:
@@ -521,11 +533,11 @@ class XPUInt4Linear(nn.Module):
             qzeros = torch.full((group_count, self.out_features), 8, dtype=torch.int8)
 
         with torch.no_grad():
-            self.qweight.copy_(qweight.to(device=self.qweight.device, dtype=self.qweight.dtype))
-            self.qscale.copy_(qscale.to(device=self.qscale.device, dtype=self.qscale.dtype))
-            self.qzeros.copy_(qzeros.to(device=self.qzeros.device, dtype=self.qzeros.dtype))
+            self.qweight.copy_(qweight.to(dtype=self.qweight.dtype))
+            self.qscale.copy_(qscale.to(dtype=self.qscale.dtype))
+            self.qzeros.copy_(qzeros.to(dtype=self.qzeros.dtype))
             if module.bias is not None and self.bias is not None:
-                self.bias.copy_(module.bias.to(device=self.bias.device, dtype=self.bias.dtype))
+                self.bias.copy_(module.bias.detach().to(device=torch.device("cpu"), dtype=self.bias.dtype))
 
     @staticmethod
     def _quantize_weight(

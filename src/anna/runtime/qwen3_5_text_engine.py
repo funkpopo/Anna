@@ -362,12 +362,60 @@ class AnnaQwen3_5TextEngine:
 
         auto_chunk = int(target_chunk_budget // estimated_bytes_per_token)
         resolved = max(128, min(2048, auto_chunk))
+        large_arc_moe_cap = self._large_arc_moe_prefill_chunk_cap()
+        if large_arc_moe_cap > 0:
+            resolved = min(resolved, large_arc_moe_cap)
         logger.info(
             "Enabled auto prefill chunking on %s: chunk_size=%s estimated_bytes_per_token=%s target_budget=%s",
             self.device_context.device,
             resolved,
             _format_bytes(estimated_bytes_per_token),
             _format_bytes(target_chunk_budget),
+        )
+        return resolved
+
+    def _large_arc_moe_prefill_chunk_cap(self) -> int:
+        device = getattr(self.device_context, "device", torch.device("cpu"))
+        if device.type != "xpu":
+            return 0
+        offloaded_blocks = self._offloaded_sparse_moe_blocks(self.model)
+        if not offloaded_blocks:
+            return 0
+
+        block = offloaded_blocks[0][1]
+        if (
+            getattr(block, "expert_quant", "none") != "int4"
+            or int(getattr(block, "num_experts", 0)) < 128
+            or int(getattr(block, "staged_experts_per_layer", 0)) <= 0
+        ):
+            return 0
+
+        top_k = max(1, int(getattr(block, "top_k", 1)))
+        staged = max(0, int(getattr(block, "staged_experts_per_layer", 0)))
+        active_staged = max(1, min(staged, top_k * 2))
+        bytes_per_elem = self.device_context.element_size(self.device_context.dtype)
+        hidden_size = int(self.config.text_config.hidden_size)
+        moe_bytes_per_token = hidden_size * bytes_per_elem * max(64, top_k * 8 + active_staged * 4)
+
+        memory_info = self.device_context.get_memory_info()
+        if memory_info is None:
+            target_budget = 384 << 20
+        else:
+            policy = self.device_context.safety_policy
+            available_budget = max(0, memory_info.free_bytes - policy.reserve_margin_bytes)
+            target_budget = max(
+                192 << 20,
+                min(max(available_budget // 12, 256 << 20), 512 << 20),
+            )
+
+        resolved = max(128, min(768, int(target_budget // max(1, moe_bytes_per_token))))
+        logger.info(
+            "Applied large Arc MoE prefill cap: chunk_size=%s top_k=%s staged=%s estimated_moe_bytes_per_token=%s target_budget=%s",
+            resolved,
+            top_k,
+            staged,
+            _format_bytes(moe_bytes_per_token),
+            _format_bytes(target_budget),
         )
         return resolved
 

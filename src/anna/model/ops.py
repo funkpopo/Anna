@@ -20,7 +20,6 @@ from anna.model.fused_ops import (
     paged_gqa_decode_fused_is_available,
 )
 from anna.model.quantization import (
-    AutoRoundGPTQLinear,
     XPUInt4Linear,
     convert_module_linears_to_xpu_int4,
     extract_linear_weight_bias_cpu,
@@ -1680,21 +1679,11 @@ class Qwen3SparseMoeBlock(nn.Module):
                 break
         return tuple(staged)
 
-    @staticmethod
-    def _expert_uses_autoround_packed_weights(expert: Qwen3MLP) -> bool:
-        return all(
-            isinstance(linear, AutoRoundGPTQLinear)
-            for linear in (expert.gate_proj, expert.up_proj, expert.down_proj)
-        )
-
     def _materialize_resident_expert(self, expert_idx: int) -> None:
         if self.execution_device is None:
             raise RuntimeError("Cannot materialize resident expert without an execution device.")
         expert = self.experts[expert_idx]
         if _module_device(expert).type != "cpu":
-            return
-        if self._should_use_xpu_int4() and self._expert_uses_autoround_packed_weights(expert):
-            expert.to(self.execution_device)
             return
         if self._should_use_xpu_int4():
             convert_module_linears_to_xpu_int4(
@@ -1767,22 +1756,23 @@ class Qwen3SparseMoeBlock(nn.Module):
             target_parameters = dict(target.named_parameters())
             for name, source_parameter in source.named_parameters():
                 target_parameter = target_parameters[name]
-                copied = source_parameter.to(
-                    device=target_parameter.device,
-                    dtype=target_parameter.dtype,
-                    non_blocking=non_blocking,
-                )
-                target_parameter.copy_(copied)
+                copied = source_parameter.detach()
+                if copied.device.type != "cpu" and target_parameter.device.type == "xpu":
+                    copied = copied.to(device=torch.device("cpu"))
+                if copied.dtype != target_parameter.dtype:
+                    copied = copied.to(dtype=target_parameter.dtype)
+                target_parameter.copy_(copied, non_blocking=non_blocking)
 
             target_buffers = dict(target.named_buffers())
             for name, source_buffer in source.named_buffers():
                 target_buffer = target_buffers[name]
-                copied = source_buffer.to(
-                    device=target_buffer.device,
-                    dtype=target_buffer.dtype if source_buffer.is_floating_point() else source_buffer.dtype,
-                    non_blocking=non_blocking,
-                )
-                target_buffer.copy_(copied)
+                copied = source_buffer.detach()
+                if copied.device.type != "cpu" and target_buffer.device.type == "xpu":
+                    copied = copied.to(device=torch.device("cpu"))
+                target_dtype = target_buffer.dtype if source_buffer.is_floating_point() else source_buffer.dtype
+                if copied.dtype != target_dtype:
+                    copied = copied.to(dtype=target_dtype)
+                target_buffer.copy_(copied, non_blocking=non_blocking)
 
     def _allocate_xpu_int4_expert_slot(self, source: Qwen3MLP) -> Qwen3MLP:
         if self.execution_device is None:
@@ -1813,6 +1803,9 @@ class Qwen3SparseMoeBlock(nn.Module):
             compute_dtype=compute_dtype,
             device=self.execution_device,
         )
+        target.gate_proj.prime_device_storage_()
+        target.up_proj.prime_device_storage_()
+        target.down_proj.prime_device_storage_()
         return target
 
     def _allocate_staging_module(self, source: Qwen3MLP) -> Qwen3MLP:
@@ -1969,7 +1962,6 @@ class Qwen3SparseMoeBlock(nn.Module):
                     for local_idx in candidate_idx.tolist()
                     if int(candidate_usage[int(local_idx)].item()) > 0
                 }
-                self._prefetch_cached_experts(sorted(gpu_candidates))
 
         xpu_experts: list[_MoEExpertSlice] = []
         cpu_experts: list[_MoEExpertSlice] = []
@@ -1979,10 +1971,7 @@ class Qwen3SparseMoeBlock(nn.Module):
             if _module_device(expert_layer).type != "cpu":
                 placement = "resident"
             elif expert_idx in gpu_candidates:
-                cached = self._get_cached_expert(expert_idx)
-                if cached is not None:
-                    expert_layer = cached
-                    placement = "staged"
+                placement = "staged"
             elif _module_device(expert_layer).type == "cpu":
                 placement = "cpu"
             spec = _MoEExpertSlice(
@@ -1992,14 +1981,14 @@ class Qwen3SparseMoeBlock(nn.Module):
                 expert_layer=expert_layer,
                 placement=placement,
             )
-            if _module_device(expert_layer).type == "cpu":
+            if placement == "cpu":
                 cpu_experts.append(spec)
             else:
                 xpu_experts.append(spec)
         return _MoEExecutionPlan(xpu_experts=tuple(xpu_experts), cpu_experts=tuple(cpu_experts))
 
-    @staticmethod
     def _execute_xpu_experts(
+        self,
         expert_slices: tuple[_MoEExpertSlice, ...],
         *,
         compact_hidden_states: torch.Tensor,
@@ -2008,7 +1997,13 @@ class Qwen3SparseMoeBlock(nn.Module):
         hidden_dtype: torch.dtype,
     ) -> None:
         for spec in expert_slices:
-            current_hidden_states = spec.expert_layer(compact_hidden_states[spec.start_idx : spec.end_idx])
+            expert_layer = spec.expert_layer
+            if spec.placement == "staged" and _module_device(expert_layer).type == "cpu":
+                cached = self._get_cached_expert(spec.expert_idx)
+                if cached is None:
+                    raise RuntimeError(f"Failed to materialize staged expert {spec.expert_idx} on XPU.")
+                expert_layer = cached
+            current_hidden_states = expert_layer(compact_hidden_states[spec.start_idx : spec.end_idx])
             current_hidden_states = current_hidden_states * compact_routing_weights[spec.start_idx : spec.end_idx]
             compact_outputs[spec.start_idx : spec.end_idx] = current_hidden_states.to(dtype=hidden_dtype)
 

@@ -8,6 +8,7 @@ from anna.mm.qwen3_5_text_processor import PreparedInputs
 from anna.model.qwen3_5_text_config import QuantizationConfig, Qwen3_5TextConfig, RopeParameters
 from anna.model.quantization import estimate_module_xpu_int4_bytes
 from anna.model.qwen3_5_text_model import Qwen3_5TextForCausalLM
+from anna.model.ops import Qwen3SparseMoeBlock
 from anna.runtime.device import DeviceMemoryInfo, RuntimeSafetyPolicy
 from anna.runtime.qwen3_5_text_engine import AnnaEngineError, AnnaQwen3_5TextEngine, GenerationConfig
 
@@ -705,3 +706,70 @@ def test_large_arc_moe_runtime_enables_token_io_offload() -> None:
     )
 
     assert resolved is True
+
+
+def test_large_arc_moe_auto_prefill_chunking_is_capped_for_hybrid_execution() -> None:
+    block_config = Qwen3_5TextConfig(
+        hidden_size=4096,
+        intermediate_size=8192,
+        num_hidden_layers=1,
+        num_attention_heads=16,
+        num_key_value_heads=8,
+        head_dim=128,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_num_key_heads=16,
+        linear_num_value_heads=16,
+        vocab_size=256,
+        max_position_embeddings=4096,
+        layer_types=["linear_attention"],
+        decoder_sparse_step=1,
+        moe_intermediate_size=1024,
+        shared_expert_intermediate_size=1024,
+        num_experts=128,
+        num_experts_per_tok=8,
+    )
+    block = Qwen3SparseMoeBlock(block_config)
+    block.offload_experts = True
+    block.execution_device = torch.device("xpu")
+    block.expert_quant = "int4"
+    block.resident_experts_per_layer = 80
+    block.staged_experts_per_layer = 16
+
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(mlp=block)]))
+    engine.config = SimpleNamespace(
+        text_config=SimpleNamespace(
+            hidden_size=4096,
+            num_hidden_layers=40,
+            num_key_value_heads=8,
+            head_dim=128,
+            linear_num_key_heads=16,
+            linear_key_head_dim=128,
+            linear_num_value_heads=16,
+            linear_value_head_dim=128,
+            layer_types=["full_attention"] * 10 + ["linear_attention"] * 30,
+        )
+    )
+    engine.full_attention_cache_mirror = False
+    engine.device_context = SimpleNamespace(
+        device=torch.device("xpu"),
+        dtype=torch.bfloat16,
+        safety_policy=RuntimeSafetyPolicy(
+            min_free_bytes=256 << 20,
+            reserve_margin_bytes=128 << 20,
+            max_estimated_usage_ratio=0.95,
+            generation_memory_safety_factor=1.25,
+        ),
+        element_size=lambda dtype=None: 2,
+        get_memory_info=lambda: DeviceMemoryInfo(
+            free_bytes=13 << 30,
+            total_bytes=16 << 30,
+            allocated_bytes=0,
+            reserved_bytes=0,
+        ),
+    )
+
+    resolved = engine._resolve_prefill_chunk_size(0)
+
+    assert resolved == 512
