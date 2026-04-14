@@ -19,6 +19,7 @@ dependencies = [
     "soundfile>=0.13,<1.0",
     "tokenizers>=0.22,<1.0",
     "torch>=2.7",
+    "turboquant>=0.2,<0.3",
     "typing-extensions>=4.14,<5.0",
     "uvicorn[standard]>=0.35,<1.0",
 ]

@@ -33,6 +33,9 @@ class ServeSettings:
     prompt_cache_size: int = 0
     prompt_cache_max_tokens: int = 0
     profile_runtime: bool = False
+    kv_cache_quantization: str = "none"
+    kv_cache_quant_bits: int = 4
+    kv_cache_residual_len: int = 128
     default_max_completion_tokens: int | None = None
     default_enable_thinking: bool = True
     reasoning_format: str = "deepseek"
@@ -68,6 +71,9 @@ class GenerateSettings:
     prompt_cache_size: int = 0
     prompt_cache_max_tokens: int = 0
     profile_runtime: bool = False
+    kv_cache_quantization: str = "none"
+    kv_cache_quant_bits: int = 4
+    kv_cache_residual_len: int = 128
     offload_mode: str = "auto"
     offload_vision: bool = False
     expert_quant: str = "auto"
@@ -125,6 +131,9 @@ class BenchmarkSettings:
     prompt_cache_size: int = 0
     prompt_cache_max_tokens: int = 0
     profile_runtime: bool = False
+    kv_cache_quantization: str = "none"
+    kv_cache_quant_bits: int = 4
+    kv_cache_residual_len: int = 128
     offload_mode: str = "auto"
     offload_vision: bool = False
     expert_quant: str = "auto"

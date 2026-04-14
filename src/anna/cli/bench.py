@@ -69,6 +69,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Log synchronized XPU forward timings and memory stats for prefill/decode profiling.",
     )
+    parser.add_argument(
+        "--kv-cache-quantization",
+        choices=("none", "turboquant"),
+        default="none",
+        help="Quantize compatible KV caches. TurboQuant is currently supported by the Gemma4 runtime only.",
+    )
+    parser.add_argument(
+        "--kv-cache-quant-bits",
+        type=int,
+        choices=(3, 4),
+        default=4,
+        help="TurboQuant KV-cache bit-width for compatible runtimes.",
+    )
+    parser.add_argument(
+        "--kv-cache-residual-len",
+        type=_positive_int,
+        default=128,
+        help="Keep the newest N KV tokens in full precision before TurboQuant compresses older entries.",
+    )
     parser.add_argument("--offload-mode", choices=("auto", "none", "experts"), default="auto")
     parser.add_argument(
         "--offload-vision",
@@ -155,6 +174,9 @@ def main() -> None:
         prompt_cache_size=args.prompt_cache_size,
         prompt_cache_max_tokens=args.prompt_cache_max_tokens,
         profile_runtime=args.profile_runtime,
+        kv_cache_quantization=args.kv_cache_quantization,
+        kv_cache_quant_bits=args.kv_cache_quant_bits,
+        kv_cache_residual_len=args.kv_cache_residual_len,
         offload_mode=args.offload_mode,
         offload_vision=args.offload_vision,
         expert_quant=args.expert_quant,
@@ -183,6 +205,9 @@ def main() -> None:
         prompt_cache_size=settings.prompt_cache_size,
         prompt_cache_max_tokens=settings.prompt_cache_max_tokens,
         profile_runtime=settings.profile_runtime,
+        kv_cache_quantization=settings.kv_cache_quantization,
+        kv_cache_quant_bits=settings.kv_cache_quant_bits,
+        kv_cache_residual_len=settings.kv_cache_residual_len,
         offload_mode=settings.offload_mode,
         offload_vision=settings.offload_vision,
         expert_quant=settings.expert_quant,
@@ -250,6 +275,9 @@ def main() -> None:
     print(f"prompt_cache_size={engine.optimization_config.prompt_cache_size}")
     print(f"prompt_cache_max_tokens={engine.optimization_config.prompt_cache_max_tokens}")
     print(f"profile_runtime={engine.optimization_config.profile_runtime}")
+    print(f"kv_cache_quantization={engine.optimization_config.kv_cache_quantization}")
+    print(f"kv_cache_quant_bits={engine.optimization_config.kv_cache_quant_bits}")
+    print(f"kv_cache_residual_len={engine.optimization_config.kv_cache_residual_len}")
     print(f"expert_quant={engine.expert_quant}")
     print(f"weight_quant={engine.weight_quant}")
     print(f"resident_expert_layers={engine.resident_expert_layers}")

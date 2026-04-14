@@ -50,6 +50,12 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "0.95",
             "--generation-memory-safety-factor",
             "1.25",
+            "--kv-cache-quantization",
+            "turboquant",
+            "--kv-cache-quant-bits",
+            "4",
+            "--kv-cache-residual-len",
+            "96",
             "--metrics-log-interval-seconds",
             "3.5",
         ]
@@ -64,6 +70,9 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.reserve_memory_mib == 128
     assert args.max_estimated_usage_ratio == 0.95
     assert args.generation_memory_safety_factor == 1.25
+    assert args.kv_cache_quantization == "turboquant"
+    assert args.kv_cache_quant_bits == 4
+    assert args.kv_cache_residual_len == 96
     assert args.metrics_log_interval_seconds == 3.5
 
 
