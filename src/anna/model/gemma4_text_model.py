@@ -359,34 +359,32 @@ class Gemma4DynamicCache:
         value_states: torch.Tensor,
         visible_lengths: torch.Tensor,
     ) -> None:
-        if self._use_turboquant_for_layer(layer_idx):
-            key_rows: list[Gemma4CacheRow] = []
-            value_rows: list[Gemma4CacheRow] = []
-            lengths: list[int] = []
-            for batch_idx in range(int(key_states.shape[0])):
-                visible = int(visible_lengths[batch_idx].item())
-                if visible > 0:
-                    key_row = self._new_turboquant_row()
-                    value_row = self._new_turboquant_row()
-                    key_row.append(key_states[batch_idx, :, :visible, :].detach().contiguous())
-                    value_row.append(value_states[batch_idx, :, :visible, :].detach().contiguous())
-                else:
-                    key_row = key_states[batch_idx, :, :0, :].detach().contiguous()
-                    value_row = value_states[batch_idx, :, :0, :].detach().contiguous()
-                key_rows.append(key_row)
-                value_rows.append(value_row)
-                lengths.append(visible)
-            self.shared_layers[layer_idx] = _Gemma4SharedLayerState(
-                key_rows=key_rows,
-                value_rows=value_rows,
-                visible_lengths=lengths,
+        del key_states, value_states
+
+        batch_size = self.get_batch_size()
+        key_rows: list[Gemma4CacheRow] = []
+        value_rows: list[Gemma4CacheRow] = []
+        lengths: list[int] = []
+        if batch_size <= 0:
+            self.shared_layers[layer_idx] = (
+                torch.empty((0, 0, 0, 0)),
+                torch.empty((0, 0, 0, 0)),
+                visible_lengths.detach(),
             )
             return
 
-        self.shared_layers[layer_idx] = (
-            key_states.detach(),
-            value_states.detach(),
-            visible_lengths.detach(),
+        for batch_idx in range(batch_size):
+            key_row = self.key_rows[layer_idx][batch_idx]
+            value_row = self.value_rows[layer_idx][batch_idx]
+            if key_row is None or value_row is None:
+                raise RuntimeError(f"Gemma4 shared KV state for layer {layer_idx} is missing cache rows.")
+            key_rows.append(key_row)
+            value_rows.append(value_row)
+            lengths.append(int(visible_lengths[batch_idx].item()))
+        self.shared_layers[layer_idx] = _Gemma4SharedLayerState(
+            key_rows=key_rows,
+            value_rows=value_rows,
+            visible_lengths=lengths,
         )
 
     def get_shared_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
@@ -1218,6 +1216,48 @@ class Gemma4TextModel(nn.Module):
         for layer in self.layers:
             layer.reset_runtime_buffers()
 
+    def kv_cache_runtime_info(self) -> dict[str, object]:
+        full_attention_layer_indices: list[int] = []
+        sliding_attention_layer_indices: list[int] = []
+        shared_kv_source_layer_indices: list[int] = []
+        shared_kv_consumer_layer_indices: list[int] = []
+        for layer_idx, layer in enumerate(self.layers):
+            attention = layer.self_attn
+            if attention.is_sliding:
+                sliding_attention_layer_indices.append(layer_idx)
+            else:
+                full_attention_layer_indices.append(layer_idx)
+            if attention.store_full_length_kv:
+                shared_kv_source_layer_indices.append(layer_idx)
+            if attention.is_kv_shared_layer:
+                shared_kv_consumer_layer_indices.append(layer_idx)
+
+        turboquant_enabled = self.kv_cache_quantization == "turboquant"
+        turboquant_quantized_layer_indices = (
+            list(full_attention_layer_indices)
+            if turboquant_enabled
+            else []
+        )
+        return {
+            "mode": self.kv_cache_quantization,
+            "turboquant_enabled": turboquant_enabled,
+            "turboquant_bits": self.kv_cache_quant_bits if turboquant_enabled else None,
+            "turboquant_residual_len": self.kv_cache_residual_len if turboquant_enabled else None,
+            "turboquant_applies_to": "full_attention_only" if turboquant_enabled else "disabled",
+            "full_attention_layers": len(full_attention_layer_indices),
+            "full_attention_layer_indices": full_attention_layer_indices,
+            "sliding_attention_layers": len(sliding_attention_layer_indices),
+            "sliding_attention_layer_indices": sliding_attention_layer_indices,
+            "turboquant_quantized_layers": len(turboquant_quantized_layer_indices),
+            "turboquant_quantized_layer_indices": turboquant_quantized_layer_indices,
+            "shared_kv_state_mode": "row_reference",
+            "shared_kv_row_reuse_enabled": True,
+            "shared_kv_source_layers": len(shared_kv_source_layer_indices),
+            "shared_kv_source_layer_indices": shared_kv_source_layer_indices,
+            "shared_kv_consumer_layers": len(shared_kv_consumer_layer_indices),
+            "shared_kv_consumer_layer_indices": shared_kv_consumer_layer_indices,
+        }
+
     def _append_lengths_from_attention_mask(
         self,
         *,
@@ -1485,6 +1525,9 @@ class Gemma4ForConditionalGeneration(nn.Module):
 
     def reset_runtime_buffers(self) -> None:
         self.model.reset_runtime_buffers()
+
+    def kv_cache_runtime_info(self) -> dict[str, object]:
+        return self.model.language_model.kv_cache_runtime_info()
 
     def _compute_logits(self, hidden_states: torch.Tensor, logits_to_keep: int | None) -> torch.Tensor:
         if logits_to_keep is not None and logits_to_keep > 0:

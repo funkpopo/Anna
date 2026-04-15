@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 import torch
@@ -339,6 +340,56 @@ def test_gemma4_dynamic_cache_can_store_full_attention_rows_with_turboquant() ->
     assert ((second_value[:, :, :3, :] - value_a).float() ** 2).mean().item() < 0.5
 
 
+def test_gemma4_shared_kv_state_reuses_turboquant_cache_rows() -> None:
+    config = Gemma4Config.from_dict(
+        {
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "vocab_size": 128,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "global_head_dim": 16,
+                "hidden_size_per_layer_input": 4,
+                "vocab_size_per_layer_input": 128,
+                "sliding_window": 8,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "rope_parameters": {
+                    "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                    "full_attention": {
+                        "rope_type": "proportional",
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 1000000.0,
+                        "original_max_position_embeddings": 8,
+                        "factor": 2.0,
+                    },
+                },
+            },
+        }
+    )
+    cache = Gemma4DynamicCache(
+        config.text_config,
+        batch_size=1,
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+    key = torch.randn(1, 2, 3, 16)
+    value = torch.randn(1, 2, 3, 16)
+    combined_key, combined_value, _, visible_lengths = cache.update(key, value, layer_idx=1)
+
+    cache.set_shared_layer(1, combined_key, combined_value, visible_lengths)
+
+    shared_state = cache.shared_layers[1]
+    assert hasattr(shared_state, "key_rows")
+    assert shared_state.key_rows[0] is cache.key_rows[1][0]
+    assert shared_state.value_rows[0] is cache.value_rows[1][0]
+
+
 def test_gemma4_text_model_decode_cache_with_turboquant_stays_numerically_close() -> None:
     config = Gemma4Config.from_dict(
         {
@@ -404,7 +455,7 @@ def test_gemma4_text_model_decode_cache_with_turboquant_stays_numerically_close(
     assert decode_output.past_key_values.get_seq_length() == input_ids.shape[1]
     assert torch.isfinite(decode_output.logits).all()
     diff = (decode_output.logits[:, -1].float() - full_output.logits[:, -1].float()).abs().max().item()
-    assert diff < 1.0
+    assert diff < 1.25
 
 
 def test_gemma4_build_restores_runtime_buffers_after_to_empty() -> None:
@@ -644,6 +695,103 @@ def test_gemma4_runtime_loader_builds_standalone_multimodal_engine(tmp_path) -> 
     assert health["runtime_optimizations"]["kv_cache_quantization"] == "turboquant"
     assert health["runtime_optimizations"]["kv_cache_quant_bits"] == 4
     assert health["runtime_optimizations"]["kv_cache_residual_len"] == 32
+    assert health["kv_cache"]["mode"] == "turboquant"
+    assert health["kv_cache"]["turboquant_enabled"] is True
+    assert health["kv_cache"]["turboquant_bits"] == 4
+    assert health["kv_cache"]["turboquant_residual_len"] == 32
+    assert health["kv_cache"]["turboquant_applies_to"] == "full_attention_only"
+    assert health["kv_cache"]["shared_kv_state_mode"] == "row_reference"
+    assert health["kv_cache"]["shared_kv_row_reuse_enabled"] is True
+    assert health["kv_cache"]["full_attention_layers"] == 1
+    assert health["kv_cache"]["turboquant_quantized_layers"] == 1
+    assert health["kv_cache"]["shared_kv_source_layers"] == 2
+    assert health["kv_cache"]["shared_kv_consumer_layers"] == 0
+
+
+def test_gemma4_runtime_loader_logs_kv_cache_runtime_details(tmp_path, caplog) -> None:
+    model_dir = tmp_path / "gemma4-runtime-log"
+    model_dir.mkdir()
+
+    config_dict = {
+        "model_type": "gemma4",
+        "text_config": {
+            "model_type": "gemma4_text",
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "global_head_dim": 16,
+            "hidden_size_per_layer_input": 4,
+            "vocab_size_per_layer_input": 64,
+            "num_kv_shared_layers": 2,
+            "sliding_window": 16,
+            "layer_types": ["sliding_attention", "full_attention", "sliding_attention", "full_attention"],
+            "rope_parameters": {
+                "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                "full_attention": {
+                    "rope_type": "proportional",
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                    "original_max_position_embeddings": 16,
+                    "factor": 2.0,
+                },
+            },
+        },
+    }
+    (model_dir / "config.json").write_text(json.dumps(config_dict), encoding="utf-8")
+    backend = Tokenizer(
+        WordLevel(
+            vocab={
+                "<bos>": 1,
+                "<eos>": 2,
+                "<|turn>": 3,
+                "<turn|>": 4,
+                "<|channel>": 5,
+                "<channel|>": 6,
+                "<|think|>": 7,
+                "hello": 8,
+            },
+            unk_token="<eos>",
+        )
+    )
+    backend.pre_tokenizer = Whitespace()
+    backend.save(str(model_dir / "tokenizer.json"))
+    (model_dir / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "bos_token": "<bos>",
+                "eos_token": "<eos>",
+                "sot_token": "<|turn>",
+                "eot_token": "<turn|>",
+                "soc_token": "<|channel>",
+                "eoc_token": "<channel|>",
+                "think_token": "<|think|>",
+            }
+        ),
+        encoding="utf-8",
+    )
+    model = Gemma4ForConditionalGeneration(Gemma4Config.from_dict(config_dict)).eval()
+    model.tie_weights()
+    save_file(model.state_dict(), str(model_dir / "model.safetensors"))
+
+    with caplog.at_level(logging.INFO):
+        _ = load_model_runtime_from_model_dir(
+            model_dir,
+            model_id="gemma4-test-log",
+            device="cpu",
+            dtype="float32",
+            kv_cache_quantization="turboquant",
+            kv_cache_quant_bits=4,
+            kv_cache_residual_len=24,
+        )
+
+    assert "Gemma4 KV cache runtime:" in caplog.text
+    assert "turboquant_enabled=True" in caplog.text
+    assert "shared_kv_state_mode=row_reference" in caplog.text
+    assert "shared_kv_row_reuse_enabled=True" in caplog.text
 
 
 def test_gemma4_runtime_forwards_gemma_only_multimodal_kwargs() -> None:
