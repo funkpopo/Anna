@@ -169,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--kv-cache-quantization",
         choices=("none", "turboquant"),
         default="none",
-        help="Quantize compatible KV caches. TurboQuant is currently supported by the Gemma4 runtime only.",
+        help="Quantize compatible KV caches. TurboQuant is supported by the Qwen3.5 and Gemma4 runtimes.",
     )
     parser.add_argument(
         "--kv-cache-quant-bits",
