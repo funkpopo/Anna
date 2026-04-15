@@ -44,6 +44,21 @@ class _NullCacheAllocator:
 class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
     model_family = "gemma4"
 
+    def _kv_cache_runtime_info(self) -> dict[str, object]:
+        info_getter = getattr(self.model, "kv_cache_runtime_info", None)
+        if callable(info_getter):
+            info = info_getter()
+            if isinstance(info, dict):
+                return info
+        return {
+            "mode": self.optimization_config.kv_cache_quantization,
+            "turboquant_enabled": self.optimization_config.kv_cache_quantization == "turboquant",
+            "turboquant_bits": self.optimization_config.kv_cache_quant_bits,
+            "turboquant_residual_len": self.optimization_config.kv_cache_residual_len,
+            "shared_kv_state_mode": "unknown",
+            "shared_kv_row_reuse_enabled": False,
+        }
+
     def _build_prefill_model_kwargs(
         self,
         prepared: PreparedInputs,
@@ -276,6 +291,20 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             report.skipped,
             runtime_weight_quantized_replacements,
         )
+        kv_cache_info = engine._kv_cache_runtime_info()
+        logger.info(
+            "Gemma4 KV cache runtime: mode=%s turboquant_enabled=%s turboquant_bits=%s turboquant_residual_len=%s shared_kv_state_mode=%s shared_kv_row_reuse_enabled=%s shared_kv_source_layers=%s shared_kv_consumer_layers=%s full_attention_layers=%s turboquant_quantized_layers=%s",
+            kv_cache_info.get("mode"),
+            kv_cache_info.get("turboquant_enabled"),
+            kv_cache_info.get("turboquant_bits"),
+            kv_cache_info.get("turboquant_residual_len"),
+            kv_cache_info.get("shared_kv_state_mode"),
+            kv_cache_info.get("shared_kv_row_reuse_enabled"),
+            kv_cache_info.get("shared_kv_source_layers"),
+            kv_cache_info.get("shared_kv_consumer_layers"),
+            kv_cache_info.get("full_attention_layers"),
+            kv_cache_info.get("turboquant_quantized_layers"),
+        )
         return engine
 
     @staticmethod
@@ -471,6 +500,7 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
     def health(self) -> dict[str, object]:
         memory_info = self.device_context.get_memory_info()
         service_metrics = self.service_metrics_snapshot()
+        kv_cache_runtime_info = self._kv_cache_runtime_info()
         return {
             "status": "ok",
             "model": self.default_model_id,
@@ -505,6 +535,7 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
                 "kv_cache_quant_bits": self.optimization_config.kv_cache_quant_bits,
                 "kv_cache_residual_len": self.optimization_config.kv_cache_residual_len,
             },
+            "kv_cache": kv_cache_runtime_info,
             "vision_enabled": self.config.vision_config is not None,
             "audio_enabled": self.config.audio_config is not None,
             "cache_device": str(self.device_context.migration_policy.execution_device),
