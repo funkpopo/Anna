@@ -8,6 +8,7 @@ import torch
 import anna.model.ops as model_ops
 from anna.model.quantization import AutoRoundGPTQLinear, XPUInt4Linear, replace_linear_modules
 from anna.model.qwen3_5_text_config import QuantizationConfig, Qwen3_5TextConfig, RopeParameters
+from anna.model.turboquant import TurboQuantKVRow
 from anna.model.ops import (
     Qwen3Attention,
     Qwen3DynamicCache,
@@ -159,6 +160,37 @@ def test_qwen3_forward_shapes() -> None:
     assert outputs.past_key_values.get_seq_length() == 6
 
 
+def test_qwen_text_model_decode_cache_with_turboquant_stays_numerically_close() -> None:
+    model = Qwen3_5TextForCausalLM(_tiny_config()).eval()
+    model.tie_weights()
+    model.configure_runtime(
+        torch.device("cpu"),
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+    input_ids = torch.tensor([[5, 7, 9, 11]], dtype=torch.long)
+    prompt_ids = input_ids[:, :-1]
+    append_ids = input_ids[:, -1:]
+
+    with torch.no_grad():
+        full_output = model(input_ids=input_ids, use_cache=False)
+        cache_output = model(input_ids=prompt_ids, use_cache=True)
+        assert cache_output.past_key_values is not None
+        assert isinstance(cache_output.past_key_values.turboquant_rows[1][0], TurboQuantKVRow)
+        decode_output = model(
+            input_ids=append_ids,
+            past_key_values=cache_output.past_key_values,
+            use_cache=True,
+        )
+
+    assert decode_output.past_key_values is not None
+    assert decode_output.past_key_values.get_seq_length() == input_ids.shape[1]
+    assert torch.isfinite(decode_output.logits).all()
+    diff = (decode_output.logits[:, -1].float() - full_output.logits[:, -1].float()).abs().max().item()
+    assert diff < 1.5
+
+
 def test_qwen3_incremental_decode() -> None:
     with _temporary_torch_seed(0):
         model = Qwen3_5TextForCausalLM(_tiny_config())
@@ -281,6 +313,75 @@ def test_dynamic_cache_stack_preserves_visible_prefix_for_batched_decode_updates
     assert torch.equal(combined_value[1:2, :, 5:6, :], append_value[1:2])
 
 
+def test_dynamic_cache_can_store_full_attention_rows_with_turboquant() -> None:
+    config = _tiny_config()
+    cache = Qwen3DynamicCache(
+        config,
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+    key_a = torch.randn(1, 2, 3, 16)
+    value_a = torch.randn(1, 2, 3, 16)
+    key_b = torch.randn(1, 2, 1, 16)
+    value_b = torch.randn(1, 2, 1, 16)
+
+    first_key, first_value, _ = cache.update(key_a, value_a, layer_idx=1)
+    second_key, second_value, past_lengths = cache.update(key_b, value_b, layer_idx=1)
+
+    assert isinstance(cache.turboquant_rows[1][0], TurboQuantKVRow)
+    assert cache.paged_attention_state(1) is None
+    assert first_key is not None
+    assert first_value is not None
+    assert second_key is not None
+    assert second_value is not None
+    assert torch.equal(past_lengths, torch.tensor([3], dtype=torch.long))
+    assert first_key.shape == (1, 2, 3, 16)
+    assert first_value.shape == (1, 2, 3, 16)
+    assert second_key.shape == (1, 2, 4, 16)
+    assert second_value.shape == (1, 2, 4, 16)
+    assert torch.allclose(second_key[:, :, -1:, :], key_b, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(second_value[:, :, -1:, :], value_b, atol=1e-6, rtol=1e-6)
+    assert ((second_key[:, :, :3, :] - key_a).float() ** 2).mean().item() < 1.0
+    assert ((second_value[:, :, :3, :] - value_a).float() ** 2).mean().item() < 1.0
+
+
+def test_dynamic_cache_stack_and_split_round_trips_turboquant_batches() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config)
+    cache_a = Qwen3DynamicCache(
+        config,
+        allocator=allocator,
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+    cache_b = Qwen3DynamicCache(
+        config,
+        allocator=allocator,
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+    key_a = torch.randn(1, 2, 3, 16)
+    value_a = torch.randn(1, 2, 3, 16)
+    key_b = torch.randn(1, 2, 4, 16)
+    value_b = torch.randn(1, 2, 4, 16)
+    cache_a.update(key_a, value_a, layer_idx=1)
+    cache_b.update(key_b, value_b, layer_idx=1)
+
+    stacked = Qwen3DynamicCache.stack([cache_a, cache_b], config)
+    split = stacked.split_batch()
+
+    assert len(split) == 2
+    assert isinstance(split[0].turboquant_rows[1][0], TurboQuantKVRow)
+    assert isinstance(split[1].turboquant_rows[1][0], TurboQuantKVRow)
+    assert ((split[0].visible_key_cache(1) - key_a).float() ** 2).mean().item() < 1.0
+    assert ((split[0].visible_value_cache(1) - value_a).float() ** 2).mean().item() < 1.0
+    assert ((split[1].visible_key_cache(1) - key_b).float() ** 2).mean().item() < 1.0
+    assert ((split[1].visible_value_cache(1) - value_b).float() ** 2).mean().item() < 1.0
+
+
 def test_dynamic_cache_clone_preserves_contents_with_distinct_page_tables() -> None:
     config = _tiny_config()
     allocator = Qwen3PageAllocator(config)
@@ -310,6 +411,25 @@ def test_dynamic_cache_release_reuses_freed_pages() -> None:
     cache_b.update(key, value, layer_idx=1)
 
     assert cache_b.page_tables[1][0] == first_page_ids
+
+
+def test_dynamic_cache_clone_preserves_turboquant_rows() -> None:
+    config = _tiny_config()
+    cache = Qwen3DynamicCache(
+        config,
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+    key = torch.randn(1, 2, 4, 16)
+    value = torch.randn(1, 2, 4, 16)
+    cache.update(key, value, layer_idx=1)
+
+    cloned = cache.clone()
+
+    assert isinstance(cloned.turboquant_rows[1][0], TurboQuantKVRow)
+    assert ((cloned.visible_key_cache(1) - key).float() ** 2).mean().item() < 1.0
+    assert ((cloned.visible_value_cache(1) - value).float() ** 2).mean().item() < 1.0
 
 
 def test_dynamic_cache_reserve_sequence_capacity_preallocates_pages_and_visible_buffers() -> None:

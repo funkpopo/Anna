@@ -220,7 +220,7 @@ Notes:
 Minimal example:
 
 ```powershell
-anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16
+anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16 --kv-cache-quantization turboquant --kv-cache-quant-bits 4 --kv-cache-residual-len 128
 ```
 
 Linux/bash example:
@@ -231,6 +231,9 @@ anna-serve \
   --model-name Qwen3.5-2B \
   --device xpu \
   --dtype bfloat16 \
+  --kv-cache-quantization turboquant \
+  --kv-cache-quant-bits 4 \
+  --kv-cache-residual-len 128 \
   --host 127.0.0.1 \
   --port 8000
 ```
@@ -245,6 +248,9 @@ anna-serve `
   --dtype bfloat16 `
   --offload-mode none `
   --weight-quant none `
+  --kv-cache-quantization turboquant `
+  --kv-cache-quant-bits 4 `
+  --kv-cache-residual-len 128 `
   --host 127.0.0.1 `
   --port 8000
 ```
@@ -258,6 +264,9 @@ anna-serve `
   --device xpu `
   --dtype bf16 `
   --weight-quant int4 `
+  --kv-cache-quantization turboquant `
+  --kv-cache-quant-bits 4 `
+  --kv-cache-residual-len 128 `
   --offload-vision `
   --disable-thinking `
   --reasoning-format deepseek `
@@ -276,6 +285,9 @@ anna-serve `
   --device xpu `
   --dtype bf16 `
   --weight-quant int4 `
+  --kv-cache-quantization turboquant `
+  --kv-cache-quant-bits 4 `
+  --kv-cache-residual-len 128 `
   --offload-vision `
   --disable-thinking `
   --reasoning-format deepseek `
@@ -293,6 +305,9 @@ anna-serve `
   --model-name Qwen3.5-2B `
   --device xpu `
   --dtype bfloat16 `
+  --kv-cache-quantization turboquant `
+  --kv-cache-quant-bits 4 `
+  --kv-cache-residual-len 128 `
   --metrics-log-interval-seconds 0
 ```
 
@@ -327,6 +342,9 @@ anna-generate `
   --dtype bfloat16 `
   --offload-mode none `
   --weight-quant none `
+  --kv-cache-quantization turboquant `
+  --kv-cache-quant-bits 4 `
+  --kv-cache-residual-len 128 `
   --prompt "Hello" `
   --max-new-tokens 32
 ```
@@ -339,6 +357,9 @@ anna-bench `
   --model-name Qwen3.5-2B `
   --device xpu `
   --dtype bfloat16 `
+  --kv-cache-quantization turboquant `
+  --kv-cache-quant-bits 4 `
+  --kv-cache-residual-len 128 `
   --prompt "Hello, please introduce yourself." `
   --runs 5
 ```
