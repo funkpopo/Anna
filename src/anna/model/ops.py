@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
-from anna.model.turboquant import TurboQuantKVRow
+from anna.model.turboquant import TurboQuantKVRow, TurboQuantKVUsage
 from anna.model.fused_ops import (
     run_causal_conv1d_fused,
     run_gated_delta_fused,
@@ -639,6 +639,17 @@ class Qwen3DynamicCache:
     def get_seq_lengths(self, *, device: torch.device | None = None) -> torch.Tensor:
         lengths = [self._request_seq_length(idx) for idx in range(self.get_batch_size())]
         return torch.tensor(lengths, dtype=torch.long, device=device)
+
+    def turboquant_usage(self) -> TurboQuantKVUsage:
+        usage = TurboQuantKVUsage()
+        if self.kv_cache_quantization != "turboquant":
+            return usage
+        for layer_idx in self._turboquant_layer_index_set:
+            for row in self.turboquant_rows[layer_idx]:
+                if row is None or row.length <= 0:
+                    continue
+                usage = usage.add(row.usage())
+        return usage
 
     def _request_seq_length(self, batch_idx: int) -> int:
         for layer_idx in range(self.config.num_hidden_layers):

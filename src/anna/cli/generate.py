@@ -51,14 +51,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prompt-cache-size",
         type=_non_negative_int,
-        default=0,
-        help="Keep up to N text-only prompt KV caches resident for exact prompt reuse. Set 0 to disable.",
+        default=None,
+        help="Keep up to N text-only prompt KV caches resident for exact prompt reuse. Omit to auto-enable a conservative default; set 0 to disable.",
     )
     parser.add_argument(
         "--prompt-cache-max-tokens",
         type=_non_negative_int,
-        default=0,
-        help="Only cache prompts up to N tokens. Set 0 to disable this token threshold.",
+        default=None,
+        help="Only cache prompts up to N tokens. Omit to auto-cap cached prompt length when prompt caching is enabled; set 0 to disable this token threshold.",
     )
     parser.add_argument(
         "--profile-runtime",

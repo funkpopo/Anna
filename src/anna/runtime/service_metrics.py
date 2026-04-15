@@ -9,6 +9,16 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 
 
+def _format_bytes(num_bytes: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(max(0, int(num_bytes)))
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{num_bytes} B"
+
+
 @dataclass(slots=True)
 class ServiceMetricsSnapshot:
     timestamp: float
@@ -21,8 +31,16 @@ class ServiceMetricsSnapshot:
     prompt_cache_hits_total: int = 0
     running_requests: int = 0
     waiting_requests: int = 0
+    kv_cache_mode: str = "paged"
     kv_cache_used_pages: int = 0
     kv_cache_total_pages: int = 0
+    kv_cache_used_bytes: int = 0
+    kv_cache_dense_equivalent_bytes: int = 0
+    kv_cache_quantized_bytes: int = 0
+    kv_cache_residual_bytes: int = 0
+    kv_cache_quantized_tokens: int = 0
+    kv_cache_residual_tokens: int = 0
+    prompt_cache_enabled: bool = False
     prompt_cache_entries: int = 0
 
     @property
@@ -30,6 +48,12 @@ class ServiceMetricsSnapshot:
         if self.kv_cache_total_pages <= 0:
             return 0.0
         return self.kv_cache_used_pages / self.kv_cache_total_pages
+
+    @property
+    def kv_cache_compression_ratio(self) -> float:
+        if self.kv_cache_used_bytes <= 0:
+            return 0.0
+        return self.kv_cache_dense_equivalent_bytes / self.kv_cache_used_bytes
 
 
 class AnnaServiceMetrics:
@@ -156,16 +180,53 @@ class AnnaServiceMetricsLogger:
         cache_hits = max(0, current.prompt_cache_hits_total - previous.prompt_cache_hits_total)
         prompt_tokens_per_second = prompt_tokens / elapsed
         generation_tokens_per_second = generation_tokens / elapsed
-        prompt_cache_hit_rate = 0.0 if cache_queries <= 0 else (cache_hits / cache_queries) * 100.0
-        kv_cache_usage = current.kv_cache_usage_ratio * 100.0
+        kv_cache_summary = AnnaServiceMetricsLogger._format_kv_cache_summary(current)
+        prompt_cache_summary = AnnaServiceMetricsLogger._format_prompt_cache_summary(
+            current,
+            cache_queries=cache_queries,
+            cache_hits=cache_hits,
+        )
         return (
             "Engine metrics: Avg prompt throughput: "
             f"{prompt_tokens_per_second:.1f} tokens/s, Avg generation throughput: "
             f"{generation_tokens_per_second:.1f} tokens/s, Running: {current.running_requests} reqs, "
-            f"Waiting: {current.waiting_requests} reqs, GPU KV cache usage: {kv_cache_usage:.1f}% "
-            f"({current.kv_cache_used_pages}/{current.kv_cache_total_pages} pages), "
-            f"Prompt cache hit rate: {prompt_cache_hit_rate:.1f}%"
+            f"Waiting: {current.waiting_requests} reqs, {kv_cache_summary}, {prompt_cache_summary}"
         )
+
+    @staticmethod
+    def _format_kv_cache_summary(current: ServiceMetricsSnapshot) -> str:
+        if current.kv_cache_mode == "turboquant":
+            if current.kv_cache_used_bytes <= 0:
+                return "TurboQuant KV cache: idle"
+            total_tokens = current.kv_cache_quantized_tokens + current.kv_cache_residual_tokens
+            return (
+                "TurboQuant KV cache: "
+                f"used={_format_bytes(current.kv_cache_used_bytes)}, "
+                f"dense={_format_bytes(current.kv_cache_dense_equivalent_bytes)}, "
+                f"compression={current.kv_cache_compression_ratio:.2f}x, "
+                f"quantized={current.kv_cache_quantized_tokens} tokens, "
+                f"residual={current.kv_cache_residual_tokens} tokens, "
+                f"total={total_tokens} tokens"
+            )
+        kv_cache_usage = current.kv_cache_usage_ratio * 100.0
+        return (
+            f"GPU KV cache usage: {kv_cache_usage:.1f}% "
+            f"({current.kv_cache_used_pages}/{current.kv_cache_total_pages} pages)"
+        )
+
+    @staticmethod
+    def _format_prompt_cache_summary(
+        current: ServiceMetricsSnapshot,
+        *,
+        cache_queries: int,
+        cache_hits: int,
+    ) -> str:
+        if not current.prompt_cache_enabled:
+            return "Prompt cache hit rate: disabled"
+        if cache_queries <= 0:
+            return "Prompt cache hit rate: n/a (0 lookups)"
+        prompt_cache_hit_rate = (cache_hits / cache_queries) * 100.0
+        return f"Prompt cache hit rate: {prompt_cache_hit_rate:.1f}% ({cache_hits}/{cache_queries} lookups)"
 
     @staticmethod
     def should_log_interval(previous: ServiceMetricsSnapshot, current: ServiceMetricsSnapshot) -> bool:
@@ -181,9 +242,19 @@ class AnnaServiceMetricsLogger:
             current.prompt_cache_hits_total - previous.prompt_cache_hits_total,
             current.kv_cache_used_pages - previous.kv_cache_used_pages,
             current.kv_cache_total_pages - previous.kv_cache_total_pages,
+            current.kv_cache_used_bytes - previous.kv_cache_used_bytes,
+            current.kv_cache_dense_equivalent_bytes - previous.kv_cache_dense_equivalent_bytes,
+            current.kv_cache_quantized_bytes - previous.kv_cache_quantized_bytes,
+            current.kv_cache_residual_bytes - previous.kv_cache_residual_bytes,
+            current.kv_cache_quantized_tokens - previous.kv_cache_quantized_tokens,
+            current.kv_cache_residual_tokens - previous.kv_cache_residual_tokens,
             current.prompt_cache_entries - previous.prompt_cache_entries,
         )
-        return any(delta != 0 for delta in deltas)
+        return (
+            current.kv_cache_mode != previous.kv_cache_mode
+            or current.prompt_cache_enabled != previous.prompt_cache_enabled
+            or any(delta != 0 for delta in deltas)
+        )
 
     @staticmethod
     def _is_idle(snapshot: ServiceMetricsSnapshot) -> bool:

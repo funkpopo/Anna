@@ -30,8 +30,8 @@ class ServeSettings:
     compile_mode: str = "none"
     compile_fullgraph: bool = False
     prefill_chunk_size: int = 0
-    prompt_cache_size: int = 0
-    prompt_cache_max_tokens: int = 0
+    prompt_cache_size: int | None = None
+    prompt_cache_max_tokens: int | None = None
     profile_runtime: bool = False
     kv_cache_quantization: str = "none"
     kv_cache_quant_bits: int = 4
@@ -68,8 +68,8 @@ class GenerateSettings:
     compile_mode: str = "none"
     compile_fullgraph: bool = False
     prefill_chunk_size: int = 0
-    prompt_cache_size: int = 0
-    prompt_cache_max_tokens: int = 0
+    prompt_cache_size: int | None = None
+    prompt_cache_max_tokens: int | None = None
     profile_runtime: bool = False
     kv_cache_quantization: str = "none"
     kv_cache_quant_bits: int = 4
@@ -128,8 +128,8 @@ class BenchmarkSettings:
     compile_mode: str = "none"
     compile_fullgraph: bool = False
     prefill_chunk_size: int = 0
-    prompt_cache_size: int = 0
-    prompt_cache_max_tokens: int = 0
+    prompt_cache_size: int | None = None
+    prompt_cache_max_tokens: int | None = None
     profile_runtime: bool = False
     kv_cache_quantization: str = "none"
     kv_cache_quant_bits: int = 4

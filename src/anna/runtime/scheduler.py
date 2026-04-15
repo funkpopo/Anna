@@ -192,6 +192,7 @@ class AnnaScheduler:
         try:
             if configured_chunk_size > 0 and prompt_length > configured_chunk_size:
                 past_key_values = self.engine._reserve_prefill_cache(batched)
+                self.engine._track_kv_cache(past_key_values)
                 for start_idx in range(0, prompt_length, configured_chunk_size):
                     end_idx = min(prompt_length, start_idx + configured_chunk_size)
                     chunk = type(batched)(
@@ -211,7 +212,7 @@ class AnnaScheduler:
                             use_cache=True,
                             logits_to_keep=1,
                         )
-                    past_key_values = outputs.past_key_values
+                    past_key_values = self.engine._swap_tracked_kv_cache(past_key_values, outputs.past_key_values)
                     if metrics is not None:
                         chunk_tokens = (end_idx - start_idx) * len(requests)
                         if chunk_tokens > 0:
@@ -228,8 +229,9 @@ class AnnaScheduler:
                         use_cache=True,
                         logits_to_keep=1,
                     )
-                    past_key_values = outputs.past_key_values
+                    past_key_values = self.engine._swap_tracked_kv_cache(past_key_values, outputs.past_key_values)
         except RuntimeError as exc:
+            self.engine._untrack_kv_cache(past_key_values)
             release = getattr(past_key_values, "release", None)
             if callable(release):
                 release()
@@ -241,11 +243,14 @@ class AnnaScheduler:
         total_prompt_tokens = sum(request.prompt_length for request in requests)
         if metrics is not None and prompt_tokens_recorded < total_prompt_tokens:
             metrics.record_prompt_tokens(total_prompt_tokens - prompt_tokens_recorded)
-        split_caches = outputs.past_key_values.split_batch() if outputs.past_key_values is not None else [None] * len(requests)
+        split_source = past_key_values
+        split_caches = split_source.split_batch() if split_source is not None else [None] * len(requests)
+        self.engine._untrack_kv_cache(split_source)
+        past_key_values = None
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
         active: list[SchedulerRequest] = []
         for row_idx, request in enumerate(requests):
-            request.past_key_values = split_caches[row_idx]
+            request.past_key_values = self.engine._swap_tracked_kv_cache(request.past_key_values, split_caches[row_idx])
             next_token = sample_next_token(
                 outputs.logits[row_idx, -1],
                 generated_ids=request.repetition_history,
@@ -294,6 +299,7 @@ class AnnaScheduler:
         if not callable(stack):
             raise RuntimeError(f"Cache type {cache_type.__name__} does not support scheduler batching.")
         batch_cache = stack(caches, self.engine.config.text_config)
+        self.engine._track_kv_cache(batch_cache)
 
         try:
             with self.engine.execution_lock:
@@ -304,15 +310,19 @@ class AnnaScheduler:
                     use_cache=True,
                     logits_to_keep=1,
                 )
+            batch_cache = self.engine._swap_tracked_kv_cache(batch_cache, outputs.past_key_values)
         except RuntimeError as exc:
+            self.engine._untrack_kv_cache(batch_cache)
             raise self.engine._handle_runtime_failure(exc) from exc
 
-        split_caches = outputs.past_key_values.split_batch() if outputs.past_key_values is not None else [None] * len(requests)
+        split_source = batch_cache
+        split_caches = split_source.split_batch() if split_source is not None else [None] * len(requests)
+        self.engine._untrack_kv_cache(split_source)
         next_active: list[SchedulerRequest] = []
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
         metrics = getattr(self.engine, "metrics", None)
         for row_idx, request in enumerate(requests):
-            request.past_key_values = split_caches[row_idx]
+            request.past_key_values = self.engine._swap_tracked_kv_cache(request.past_key_values, split_caches[row_idx])
             next_token = sample_next_token(
                 outputs.logits[row_idx, -1],
                 generated_ids=request.repetition_history,
@@ -413,8 +423,9 @@ class AnnaScheduler:
             if tail:
                 self._emit_text(request, tail)
         if request.past_key_values is not None:
-            request.past_key_values.release()
-            request.past_key_values = None
+            cache_to_release = request.past_key_values
+            request.past_key_values = self.engine._swap_tracked_kv_cache(request.past_key_values, None)
+            cache_to_release.release()
 
         if request.stream:
             from anna.runtime.qwen3_5_text_engine import StreamEvent
@@ -490,8 +501,9 @@ class AnnaScheduler:
         metrics = getattr(self.engine, "metrics", None)
         request.error = normalized
         if request.past_key_values is not None:
-            request.past_key_values.release()
-            request.past_key_values = None
+            cache_to_release = request.past_key_values
+            request.past_key_values = self.engine._swap_tracked_kv_cache(request.past_key_values, None)
+            cache_to_release.release()
         if request.stream:
             request.events.put(normalized)
             request.events.put(_DONE)

@@ -332,6 +332,8 @@ INFO anna.cli.serve: Route: /v1/completions, Methods: POST
 INFO anna.cli.serve: Route: /v1/audio/speech, Methods: POST
 ```
 
+Prompt cache is auto-enabled by default with a conservative size and token cap, so you will typically see `Prompt cache hit rate: n/a (0 lookups)` until exact prompt reuse happens. Pass `--prompt-cache-size 0` if you want to disable it explicitly.
+
 ### 3. Generate text directly
 
 ```powershell

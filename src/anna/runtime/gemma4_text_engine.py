@@ -128,6 +128,7 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             self.optimization_config,
             prefill_chunk_size=self._resolve_prefill_chunk_size(self.optimization_config.prefill_chunk_size),
         )
+        self.optimization_config = self._resolve_prompt_cache_config(self.optimization_config)
         self.execution_lock = threading.Lock()
         self.scheduler = None
         self._compiled_text_forward = None
@@ -146,8 +147,8 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         compile_mode: str = "none",
         compile_fullgraph: bool = False,
         prefill_chunk_size: int = 0,
-        prompt_cache_size: int = 0,
-        prompt_cache_max_tokens: int = 0,
+        prompt_cache_size: int | None = None,
+        prompt_cache_max_tokens: int | None = None,
         profile_runtime: bool = False,
         kv_cache_quantization: str = "none",
         kv_cache_quant_bits: int = 4,
@@ -304,6 +305,11 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             kv_cache_info.get("shared_kv_consumer_layers"),
             kv_cache_info.get("full_attention_layers"),
             kv_cache_info.get("turboquant_quantized_layers"),
+        )
+        logger.info(
+            "Prompt cache runtime: size=%s max_tokens=%s",
+            engine.optimization_config.prompt_cache_size,
+            engine.optimization_config.prompt_cache_max_tokens,
         )
         return engine
 
@@ -529,6 +535,7 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
                 "compiled_text_forward": self._compiled_text_forward is not None,
                 "prefill_chunk_size": self.optimization_config.prefill_chunk_size,
                 "prompt_cache_size": self.optimization_config.prompt_cache_size,
+                "prompt_cache_max_tokens": self.optimization_config.prompt_cache_max_tokens,
                 "prompt_cache_entries": len(self._prompt_cache),
                 "profile_runtime": self.optimization_config.profile_runtime,
                 "kv_cache_quantization": self.optimization_config.kv_cache_quantization,
@@ -562,10 +569,18 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
                 "generation_tokens_total": service_metrics.generation_tokens_total,
                 "prompt_cache_queries_total": service_metrics.prompt_cache_queries_total,
                 "prompt_cache_hits_total": service_metrics.prompt_cache_hits_total,
+                "prompt_cache_enabled": service_metrics.prompt_cache_enabled,
                 "prompt_cache_entries": service_metrics.prompt_cache_entries,
                 "running_requests": service_metrics.running_requests,
                 "waiting_requests": service_metrics.waiting_requests,
+                "kv_cache_mode": service_metrics.kv_cache_mode,
                 "kv_cache_used_pages": service_metrics.kv_cache_used_pages,
                 "kv_cache_total_pages": service_metrics.kv_cache_total_pages,
+                "kv_cache_used_bytes": service_metrics.kv_cache_used_bytes,
+                "kv_cache_dense_equivalent_bytes": service_metrics.kv_cache_dense_equivalent_bytes,
+                "kv_cache_quantized_bytes": service_metrics.kv_cache_quantized_bytes,
+                "kv_cache_residual_bytes": service_metrics.kv_cache_residual_bytes,
+                "kv_cache_quantized_tokens": service_metrics.kv_cache_quantized_tokens,
+                "kv_cache_residual_tokens": service_metrics.kv_cache_residual_tokens,
             },
         }

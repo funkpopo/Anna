@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -26,6 +27,28 @@ class TurboQuantValueState(NamedTuple):
     zeros: torch.Tensor
     bits: int
     group_size: int
+
+
+@dataclass(slots=True)
+class TurboQuantKVUsage:
+    total_bytes: int = 0
+    dense_equivalent_bytes: int = 0
+    quantized_bytes: int = 0
+    residual_bytes: int = 0
+    quantized_tokens: int = 0
+    residual_tokens: int = 0
+    rows: int = 0
+
+    def add(self, other: "TurboQuantKVUsage") -> "TurboQuantKVUsage":
+        return TurboQuantKVUsage(
+            total_bytes=self.total_bytes + other.total_bytes,
+            dense_equivalent_bytes=self.dense_equivalent_bytes + other.dense_equivalent_bytes,
+            quantized_bytes=self.quantized_bytes + other.quantized_bytes,
+            residual_bytes=self.residual_bytes + other.residual_bytes,
+            quantized_tokens=self.quantized_tokens + other.quantized_tokens,
+            residual_tokens=self.residual_tokens + other.residual_tokens,
+            rows=self.rows + other.rows,
+        )
 
 
 def turboquant_is_available() -> bool:
@@ -143,6 +166,12 @@ def _resolve_value_group_size(head_dim: int) -> int:
         if candidate <= head_dim and head_dim % candidate == 0:
             return candidate
     return 1
+
+
+def _tensor_nbytes(tensor: torch.Tensor | None) -> int:
+    if tensor is None:
+        return 0
+    return int(tensor.numel() * tensor.element_size())
 
 
 def _pack_value_data(values: torch.Tensor, *, bits: int) -> torch.Tensor:
@@ -523,6 +552,49 @@ class TurboQuantKVRow:
         if self._residual_keys is None:
             return 0
         return int(self._residual_keys.shape[1])
+
+    def usage(self) -> TurboQuantKVUsage:
+        if not self.initialized:
+            return TurboQuantKVUsage()
+        assert self.dtype is not None
+        assert self.head_dim is not None
+        assert self.num_heads is not None
+
+        quantized_key_bytes = 0
+        if self._quantized_keys is not None:
+            quantized_key_bytes = (
+                _tensor_nbytes(self._quantized_keys.mse_indices)
+                + _tensor_nbytes(self._quantized_keys.norms)
+                + _tensor_nbytes(self._quantized_keys.qjl_signs)
+                + _tensor_nbytes(self._quantized_keys.residual_norms)
+            )
+        quantized_value_bytes = 0
+        if self._quantized_values is not None:
+            quantized_value_bytes = (
+                _tensor_nbytes(self._quantized_values.data)
+                + _tensor_nbytes(self._quantized_values.scales)
+                + _tensor_nbytes(self._quantized_values.zeros)
+            )
+        residual_key_bytes = _tensor_nbytes(self._residual_keys)
+        residual_value_bytes = _tensor_nbytes(self._residual_values)
+        quantized_bytes = quantized_key_bytes + quantized_value_bytes
+        residual_bytes = residual_key_bytes + residual_value_bytes
+        dense_equivalent_bytes = (
+            int(self.length)
+            * int(self.num_heads)
+            * int(self.head_dim)
+            * torch.empty((), dtype=self.dtype).element_size()
+            * 2
+        )
+        return TurboQuantKVUsage(
+            total_bytes=quantized_bytes + residual_bytes,
+            dense_equivalent_bytes=dense_equivalent_bytes,
+            quantized_bytes=quantized_bytes,
+            residual_bytes=residual_bytes,
+            quantized_tokens=self.quantized_length,
+            residual_tokens=self.residual_length,
+            rows=1 if self.length > 0 else 0,
+        )
 
     def append(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
         if key_states.ndim != 3 or value_states.ndim != 3:

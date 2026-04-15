@@ -4,6 +4,7 @@ import itertools
 import logging
 import threading
 import time
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -17,7 +18,7 @@ from anna.model.fused_ops import maybe_load_gated_delta_library, paged_gqa_decod
 from anna.model.quantization import AutoRoundGPTQLinear, convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
-from anna.model.turboquant import turboquant_is_available
+from anna.model.turboquant import TurboQuantKVUsage, turboquant_is_available
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
@@ -91,8 +92,8 @@ class EngineOptimizationConfig:
     compile_mode: str = "none"
     compile_fullgraph: bool = False
     prefill_chunk_size: int = 0
-    prompt_cache_size: int = 0
-    prompt_cache_max_tokens: int = 0
+    prompt_cache_size: int | None = None
+    prompt_cache_max_tokens: int | None = None
     profile_runtime: bool = False
     kv_cache_quantization: str = "none"
     kv_cache_quant_bits: int = 4
@@ -234,11 +235,15 @@ class AnnaQwen3_5TextEngine:
             self.optimization_config,
             prefill_chunk_size=self._resolve_prefill_chunk_size(self.optimization_config.prefill_chunk_size),
         )
+        self.optimization_config = self._resolve_prompt_cache_config(self.optimization_config)
         self._attach_cache_allocator()
         self.execution_lock = threading.Lock()
         self.scheduler = None
         self._compiled_text_forward = None
         self._prompt_cache: OrderedDict[tuple[int, ...], PromptCacheEntry] = OrderedDict()
+        self._live_kv_caches_lock = threading.Lock()
+        self._live_kv_caches_weak: weakref.WeakValueDictionary[int, object] = weakref.WeakValueDictionary()
+        self._live_kv_caches_strong: dict[int, object] = {}
         self.metrics = AnnaServiceMetrics()
         self._apply_runtime_optimizations()
 
@@ -246,6 +251,11 @@ class AnnaQwen3_5TextEngine:
     def _normalize_optimization_config(config: EngineOptimizationConfig | None) -> EngineOptimizationConfig:
         if config is None:
             return EngineOptimizationConfig()
+        def _normalize_optional_non_negative_int(value: int | None) -> int | None:
+            if value is None:
+                return None
+            return max(0, int(value))
+
         kv_cache_quant_bits = int(config.kv_cache_quant_bits)
         if kv_cache_quant_bits not in {3, 4}:
             raise ValueError(f"Unsupported TurboQuant KV-cache bit-width: {config.kv_cache_quant_bits}. Expected 3 or 4.")
@@ -253,8 +263,8 @@ class AnnaQwen3_5TextEngine:
             compile_mode=normalize_compile_mode(config.compile_mode),
             compile_fullgraph=bool(config.compile_fullgraph),
             prefill_chunk_size=max(0, int(config.prefill_chunk_size)),
-            prompt_cache_size=max(0, int(config.prompt_cache_size)),
-            prompt_cache_max_tokens=max(0, int(config.prompt_cache_max_tokens)),
+            prompt_cache_size=_normalize_optional_non_negative_int(config.prompt_cache_size),
+            prompt_cache_max_tokens=_normalize_optional_non_negative_int(config.prompt_cache_max_tokens),
             profile_runtime=bool(config.profile_runtime),
             kv_cache_quantization=normalize_kv_cache_quantization(config.kv_cache_quantization),
             kv_cache_quant_bits=kv_cache_quant_bits,
@@ -321,6 +331,90 @@ class AnnaQwen3_5TextEngine:
             _format_bytes(target_chunk_budget),
         )
         return resolved
+
+    def _prompt_cache_budget_bytes(self) -> int | None:
+        memory_info = self.device_context.get_memory_info()
+        if memory_info is None:
+            return None
+        return max(0, int(memory_info.free_bytes) - int(self.device_context.safety_policy.reserve_margin_bytes))
+
+    def _resolve_prompt_cache_size(self, requested_size: int | None) -> int:
+        if requested_size is not None:
+            return max(0, int(requested_size))
+        device = getattr(self.device_context, "device", torch.device("cpu"))
+        if device.type == "xpu":
+            return 1
+        if device.type == "cuda":
+            return 2
+        return 4
+
+    def _resolve_prompt_cache_max_tokens(
+        self,
+        requested_max_tokens: int | None,
+        *,
+        resolved_prompt_cache_size: int,
+        prefill_chunk_size: int,
+    ) -> int:
+        if requested_max_tokens is not None:
+            return max(0, int(requested_max_tokens))
+        if resolved_prompt_cache_size <= 0:
+            return 0
+
+        device = getattr(self.device_context, "device", torch.device("cpu"))
+        if device.type != "xpu":
+            return 2048
+
+        prompt_cache_budget = self._prompt_cache_budget_bytes()
+        if prompt_cache_budget is not None and prompt_cache_budget < (768 << 20):
+            return 256
+        if prefill_chunk_size > 0:
+            return max(256, min(1024, int(prefill_chunk_size)))
+        return 512
+
+    def _resolve_prompt_cache_config(self, optimization_config: EngineOptimizationConfig) -> EngineOptimizationConfig:
+        requested_size = optimization_config.prompt_cache_size
+        requested_max_tokens = optimization_config.prompt_cache_max_tokens
+        resolved_size = self._resolve_prompt_cache_size(requested_size)
+        resolved_max_tokens = self._resolve_prompt_cache_max_tokens(
+            requested_max_tokens,
+            resolved_prompt_cache_size=resolved_size,
+            prefill_chunk_size=optimization_config.prefill_chunk_size,
+        )
+        if requested_size is None or requested_max_tokens is None:
+            logger.info(
+                "Resolved prompt cache defaults on %s: size=%s max_tokens=%s",
+                self.device_context.device,
+                resolved_size,
+                resolved_max_tokens,
+            )
+        return replace(
+            optimization_config,
+            prompt_cache_size=resolved_size,
+            prompt_cache_max_tokens=resolved_max_tokens,
+        )
+
+    def _effective_prompt_cache_size(self) -> int:
+        prompt_cache_size = getattr(self.optimization_config, "prompt_cache_size", None)
+        if prompt_cache_size is not None:
+            return max(0, int(prompt_cache_size))
+        if not hasattr(self, "device_context"):
+            return 0
+        return self._resolve_prompt_cache_size(None)
+
+    def _effective_prompt_cache_max_tokens(self) -> int:
+        prompt_cache_max_tokens = getattr(self.optimization_config, "prompt_cache_max_tokens", None)
+        if prompt_cache_max_tokens is not None:
+            return max(0, int(prompt_cache_max_tokens))
+        prompt_cache_size = self._effective_prompt_cache_size()
+        if prompt_cache_size <= 0:
+            return 0
+        if not hasattr(self, "device_context"):
+            return 0
+        return self._resolve_prompt_cache_max_tokens(
+            None,
+            resolved_prompt_cache_size=prompt_cache_size,
+            prefill_chunk_size=max(0, int(getattr(self.optimization_config, "prefill_chunk_size", 0))),
+        )
 
     def _apply_runtime_optimizations(self) -> None:
         text_model = self._text_model(self.model)
@@ -389,8 +483,8 @@ class AnnaQwen3_5TextEngine:
         compile_mode: str = "none",
         compile_fullgraph: bool = False,
         prefill_chunk_size: int = 0,
-        prompt_cache_size: int = 0,
-        prompt_cache_max_tokens: int = 0,
+        prompt_cache_size: int | None = None,
+        prompt_cache_max_tokens: int | None = None,
         profile_runtime: bool = False,
         kv_cache_quantization: str = "none",
         kv_cache_quant_bits: int = 4,
@@ -627,6 +721,11 @@ class AnnaQwen3_5TextEngine:
             kv_cache_info.get("turboquant_residual_len"),
             kv_cache_info.get("full_attention_layers"),
             kv_cache_info.get("turboquant_quantized_layers"),
+        )
+        logger.info(
+            "Prompt cache runtime: size=%s max_tokens=%s",
+            engine.optimization_config.prompt_cache_size,
+            engine.optimization_config.prompt_cache_max_tokens,
         )
         return engine
 
@@ -1058,6 +1157,70 @@ class AnnaQwen3_5TextEngine:
         if text_model is not None and hasattr(text_model, "cache_allocator"):
             text_model.cache_allocator = self.cache_allocator
 
+    def _ensure_live_kv_cache_registry(self) -> None:
+        if not hasattr(self, "_live_kv_caches_lock"):
+            self._live_kv_caches_lock = threading.Lock()
+        if not hasattr(self, "_live_kv_caches_weak"):
+            self._live_kv_caches_weak = weakref.WeakValueDictionary()
+        if not hasattr(self, "_live_kv_caches_strong"):
+            self._live_kv_caches_strong = {}
+
+    def _track_kv_cache(self, cache: object | None) -> None:
+        if cache is None:
+            return
+        self._ensure_live_kv_cache_registry()
+        with self._live_kv_caches_lock:
+            cache_id = id(cache)
+            self._live_kv_caches_strong.pop(cache_id, None)
+            try:
+                self._live_kv_caches_weak[cache_id] = cache
+            except TypeError:
+                self._live_kv_caches_strong[cache_id] = cache
+
+    def _untrack_kv_cache(self, cache: object | None) -> None:
+        if cache is None:
+            return
+        self._ensure_live_kv_cache_registry()
+        with self._live_kv_caches_lock:
+            cache_id = id(cache)
+            self._live_kv_caches_weak.pop(cache_id, None)
+            self._live_kv_caches_strong.pop(cache_id, None)
+
+    def _swap_tracked_kv_cache(self, current: object | None, new: object | None) -> object | None:
+        if current is new:
+            if new is not None:
+                self._track_kv_cache(new)
+            return new
+        self._untrack_kv_cache(current)
+        self._track_kv_cache(new)
+        return new
+
+    def _turboquant_kv_usage(self) -> TurboQuantKVUsage:
+        if self.optimization_config.kv_cache_quantization != "turboquant":
+            return TurboQuantKVUsage()
+        self._ensure_live_kv_cache_registry()
+
+        caches: list[object] = []
+        for entry in getattr(self, "_prompt_cache", {}).values():
+            cache = getattr(entry, "past_key_values", None)
+            if cache is not None:
+                caches.append(cache)
+        with self._live_kv_caches_lock:
+            caches.extend(list(self._live_kv_caches_weak.values()))
+            caches.extend(list(self._live_kv_caches_strong.values()))
+
+        usage = TurboQuantKVUsage()
+        seen_ids: set[int] = set()
+        for cache in caches:
+            cache_id = id(cache)
+            if cache_id in seen_ids:
+                continue
+            seen_ids.add(cache_id)
+            usage_getter = getattr(cache, "turboquant_usage", None)
+            if callable(usage_getter):
+                usage = usage.add(usage_getter())
+        return usage
+
     def _reserve_prefill_cache(self, prepared: PreparedInputs) -> Qwen3DynamicCache | None:
         config = getattr(self, "config", None)
         allocator = getattr(self, "cache_allocator", None)
@@ -1110,10 +1273,19 @@ class AnnaQwen3_5TextEngine:
         metrics = getattr(self, "metrics", None)
         snapshot = metrics.snapshot() if metrics is not None else ServiceMetricsSnapshot(timestamp=time.perf_counter())
         used_pages, total_pages = self._kv_cache_page_counts()
+        turboquant_usage = self._turboquant_kv_usage()
         return replace(
             snapshot,
+            kv_cache_mode=self.optimization_config.kv_cache_quantization,
             kv_cache_used_pages=used_pages,
             kv_cache_total_pages=total_pages,
+            kv_cache_used_bytes=turboquant_usage.total_bytes,
+            kv_cache_dense_equivalent_bytes=turboquant_usage.dense_equivalent_bytes,
+            kv_cache_quantized_bytes=turboquant_usage.quantized_bytes,
+            kv_cache_residual_bytes=turboquant_usage.residual_bytes,
+            kv_cache_quantized_tokens=turboquant_usage.quantized_tokens,
+            kv_cache_residual_tokens=turboquant_usage.residual_tokens,
+            prompt_cache_enabled=self._effective_prompt_cache_size() > 0,
             prompt_cache_entries=len(getattr(self, "_prompt_cache", {})),
         )
 
@@ -1182,11 +1354,19 @@ class AnnaQwen3_5TextEngine:
                 "generation_tokens_total": service_metrics.generation_tokens_total,
                 "prompt_cache_queries_total": service_metrics.prompt_cache_queries_total,
                 "prompt_cache_hits_total": service_metrics.prompt_cache_hits_total,
+                "prompt_cache_enabled": service_metrics.prompt_cache_enabled,
                 "prompt_cache_entries": service_metrics.prompt_cache_entries,
                 "running_requests": service_metrics.running_requests,
                 "waiting_requests": service_metrics.waiting_requests,
+                "kv_cache_mode": service_metrics.kv_cache_mode,
                 "kv_cache_used_pages": service_metrics.kv_cache_used_pages,
                 "kv_cache_total_pages": service_metrics.kv_cache_total_pages,
+                "kv_cache_used_bytes": service_metrics.kv_cache_used_bytes,
+                "kv_cache_dense_equivalent_bytes": service_metrics.kv_cache_dense_equivalent_bytes,
+                "kv_cache_quantized_bytes": service_metrics.kv_cache_quantized_bytes,
+                "kv_cache_residual_bytes": service_metrics.kv_cache_residual_bytes,
+                "kv_cache_quantized_tokens": service_metrics.kv_cache_quantized_tokens,
+                "kv_cache_residual_tokens": service_metrics.kv_cache_residual_tokens,
             },
         }
 
@@ -1500,11 +1680,11 @@ class AnnaQwen3_5TextEngine:
         return outputs
 
     def _prompt_cache_key(self, prepared: PreparedInputs) -> tuple[int, ...] | None:
-        if self.optimization_config.prompt_cache_size <= 0:
+        if self._effective_prompt_cache_size() <= 0:
             return None
         if self._has_multimodal_inputs(prepared):
             return None
-        prompt_cache_max_tokens = self.optimization_config.prompt_cache_max_tokens
+        prompt_cache_max_tokens = self._effective_prompt_cache_max_tokens()
         if prompt_cache_max_tokens > 0 and int(prepared.input_ids.shape[1]) > prompt_cache_max_tokens:
             return None
         return tuple(int(token_id) for token_id in prepared.input_ids[0].tolist())
@@ -1546,7 +1726,8 @@ class AnnaQwen3_5TextEngine:
         past_key_values: object | None,
         prompt_tokens: int,
     ) -> None:
-        if key is None or past_key_values is None or self.optimization_config.prompt_cache_size <= 0:
+        prompt_cache_size = self._effective_prompt_cache_size()
+        if key is None or past_key_values is None or prompt_cache_size <= 0:
             return
         clone = getattr(past_key_values, "clone", None)
         if not callable(clone):
@@ -1569,7 +1750,7 @@ class AnnaQwen3_5TextEngine:
             prompt_tokens=prompt_tokens,
         )
 
-        while len(self._prompt_cache) > self.optimization_config.prompt_cache_size:
+        while len(self._prompt_cache) > prompt_cache_size:
             stale_key, stale_entry = self._prompt_cache.popitem(last=False)
             release = getattr(stale_entry.past_key_values, "release", None)
             if callable(release):
@@ -1600,6 +1781,7 @@ class AnnaQwen3_5TextEngine:
         try:
             if chunk_size > 0 and not self._has_multimodal_inputs(prepared) and int(input_ids.shape[1]) > chunk_size:
                 past_key_values = self._reserve_prefill_cache(prepared)
+                self._track_kv_cache(past_key_values)
                 total_tokens = int(input_ids.shape[1])
                 for start_idx in range(0, total_tokens, chunk_size):
                     end_idx = min(total_tokens, start_idx + chunk_size)
@@ -1616,7 +1798,7 @@ class AnnaQwen3_5TextEngine:
                         use_cache=True,
                         logits_to_keep=1,
                     )
-                    past_key_values = outputs.past_key_values
+                    past_key_values = self._swap_tracked_kv_cache(past_key_values, outputs.past_key_values)
                     if metrics is not None:
                         chunk_tokens = end_idx - start_idx
                         if chunk_tokens > 0:
@@ -1634,6 +1816,7 @@ class AnnaQwen3_5TextEngine:
                 )
                 past_key_values = outputs.past_key_values
         except Exception:
+            self._untrack_kv_cache(past_key_values)
             release = getattr(past_key_values, "release", None)
             if callable(release):
                 release()
@@ -1642,6 +1825,7 @@ class AnnaQwen3_5TextEngine:
         if outputs is None:
             raise RuntimeError("Prompt prefill did not produce model outputs.")
 
+        self._untrack_kv_cache(past_key_values)
         logits = outputs.logits[0, -1]
         self._remember_prompt_cache_entry(
             key=cache_key,
@@ -2165,7 +2349,7 @@ class AnnaQwen3_5TextEngine:
                 prefill = self._prefill_generation_prompt(prepared)
             except RuntimeError as exc:
                 raise self._handle_runtime_failure(exc) from exc
-            past_key_values = prefill.past_key_values
+            past_key_values = self._swap_tracked_kv_cache(past_key_values, prefill.past_key_values)
             current_logits = prefill.logits
 
             for step_idx in range(config.max_new_tokens):
@@ -2181,7 +2365,7 @@ class AnnaQwen3_5TextEngine:
                                 logits_to_keep=1,
                             )
                         current_logits = outputs.logits[0, -1]
-                        past_key_values = outputs.past_key_values
+                        past_key_values = self._swap_tracked_kv_cache(past_key_values, outputs.past_key_values)
                     except RuntimeError as exc:
                         raise self._handle_runtime_failure(exc) from exc
 
@@ -2246,6 +2430,7 @@ class AnnaQwen3_5TextEngine:
             )
         finally:
             if past_key_values is not None:
+                self._untrack_kv_cache(past_key_values)
                 past_key_values.release()
 
     @torch.inference_mode()
@@ -2277,7 +2462,7 @@ class AnnaQwen3_5TextEngine:
                 prefill = self._prefill_generation_prompt(prepared)
             except RuntimeError as exc:
                 raise self._handle_runtime_failure(exc) from exc
-            past_key_values = prefill.past_key_values
+            past_key_values = self._swap_tracked_kv_cache(past_key_values, prefill.past_key_values)
             current_logits = prefill.logits
 
             for step_idx in range(config.max_new_tokens):
@@ -2293,7 +2478,7 @@ class AnnaQwen3_5TextEngine:
                                 logits_to_keep=1,
                             )
                         current_logits = outputs.logits[0, -1]
-                        past_key_values = outputs.past_key_values
+                        past_key_values = self._swap_tracked_kv_cache(past_key_values, outputs.past_key_values)
                     except RuntimeError as exc:
                         raise self._handle_runtime_failure(exc) from exc
 
@@ -2390,4 +2575,5 @@ class AnnaQwen3_5TextEngine:
             )
         finally:
             if past_key_values is not None:
+                self._untrack_kv_cache(past_key_values)
                 past_key_values.release()

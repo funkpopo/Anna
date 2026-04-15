@@ -83,6 +83,8 @@ def test_serve_parser_defaults_to_direct_generation() -> None:
 
     assert args.scheduler_max_batch_size == 1
     assert args.metrics_log_interval_seconds == 10.0
+    assert args.prompt_cache_size is None
+    assert args.prompt_cache_max_tokens is None
 
 
 class _FakeEngine:

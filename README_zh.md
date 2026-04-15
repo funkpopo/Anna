@@ -330,6 +330,8 @@ INFO anna.cli.serve: Route: /v1/completions, Methods: POST
 INFO anna.cli.serve: Route: /v1/audio/speech, Methods: POST
 ```
 
+Prompt cache 现在默认会以保守配置自动启用，所以在周期指标里通常会先看到 `Prompt cache hit rate: n/a (0 lookups)`，直到出现完全相同的 prompt 复用；如果你想显式关闭，可传 `--prompt-cache-size 0`。
+
 ### 3. 直接文本生成
 
 ```powershell

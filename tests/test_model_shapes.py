@@ -346,6 +346,27 @@ def test_dynamic_cache_can_store_full_attention_rows_with_turboquant() -> None:
     assert ((second_value[:, :, :3, :] - value_a).float() ** 2).mean().item() < 1.0
 
 
+def test_dynamic_cache_reports_turboquant_usage() -> None:
+    config = _tiny_config()
+    cache = Qwen3DynamicCache(
+        config,
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+    key = torch.randn(1, 2, 4, 16)
+    value = torch.randn(1, 2, 4, 16)
+
+    cache.update(key, value, layer_idx=1, require_dense_cache=False)
+    usage = cache.turboquant_usage()
+
+    assert usage.total_bytes > 0
+    assert usage.dense_equivalent_bytes > 0
+    assert usage.dense_equivalent_bytes >= usage.total_bytes
+    assert usage.quantized_tokens > 0
+    assert usage.residual_tokens == 2
+
+
 def test_dynamic_cache_stack_and_split_round_trips_turboquant_batches() -> None:
     config = _tiny_config()
     allocator = Qwen3PageAllocator(config)

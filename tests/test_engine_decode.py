@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import weakref
 from collections import OrderedDict
 from types import MethodType, SimpleNamespace
 
@@ -8,8 +10,10 @@ import torch
 
 from anna.core.function_calling import ParsedToolCall
 from anna.mm.qwen3_5_text_processor import PreparedInputs
+from anna.model.turboquant import TurboQuantKVUsage
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, GenerationConfig, ThinkingStreamParser
 from anna.runtime.qwen3_5_text_engine import EngineOptimizationConfig, StreamEvent, TextGenerationResult
+from anna.runtime.service_metrics import AnnaServiceMetrics
 from anna.runtime.streaming import IncrementalTextAssembler
 
 
@@ -285,6 +289,105 @@ def test_trim_runtime_cache_if_idle_skips_when_requests_are_active() -> None:
 
     assert engine.cache_allocator.trim_calls == 0
     assert engine.device_context.release_calls == 0
+
+
+def test_prompt_cache_defaults_auto_enable_on_xpu() -> None:
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.device_context = SimpleNamespace(
+        device=torch.device("xpu"),
+        safety_policy=SimpleNamespace(reserve_margin_bytes=128 << 20),
+        get_memory_info=lambda: SimpleNamespace(free_bytes=2 << 30),
+    )
+
+    resolved = engine._resolve_prompt_cache_config(
+        EngineOptimizationConfig(
+            prefill_chunk_size=768,
+            prompt_cache_size=None,
+            prompt_cache_max_tokens=None,
+        )
+    )
+
+    assert resolved.prompt_cache_size == 1
+    assert resolved.prompt_cache_max_tokens == 768
+
+
+def test_prompt_cache_explicit_zero_disables_auto_defaults() -> None:
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.device_context = SimpleNamespace(
+        device=torch.device("xpu"),
+        safety_policy=SimpleNamespace(reserve_margin_bytes=128 << 20),
+        get_memory_info=lambda: SimpleNamespace(free_bytes=2 << 30),
+    )
+
+    resolved = engine._resolve_prompt_cache_config(
+        EngineOptimizationConfig(
+            prefill_chunk_size=768,
+            prompt_cache_size=0,
+            prompt_cache_max_tokens=None,
+        )
+    )
+
+    assert resolved.prompt_cache_size == 0
+    assert resolved.prompt_cache_max_tokens == 0
+
+
+def test_service_metrics_snapshot_aggregates_turboquant_usage_from_live_and_prompt_caches() -> None:
+    class _DummyTurboCache:
+        def __init__(self, *, usage: TurboQuantKVUsage) -> None:
+            self._usage = usage
+
+        def turboquant_usage(self) -> TurboQuantKVUsage:
+            return self._usage
+
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.metrics = AnnaServiceMetrics()
+    engine.optimization_config = EngineOptimizationConfig(
+        kv_cache_quantization="turboquant",
+        prompt_cache_size=2,
+    )
+    engine.cache_allocator = SimpleNamespace(layers=())
+    engine._prompt_cache = OrderedDict()
+    engine._live_kv_caches_lock = threading.Lock()
+    engine._live_kv_caches_weak = weakref.WeakValueDictionary()
+    engine._live_kv_caches_strong = {}
+
+    prompt_cache_usage = TurboQuantKVUsage(
+        total_bytes=4 << 20,
+        dense_equivalent_bytes=16 << 20,
+        quantized_bytes=3 << 20,
+        residual_bytes=1 << 20,
+        quantized_tokens=2048,
+        residual_tokens=64,
+        rows=2,
+    )
+    live_usage = TurboQuantKVUsage(
+        total_bytes=6 << 20,
+        dense_equivalent_bytes=18 << 20,
+        quantized_bytes=4 << 20,
+        residual_bytes=2 << 20,
+        quantized_tokens=3072,
+        residual_tokens=128,
+        rows=3,
+    )
+    engine._prompt_cache[(1, 2, 3)] = SimpleNamespace(
+        logits=torch.tensor([1.0]),
+        past_key_values=_DummyTurboCache(usage=prompt_cache_usage),
+        prompt_tokens=3,
+    )
+    live_cache = _DummyTurboCache(usage=live_usage)
+    engine._track_kv_cache(live_cache)
+
+    snapshot = engine.service_metrics_snapshot()
+
+    assert snapshot.kv_cache_mode == "turboquant"
+    assert snapshot.prompt_cache_enabled is True
+    assert snapshot.prompt_cache_entries == 1
+    assert snapshot.kv_cache_used_bytes == (10 << 20)
+    assert snapshot.kv_cache_dense_equivalent_bytes == (34 << 20)
+    assert snapshot.kv_cache_quantized_bytes == (7 << 20)
+    assert snapshot.kv_cache_residual_bytes == (3 << 20)
+    assert snapshot.kv_cache_quantized_tokens == 5120
+    assert snapshot.kv_cache_residual_tokens == 192
 
 
 def test_qwen_runtime_accepts_turboquant_kv_cache_quantization_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
