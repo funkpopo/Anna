@@ -17,6 +17,7 @@ from anna.model.fused_ops import maybe_load_gated_delta_library, paged_gqa_decod
 from anna.model.quantization import AutoRoundGPTQLinear, convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
+from anna.model.turboquant import turboquant_is_available
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
@@ -217,13 +218,14 @@ class AnnaQwen3_5TextEngine:
         self.resident_expert_layers = len(self.resident_expert_layer_indices)
         self.cached_experts_per_layer = max(0, int(cached_experts_per_layer))
         self.optimization_config = self._normalize_optimization_config(optimization_config)
+        turboquant_kv_enabled = self.optimization_config.kv_cache_quantization == "turboquant"
         use_paged_full_attention_decode = False
-        if self.device_context.device.type == "xpu":
+        if self.device_context.device.type == "xpu" and not turboquant_kv_enabled:
             maybe_load_gated_delta_library()
             use_paged_full_attention_decode = paged_gqa_decode_fused_is_available()
         self.cache_allocator = Qwen3PageAllocator(
             self.config.text_config,
-            maintain_full_attention_mirror=not use_paged_full_attention_decode,
+            maintain_full_attention_mirror=not use_paged_full_attention_decode and not turboquant_kv_enabled,
         )
         self.full_attention_cache_mirror = (
             self.cache_allocator.maintain_full_attention_mirror and bool(self.cache_allocator.full_attention_layer_indices)
@@ -270,12 +272,19 @@ class AnnaQwen3_5TextEngine:
         bytes_per_elem = self.device_context.element_size(self.device_context.dtype)
         full_layers = sum(1 for layer_type in text_config.layer_types if layer_type == "full_attention")
         linear_layers = max(0, int(text_config.num_hidden_layers) - full_layers)
+        full_layer_kv_bytes = (
+            0
+            if self.optimization_config.kv_cache_quantization == "turboquant"
+            else (
+                full_layers
+                * 2
+                * int(text_config.num_key_value_heads)
+                * int(text_config.head_dim)
+                * bytes_per_elem
+            )
+        )
         per_token_kv_bytes = (
-            full_layers
-            * 2
-            * int(text_config.num_key_value_heads)
-            * int(text_config.head_dim)
-            * bytes_per_elem
+            full_layer_kv_bytes
         )
         if self.full_attention_cache_mirror:
             per_token_kv_bytes *= 2
@@ -344,6 +353,30 @@ class AnnaQwen3_5TextEngine:
         except Exception:
             logger.exception("Failed to enable torch.compile for text generation path; falling back to eager mode.")
             self._compiled_text_forward = None
+
+    def _kv_cache_runtime_info(self) -> dict[str, object]:
+        info_getter = getattr(self.model, "kv_cache_runtime_info", None)
+        if callable(info_getter):
+            info = info_getter()
+            if isinstance(info, dict):
+                return info
+        turboquant_enabled = self.optimization_config.kv_cache_quantization == "turboquant"
+        full_attention_layers = [
+            layer_idx
+            for layer_idx, layer_type in enumerate(self.config.text_config.layer_types)
+            if layer_type == "full_attention"
+        ]
+        return {
+            "mode": self.optimization_config.kv_cache_quantization,
+            "turboquant_enabled": turboquant_enabled,
+            "turboquant_bits": self.optimization_config.kv_cache_quant_bits if turboquant_enabled else None,
+            "turboquant_residual_len": self.optimization_config.kv_cache_residual_len if turboquant_enabled else None,
+            "turboquant_applies_to": "full_attention_only" if turboquant_enabled else "disabled",
+            "full_attention_layers": len(full_attention_layers),
+            "full_attention_layer_indices": full_attention_layers,
+            "turboquant_quantized_layers": len(full_attention_layers) if turboquant_enabled else 0,
+            "turboquant_quantized_layer_indices": full_attention_layers if turboquant_enabled else [],
+        }
 
     @classmethod
     def from_model_dir(
@@ -456,6 +489,9 @@ class AnnaQwen3_5TextEngine:
                 resident_expert_layer_indices=initial_resident_expert_layer_indices,
                 expert_quant=resolved_expert_quant,
                 cached_experts_per_layer=initial_cached_experts_per_layer,
+                kv_cache_quantization=resolved_kv_cache_quantization,
+                kv_cache_quant_bits=kv_cache_quant_bits,
+                kv_cache_residual_len=kv_cache_residual_len,
             )
             cls._prepare_loaded_quantized_modules_for_execution(
                 model=model,
@@ -477,6 +513,9 @@ class AnnaQwen3_5TextEngine:
                     resident_expert_layer_indices=resolved_resident_expert_layer_indices,
                     expert_quant=resolved_expert_quant,
                     cached_experts_per_layer=initial_cached_experts_per_layer,
+                    kv_cache_quantization=resolved_kv_cache_quantization,
+                    kv_cache_quant_bits=kv_cache_quant_bits,
+                    kv_cache_residual_len=kv_cache_residual_len,
                 )
                 cls._prepare_loaded_quantized_modules_for_execution(
                     model=model,
@@ -498,6 +537,9 @@ class AnnaQwen3_5TextEngine:
                     resident_expert_layer_indices=resolved_resident_expert_layer_indices,
                     expert_quant=resolved_expert_quant,
                     cached_experts_per_layer=resolved_cached_experts_per_layer,
+                    kv_cache_quantization=resolved_kv_cache_quantization,
+                    kv_cache_quant_bits=kv_cache_quant_bits,
+                    kv_cache_residual_len=kv_cache_residual_len,
                 )
                 cls._prepare_loaded_quantized_modules_for_execution(
                     model=model,
@@ -548,7 +590,7 @@ class AnnaQwen3_5TextEngine:
             report.quantized_replacements,
         )
 
-        return cls(
+        engine = cls(
             model=model,
             tokenizer=tokenizer,
             processor=processor,
@@ -576,6 +618,17 @@ class AnnaQwen3_5TextEngine:
                 kv_cache_residual_len=kv_cache_residual_len,
             ),
         )
+        kv_cache_info = engine._kv_cache_runtime_info()
+        logger.info(
+            "Qwen3.5 KV cache runtime: mode=%s turboquant_enabled=%s turboquant_bits=%s turboquant_residual_len=%s full_attention_layers=%s turboquant_quantized_layers=%s",
+            kv_cache_info.get("mode"),
+            kv_cache_info.get("turboquant_enabled"),
+            kv_cache_info.get("turboquant_bits"),
+            kv_cache_info.get("turboquant_residual_len"),
+            kv_cache_info.get("full_attention_layers"),
+            kv_cache_info.get("turboquant_quantized_layers"),
+        )
+        return engine
 
     @staticmethod
     def _resolve_offload_mode(
@@ -608,14 +661,12 @@ class AnnaQwen3_5TextEngine:
         requested_mode: str,
         device_context: DeviceContext,
     ) -> str:
-        del device_context
         normalized = normalize_kv_cache_quantization(requested_mode)
-        if normalized == "none":
-            return normalized
-        raise ValueError(
-            "TurboQuant KV-cache compression is not supported for the qwen3_5_text runtime. "
-            "Anna's Qwen backend uses a paged hybrid cache and fused decode path instead."
-        )
+        if normalized == "turboquant" and not turboquant_is_available():
+            raise ValueError(
+                "TurboQuant KV-cache compression was requested, but the 'turboquant' dependency is not installed."
+            )
+        return normalized
 
     @staticmethod
     def _resolve_offload_vision(
@@ -1018,6 +1069,9 @@ class AnnaQwen3_5TextEngine:
             text_config,
             allocator=allocator,
             batch_size=batch_size,
+            kv_cache_quantization=self.optimization_config.kv_cache_quantization,
+            kv_cache_quant_bits=self.optimization_config.kv_cache_quant_bits,
+            kv_cache_residual_len=self.optimization_config.kv_cache_residual_len,
         )
         cache.reserve_sequence_capacity(int(prepared.input_ids.shape[1]))
         return cache
@@ -1067,6 +1121,7 @@ class AnnaQwen3_5TextEngine:
         quant_method = self.config.quantization_config.quant_method or "dense"
         memory_info = self.device_context.get_memory_info()
         service_metrics = self.service_metrics_snapshot()
+        kv_cache_runtime_info = self._kv_cache_runtime_info()
         return {
             "status": "ok",
             "model": self.default_model_id,
@@ -1118,6 +1173,7 @@ class AnnaQwen3_5TextEngine:
                 "allocated_bytes": memory_info.allocated_bytes,
                 "reserved_bytes": memory_info.reserved_bytes,
             },
+            "kv_cache": kv_cache_runtime_info,
             "service_metrics": {
                 "requests_started_total": service_metrics.requests_started_total,
                 "requests_completed_total": service_metrics.requests_completed_total,

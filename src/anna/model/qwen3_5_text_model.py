@@ -65,6 +65,9 @@ class Qwen3TextModel(nn.Module):
         self.config = config
         self.cache_allocator: Qwen3PageAllocator | None = None
         self.execution_device: torch.device | None = None
+        self.kv_cache_quantization = "none"
+        self.kv_cache_quant_bits = 4
+        self.kv_cache_residual_len = 128
         padding_idx = config.pad_token_id if 0 <= config.pad_token_id < config.vocab_size else None
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config, idx) for idx in range(config.num_hidden_layers)])
@@ -81,8 +84,14 @@ class Qwen3TextModel(nn.Module):
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         expert_quant: str = "none",
         cached_experts_per_layer: int | None = None,
+        kv_cache_quantization: str = "none",
+        kv_cache_quant_bits: int = 4,
+        kv_cache_residual_len: int = 128,
     ) -> None:
         self.execution_device = execution_device
+        self.kv_cache_quantization = kv_cache_quantization
+        self.kv_cache_quant_bits = int(kv_cache_quant_bits)
+        self.kv_cache_residual_len = int(kv_cache_residual_len)
         self.embed_tokens.to(torch.device("cpu") if offload_token_io else execution_device)
         self.rotary_emb.to(execution_device)
         self.norm.to(execution_device)
@@ -136,7 +145,13 @@ class Qwen3TextModel(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = Qwen3DynamicCache(self.config, allocator=self.cache_allocator)
+            past_key_values = Qwen3DynamicCache(
+                self.config,
+                allocator=self.cache_allocator,
+                kv_cache_quantization=self.kv_cache_quantization,
+                kv_cache_quant_bits=self.kv_cache_quant_bits,
+                kv_cache_residual_len=self.kv_cache_residual_len,
+            )
 
         execution_device = self.execution_device or _module_device(self.norm)
         if inputs_embeds.device != execution_device:
@@ -169,6 +184,23 @@ class Qwen3TextModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
         return TextModelOutput(last_hidden_state=hidden_states, past_key_values=past_key_values)
+
+    def kv_cache_runtime_info(self) -> dict[str, object]:
+        turboquant_enabled = self.kv_cache_quantization == "turboquant"
+        full_attention_layer_indices = [
+            layer_idx for layer_idx, layer_type in enumerate(self.config.layer_types) if layer_type == "full_attention"
+        ]
+        return {
+            "mode": self.kv_cache_quantization,
+            "turboquant_enabled": turboquant_enabled,
+            "turboquant_bits": self.kv_cache_quant_bits if turboquant_enabled else None,
+            "turboquant_residual_len": self.kv_cache_residual_len if turboquant_enabled else None,
+            "turboquant_applies_to": "full_attention_only" if turboquant_enabled else "disabled",
+            "full_attention_layers": len(full_attention_layer_indices),
+            "full_attention_layer_indices": full_attention_layer_indices,
+            "turboquant_quantized_layers": len(full_attention_layer_indices) if turboquant_enabled else 0,
+            "turboquant_quantized_layer_indices": full_attention_layer_indices if turboquant_enabled else [],
+        }
 
 
 class Qwen3VisionRotaryEmbedding(nn.Module):
@@ -437,6 +469,9 @@ class Qwen3Model(nn.Module):
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         expert_quant: str = "none",
         cached_experts_per_layer: int | None = None,
+        kv_cache_quantization: str = "none",
+        kv_cache_quant_bits: int = 4,
+        kv_cache_residual_len: int = 128,
     ) -> None:
         self.language_model.configure_runtime(
             execution_device,
@@ -446,6 +481,9 @@ class Qwen3Model(nn.Module):
             resident_expert_layer_indices=resident_expert_layer_indices,
             expert_quant=expert_quant,
             cached_experts_per_layer=cached_experts_per_layer,
+            kv_cache_quantization=kv_cache_quantization,
+            kv_cache_quant_bits=kv_cache_quant_bits,
+            kv_cache_residual_len=kv_cache_residual_len,
         )
         if self.visual is not None:
             self.visual.to(torch.device("cpu") if offload_vision else execution_device)
@@ -641,6 +679,9 @@ class Qwen3Model(nn.Module):
             past_key_values = Qwen3DynamicCache(
                 self.config.text_config,
                 allocator=self.language_model.cache_allocator,
+                kv_cache_quantization=self.language_model.kv_cache_quantization,
+                kv_cache_quant_bits=self.language_model.kv_cache_quant_bits,
+                kv_cache_residual_len=self.language_model.kv_cache_residual_len,
             )
 
         if inputs_embeds is None:
@@ -687,6 +728,9 @@ class Qwen3Model(nn.Module):
             rope_deltas=None if outputs.past_key_values is None else outputs.past_key_values.rope_deltas,
         )
 
+    def kv_cache_runtime_info(self) -> dict[str, object]:
+        return self.language_model.kv_cache_runtime_info()
+
 
 class Qwen3_5TextForCausalLM(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig):
@@ -705,6 +749,9 @@ class Qwen3_5TextForCausalLM(nn.Module):
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         expert_quant: str = "none",
         cached_experts_per_layer: int | None = None,
+        kv_cache_quantization: str = "none",
+        kv_cache_quant_bits: int = 4,
+        kv_cache_residual_len: int = 128,
     ) -> None:
         self.model.configure_runtime(
             execution_device,
@@ -714,6 +761,9 @@ class Qwen3_5TextForCausalLM(nn.Module):
             resident_expert_layer_indices=resident_expert_layer_indices,
             expert_quant=expert_quant,
             cached_experts_per_layer=cached_experts_per_layer,
+            kv_cache_quantization=kv_cache_quantization,
+            kv_cache_quant_bits=kv_cache_quant_bits,
+            kv_cache_residual_len=kv_cache_residual_len,
         )
         self.lm_head.to(torch.device("cpu") if offload_token_io else execution_device)
 
@@ -767,6 +817,9 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         expert_quant: str = "none",
         cached_experts_per_layer: int | None = None,
+        kv_cache_quantization: str = "none",
+        kv_cache_quant_bits: int = 4,
+        kv_cache_residual_len: int = 128,
     ) -> None:
         self.model.configure_runtime(
             execution_device,
@@ -777,6 +830,9 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             resident_expert_layer_indices=resident_expert_layer_indices,
             expert_quant=expert_quant,
             cached_experts_per_layer=cached_experts_per_layer,
+            kv_cache_quantization=kv_cache_quantization,
+            kv_cache_quant_bits=kv_cache_quant_bits,
+            kv_cache_residual_len=kv_cache_residual_len,
         )
         self.lm_head.to(torch.device("cpu") if offload_token_io else execution_device)
 
@@ -851,3 +907,6 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             hidden_states = hidden_states.to(device=lm_head_device)
         logits = self.lm_head(hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values, rope_deltas=outputs.rope_deltas)
+
+    def kv_cache_runtime_info(self) -> dict[str, object]:
+        return self.model.kv_cache_runtime_info()
