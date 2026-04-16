@@ -122,7 +122,9 @@ class AutoRoundGPTQLinear(nn.Module):
         return _unpack_int4_first_dim(self.qweight)[: self.in_features, : self.out_features]
 
     def _unpack_qzeros(self) -> torch.Tensor:
-        return _unpack_int4_last_dim(self.qzeros)[:, : self.out_features]
+        # AutoRound's AutoGPTQ-compatible export stores (zero_point - 1) in the packed qzeros tensor.
+        # See auto_round.export.export_to_autogptq.qlinear_triton.QuantLinear.pack().
+        return _unpack_int4_last_dim(self.qzeros)[:, : self.out_features] + 1
 
     def _dequantize_weight(self) -> torch.Tensor:
         if self.qweight.numel() == 0 or self.qzeros.numel() == 0 or self.scales.numel() == 0:
@@ -149,7 +151,7 @@ class AutoRoundGPTQLinear(nn.Module):
         packed_weight_cpu = _unpack_int4_first_dim(self.qweight.to(device="cpu", dtype=torch.int32))[
             : self.in_features, : self.out_features
         ]
-        zeros_cpu = _unpack_int4_last_dim(self.qzeros.to(device="cpu", dtype=torch.int32))[:, : self.out_features]
+        zeros_cpu = self._unpack_qzeros().to(device="cpu", dtype=torch.int32)
         scales_cpu = self.scales.to(device="cpu", dtype=torch.float32)
 
         padded_weight = torch.empty((padded_in_features, self.out_features), dtype=torch.int32, device="cpu")

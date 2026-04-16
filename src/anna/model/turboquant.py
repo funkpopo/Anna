@@ -497,6 +497,9 @@ class TurboQuantKVRow:
         self._quantized_values: TurboQuantValueState | None = None
         self._residual_keys: torch.Tensor | None = None
         self._residual_values: torch.Tensor | None = None
+        self._decode_quantized_keys: torch.Tensor | None = None
+        self._decode_quantized_values: torch.Tensor | None = None
+        self._decode_quantized_length = 0
         self._length = 0
 
     @property
@@ -523,6 +526,46 @@ class TurboQuantKVRow:
         if self._residual_keys is None:
             return 0
         return int(self._residual_keys.shape[1])
+
+    def _invalidate_decode_cache(self) -> None:
+        self._decode_quantized_keys = None
+        self._decode_quantized_values = None
+        self._decode_quantized_length = 0
+
+    def _materialize_quantized_prefix(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        quantized_len = self.quantized_length
+        if (
+            self._quantized_keys is None
+            or self._quantized_values is None
+            or quantized_len <= 0
+        ):
+            self._invalidate_decode_cache()
+            return None, None
+
+        if (
+            self._decode_quantized_keys is not None
+            and self._decode_quantized_values is not None
+            and self._decode_quantized_length == quantized_len
+        ):
+            return self._decode_quantized_keys, self._decode_quantized_values
+
+        assert self.device is not None
+        assert self.dtype is not None
+        quantized_keys = dequantize_turboquant_keys(
+            self._quantized_keys,
+            bits=self.bits,
+            device=self.device,
+            dtype=self.dtype,
+        ).contiguous()
+        quantized_values = dequantize_turboquant_values(
+            self._quantized_values,
+            device=self.device,
+            dtype=self.dtype,
+        ).contiguous()
+        self._decode_quantized_keys = quantized_keys
+        self._decode_quantized_values = quantized_values
+        self._decode_quantized_length = quantized_len
+        return quantized_keys, quantized_values
 
     def append(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
         if key_states.ndim != 3 or value_states.ndim != 3:
@@ -595,6 +638,7 @@ class TurboQuantKVRow:
         self._quantized_values = _concat_value_states(self._quantized_values, quantized_values)
         self._residual_keys = residual_keys[:, overflow:, :].contiguous()
         self._residual_values = residual_values[:, overflow:, :].contiguous()
+        self._invalidate_decode_cache()
 
     def materialize(
         self,
@@ -611,21 +655,10 @@ class TurboQuantKVRow:
         key_parts: list[torch.Tensor] = []
         value_parts: list[torch.Tensor] = []
         if self._quantized_keys is not None and self._quantized_values is not None and self.quantized_length > 0:
-            key_parts.append(
-                dequantize_turboquant_keys(
-                    self._quantized_keys,
-                    bits=self.bits,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-            )
-            value_parts.append(
-                dequantize_turboquant_values(
-                    self._quantized_values,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-            )
+            quantized_keys, quantized_values = self._materialize_quantized_prefix()
+            if quantized_keys is not None and quantized_values is not None:
+                key_parts.append(quantized_keys)
+                value_parts.append(quantized_values)
         if self._residual_keys is not None and self._residual_values is not None and self._residual_keys.numel() > 0:
             key_parts.append(self._residual_keys)
             value_parts.append(self._residual_values)
@@ -673,18 +706,17 @@ class TurboQuantKVRow:
         score_parts: list[torch.Tensor] = []
         quantized_len = self.quantized_length
         residual_len = self.residual_length
+        quantized_keys = None
+        quantized_values = None
 
         if self._quantized_keys is not None and self._quantized_values is not None and quantized_len > 0:
-            score_parts.append(
-                turboquant_key_attention_scores(
-                    query=query,
-                    state=self._quantized_keys,
-                    bits=self.bits,
-                    device=self.device,
-                    num_key_value_groups=num_key_value_groups,
-                    scaling=scaling,
-                )
-            )
+            quantized_keys, quantized_values = self._materialize_quantized_prefix()
+            if quantized_keys is not None:
+                quantized_scores = torch.matmul(
+                    grouped_query,
+                    quantized_keys.float().unsqueeze(1).transpose(-1, -2),
+                ) * scaling
+                score_parts.append(quantized_scores)
         if self._residual_keys is not None and self._residual_values is not None and residual_len > 0:
             residual_scores = torch.matmul(
                 grouped_query,
@@ -699,15 +731,10 @@ class TurboQuantKVRow:
         attn_probs = torch.softmax(attn_scores.float(), dim=-1)
         attn_output = query.new_zeros(grouped_shape)
         offset = 0
-        if self._quantized_values is not None and quantized_len > 0:
-            quantized_values = dequantize_turboquant_values(
-                self._quantized_values,
-                device=self.device,
-                dtype=self.dtype,
-            ).float()
+        if quantized_values is not None and quantized_len > 0:
             attn_output = attn_output + torch.matmul(
                 attn_probs[..., offset : offset + quantized_len],
-                quantized_values.unsqueeze(1),
+                quantized_values.float().unsqueeze(1),
             ).to(dtype=query.dtype)
             offset += quantized_len
         if self._residual_values is not None and residual_len > 0:
@@ -731,6 +758,13 @@ class TurboQuantKVRow:
         cloned._quantized_values = _clone_value_state(self._quantized_values)
         cloned._residual_keys = None if self._residual_keys is None else self._residual_keys.clone()
         cloned._residual_values = None if self._residual_values is None else self._residual_values.clone()
+        cloned._decode_quantized_keys = (
+            None if self._decode_quantized_keys is None else self._decode_quantized_keys.clone()
+        )
+        cloned._decode_quantized_values = (
+            None if self._decode_quantized_values is None else self._decode_quantized_values.clone()
+        )
+        cloned._decode_quantized_length = self._decode_quantized_length
         cloned._length = self._length
         return cloned
 
@@ -744,6 +778,22 @@ class TurboQuantKVRow:
             return self
         self._quantized_keys = _move_key_state(self._quantized_keys, device=device, dtype=dtype)
         self._quantized_values = _move_value_state(self._quantized_values, device=device, dtype=dtype)
+        if self._decode_quantized_keys is not None:
+            kwargs: dict[str, object] = {}
+            if device is not None:
+                kwargs["device"] = device
+            if dtype is not None:
+                kwargs["dtype"] = dtype
+            if kwargs:
+                self._decode_quantized_keys = self._decode_quantized_keys.to(**kwargs)
+        if self._decode_quantized_values is not None:
+            kwargs = {}
+            if device is not None:
+                kwargs["device"] = device
+            if dtype is not None:
+                kwargs["dtype"] = dtype
+            if kwargs:
+                self._decode_quantized_values = self._decode_quantized_values.to(**kwargs)
         if self._residual_keys is not None:
             kwargs: dict[str, object] = {}
             if device is not None:
