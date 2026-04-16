@@ -460,12 +460,30 @@ class AnnaQwen3_5TextEngine:
             else device_context.device
         )
         try:
+            logger.info(
+                "Building Qwen3.5 runtime: model_dir=%s compute_device=%s load_device=%s offload=%s expert_quant=%s weight_quant=%s resident_expert_layers=%s cached_experts_per_layer=%s kv_cache=%s",
+                model_path,
+                device_context.device,
+                model_device,
+                resolved_offload_mode,
+                resolved_expert_quant,
+                resolved_weight_quant,
+                0 if resolved_resident_expert_layer_indices is None else len(resolved_resident_expert_layer_indices),
+                resolved_cached_experts_per_layer,
+                resolved_kv_cache_quantization,
+            )
             model, model_quantized_replacements = build_qwen3_5_text_model(
                 config,
                 device=model_device,
                 dtype=device_context.dtype,
             )
             report = load_qwen3_5_text_model_weights(model, model_path)
+            logger.info(
+                "Finished loading Qwen3.5 weights: tensors_loaded=%s tensors_skipped=%s quantized_placeholders=%s",
+                report.loaded,
+                report.skipped,
+                model_quantized_replacements,
+            )
             runtime_weight_quantized_replacements = 0
             if resolved_weight_quant == "int4":
                 runtime_weight_quantized_replacements = cls._apply_runtime_weight_quantization(
@@ -480,6 +498,14 @@ class AnnaQwen3_5TextEngine:
             initial_resident_expert_layer_indices = () if auto_resident_indices else resolved_resident_expert_layer_indices
             initial_cached_experts_per_layer = 0 if auto_cached_experts_per_layer else resolved_cached_experts_per_layer
 
+            logger.info(
+                "Configuring Qwen3.5 runtime placement on %s: offload_experts=%s offload_vision=%s resident_expert_indices=%s cached_experts_per_layer=%s",
+                device_context.device,
+                resolved_offload_mode == "experts",
+                resolved_offload_vision,
+                list(initial_resident_expert_layer_indices),
+                initial_cached_experts_per_layer,
+            )
             model.configure_runtime(
                 device_context.device,
                 offload_experts=resolved_offload_mode == "experts",
@@ -493,6 +519,7 @@ class AnnaQwen3_5TextEngine:
                 kv_cache_quant_bits=kv_cache_quant_bits,
                 kv_cache_residual_len=kv_cache_residual_len,
             )
+            logger.info("Preparing loaded quantized Qwen3.5 modules for XPU execution.")
             cls._prepare_loaded_quantized_modules_for_execution(
                 model=model,
                 config=config,

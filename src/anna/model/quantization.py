@@ -14,6 +14,7 @@ _INT4_VALUES_PER_PACK = 8
 _AUTO_ROUND_QUANT_METHODS = frozenset({"auto-round", "auto_round"})
 _AUTO_ROUND_PACKING_FORMATS = frozenset({"auto_round:auto_gptq"})
 _FLOAT_OVERRIDE_DATA_TYPES = frozenset({"fp", "float", "float16", "fp16", "bfloat16", "bf16"})
+_REGEX_META_CHARS = frozenset("\\[](){}?*+^$|")
 
 
 def _empty_parameter(
@@ -412,6 +413,15 @@ class QuantizedModuleSpec:
     quant_method: str
 
 
+@dataclass(slots=True)
+class _QuantizationLookup:
+    excluded_prefixes: tuple[str, ...]
+    exact_overrides: dict[str, dict[str, object]]
+    normalized_candidate_overrides: dict[str, dict[str, object]]
+    regex_overrides: tuple[tuple[re.Pattern[str], re.Pattern[str] | None, dict[str, object]], ...]
+    block_names: tuple[str, ...]
+
+
 def _normalize_exclusion(module_name: str) -> str:
     for prefix in ("model.language_model.", "model.visual.", "model."):
         if module_name.startswith(prefix):
@@ -419,42 +429,69 @@ def _normalize_exclusion(module_name: str) -> str:
     return module_name
 
 
-def _module_override_config(module_name: str, quantization_config: QuantizationConfig) -> dict[str, object] | None:
-    if not quantization_config.extra_config:
-        return None
+def _looks_like_regex(pattern: str) -> bool:
+    return any(char in _REGEX_META_CHARS for char in pattern)
 
-    exact_match = quantization_config.extra_config.get(module_name)
+
+def _build_quantization_lookup(quantization_config: QuantizationConfig) -> _QuantizationLookup:
+    exact_overrides: dict[str, dict[str, object]] = {}
+    normalized_candidate_overrides: dict[str, dict[str, object]] = {}
+    regex_overrides: list[tuple[re.Pattern[str], re.Pattern[str] | None, dict[str, object]]] = []
+
+    for pattern, override in quantization_config.extra_config.items():
+        exact_overrides[pattern] = override
+        normalized_candidate_overrides.setdefault(_normalize_exclusion(pattern), override)
+        if not _looks_like_regex(pattern):
+            continue
+
+        candidate = _normalize_exclusion(pattern)
+        try:
+            compiled_pattern = re.compile(pattern)
+            compiled_candidate = None if candidate == pattern else re.compile(candidate)
+        except re.error as exc:
+            raise ValueError(f"Invalid quantization extra_config regex {pattern!r}: {exc}") from exc
+        regex_overrides.append((compiled_pattern, compiled_candidate, override))
+
+    return _QuantizationLookup(
+        excluded_prefixes=tuple(_normalize_exclusion(candidate) for candidate in quantization_config.modules_to_not_convert),
+        exact_overrides=exact_overrides,
+        normalized_candidate_overrides=normalized_candidate_overrides,
+        regex_overrides=tuple(regex_overrides),
+        block_names=tuple(name for name in quantization_config.block_name_to_quantize if name),
+    )
+
+
+def _module_override_config_fast(
+    module_name: str,
+    normalized_name: str,
+    lookup: _QuantizationLookup,
+) -> dict[str, object] | None:
+    exact_match = lookup.exact_overrides.get(module_name)
     if exact_match is not None:
         return exact_match
 
-    normalized = _normalize_exclusion(module_name)
-    normalized_match = quantization_config.extra_config.get(normalized)
+    normalized_match = lookup.normalized_candidate_overrides.get(normalized_name)
     if normalized_match is not None:
         return normalized_match
 
-    for pattern, override in quantization_config.extra_config.items():
-        candidate = pattern
-        for prefix in ("model.language_model.", "model.visual.", "model."):
-            if candidate.startswith(prefix):
-                candidate = candidate[len(prefix) :]
-                break
-        try:
-            if re.fullmatch(pattern, module_name) or re.fullmatch(candidate, normalized):
-                return override
-        except re.error as exc:
-            raise ValueError(f"Invalid quantization extra_config regex {pattern!r}: {exc}") from exc
+    for compiled_pattern, compiled_candidate, override in lookup.regex_overrides:
+        if compiled_pattern.fullmatch(module_name):
+            return override
+        if compiled_candidate is not None and compiled_candidate.fullmatch(normalized_name):
+            return override
     return None
 
 
-def _should_skip(module_name: str, quantization_config: QuantizationConfig) -> bool:
-    if quantization_config.modules_to_not_convert:
-        normalized = _normalize_exclusion(module_name)
-        for candidate in quantization_config.modules_to_not_convert:
-            candidate = _normalize_exclusion(candidate)
-            if normalized == candidate or normalized.startswith(candidate + "."):
-                return True
+def _should_skip_fast(
+    module_name: str,
+    normalized_name: str,
+    lookup: _QuantizationLookup,
+) -> bool:
+    for candidate in lookup.excluded_prefixes:
+        if normalized_name == candidate or normalized_name.startswith(candidate + "."):
+            return True
 
-    override = _module_override_config(module_name, quantization_config)
+    override = _module_override_config_fast(module_name, normalized_name, lookup)
     if override is None:
         return False
 
@@ -468,11 +505,29 @@ def _should_skip(module_name: str, quantization_config: QuantizationConfig) -> b
     return False
 
 
-def _should_quantize_autoround_module(module_name: str, quantization_config: QuantizationConfig) -> bool:
-    block_names = tuple(name for name in quantization_config.block_name_to_quantize if name)
+def _should_quantize_autoround_module_fast(module_name: str, block_names: tuple[str, ...]) -> bool:
     if not block_names:
         raise ValueError("AutoRound quantization_config is missing block_name_to_quantize.")
     return any(module_name == block_name or module_name.startswith(block_name + ".") for block_name in block_names)
+
+
+def _module_override_config(module_name: str, quantization_config: QuantizationConfig) -> dict[str, object] | None:
+    if not quantization_config.extra_config:
+        return None
+    normalized = _normalize_exclusion(module_name)
+    return _module_override_config_fast(module_name, normalized, _build_quantization_lookup(quantization_config))
+
+
+def _should_skip(module_name: str, quantization_config: QuantizationConfig) -> bool:
+    normalized = _normalize_exclusion(module_name)
+    return _should_skip_fast(module_name, normalized, _build_quantization_lookup(quantization_config))
+
+
+def _should_quantize_autoround_module(module_name: str, quantization_config: QuantizationConfig) -> bool:
+    return _should_quantize_autoround_module_fast(
+        module_name,
+        tuple(name for name in quantization_config.block_name_to_quantize if name),
+    )
 
 
 def _set_submodule(model: nn.Module, module_name: str, replacement: nn.Module) -> None:
@@ -611,12 +666,14 @@ def replace_linear_modules(
         if data_type not in {"int", "int4"}:
             raise ValueError(f"Unsupported AutoRound data_type: {quantization_config.data_type!r}.")
 
+    lookup = _build_quantization_lookup(quantization_config)
     for module_name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             continue
-        if _should_skip(module_name, quantization_config):
+        normalized_name = _normalize_exclusion(module_name)
+        if _should_skip_fast(module_name, normalized_name, lookup):
             continue
-        if quant_method in _AUTO_ROUND_QUANT_METHODS and not _should_quantize_autoround_module(module_name, quantization_config):
+        if quant_method in _AUTO_ROUND_QUANT_METHODS and not _should_quantize_autoround_module_fast(module_name, lookup.block_names):
             continue
         module_device = module.weight.device
 
