@@ -1873,6 +1873,61 @@ class Qwen3SparseMoeBlock(nn.Module):
         self._expert_cache[expert_idx] = cached
         return cached
 
+    def _prepare_cached_experts(self, required_expert_indices: list[int]) -> dict[int, Qwen3MLP]:
+        if (
+            not self.offload_experts
+            or self.execution_device is None
+            or self.cached_experts_per_layer <= 0
+            or not required_expert_indices
+        ):
+            return {}
+
+        started_at = time.perf_counter()
+        prepared: dict[int, Qwen3MLP] = {}
+        protected = {int(expert_idx) for expert_idx in required_expert_indices}
+        cache_hits = 0
+        staged = 0
+        for expert_idx in required_expert_indices:
+            cached = self._expert_cache.get(expert_idx)
+            if cached is None:
+                continue
+            self._expert_cache.move_to_end(expert_idx)
+            prepared[expert_idx] = cached
+            cache_hits += 1
+
+        missing = [expert_idx for expert_idx in required_expert_indices if expert_idx not in prepared]
+        if missing:
+            free_slots = max(0, self.cached_experts_per_layer - len(self._expert_cache))
+            evictions_needed = max(0, len(missing) - free_slots)
+            if evictions_needed > 0:
+                eviction_candidates = [expert_idx for expert_idx in self._expert_cache.keys() if expert_idx not in protected]
+                if len(eviction_candidates) < evictions_needed:
+                    evictions_needed = len(eviction_candidates)
+                for expert_idx in eviction_candidates[:evictions_needed]:
+                    self._expert_cache.pop(expert_idx, None)
+
+            for expert_idx in missing:
+                if len(self._expert_cache) >= self.cached_experts_per_layer:
+                    break
+                cached = self._materialize_cached_expert(expert_idx)
+                self._expert_cache[expert_idx] = cached
+                prepared[expert_idx] = cached
+                staged += 1
+
+        if self.profile_runtime and self.execution_device.type == "xpu" and hasattr(torch, "xpu"):
+            torch.xpu.synchronize()
+            logger.info(
+                "MoE expert cache prepared: requested=%s hits=%s staged=%s unresolved=%s cache_size=%s capacity=%s elapsed=%.4f",
+                len(required_expert_indices),
+                cache_hits,
+                staged,
+                max(0, len(required_expert_indices) - len(prepared)),
+                len(self._expert_cache),
+                self.cached_experts_per_layer,
+                time.perf_counter() - started_at,
+            )
+        return prepared
+
     def _route_tokens(
         self,
         router_logits: torch.Tensor,
@@ -1939,11 +1994,14 @@ class Qwen3SparseMoeBlock(nn.Module):
         usage = usage.to(device=selected_experts.device)
         hit_experts = usage.nonzero(as_tuple=False).flatten()
         gpu_candidates: set[int] = set()
+        prepared_gpu_experts: dict[int, Qwen3MLP] = {}
         if self.offload_experts and self.execution_device is not None and hit_experts.numel() > 0:
             gpu_count = min(int(hit_experts.numel()), self.cached_experts_per_layer)
             if gpu_count > 0:
                 _, candidate_idx = torch.topk(usage, k=gpu_count)
-                gpu_candidates = {int(idx) for idx in candidate_idx.tolist() if int(usage[idx].item()) > 0}
+                gpu_candidate_list = [int(idx) for idx in candidate_idx.tolist() if int(usage[idx].item()) > 0]
+                gpu_candidates = set(gpu_candidate_list)
+                prepared_gpu_experts = self._prepare_cached_experts(gpu_candidate_list)
 
         sorted_token_idx, sorted_route_idx, expert_offsets = self._sorted_routing_assignments(selected_experts, usage)
         compact_hidden_states, compact_routing_weights = self._compact_routing_inputs(
@@ -1956,7 +2014,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         for expert_idx in hit_experts.tolist():
             expert_layer = self.experts[expert_idx]
             if expert_idx in gpu_candidates:
-                cached = self._get_cached_expert(expert_idx)
+                cached = prepared_gpu_experts.get(expert_idx)
                 if cached is not None:
                     expert_layer = cached
             start_idx = int(expert_offsets[expert_idx].item())
