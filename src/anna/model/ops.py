@@ -1745,7 +1745,11 @@ class Qwen3SparseMoeBlock(nn.Module):
             expert_device = execution_device if resident_experts or not offload_experts else torch.device("cpu")
             for expert in self.experts:
                 expert.to(expert_device)
-                if self.offload_experts and expert_device.type == "cpu":
+                if (
+                    self.offload_experts
+                    and expert_device.type == "cpu"
+                    and not self._has_quantized_linear_payload(expert)
+                ):
                     self.host_experts_pinned = self._pin_module_host_memory(expert) or self.host_experts_pinned
 
     def _should_use_xpu_int4(self) -> bool:
