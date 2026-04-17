@@ -124,6 +124,29 @@ inline float load_as_float(const scalar_t* ptr, int64_t idx) {
   return static_cast<float>(ptr[idx]);
 }
 
+inline float load_grouped_int4_weight(
+    const int32_t* qweight_ptr,
+    const float* qscale_ptr,
+    const int8_t* qzeros_ptr,
+    int64_t bank_slot,
+    int64_t out_idx,
+    int64_t in_idx,
+    int64_t out_features,
+    int64_t packed_cols,
+    int64_t group_count,
+    int64_t group_size) {
+  const int64_t packed_idx = in_idx >> 3;
+  const int64_t shift = (in_idx & 7) << 2;
+  const int64_t qweight_offset = (bank_slot * out_features + out_idx) * packed_cols + packed_idx;
+  const uint32_t packed = static_cast<uint32_t>(qweight_ptr[qweight_offset]);
+  const int32_t qvalue = static_cast<int32_t>((packed >> shift) & 0xFu);
+  int64_t group_idx = in_idx / group_size;
+  group_idx = sycl::min<int64_t>(group_idx, group_count - 1);
+  const int64_t scale_offset = (bank_slot * group_count + group_idx) * out_features + out_idx;
+  const int32_t zero_point = static_cast<int32_t>(qzeros_ptr[scale_offset]);
+  return (static_cast<float>(qvalue - zero_point)) * qscale_ptr[scale_offset];
+}
+
 template <typename scalar_t, typename PartialAccessor, typename VectorAccessor>
 inline void normalize_gated_delta_qk(
     const scalar_t* query_ptr,
@@ -280,6 +303,23 @@ void validate_rmsnorm_xpu_inputs(
   TORCH_CHECK(weight.device() == device, "weight must be on the same device as input");
 }
 
+void validate_rmsnorm_gated_inputs(
+    const at::Tensor& input,
+    const at::Tensor& gate,
+    const at::Tensor& weight) {
+  validate_rmsnorm_inputs(input, weight);
+  TORCH_CHECK(gate.sizes() == input.sizes(), "gate shape must match input shape");
+  TORCH_CHECK(gate.scalar_type() == input.scalar_type(), "gate dtype must match input dtype");
+}
+
+void validate_rmsnorm_gated_xpu_inputs(
+    const at::Tensor& input,
+    const at::Tensor& gate,
+    const at::Tensor& weight) {
+  validate_rmsnorm_xpu_inputs(input, weight);
+  TORCH_CHECK(gate.device() == input.device(), "gate must be on the same device as input");
+}
+
 void validate_qk_norm_rotary_inputs(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -348,6 +388,196 @@ void validate_moe_router_inputs(
 void validate_moe_router_xpu_inputs(const at::Tensor& router_logits) {
   auto device = router_logits.device();
   TORCH_CHECK(device.type() == c10::DeviceType::XPU, "router_logits must be an XPU tensor");
+}
+
+void validate_moe_dispatch_inputs(
+    const at::Tensor& hidden_states,
+    const at::Tensor& routing_weights,
+    const at::Tensor& selected_experts,
+    const at::Tensor& expert_usage) {
+  TORCH_CHECK(hidden_states.dim() == 2, "hidden_states must be [tokens, hidden_dim]");
+  TORCH_CHECK(routing_weights.dim() == 2, "routing_weights must be [tokens, top_k]");
+  TORCH_CHECK(selected_experts.sizes() == routing_weights.sizes(), "selected_experts shape must match routing_weights");
+  TORCH_CHECK(expert_usage.dim() == 1, "expert_usage must be [num_experts]");
+  TORCH_CHECK(hidden_states.size(0) == routing_weights.size(0), "hidden_states/routing_weights token count mismatch");
+  TORCH_CHECK(hidden_states.size(1) > 0, "hidden_dim must be positive");
+  TORCH_CHECK(routing_weights.size(1) > 0, "top_k must be positive");
+  TORCH_CHECK(expert_usage.size(0) > 0, "num_experts must be positive");
+  TORCH_CHECK(selected_experts.scalar_type() == at::kLong, "selected_experts must be int64");
+  TORCH_CHECK(
+      expert_usage.scalar_type() == at::kInt || expert_usage.scalar_type() == at::kLong,
+      "expert_usage must be int32 or int64");
+  TORCH_CHECK(at::isFloatingType(hidden_states.scalar_type()), "hidden_states must be floating-point");
+  TORCH_CHECK(hidden_states.scalar_type() == routing_weights.scalar_type(), "routing_weights dtype must match hidden_states");
+  TORCH_CHECK(
+      hidden_states.scalar_type() == at::kHalf || hidden_states.scalar_type() == at::kBFloat16 ||
+          hidden_states.scalar_type() == at::kFloat,
+      "moe_dispatch_fused XPU kernel supports float16, bfloat16, and float32 hidden states");
+}
+
+void validate_moe_dispatch_xpu_inputs(
+    const at::Tensor& hidden_states,
+    const at::Tensor& routing_weights,
+    const at::Tensor& selected_experts,
+    const at::Tensor& expert_usage) {
+  auto device = hidden_states.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "hidden_states must be an XPU tensor");
+  TORCH_CHECK(routing_weights.device() == device, "routing_weights must be on the same device as hidden_states");
+  TORCH_CHECK(selected_experts.device() == device, "selected_experts must be on the same device as hidden_states");
+  TORCH_CHECK(expert_usage.device() == device, "expert_usage must be on the same device as hidden_states");
+}
+
+void validate_moe_scatter_inputs(
+    const at::Tensor& compact_outputs,
+    const at::Tensor& sorted_token_idx,
+    int64_t num_tokens) {
+  TORCH_CHECK(compact_outputs.dim() == 2, "compact_outputs must be [routes, hidden_dim]");
+  TORCH_CHECK(sorted_token_idx.dim() == 1, "sorted_token_idx must be [routes]");
+  TORCH_CHECK(sorted_token_idx.size(0) == compact_outputs.size(0), "sorted_token_idx route count mismatch");
+  TORCH_CHECK(num_tokens >= 0, "num_tokens must be non-negative");
+  TORCH_CHECK(compact_outputs.size(1) > 0, "hidden_dim must be positive");
+  TORCH_CHECK(sorted_token_idx.scalar_type() == at::kLong, "sorted_token_idx must be int64");
+  TORCH_CHECK(at::isFloatingType(compact_outputs.scalar_type()), "compact_outputs must be floating-point");
+  TORCH_CHECK(
+      compact_outputs.scalar_type() == at::kHalf || compact_outputs.scalar_type() == at::kBFloat16 ||
+          compact_outputs.scalar_type() == at::kFloat,
+      "moe_scatter_fused XPU kernel supports float16, bfloat16, and float32 compact outputs");
+}
+
+void validate_moe_scatter_xpu_inputs(
+    const at::Tensor& compact_outputs,
+    const at::Tensor& sorted_token_idx) {
+  auto device = compact_outputs.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "compact_outputs must be an XPU tensor");
+  TORCH_CHECK(sorted_token_idx.device() == device, "sorted_token_idx must be on the same device as compact_outputs");
+}
+
+void validate_int4_expert_bank_tensor(
+    const at::Tensor& tensor,
+    const char* name,
+    int64_t rank,
+    at::ScalarType scalar_type,
+    int64_t active_capacity) {
+  TORCH_CHECK(tensor.dim() == rank, name, " must have rank ", rank);
+  TORCH_CHECK(tensor.scalar_type() == scalar_type, name, " has an unexpected dtype");
+  TORCH_CHECK(tensor.size(0) == active_capacity, name, " bank capacity mismatch");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void validate_moe_grouped_int4_mlp_inputs(
+    const at::Tensor& compact_hidden_states,
+    const at::Tensor& compact_routing_weights,
+    const at::Tensor& compact_outputs,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& active_experts,
+    const at::Tensor& active_slots,
+    const at::Tensor& gate_qweight,
+    const at::Tensor& gate_qscale,
+    const at::Tensor& gate_qzeros,
+    const at::Tensor& up_qweight,
+    const at::Tensor& up_qscale,
+    const at::Tensor& up_qzeros,
+    const at::Tensor& down_qweight,
+    const at::Tensor& down_qscale,
+    const at::Tensor& down_qzeros,
+    int64_t group_size,
+    int64_t max_routes_per_expert) {
+  TORCH_CHECK(compact_hidden_states.dim() == 2, "compact_hidden_states must be [routes, hidden_dim]");
+  TORCH_CHECK(compact_routing_weights.dim() == 2, "compact_routing_weights must be [routes, 1]");
+  TORCH_CHECK(compact_outputs.dim() == 2, "compact_outputs must be [routes, hidden_dim]");
+  TORCH_CHECK(compact_routing_weights.size(0) == compact_hidden_states.size(0), "routing route count mismatch");
+  TORCH_CHECK(compact_routing_weights.size(1) == 1, "compact_routing_weights must have trailing dimension 1");
+  TORCH_CHECK(compact_outputs.sizes() == compact_hidden_states.sizes(), "compact_outputs shape must match compact_hidden_states");
+  TORCH_CHECK(compact_outputs.is_contiguous(), "compact_outputs must be contiguous");
+  TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be [num_experts + 1]");
+  TORCH_CHECK(expert_offsets.size(0) >= 2, "expert_offsets must contain at least two entries");
+  TORCH_CHECK(active_experts.dim() == 1, "active_experts must be [active_count]");
+  TORCH_CHECK(active_slots.dim() == 1, "active_slots must be [active_count]");
+  TORCH_CHECK(active_experts.size(0) == active_slots.size(0), "active_experts/active_slots count mismatch");
+  TORCH_CHECK(active_experts.size(0) > 0, "active expert count must be positive");
+  TORCH_CHECK(compact_hidden_states.size(1) > 0, "hidden_dim must be positive");
+  TORCH_CHECK(group_size > 0 && group_size % 32 == 0, "group_size must be a positive multiple of 32");
+  TORCH_CHECK(max_routes_per_expert > 0, "max_routes_per_expert must be positive");
+  TORCH_CHECK(expert_offsets.scalar_type() == at::kLong, "expert_offsets must be int64");
+  TORCH_CHECK(active_experts.scalar_type() == at::kLong, "active_experts must be int64");
+  TORCH_CHECK(active_slots.scalar_type() == at::kLong, "active_slots must be int64");
+  TORCH_CHECK(at::isFloatingType(compact_hidden_states.scalar_type()), "compact_hidden_states must be floating-point");
+  TORCH_CHECK(
+      compact_hidden_states.scalar_type() == at::kHalf || compact_hidden_states.scalar_type() == at::kBFloat16 ||
+          compact_hidden_states.scalar_type() == at::kFloat,
+      "moe_grouped_int4_mlp_fused XPU kernel supports float16, bfloat16, and float32 hidden states");
+  TORCH_CHECK(
+      compact_routing_weights.scalar_type() == compact_hidden_states.scalar_type(),
+      "compact_routing_weights dtype must match compact_hidden_states");
+  TORCH_CHECK(
+      compact_outputs.scalar_type() == compact_hidden_states.scalar_type(),
+      "compact_outputs dtype must match compact_hidden_states");
+
+  TORCH_CHECK(gate_qweight.dim() == 3, "gate_qweight must have rank 3");
+  TORCH_CHECK(gate_qweight.scalar_type() == at::kInt, "gate_qweight has an unexpected dtype");
+  TORCH_CHECK(gate_qweight.is_contiguous(), "gate_qweight must be contiguous");
+  const auto bank_capacity = gate_qweight.size(0);
+  validate_int4_expert_bank_tensor(gate_qscale, "gate_qscale", 3, at::kFloat, bank_capacity);
+  validate_int4_expert_bank_tensor(gate_qzeros, "gate_qzeros", 3, at::kChar, bank_capacity);
+  validate_int4_expert_bank_tensor(up_qweight, "up_qweight", 3, at::kInt, bank_capacity);
+  validate_int4_expert_bank_tensor(up_qscale, "up_qscale", 3, at::kFloat, bank_capacity);
+  validate_int4_expert_bank_tensor(up_qzeros, "up_qzeros", 3, at::kChar, bank_capacity);
+  validate_int4_expert_bank_tensor(down_qweight, "down_qweight", 3, at::kInt, bank_capacity);
+  validate_int4_expert_bank_tensor(down_qscale, "down_qscale", 3, at::kFloat, bank_capacity);
+  validate_int4_expert_bank_tensor(down_qzeros, "down_qzeros", 3, at::kChar, bank_capacity);
+
+  const auto hidden_dim = compact_hidden_states.size(1);
+  const auto intermediate_dim = gate_qweight.size(1);
+  TORCH_CHECK(bank_capacity > 0, "int4 expert bank capacity must be positive");
+  TORCH_CHECK(intermediate_dim > 0, "intermediate_dim must be positive");
+  TORCH_CHECK(gate_qweight.size(2) > 0, "gate_qweight packed columns must be positive");
+  TORCH_CHECK(down_qweight.size(2) > 0, "down_qweight packed columns must be positive");
+  TORCH_CHECK(gate_qweight.sizes() == up_qweight.sizes(), "gate/up qweight bank shape mismatch");
+  TORCH_CHECK(gate_qscale.sizes() == up_qscale.sizes(), "gate/up qscale bank shape mismatch");
+  TORCH_CHECK(gate_qzeros.sizes() == up_qzeros.sizes(), "gate/up qzeros bank shape mismatch");
+  TORCH_CHECK(gate_qscale.size(2) == intermediate_dim, "gate_qscale output dimension mismatch");
+  TORCH_CHECK(gate_qzeros.size(2) == intermediate_dim, "gate_qzeros output dimension mismatch");
+  TORCH_CHECK(down_qweight.size(1) == hidden_dim, "down_qweight output dimension must match hidden_dim");
+  TORCH_CHECK(down_qscale.size(2) == hidden_dim, "down_qscale output dimension mismatch");
+  TORCH_CHECK(down_qzeros.size(2) == hidden_dim, "down_qzeros output dimension mismatch");
+  TORCH_CHECK(gate_qweight.size(2) * 8 >= hidden_dim, "gate/up qweight packed width is smaller than hidden_dim");
+  TORCH_CHECK(down_qweight.size(2) * 8 >= intermediate_dim, "down_qweight packed width is smaller than intermediate_dim");
+  TORCH_CHECK(gate_qscale.size(1) * group_size >= hidden_dim, "gate/up qscale group count is smaller than hidden_dim");
+  TORCH_CHECK(down_qscale.size(1) * group_size >= intermediate_dim, "down_qscale group count is smaller than intermediate_dim");
+}
+
+void validate_moe_grouped_int4_mlp_xpu_inputs(
+    const at::Tensor& compact_hidden_states,
+    const at::Tensor& compact_routing_weights,
+    const at::Tensor& compact_outputs,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& active_experts,
+    const at::Tensor& active_slots,
+    const at::Tensor& gate_qweight,
+    const at::Tensor& gate_qscale,
+    const at::Tensor& gate_qzeros,
+    const at::Tensor& up_qweight,
+    const at::Tensor& up_qscale,
+    const at::Tensor& up_qzeros,
+    const at::Tensor& down_qweight,
+    const at::Tensor& down_qscale,
+    const at::Tensor& down_qzeros) {
+  auto device = compact_hidden_states.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "compact_hidden_states must be an XPU tensor");
+  TORCH_CHECK(compact_routing_weights.device() == device, "compact_routing_weights must be on the same device");
+  TORCH_CHECK(compact_outputs.device() == device, "compact_outputs must be on the same device");
+  TORCH_CHECK(expert_offsets.device() == device, "expert_offsets must be on the same device");
+  TORCH_CHECK(active_experts.device() == device, "active_experts must be on the same device");
+  TORCH_CHECK(active_slots.device() == device, "active_slots must be on the same device");
+  TORCH_CHECK(gate_qweight.device() == device, "gate_qweight must be on the same device");
+  TORCH_CHECK(gate_qscale.device() == device, "gate_qscale must be on the same device");
+  TORCH_CHECK(gate_qzeros.device() == device, "gate_qzeros must be on the same device");
+  TORCH_CHECK(up_qweight.device() == device, "up_qweight must be on the same device");
+  TORCH_CHECK(up_qscale.device() == device, "up_qscale must be on the same device");
+  TORCH_CHECK(up_qzeros.device() == device, "up_qzeros must be on the same device");
+  TORCH_CHECK(down_qweight.device() == device, "down_qweight must be on the same device");
+  TORCH_CHECK(down_qscale.device() == device, "down_qscale must be on the same device");
+  TORCH_CHECK(down_qzeros.device() == device, "down_qzeros must be on the same device");
 }
 
 void validate_gqa_decode_inputs(
@@ -733,6 +963,16 @@ at::Tensor rmsnorm_fused_ex_meta(
   return at::empty(input.sizes(), meta_options);
 }
 
+at::Tensor rmsnorm_gated_fused_meta(
+    const at::Tensor& input,
+    const at::Tensor& gate,
+    const at::Tensor& weight,
+    double /*eps*/) {
+  validate_rmsnorm_gated_inputs(input, gate, weight);
+  auto meta_options = input.options().device(c10::Device(c10::DeviceType::Meta));
+  return at::empty(input.sizes(), meta_options);
+}
+
 template <bool AddUnitOffset>
 at::Tensor rmsnorm_fused_xpu_impl(
     const at::Tensor& input_in,
@@ -795,6 +1035,80 @@ at::Tensor rmsnorm_fused_xpu_impl(
                   const float weight_value = AddUnitOffset ? (1.0f + weight_ptr[idx]) : weight_ptr[idx];
                   const float scaled = value * inv_rms * weight_value;
                   output_ptr[row_base + idx] = static_cast<scalar_t>(scaled);
+                }
+              });
+        });
+      });
+
+  return output;
+}
+
+at::Tensor rmsnorm_gated_fused_xpu(
+    const at::Tensor& input_in,
+    const at::Tensor& gate_in,
+    const at::Tensor& weight_in,
+    double eps) {
+  validate_rmsnorm_gated_inputs(input_in, gate_in, weight_in);
+  validate_rmsnorm_gated_xpu_inputs(input_in, gate_in, weight_in);
+
+  auto input = input_in.contiguous();
+  auto gate = gate_in.contiguous();
+  auto weight = weight_in.to(at::kFloat).contiguous();
+  auto output = at::empty(input.sizes(), input.options());
+
+  const auto hidden_size = input.size(-1);
+  const auto row_count = input.numel() / hidden_size;
+  const int64_t local_size =
+      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(hidden_size, 256))), 256);
+  const float eps_f = static_cast<float>(eps);
+  auto stream = c10::xpu::getCurrentXPUStream(input.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      input.scalar_type(),
+      "rmsnorm_gated_fused_xpu",
+      [&] {
+        const scalar_t* input_ptr = input.const_data_ptr<scalar_t>();
+        const scalar_t* gate_ptr = gate.const_data_ptr<scalar_t>();
+        const float* weight_ptr = weight.const_data_ptr<float>();
+        scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
+
+        stream.queue().submit([&](sycl::handler& cgh) {
+          sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
+          cgh.parallel_for(
+              sycl::nd_range<2>(
+                  sycl::range<2>(static_cast<size_t>(row_count), static_cast<size_t>(local_size)),
+                  sycl::range<2>(1, static_cast<size_t>(local_size))),
+              [=](sycl::nd_item<2> item) {
+                const int64_t row = static_cast<int64_t>(item.get_group(0));
+                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+                const int64_t row_base = row * hidden_size;
+
+                float local_sum_sq = 0.0f;
+                for (int64_t idx = lane; idx < hidden_size; idx += local_size) {
+                  const float value = load_as_float(input_ptr, row_base + idx);
+                  local_sum_sq += value * value;
+                }
+
+                partial_sum[lane] = local_sum_sq;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
+                  if (lane < stride) {
+                    partial_sum[lane] += partial_sum[lane + stride];
+                  }
+                  item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                const float inv_rms = sycl::rsqrt(partial_sum[0] / static_cast<float>(hidden_size) + eps_f);
+                for (int64_t idx = lane; idx < hidden_size; idx += local_size) {
+                  const int64_t offset = row_base + idx;
+                  const float value = load_as_float(input_ptr, offset);
+                  const float gate_value = load_as_float(gate_ptr, offset);
+                  const float silu_gate = gate_value / (1.0f + sycl::exp(-gate_value));
+                  const float scaled = value * inv_rms * weight_ptr[idx] * silu_gate;
+                  output_ptr[offset] = static_cast<scalar_t>(scaled);
                 }
               });
         });
@@ -1170,6 +1484,503 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_router_fused_xpu(
       });
 
   return {routing_weights, selected_experts, expert_usage};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_dispatch_fused_meta(
+    const at::Tensor& hidden_states,
+    const at::Tensor& routing_weights,
+    const at::Tensor& selected_experts,
+    const at::Tensor& expert_usage) {
+  validate_moe_dispatch_inputs(hidden_states, routing_weights, selected_experts, expert_usage);
+  const auto total_routes = routing_weights.numel();
+  auto index_options = selected_experts.options().device(c10::Device(c10::DeviceType::Meta)).dtype(at::kLong);
+  auto hidden_options = hidden_states.options().device(c10::Device(c10::DeviceType::Meta));
+  return {
+      at::empty({total_routes}, index_options),
+      at::empty({expert_usage.size(0) + 1}, index_options),
+      at::empty({total_routes, hidden_states.size(1)}, hidden_options),
+      at::empty({total_routes, 1}, hidden_options),
+  };
+}
+
+at::Tensor moe_scatter_fused_meta(
+    const at::Tensor& compact_outputs,
+    const at::Tensor& sorted_token_idx,
+    int64_t num_tokens) {
+  validate_moe_scatter_inputs(compact_outputs, sorted_token_idx, num_tokens);
+  auto meta_options = compact_outputs.options().device(c10::Device(c10::DeviceType::Meta));
+  return at::empty({num_tokens, compact_outputs.size(1)}, meta_options);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_dispatch_fused_xpu(
+    const at::Tensor& hidden_states_in,
+    const at::Tensor& routing_weights_in,
+    const at::Tensor& selected_experts_in,
+    const at::Tensor& expert_usage_in) {
+  validate_moe_dispatch_inputs(hidden_states_in, routing_weights_in, selected_experts_in, expert_usage_in);
+  validate_moe_dispatch_xpu_inputs(hidden_states_in, routing_weights_in, selected_experts_in, expert_usage_in);
+
+  auto hidden_states = hidden_states_in.contiguous();
+  auto routing_weights = routing_weights_in.contiguous();
+  auto selected_experts = selected_experts_in.contiguous();
+  auto expert_usage = expert_usage_in.contiguous();
+
+  const auto tokens = hidden_states.size(0);
+  const auto hidden_dim = hidden_states.size(1);
+  const auto top_k = routing_weights.size(1);
+  const auto num_experts = expert_usage.size(0);
+  const auto total_routes = tokens * top_k;
+  const int64_t local_size =
+      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(hidden_dim, 256))), 256);
+
+  auto index_options = selected_experts.options().dtype(at::kLong);
+  auto sorted_token_idx = at::empty({total_routes}, index_options);
+  auto expert_offsets = at::empty({num_experts + 1}, index_options);
+  auto route_counters = at::zeros({num_experts}, index_options);
+  auto compact_hidden_states = at::empty({total_routes, hidden_dim}, hidden_states.options());
+  auto compact_routing_weights = at::empty({total_routes, 1}, hidden_states.options());
+  auto stream = c10::xpu::getCurrentXPUStream(hidden_states.device().index());
+
+  AT_DISPATCH_INTEGRAL_TYPES(
+      expert_usage.scalar_type(),
+      "moe_dispatch_offsets_xpu",
+      [&] {
+        const scalar_t* usage_ptr = expert_usage.const_data_ptr<scalar_t>();
+        int64_t* offsets_ptr = expert_offsets.mutable_data_ptr<int64_t>();
+        stream.queue().submit([&](sycl::handler& cgh) {
+          cgh.single_task([=]() {
+            int64_t running_offset = 0;
+            offsets_ptr[0] = 0;
+            for (int64_t expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+              running_offset += static_cast<int64_t>(usage_ptr[expert_idx]);
+              offsets_ptr[expert_idx + 1] = running_offset;
+            }
+          });
+        });
+      });
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      hidden_states.scalar_type(),
+      "moe_dispatch_fused_xpu",
+      [&] {
+        const scalar_t* hidden_ptr = hidden_states.const_data_ptr<scalar_t>();
+        const scalar_t* routing_ptr = routing_weights.const_data_ptr<scalar_t>();
+        const int64_t* selected_ptr = selected_experts.const_data_ptr<int64_t>();
+        const int64_t* offsets_ptr = expert_offsets.const_data_ptr<int64_t>();
+        int64_t* counters_ptr = route_counters.mutable_data_ptr<int64_t>();
+        int64_t* sorted_token_ptr = sorted_token_idx.mutable_data_ptr<int64_t>();
+        scalar_t* compact_hidden_ptr = compact_hidden_states.mutable_data_ptr<scalar_t>();
+        scalar_t* compact_weight_ptr = compact_routing_weights.mutable_data_ptr<scalar_t>();
+        const size_t route_count = static_cast<size_t>(total_routes);
+
+        stream.queue().submit([&](sycl::handler& cgh) {
+          sycl::local_accessor<int64_t, 1> route_position(sycl::range<1>(1), cgh);
+          cgh.parallel_for(
+              sycl::nd_range<2>(
+                  sycl::range<2>(route_count, static_cast<size_t>(local_size)),
+                  sycl::range<2>(1, static_cast<size_t>(local_size))),
+              [=](sycl::nd_item<2> item) {
+                const int64_t route_linear = static_cast<int64_t>(item.get_group(0));
+                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+                const int64_t token_idx = route_linear / top_k;
+                const int64_t route_idx = route_linear - token_idx * top_k;
+                const int64_t expert_idx = selected_ptr[route_linear];
+
+                if (lane == 0) {
+                  auto counter_ref = sycl::atomic_ref<
+                      int64_t,
+                      sycl::memory_order::relaxed,
+                      sycl::memory_scope::device,
+                      sycl::access::address_space::global_space>(counters_ptr[expert_idx]);
+                  route_position[0] = offsets_ptr[expert_idx] + counter_ref.fetch_add(1);
+                  sorted_token_ptr[route_position[0]] = token_idx;
+                  compact_weight_ptr[route_position[0]] = routing_ptr[token_idx * top_k + route_idx];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                const int64_t output_base = route_position[0] * hidden_dim;
+                const int64_t input_base = token_idx * hidden_dim;
+                for (int64_t dim_idx = lane; dim_idx < hidden_dim; dim_idx += local_size) {
+                  compact_hidden_ptr[output_base + dim_idx] = hidden_ptr[input_base + dim_idx];
+                }
+              });
+        });
+      });
+
+  return {sorted_token_idx, expert_offsets, compact_hidden_states, compact_routing_weights};
+}
+
+at::Tensor moe_scatter_fused_xpu(
+    const at::Tensor& compact_outputs_in,
+    const at::Tensor& sorted_token_idx_in,
+    int64_t num_tokens) {
+  validate_moe_scatter_inputs(compact_outputs_in, sorted_token_idx_in, num_tokens);
+  validate_moe_scatter_xpu_inputs(compact_outputs_in, sorted_token_idx_in);
+
+  auto compact_outputs = compact_outputs_in.contiguous();
+  auto sorted_token_idx = sorted_token_idx_in.contiguous();
+  const auto routes = compact_outputs.size(0);
+  const auto hidden_dim = compact_outputs.size(1);
+  const int64_t local_size =
+      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(hidden_dim, 256))), 256);
+
+  auto accum = at::zeros({num_tokens, hidden_dim}, compact_outputs.options().dtype(at::kFloat));
+  auto output = at::empty({num_tokens, hidden_dim}, compact_outputs.options());
+  auto stream = c10::xpu::getCurrentXPUStream(compact_outputs.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      compact_outputs.scalar_type(),
+      "moe_scatter_fused_xpu",
+      [&] {
+        const scalar_t* compact_ptr = compact_outputs.const_data_ptr<scalar_t>();
+        const int64_t* token_ptr = sorted_token_idx.const_data_ptr<int64_t>();
+        float* accum_ptr = accum.mutable_data_ptr<float>();
+        scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
+        const size_t route_count = static_cast<size_t>(routes);
+        const size_t output_rows = static_cast<size_t>(num_tokens);
+
+        stream.queue().submit([&](sycl::handler& cgh) {
+          cgh.parallel_for(
+              sycl::nd_range<2>(
+                  sycl::range<2>(route_count, static_cast<size_t>(local_size)),
+                  sycl::range<2>(1, static_cast<size_t>(local_size))),
+              [=](sycl::nd_item<2> item) {
+                const int64_t route_idx = static_cast<int64_t>(item.get_group(0));
+                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+                const int64_t token_idx = token_ptr[route_idx];
+                const int64_t input_base = route_idx * hidden_dim;
+                const int64_t output_base = token_idx * hidden_dim;
+                for (int64_t dim_idx = lane; dim_idx < hidden_dim; dim_idx += local_size) {
+                  auto output_ref = sycl::atomic_ref<
+                      float,
+                      sycl::memory_order::relaxed,
+                      sycl::memory_scope::device,
+                      sycl::access::address_space::global_space>(accum_ptr[output_base + dim_idx]);
+                  output_ref.fetch_add(load_as_float(compact_ptr, input_base + dim_idx));
+                }
+              });
+        });
+
+        stream.queue().submit([&](sycl::handler& cgh) {
+          cgh.parallel_for(
+              sycl::nd_range<2>(
+                  sycl::range<2>(output_rows, static_cast<size_t>(local_size)),
+                  sycl::range<2>(1, static_cast<size_t>(local_size))),
+              [=](sycl::nd_item<2> item) {
+                const int64_t token_idx = static_cast<int64_t>(item.get_group(0));
+                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+                const int64_t row_base = token_idx * hidden_dim;
+                for (int64_t dim_idx = lane; dim_idx < hidden_dim; dim_idx += local_size) {
+                  output_ptr[row_base + dim_idx] = static_cast<scalar_t>(accum_ptr[row_base + dim_idx]);
+                }
+              });
+        });
+      });
+
+  return output;
+}
+
+at::Tensor moe_grouped_int4_mlp_fused_meta(
+    const at::Tensor& compact_hidden_states,
+    const at::Tensor& compact_routing_weights,
+    const at::Tensor& compact_outputs,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& active_experts,
+    const at::Tensor& active_slots,
+    const at::Tensor& gate_qweight,
+    const at::Tensor& gate_qscale,
+    const at::Tensor& gate_qzeros,
+    const at::Tensor& up_qweight,
+    const at::Tensor& up_qscale,
+    const at::Tensor& up_qzeros,
+    const at::Tensor& down_qweight,
+    const at::Tensor& down_qscale,
+    const at::Tensor& down_qzeros,
+    int64_t group_size,
+    int64_t max_routes_per_expert) {
+  validate_moe_grouped_int4_mlp_inputs(
+      compact_hidden_states,
+      compact_routing_weights,
+      compact_outputs,
+      expert_offsets,
+      active_experts,
+      active_slots,
+      gate_qweight,
+      gate_qscale,
+      gate_qzeros,
+      up_qweight,
+      up_qscale,
+      up_qzeros,
+      down_qweight,
+      down_qscale,
+      down_qzeros,
+      group_size,
+      max_routes_per_expert);
+  return compact_outputs;
+}
+
+at::Tensor moe_grouped_int4_mlp_fused_xpu(
+    const at::Tensor& compact_hidden_states_in,
+    const at::Tensor& compact_routing_weights_in,
+    const at::Tensor& compact_outputs_in,
+    const at::Tensor& expert_offsets_in,
+    const at::Tensor& active_experts_in,
+    const at::Tensor& active_slots_in,
+    const at::Tensor& gate_qweight_in,
+    const at::Tensor& gate_qscale_in,
+    const at::Tensor& gate_qzeros_in,
+    const at::Tensor& up_qweight_in,
+    const at::Tensor& up_qscale_in,
+    const at::Tensor& up_qzeros_in,
+    const at::Tensor& down_qweight_in,
+    const at::Tensor& down_qscale_in,
+    const at::Tensor& down_qzeros_in,
+    int64_t group_size,
+    int64_t max_routes_per_expert) {
+  validate_moe_grouped_int4_mlp_inputs(
+      compact_hidden_states_in,
+      compact_routing_weights_in,
+      compact_outputs_in,
+      expert_offsets_in,
+      active_experts_in,
+      active_slots_in,
+      gate_qweight_in,
+      gate_qscale_in,
+      gate_qzeros_in,
+      up_qweight_in,
+      up_qscale_in,
+      up_qzeros_in,
+      down_qweight_in,
+      down_qscale_in,
+      down_qzeros_in,
+      group_size,
+      max_routes_per_expert);
+  validate_moe_grouped_int4_mlp_xpu_inputs(
+      compact_hidden_states_in,
+      compact_routing_weights_in,
+      compact_outputs_in,
+      expert_offsets_in,
+      active_experts_in,
+      active_slots_in,
+      gate_qweight_in,
+      gate_qscale_in,
+      gate_qzeros_in,
+      up_qweight_in,
+      up_qscale_in,
+      up_qzeros_in,
+      down_qweight_in,
+      down_qscale_in,
+      down_qzeros_in);
+
+  auto compact_hidden_states = compact_hidden_states_in.contiguous();
+  auto compact_routing_weights = compact_routing_weights_in.contiguous();
+  auto output = compact_outputs_in;
+  auto expert_offsets = expert_offsets_in.contiguous();
+  auto active_experts = active_experts_in.contiguous();
+  auto active_slots = active_slots_in.contiguous();
+  auto gate_qweight = gate_qweight_in.contiguous();
+  auto gate_qscale = gate_qscale_in.contiguous();
+  auto gate_qzeros = gate_qzeros_in.contiguous();
+  auto up_qweight = up_qweight_in.contiguous();
+  auto up_qscale = up_qscale_in.contiguous();
+  auto up_qzeros = up_qzeros_in.contiguous();
+  auto down_qweight = down_qweight_in.contiguous();
+  auto down_qscale = down_qscale_in.contiguous();
+  auto down_qzeros = down_qzeros_in.contiguous();
+
+  const auto routes = compact_hidden_states.size(0);
+  const auto hidden_dim = compact_hidden_states.size(1);
+  const auto active_count = active_experts.size(0);
+  const auto intermediate_dim = gate_qweight.size(1);
+  const auto hidden_packed_cols = gate_qweight.size(2);
+  const auto hidden_group_count = gate_qscale.size(1);
+  const auto intermediate_packed_cols = down_qweight.size(2);
+  const auto intermediate_group_count = down_qscale.size(1);
+
+  if (routes == 0) {
+    return output;
+  }
+
+  auto activation = at::empty({routes, intermediate_dim}, compact_hidden_states.options().dtype(at::kFloat));
+  auto stream = c10::xpu::getCurrentXPUStream(compact_hidden_states.device().index());
+  const int64_t gate_local_size =
+      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(hidden_dim, 256))), 256);
+  const int64_t down_local_size =
+      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(intermediate_dim, 256))), 256);
+  const size_t active_range = static_cast<size_t>(active_count);
+  const size_t gate_group_range = static_cast<size_t>(max_routes_per_expert * intermediate_dim);
+  const size_t down_group_range = static_cast<size_t>(max_routes_per_expert * hidden_dim);
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      compact_hidden_states.scalar_type(),
+      "moe_grouped_int4_mlp_gate_up_xpu",
+      [&] {
+        const scalar_t* hidden_ptr = compact_hidden_states.const_data_ptr<scalar_t>();
+        const scalar_t* routing_ptr = compact_routing_weights.const_data_ptr<scalar_t>();
+        (void)routing_ptr;
+        const int64_t* offsets_ptr = expert_offsets.const_data_ptr<int64_t>();
+        const int64_t* active_experts_ptr = active_experts.const_data_ptr<int64_t>();
+        const int64_t* active_slots_ptr = active_slots.const_data_ptr<int64_t>();
+        const int32_t* gate_qweight_ptr = gate_qweight.const_data_ptr<int32_t>();
+        const float* gate_qscale_ptr = gate_qscale.const_data_ptr<float>();
+        const int8_t* gate_qzeros_ptr = gate_qzeros.const_data_ptr<int8_t>();
+        const int32_t* up_qweight_ptr = up_qweight.const_data_ptr<int32_t>();
+        const float* up_qscale_ptr = up_qscale.const_data_ptr<float>();
+        const int8_t* up_qzeros_ptr = up_qzeros.const_data_ptr<int8_t>();
+        float* activation_ptr = activation.mutable_data_ptr<float>();
+
+        stream.queue().submit([&](sycl::handler& cgh) {
+          sycl::local_accessor<float, 1> partial_gate(sycl::range<1>(static_cast<size_t>(gate_local_size)), cgh);
+          sycl::local_accessor<float, 1> partial_up(sycl::range<1>(static_cast<size_t>(gate_local_size)), cgh);
+          cgh.parallel_for(
+              sycl::nd_range<2>(
+                  sycl::range<2>(active_range, gate_group_range * static_cast<size_t>(gate_local_size)),
+                  sycl::range<2>(1, static_cast<size_t>(gate_local_size))),
+              [=](sycl::nd_item<2> item) {
+                const int64_t active_idx = static_cast<int64_t>(item.get_group(0));
+                const int64_t linear_idx = static_cast<int64_t>(item.get_group(1));
+                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+                const int64_t expert_idx = active_experts_ptr[active_idx];
+                const int64_t bank_slot = active_slots_ptr[active_idx];
+                const int64_t start = offsets_ptr[expert_idx];
+                const int64_t end = offsets_ptr[expert_idx + 1];
+                const int64_t route_count = end - start;
+                const int64_t route_offset = linear_idx / intermediate_dim;
+                const int64_t intermediate_idx = linear_idx - route_offset * intermediate_dim;
+                if (route_offset >= route_count) {
+                  return;
+                }
+
+                const int64_t route_idx = start + route_offset;
+                const int64_t hidden_base = route_idx * hidden_dim;
+                float gate_acc = 0.0f;
+                float up_acc = 0.0f;
+                for (int64_t hidden_idx = lane; hidden_idx < hidden_dim; hidden_idx += gate_local_size) {
+                  const float hidden_value = load_as_float(hidden_ptr, hidden_base + hidden_idx);
+                  gate_acc += hidden_value *
+                      load_grouped_int4_weight(
+                          gate_qweight_ptr,
+                          gate_qscale_ptr,
+                          gate_qzeros_ptr,
+                          bank_slot,
+                          intermediate_idx,
+                          hidden_idx,
+                          intermediate_dim,
+                          hidden_packed_cols,
+                          hidden_group_count,
+                          group_size);
+                  up_acc += hidden_value *
+                      load_grouped_int4_weight(
+                          up_qweight_ptr,
+                          up_qscale_ptr,
+                          up_qzeros_ptr,
+                          bank_slot,
+                          intermediate_idx,
+                          hidden_idx,
+                          intermediate_dim,
+                          hidden_packed_cols,
+                          hidden_group_count,
+                          group_size);
+                }
+
+                partial_gate[lane] = gate_acc;
+                partial_up[lane] = up_acc;
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int64_t stride = gate_local_size / 2; stride > 0; stride >>= 1) {
+                  if (lane < stride) {
+                    partial_gate[lane] += partial_gate[lane + stride];
+                    partial_up[lane] += partial_up[lane + stride];
+                  }
+                  item.barrier(sycl::access::fence_space::local_space);
+                }
+                if (lane == 0) {
+                  const float gate_value = partial_gate[0];
+                  const float silu_gate = gate_value / (1.0f + sycl::exp(-gate_value));
+                  activation_ptr[route_idx * intermediate_dim + intermediate_idx] = silu_gate * partial_up[0];
+                }
+              });
+        });
+      });
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      compact_hidden_states.scalar_type(),
+      "moe_grouped_int4_mlp_down_xpu",
+      [&] {
+        const scalar_t* routing_ptr = compact_routing_weights.const_data_ptr<scalar_t>();
+        const int64_t* offsets_ptr = expert_offsets.const_data_ptr<int64_t>();
+        const int64_t* active_experts_ptr = active_experts.const_data_ptr<int64_t>();
+        const int64_t* active_slots_ptr = active_slots.const_data_ptr<int64_t>();
+        const float* activation_ptr = activation.const_data_ptr<float>();
+        const int32_t* down_qweight_ptr = down_qweight.const_data_ptr<int32_t>();
+        const float* down_qscale_ptr = down_qscale.const_data_ptr<float>();
+        const int8_t* down_qzeros_ptr = down_qzeros.const_data_ptr<int8_t>();
+        scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
+
+        stream.queue().submit([&](sycl::handler& cgh) {
+          sycl::local_accessor<float, 1> partial_down(sycl::range<1>(static_cast<size_t>(down_local_size)), cgh);
+          cgh.parallel_for(
+              sycl::nd_range<2>(
+                  sycl::range<2>(active_range, down_group_range * static_cast<size_t>(down_local_size)),
+                  sycl::range<2>(1, static_cast<size_t>(down_local_size))),
+              [=](sycl::nd_item<2> item) {
+                const int64_t active_idx = static_cast<int64_t>(item.get_group(0));
+                const int64_t linear_idx = static_cast<int64_t>(item.get_group(1));
+                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+                const int64_t expert_idx = active_experts_ptr[active_idx];
+                const int64_t bank_slot = active_slots_ptr[active_idx];
+                const int64_t start = offsets_ptr[expert_idx];
+                const int64_t end = offsets_ptr[expert_idx + 1];
+                const int64_t route_count = end - start;
+                const int64_t route_offset = linear_idx / hidden_dim;
+                const int64_t hidden_idx = linear_idx - route_offset * hidden_dim;
+                if (route_offset >= route_count) {
+                  return;
+                }
+
+                const int64_t route_idx = start + route_offset;
+                const int64_t activation_base = route_idx * intermediate_dim;
+                float down_acc = 0.0f;
+                for (int64_t intermediate_idx = lane; intermediate_idx < intermediate_dim; intermediate_idx += down_local_size) {
+                  down_acc += activation_ptr[activation_base + intermediate_idx] *
+                      load_grouped_int4_weight(
+                          down_qweight_ptr,
+                          down_qscale_ptr,
+                          down_qzeros_ptr,
+                          bank_slot,
+                          hidden_idx,
+                          intermediate_idx,
+                          hidden_dim,
+                          intermediate_packed_cols,
+                          intermediate_group_count,
+                          group_size);
+                }
+
+                partial_down[lane] = down_acc;
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int64_t stride = down_local_size / 2; stride > 0; stride >>= 1) {
+                  if (lane < stride) {
+                    partial_down[lane] += partial_down[lane + stride];
+                  }
+                  item.barrier(sycl::access::fence_space::local_space);
+                }
+                if (lane == 0) {
+                  const float route_weight = load_as_float(routing_ptr, route_idx);
+                  output_ptr[route_idx * hidden_dim + hidden_idx] =
+                      static_cast<scalar_t>(partial_down[0] * route_weight);
+                }
+              });
+        });
+      });
+
+  return output;
 }
 
 at::Tensor gqa_decode_fused_meta(
@@ -1808,6 +2619,39 @@ TORCH_LIBRARY(anna, m) {
       "bool normalize_topk_prob=True"
       ") -> (Tensor, Tensor, Tensor)");
   m.def(
+      "moe_dispatch_fused("
+      "Tensor hidden_states, "
+      "Tensor routing_weights, "
+      "Tensor selected_experts, "
+      "Tensor expert_usage"
+      ") -> (Tensor, Tensor, Tensor, Tensor)");
+  m.def(
+      "moe_scatter_fused("
+      "Tensor compact_outputs, "
+      "Tensor sorted_token_idx, "
+      "int num_tokens"
+      ") -> Tensor");
+  m.def(
+      "moe_grouped_int4_mlp_fused("
+      "Tensor compact_hidden_states, "
+      "Tensor compact_routing_weights, "
+      "Tensor(a!) compact_outputs, "
+      "Tensor expert_offsets, "
+      "Tensor active_experts, "
+      "Tensor active_slots, "
+      "Tensor gate_qweight, "
+      "Tensor gate_qscale, "
+      "Tensor gate_qzeros, "
+      "Tensor up_qweight, "
+      "Tensor up_qscale, "
+      "Tensor up_qzeros, "
+      "Tensor down_qweight, "
+      "Tensor down_qscale, "
+      "Tensor down_qzeros, "
+      "int group_size, "
+      "int max_routes_per_expert"
+      ") -> Tensor(a!)");
+  m.def(
       "rmsnorm_fused("
       "Tensor input, "
       "Tensor weight, "
@@ -1819,6 +2663,13 @@ TORCH_LIBRARY(anna, m) {
       "Tensor weight, "
       "float eps, "
       "bool add_unit_offset=False"
+      ") -> Tensor");
+  m.def(
+      "rmsnorm_gated_fused("
+      "Tensor input, "
+      "Tensor gate, "
+      "Tensor weight, "
+      "float eps"
       ") -> Tensor");
   m.def(
       "qk_norm_rotary_fused("
@@ -1881,8 +2732,12 @@ TORCH_LIBRARY_IMPL(anna, Meta, m) {
   m.impl("gqa_decode_fused", anna::gqa_decode_fused_meta);
   m.impl("paged_gqa_decode_fused", anna::paged_gqa_decode_fused_meta);
   m.impl("moe_router_fused", anna::moe_router_fused_meta);
+  m.impl("moe_dispatch_fused", anna::moe_dispatch_fused_meta);
+  m.impl("moe_scatter_fused", anna::moe_scatter_fused_meta);
+  m.impl("moe_grouped_int4_mlp_fused", anna::moe_grouped_int4_mlp_fused_meta);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_meta);
   m.impl("rmsnorm_fused_ex", anna::rmsnorm_fused_ex_meta);
+  m.impl("rmsnorm_gated_fused", anna::rmsnorm_gated_fused_meta);
   m.impl("qk_norm_rotary_fused", anna::qk_norm_rotary_fused_meta);
   m.impl("qk_norm_rotary_fused_ex", anna::qk_norm_rotary_fused_ex_meta);
   m.impl("causal_conv1d_prefill", anna::causal_conv1d_prefill_meta);
@@ -1895,8 +2750,12 @@ TORCH_LIBRARY_IMPL(anna, XPU, m) {
   m.impl("gqa_decode_fused", anna::gqa_decode_fused_xpu);
   m.impl("paged_gqa_decode_fused", anna::paged_gqa_decode_fused_xpu);
   m.impl("moe_router_fused", anna::moe_router_fused_xpu);
+  m.impl("moe_dispatch_fused", anna::moe_dispatch_fused_xpu);
+  m.impl("moe_scatter_fused", anna::moe_scatter_fused_xpu);
+  m.impl("moe_grouped_int4_mlp_fused", anna::moe_grouped_int4_mlp_fused_xpu);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_xpu);
   m.impl("rmsnorm_fused_ex", anna::rmsnorm_fused_ex_xpu);
+  m.impl("rmsnorm_gated_fused", anna::rmsnorm_gated_fused_xpu);
   m.impl("qk_norm_rotary_fused", anna::qk_norm_rotary_fused_xpu);
   m.impl("qk_norm_rotary_fused_ex", anna::qk_norm_rotary_fused_ex_xpu);
   m.impl("causal_conv1d_prefill", anna::causal_conv1d_prefill_xpu);

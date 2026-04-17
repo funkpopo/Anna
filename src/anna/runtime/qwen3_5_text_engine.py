@@ -573,6 +573,37 @@ class AnnaQwen3_5TextEngine:
                     config=config,
                     device=device_context.device,
                 )
+            elif (
+                resolved_offload_mode == "experts"
+                and resolved_expert_quant == "int4"
+                and device_context.device.type == "xpu"
+                and int(resolved_cached_experts_per_layer or 0) > 0
+            ):
+                promoted_cached_experts_per_layer = cls._estimate_cached_experts_per_layer(
+                    model=model,
+                    device_context=device_context,
+                    expert_quant=resolved_expert_quant,
+                )
+                if promoted_cached_experts_per_layer > int(resolved_cached_experts_per_layer or 0):
+                    logger.info(
+                        "Promoting XPU expert cache capacity from requested=%s to effective=%s based on free device memory.",
+                        resolved_cached_experts_per_layer,
+                        promoted_cached_experts_per_layer,
+                    )
+                    resolved_cached_experts_per_layer = promoted_cached_experts_per_layer
+                    model.configure_runtime(
+                        device_context.device,
+                        offload_experts=resolved_offload_mode == "experts",
+                        offload_vision=resolved_offload_vision,
+                        offload_token_io=False,
+                        resident_expert_layers=0,
+                        resident_expert_layer_indices=resolved_resident_expert_layer_indices,
+                        expert_quant=resolved_expert_quant,
+                        cached_experts_per_layer=resolved_cached_experts_per_layer,
+                        kv_cache_quantization=resolved_kv_cache_quantization,
+                        kv_cache_quant_bits=kv_cache_quant_bits,
+                        kv_cache_residual_len=kv_cache_residual_len,
+                    )
             resolved_cached_experts_per_layer = cls._effective_cached_experts_per_layer(model)
             model.eval()
         except RuntimeError as exc:
@@ -1049,9 +1080,22 @@ class AnnaQwen3_5TextEngine:
         if per_expert_bytes <= 0:
             return max(exemplar_block.top_k, 0)
 
-        cache_target_free_bytes = max(768 << 20, int(memory_info.total_bytes * 0.06))
-        cache_budget_fraction = 0.65 if expert_quant == "int4" else 0.35
-        cache_budget_bytes = int(max(0, int(memory_info.free_bytes) - cache_target_free_bytes) * cache_budget_fraction)
+        safety = device_context.safety_policy
+        reserve_bytes = max(
+            int(safety.min_free_bytes),
+            int(safety.reserve_margin_bytes),
+            int(memory_info.total_bytes * (1.0 - safety.max_estimated_usage_ratio)),
+        )
+        if expert_quant == "int4":
+            cache_target_free_bytes = max(reserve_bytes, 1536 << 20, int(memory_info.total_bytes * 0.10))
+            cache_budget_fraction = 0.70
+        else:
+            cache_target_free_bytes = max(reserve_bytes, 768 << 20, int(memory_info.total_bytes * 0.06))
+            cache_budget_fraction = 0.35
+        budget_factor = max(1.0, float(safety.generation_memory_safety_factor))
+        cache_budget_bytes = int(
+            max(0, int(memory_info.free_bytes) - cache_target_free_bytes) * cache_budget_fraction / budget_factor
+        )
         auto_cached = cache_budget_bytes // max(1, per_expert_bytes * len(offloaded_blocks))
 
         minimum_cache = exemplar_block.top_k
@@ -1063,11 +1107,12 @@ class AnnaQwen3_5TextEngine:
             resolved = max(minimum_cache, min(max_cache, auto_cached))
 
         logger.info(
-            "Auto expert cache sizing: expert_quant=%s free=%s target_free=%s cache_budget_fraction=%.2f cache_budget=%s offloaded_layers=%s per_expert=%s cached_experts_per_layer=%s",
+            "Auto expert cache sizing: expert_quant=%s free=%s target_free=%s cache_budget_fraction=%.2f budget_factor=%.2f cache_budget=%s offloaded_layers=%s per_expert=%s cached_experts_per_layer=%s",
             expert_quant,
             _format_bytes(memory_info.free_bytes),
             _format_bytes(cache_target_free_bytes),
             cache_budget_fraction,
+            budget_factor,
             _format_bytes(cache_budget_bytes),
             len(offloaded_blocks),
             _format_bytes(per_expert_bytes),

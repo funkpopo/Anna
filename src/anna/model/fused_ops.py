@@ -86,6 +86,27 @@ def _moe_router_op():
     return getattr(namespace, "moe_router_fused", None)
 
 
+def _moe_dispatch_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "moe_dispatch_fused", None)
+
+
+def _moe_scatter_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "moe_scatter_fused", None)
+
+
+def _moe_grouped_int4_mlp_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "moe_grouped_int4_mlp_fused", None)
+
+
 def _rmsnorm_op():
     namespace = getattr(torch.ops, "anna", None)
     if namespace is None:
@@ -98,6 +119,13 @@ def _rmsnorm_ex_op():
     if namespace is None:
         return None
     return getattr(namespace, "rmsnorm_fused_ex", None)
+
+
+def _rmsnorm_gated_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "rmsnorm_gated_fused", None)
 
 
 def _qk_norm_rotary_op():
@@ -147,6 +175,18 @@ def moe_router_fused_is_available() -> bool:
     return _moe_router_op() is not None
 
 
+def moe_dispatch_fused_is_available() -> bool:
+    return _moe_dispatch_op() is not None
+
+
+def moe_scatter_fused_is_available() -> bool:
+    return _moe_scatter_op() is not None
+
+
+def moe_grouped_int4_mlp_fused_is_available() -> bool:
+    return _moe_grouped_int4_mlp_op() is not None
+
+
 def rmsnorm_fused_is_available() -> bool:
     return _rmsnorm_op() is not None
 
@@ -157,6 +197,10 @@ def qk_norm_rotary_fused_is_available() -> bool:
 
 def rmsnorm_fused_ex_is_available() -> bool:
     return _rmsnorm_ex_op() is not None
+
+
+def rmsnorm_gated_fused_is_available() -> bool:
+    return _rmsnorm_gated_op() is not None
 
 
 def gated_delta_fused_is_available() -> bool:
@@ -267,6 +311,93 @@ def run_moe_router_fused(
     return op(router_logits, int(top_k), bool(normalize_topk_prob))
 
 
+def run_moe_dispatch_fused(
+    *,
+    hidden_states: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    expert_usage: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    op = _moe_dispatch_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _moe_dispatch_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna moe_dispatch_fused op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(hidden_states, routing_weights, selected_experts, expert_usage)
+
+
+def run_moe_scatter_fused(
+    *,
+    compact_outputs: torch.Tensor,
+    sorted_token_idx: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    op = _moe_scatter_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _moe_scatter_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna moe_scatter_fused op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(compact_outputs, sorted_token_idx, int(num_tokens))
+
+
+def run_moe_grouped_int4_mlp_fused(
+    *,
+    compact_hidden_states: torch.Tensor,
+    compact_routing_weights: torch.Tensor,
+    compact_outputs: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    active_experts: torch.Tensor,
+    active_slots: torch.Tensor,
+    gate_qweight: torch.Tensor,
+    gate_qscale: torch.Tensor,
+    gate_qzeros: torch.Tensor,
+    up_qweight: torch.Tensor,
+    up_qscale: torch.Tensor,
+    up_qzeros: torch.Tensor,
+    down_qweight: torch.Tensor,
+    down_qscale: torch.Tensor,
+    down_qzeros: torch.Tensor,
+    group_size: int,
+    max_routes_per_expert: int,
+) -> torch.Tensor:
+    op = _moe_grouped_int4_mlp_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _moe_grouped_int4_mlp_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna moe_grouped_int4_mlp_fused op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(
+        compact_hidden_states,
+        compact_routing_weights,
+        compact_outputs,
+        expert_offsets,
+        active_experts,
+        active_slots,
+        gate_qweight,
+        gate_qscale,
+        gate_qzeros,
+        up_qweight,
+        up_qscale,
+        up_qzeros,
+        down_qweight,
+        down_qscale,
+        down_qzeros,
+        int(group_size),
+        int(max_routes_per_expert),
+    )
+
+
 def run_rmsnorm_fused(
     *,
     input: torch.Tensor,
@@ -302,6 +433,25 @@ def run_rmsnorm_fused_ex(
             "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
         )
     return op(input, weight, float(eps), bool(add_unit_offset))
+
+
+def run_rmsnorm_gated_fused(
+    *,
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    op = _rmsnorm_gated_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _rmsnorm_gated_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna rmsnorm_gated_fused op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(input, gate, weight, float(eps))
 
 
 def run_qk_norm_rotary_fused(
