@@ -1088,17 +1088,19 @@ class AnnaQwen3_5TextEngine:
         )
         if expert_quant == "int4":
             cache_target_free_bytes = max(reserve_bytes, 1536 << 20, int(memory_info.total_bytes * 0.10))
-            cache_budget_fraction = 0.70
+            cache_budget_fraction = 0.85
+            budget_factor = max(1.0, min(float(safety.generation_memory_safety_factor), 1.25))
+            minimum_cache = max(exemplar_block.top_k, exemplar_block.top_k * 8)
         else:
             cache_target_free_bytes = max(reserve_bytes, 768 << 20, int(memory_info.total_bytes * 0.06))
             cache_budget_fraction = 0.35
-        budget_factor = max(1.0, float(safety.generation_memory_safety_factor))
+            budget_factor = max(1.0, float(safety.generation_memory_safety_factor))
+            minimum_cache = exemplar_block.top_k
         cache_budget_bytes = int(
             max(0, int(memory_info.free_bytes) - cache_target_free_bytes) * cache_budget_fraction / budget_factor
         )
         auto_cached = cache_budget_bytes // max(1, per_expert_bytes * len(offloaded_blocks))
 
-        minimum_cache = exemplar_block.top_k
         max_cache = exemplar_block.num_experts
         minimum_budget_bytes = per_expert_bytes * len(offloaded_blocks) * minimum_cache
         if cache_budget_bytes < minimum_budget_bytes:
@@ -1107,7 +1109,7 @@ class AnnaQwen3_5TextEngine:
             resolved = max(minimum_cache, min(max_cache, auto_cached))
 
         logger.info(
-            "Auto expert cache sizing: expert_quant=%s free=%s target_free=%s cache_budget_fraction=%.2f budget_factor=%.2f cache_budget=%s offloaded_layers=%s per_expert=%s cached_experts_per_layer=%s",
+            "Auto expert cache sizing: expert_quant=%s free=%s target_free=%s cache_budget_fraction=%.2f budget_factor=%.2f cache_budget=%s offloaded_layers=%s per_expert=%s minimum_cache=%s cached_experts_per_layer=%s",
             expert_quant,
             _format_bytes(memory_info.free_bytes),
             _format_bytes(cache_target_free_bytes),
@@ -1116,6 +1118,7 @@ class AnnaQwen3_5TextEngine:
             _format_bytes(cache_budget_bytes),
             len(offloaded_blocks),
             _format_bytes(per_expert_bytes),
+            minimum_cache,
             resolved,
         )
         return resolved
