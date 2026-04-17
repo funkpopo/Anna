@@ -293,6 +293,16 @@ class Qwen3_5TextModelConfig:
         generation_config_data: dict[str, Any] | None = None,
     ) -> "Qwen3_5TextModelConfig":
         text_config_data = config_data.get("text_config", {})
+        text_config = Qwen3_5TextConfig.from_dict(config_data)
+        quantization_config = QuantizationConfig.from_dict(config_data.get("quantization_config"))
+        if text_config.is_moe_model and quantization_config.is_enabled:
+            # Qwen3.5 MoE router gates are stored as dense float weights in the checkpoint even when
+            # expert MLP projections are exported in AutoRound format. Keep them out of placeholder
+            # replacement so `mlp.gate.weight` tensors still load into nn.Linear modules.
+            quantization_config.extra_config.setdefault(
+                r".*\.mlp\.gate$",
+                {"bits": 16, "data_type": "fp"},
+            )
         default_max_completion_tokens_value = _first_non_null(
             config_data.get("max_completion_tokens"),
             config_data.get("max_new_tokens"),
@@ -309,10 +319,10 @@ class Qwen3_5TextModelConfig:
         )
         return cls(
             model_type=config_data.get("model_type", "qwen3_5"),
-            text_config=Qwen3_5TextConfig.from_dict(config_data),
+            text_config=text_config,
             vision_config=Qwen3_5TextVisionConfig.from_dict(config_data.get("vision_config")),
             preprocessor_config=VisionPreprocessorConfig.from_dict(preprocessor_data),
-            quantization_config=QuantizationConfig.from_dict(config_data.get("quantization_config")),
+            quantization_config=quantization_config,
             default_max_completion_tokens=default_max_completion_tokens,
             tie_word_embeddings=bool(_first_non_null(config_data.get("tie_word_embeddings"), True)),
             image_token_id=_int_from_candidates(config_data.get("image_token_id"), 248056),
