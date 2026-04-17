@@ -2,65 +2,92 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-Anna is a from-scratch Qwen3.5 inference service for Intel Arc GPUs with an OpenAI-compatible API.
+Anna is a local inference runtime and OpenAI-compatible API server focused on PyTorch/XPU execution for Intel Arc Alchemist . The current project can serve Qwen3.5 text-generation checkpoints, Gemma 4 multimodal checkpoints, and Qwen3-TTS speech synthesis checkpoints from local model directories.
 
-## Requirements (local development and testing)
+## Features
 
-- Windows or Linux + Intel Arc GPU
-- PyTorch with `xpu`
-- Intel oneAPI DPC++/C++
-- Ability to build and load the custom `anna_gated_delta_fused` operator locally
-
-If you want to run a local Qwen3.5 model on an Arc A770 or A750, this README is written for that path. Windows remains the primary development environment; Linux uses the same runtime with a Linux-specific fused-op build flow.
-
-## Main Features
-
-- OpenAI-compatible API
+- OpenAI-compatible routes:
+  - `GET /healthz`
   - `GET /v1/models`
   - `POST /v1/chat/completions`
   - `POST /v1/completions`
   - `POST /v1/audio/speech`
-- Text generation and streaming responses
-- Qwen3-TTS speech synthesis
-- `anna-speak` CLI for local TTS generation
-- `xpu` inference
-- Linear-attention SYCL fused ops
-- Service address and available routes printed on startup
-- Aggregated runtime metrics printed in the terminal
-  - Idle periods do not keep spamming logs
+- Non-streaming and streaming generation for chat and text completions
+- Optional reasoning separation through `reasoning_content`
+- Tool/function calling for chat models, including streamed tool-call deltas
+- Local multimodal chat input support
+  - Qwen3.5: text, image, video
+  - Gemma4: text, image, video, audio
+- Local speech synthesis for `qwen3_tts` through API and `anna-speak`
+- CLI entry points: `anna-serve`, `anna-generate`, `anna-bench`, `anna-speak`
+- XPU-oriented runtime controls:
+  - `torch.compile`
+  - prefill chunking
+  - exact prompt KV-cache reuse
+  - TurboQuant KV-cache compression
+  - runtime int4 weight quantization
+  - Qwen MoE expert offload and expert caching
+  - continuous batching
+  - optional SYCL fused custom ops
+- Health, memory, cache, and request metrics exposed through `/healthz` and terminal logs
 
-## Recommended Environment
+## Supported Model Families
 
-The current `main` branch is expected to run in an environment like this:
+Anna selects the runtime from the top-level `model_type` in `config.json`:
 
-- Windows 11 or a recent Linux distribution
-- Python 3.11 or 3.12
-- Intel Arc A770 / A750
-- Intel GPU driver installed correctly
-- PyTorch installed with `xpu` support
-- Intel oneAPI DPC++/C++ Compiler
-- Visual Studio 2022 Build Tools on Windows only
+- `qwen3_tts` -> Qwen3-TTS runtime
+- `gemma4` -> Gemma4 runtime
+- everything else -> Qwen3.5 text runtime
 
-## Setup
+| Family | `config.json` top-level `model_type` | Other recognized model types/configs | Capabilities | Main commands |
+| --- | --- | --- | --- | --- |
+| Qwen3.5 text runtime | Any non-`qwen3_tts` and non-`gemma4` value; known values include `qwen3_5`, `qwen3_5_text`, `qwen3_5_moe`, `qwen3_5_vl` | Optional `vision_config`; Qwen quantization configs such as AWQ and AutoRound are parsed from model files | Text completions, chat completions, streaming, reasoning output, tool calling, multimodal chat with image/video | `anna-serve`, `anna-generate`, `anna-bench` |
+| Gemma4 runtime | `gemma4` | `text_config.model_type=gemma4_text`; optional `vision_config.model_type=gemma4_vision`; optional `audio_config.model_type=gemma4_audio` | Text completions, chat completions, streaming, reasoning output, tool calling, multimodal chat with image/video/audio | `anna-serve`, `anna-generate`, `anna-bench` |
+| Qwen3-TTS runtime | `qwen3_tts` | Runtime `tts_model_type` can be `base`, `custom_voice`, or `voice_design` | Speech synthesis through API or CLI | `anna-serve`, `anna-speak` |
 
-### 1. Clone the repository (`main` already includes SYCL)
+Notes:
 
-```powershell
-git clone -b main <your-repo-url> Anna
+- `anna-generate` and `anna-bench` are only for text-generation families (`qwen3_5_text` and `gemma4`).
+- `anna-speak` is only for `qwen3_tts`.
+- `/v1/audio/speech` only succeeds when the loaded model supports speech synthesis.
+- `anna-bench` supports `--image` and `--video`, but not audio benchmarking.
+- Multimodal media input is available through chat-style message content arrays and the benchmark CLI; `/v1/completions` remains text-only.
+
+## Requirements
+
+- Python `3.11+`
+- A local model directory containing `config.json`, tokenizer files, and weights
+- PyTorch installed separately for your platform
+  - CPU works for debugging and tests
+  - Intel Arc + a PyTorch build with `xpu` support is the intended runtime path
+- `imageio` and `imageio-ffmpeg` for video input support
+- `qwen-tts` for `qwen3_tts` models
+- To build the optional fused XPU operator:
+  - Intel oneAPI DPC++/C++ Compiler
+  - Visual Studio Build Tools on Windows
+
+The Python package dependencies above are installed by `pip install -e .`; PyTorch and oneAPI are environment-specific and should be installed separately.
+
+## Installation
+
+### 1. Clone and enter the repository
+
+```bash
+git clone <your-repo-url> Anna
 cd Anna
 ```
 
-### 2. Create a Python environment
+### 2. Create and activate a virtual environment
 
-Windows example with Conda/Miniforge:
+Windows PowerShell:
 
 ```powershell
-conda create -n anna python=3.12 -y
-conda activate anna
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install -U pip
 ```
 
-Linux example with `venv`:
+Linux:
 
 ```bash
 python3 -m venv .venv
@@ -68,434 +95,226 @@ source .venv/bin/activate
 python -m pip install -U pip
 ```
 
-### 3. Install PyTorch
-
-After installation, verify it first:
-
-```powershell
-python -c "import torch; print(torch.__version__); print(torch.xpu.is_available())"
-```
-
-The minimum expectation is:
-
-- `import torch` works
-- `torch.xpu.is_available()` prints `True`
-
-### 4. Install the project itself
-
-Runtime only:
-
-```powershell
-pip install -e .
-```
-
-Notes:
-
-- `pip install -e .` only installs the Python package, it does not compile the SYCL fused op
-- After installation, you must still run `python tools/build_gated_delta_fused_op.py`
-
-### 5. Prepare the compiler environment
-
-The build script is now platform-aware and supports overrides through environment variables.
-
-On Windows:
-
-- Prefer having `dpcpp.exe` on `PATH`
-- If it is not on `PATH`, the build script also searches standard oneAPI install directories under `Program Files`
-- For the MSVC environment, the build script searches standard Visual Studio Build Tools / IDE locations; if you use a non-standard installation, set `ANNA_VCVARS64`
-- You can always override the compiler path explicitly with `ANNA_DPCPP`
-
-```powershell
-$env:ANNA_DPCPP = "C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin\dpcpp.exe"
-$env:ANNA_VCVARS64 = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-```
-
-On Linux:
-
-- Ensure `dpcpp` is on `PATH`, or set `ANNA_DPCPP` to its absolute path
-- If your oneAPI runtime libraries live outside the compiler-relative `lib` directories, set `ANNA_ONEAPI_RUNTIME_PATHS` with `:`-separated directories
+### 3. Install Anna
 
 ```bash
-export ANNA_DPCPP=/opt/intel/oneapi/compiler/latest/bin/dpcpp
-export ANNA_ONEAPI_RUNTIME_PATHS=/opt/intel/oneapi/compiler/latest/lib:/opt/intel/oneapi/compiler/latest/lib/x64
+python -m pip install -e .
 ```
 
-### 6. Build the SYCL fused op
+Optional development dependencies:
 
-This is a required step on the current `main` branch when running on Intel Arc with `xpu`:
+```bash
+python -m pip install -e ".[dev]"
+```
 
-```powershell
+### 4. Install and verify PyTorch
+
+Install a PyTorch build that matches your target device. If you plan to use Intel Arc, install a build with `xpu` support and verify it:
+
+```bash
+python -c "import torch; print(torch.__version__); print(hasattr(torch, 'xpu')); print(torch.xpu.is_available() if hasattr(torch, 'xpu') else False)"
+```
+
+### 5. Build the fused XPU operator
+
+This is recommended for XPU performance work, but not required for basic CPU use.
+
+```bash
 python tools/build_gated_delta_fused_op.py
 ```
 
-If the build succeeds, the dynamic library will be generated here:
+The build output is written under `.build/anna_gated_delta_fused`.
 
-- Windows: `.build\anna_gated_delta_fused\anna_gated_delta_fused.pyd`
-- Linux: `.build/anna_gated_delta_fused/anna_gated_delta_fused.so`
+## Example Local Model Directories
 
-The terminal usually prints output similar to:
+If you already downloaded checkpoints into the repository-local `models/` directory, examples currently present in this workspace include:
 
-```text
-Compiling Anna fused XPU/SYCL ops...
-library_path=<repo>/.build/anna_gated_delta_fused/anna_gated_delta_fused.<pyd|so>
-gated_delta_registered=True
-causal_conv1d_registered=True
-```
+- `models/Intel/Qwen3___5-2B-int4-AutoRound`
+- `models/Intel/Qwen3___5-35B-A3B-int4-AutoRound`
+- `models/google/gemma-4-E4B-it`
+- `models/Qwen/Qwen3-TTS-12Hz-1___7B-Base`
 
-### 7. Optional verification
+Any command below expects `--model-dir` to point at a directory like the ones above.
 
-```powershell
-pytest tests/test_fused_op_xpu.py -q
-```
+## Quick Start
 
-For a full regression run:
-
-```powershell
-pytest -q
-```
-
-### 8. SoX (optional)
-
-The upstream `qwen-tts` runtime may print a warning if the SoX CLI is not on your `PATH` (`'sox' is not recognized...`). Inference still runs; installing SoX silences the warning and enables SoX-based audio helpers when the stack invokes them.
-
-On Windows, pick one:
-
-- **Chocolatey** (Administrator shell): `choco install sox`
-- **Scoop**: `scoop install sox`
-- **Manual**: Install a build that provides `sox.exe` (see [SoX](http://sox.sourceforge.net/)), then add its directory to your user or system `PATH`.
-
-On Linux, install `sox` from your distribution package manager and confirm `sox --version` works in a new shell.
-
-Open a **new** terminal and confirm:
-
-```powershell
-sox --version
-```
-
-## Local Model Directory Requirements
-
-### Text / multimodal Qwen models
-
-Your local model directory should contain at least:
-
-- `config.json`
-- `tokenizer.json`
-- `tokenizer_config.json`
-- `model.safetensors` or sharded `*.safetensors`
-
-For example:
-
-```text
-D:\Projects\Anna\models\Qwen\Qwen3___5-2B
-```
-
-### Qwen3-TTS 12Hz models
-
-Anna also supports official `Qwen3-TTS` 12Hz model directories through the `qwen-tts` runtime path. A local `qwen3_tts` model directory should contain at least:
-
-- `config.json`
-- `tokenizer_config.json`
-- `vocab.json`
-- `merges.txt`
-- `model.safetensors`
-- `speech_tokenizer\config.json`
-- `speech_tokenizer\model.safetensors`
-
-For example:
-
-```text
-D:\Projects\Anna\models\Qwen\Qwen3-TTS-12Hz-1___7B-Base
-```
-
-Notes:
-
-- `anna-generate` and `anna-bench` remain for the `qwen3_5_text` family; use `anna-speak` or `POST /v1/audio/speech` for the `qwen3_tts` family
-- current TTS support is aimed at official 12Hz model layouts such as `Base`, `CustomVoice`, and `VoiceDesign`
-- optional **SoX** install: see [Step 8: SoX (optional)](#8-sox-optional); missing SoX only triggers a warning and does not block 12Hz inference here
-
-## Command Examples
-
-### 1. Start the server
+### Serve an OpenAI-compatible API
 
 Minimal example:
 
-```powershell
-anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16 --kv-cache-quantization turboquant --kv-cache-quant-bits 4 --kv-cache-residual-len 128
+```bash
+anna-serve --model-dir <path-to-model> --host 127.0.0.1 --port 8000
 ```
 
-Linux/bash example:
+Typical XPU-oriented example:
 
 ```bash
 anna-serve \
-  --model-dir /path/to/model \
-  --model-name Qwen3.5-2B \
+  --model-dir <path-to-model> \
   --device xpu \
   --dtype bfloat16 \
   --kv-cache-quantization turboquant \
   --kv-cache-quant-bits 4 \
-  --kv-cache-residual-len 128 \
-  --host 127.0.0.1 \
-  --port 8000
+  --weight-quant auto \
+  --prompt-cache-size 4
 ```
 
-Example aligned with the current `main` branch and environment:
+For large Qwen MoE models, you can additionally tune options such as:
 
-```powershell
-anna-serve `
-  --model-dir D:\Projects\Anna\models\Qwen\Qwen3___5-2B `
-  --model-name Qwen3.5-2B `
-  --device xpu `
-  --dtype bfloat16 `
-  --offload-mode none `
-  --weight-quant none `
-  --kv-cache-quantization turboquant `
-  --kv-cache-quant-bits 4 `
-  --kv-cache-residual-len 128 `
-  --host 127.0.0.1 `
-  --port 8000
+- `--offload-mode experts`
+- `--expert-quant int4`
+- `--cached-experts-per-layer <N>` (64 recommended)
+- `--resident-expert-layers <N>`
+
+### Generate text locally
+
+`anna-generate` is a prompt-to-text CLI for text-generation families:
+
+```bash
+anna-generate --model-dir <path-to-text-model> --prompt "Write a short summary of KV cache."
 ```
 
-Example for an Arc A770 deployment with a local Qwen3.5 9B distilled model, int4 dense weights, and tighter memory guardrails:
+### Benchmark a model
 
-```powershell
-anna-serve `
-  --model-dir D:\Projects\Anna\models\Jackrong\Qwen3___5-9B-Claude-4___6-Opus-Reasoning-Distilled-v2 `
-  --model-name qwen3.5 `
-  --device xpu `
-  --dtype bf16 `
-  --weight-quant int4 `
-  --kv-cache-quantization turboquant `
-  --kv-cache-quant-bits 4 `
-  --kv-cache-residual-len 128 `
-  --offload-vision `
-  --disable-thinking `
-  --reasoning-format deepseek `
-  --min-free-memory-mib 256 `
-  --reserve-memory-mib 128 `
-  --max-estimated-usage-ratio 0.95 `
-  --generation-memory-safety-factor 1.25
+Text benchmark:
+
+```bash
+anna-bench --model-dir <path-to-text-model> --prompt "Explain grouped-query attention." --warmup 1 --runs 3
 ```
 
-Example for running the local Gemma 4 E4B multimodal runtime on Arc A770 with the same safety-oriented admission settings:
+Image benchmark:
 
-```powershell
-anna-serve `
-  --model-dir D:\Projects\Anna\models\google\gemma-4-E4B-it `
-  --model-name gemma4 `
-  --device xpu `
-  --dtype bf16 `
-  --weight-quant int4 `
-  --kv-cache-quantization turboquant `
-  --kv-cache-quant-bits 4 `
-  --kv-cache-residual-len 128 `
-  --offload-vision `
-  --disable-thinking `
-  --reasoning-format deepseek `
-  --min-free-memory-mib 256 `
-  --reserve-memory-mib 128 `
-  --max-estimated-usage-ratio 0.95 `
-  --generation-memory-safety-factor 1.25
+```bash
+anna-bench --model-dir <path-to-multimodal-model> --prompt "Describe the image." --image ./demo.png
 ```
 
-If you do not want periodic metrics logs:
+Video benchmark:
 
-```powershell
-anna-serve `
-  --model-dir D:\Projects\Anna\models\Qwen\Qwen3___5-2B `
-  --model-name Qwen3.5-2B `
-  --device xpu `
-  --dtype bfloat16 `
-  --kv-cache-quantization turboquant `
-  --kv-cache-quant-bits 4 `
-  --kv-cache-residual-len 128 `
-  --metrics-log-interval-seconds 0
+```bash
+anna-bench --model-dir <path-to-multimodal-model> --prompt "Summarize the clip." --video ./demo.mp4
 ```
 
-### 2. What the terminal prints on startup
+### Synthesize speech with Qwen3-TTS
 
-After the server starts, the terminal prints:
+Base voice-clone model:
 
-- The service address
-- The currently available routes
-- Aggregated runtime metrics
-
-Example:
-
-```text
-INFO anna.cli.serve: Starting Anna server on http://127.0.0.1:8000
-INFO anna.cli.serve: Available routes are:
-INFO anna.cli.serve: Route: /openapi.json, Methods: HEAD, GET
-INFO anna.cli.serve: Route: /healthz, Methods: GET
-INFO anna.cli.serve: Route: /v1/models, Methods: GET
-INFO anna.cli.serve: Route: /v1/chat/completions, Methods: POST
-INFO anna.cli.serve: Route: /v1/completions, Methods: POST
-INFO anna.cli.serve: Route: /v1/audio/speech, Methods: POST
+```bash
+anna-speak \
+  --model-dir <path-to-qwen3-tts-base> \
+  --input "Hello from Anna." \
+  --output out.wav \
+  --ref-audio ref.wav \
+  --ref-text "Reference transcript."
 ```
 
-### 3. Generate text directly
+CustomVoice model:
 
-```powershell
-anna-generate `
-  --model-dir D:\Projects\Anna\models\Qwen\Qwen3___5-2B `
-  --model-name Qwen3.5-2B `
-  --device xpu `
-  --dtype bfloat16 `
-  --offload-mode none `
-  --weight-quant none `
-  --kv-cache-quantization turboquant `
-  --kv-cache-quant-bits 4 `
-  --kv-cache-residual-len 128 `
-  --prompt "Hello" `
-  --max-new-tokens 32
+```bash
+anna-speak \
+  --model-dir <path-to-qwen3-tts-custom> \
+  --input "Hello from Anna." \
+  --output out.wav \
+  --speaker Vivian \
+  --instruct "Speak with energy."
 ```
 
-### 4. Run a benchmark
+VoiceDesign model:
 
-```powershell
-anna-bench `
-  --model-dir D:\Projects\Anna\models\Qwen\Qwen3___5-2B `
-  --model-name Qwen3.5-2B `
-  --device xpu `
-  --dtype bfloat16 `
-  --kv-cache-quantization turboquant `
-  --kv-cache-quant-bits 4 `
-  --kv-cache-residual-len 128 `
-  --prompt "Hello, please introduce yourself." `
-  --runs 5
+```bash
+anna-speak \
+  --model-dir <path-to-qwen3-tts-voice-design> \
+  --input "Hello from Anna." \
+  --output out.wav \
+  --instruct "A calm, warm female voice."
 ```
 
-### 5. Generate speech directly with Qwen3-TTS Base
+The CLI supports `wav` and `flac` output through `--response-format`.
 
-This path is intended for local voice-clone models such as `Qwen3-TTS-12Hz-1.7B-Base`.
+## OpenAI-Compatible API
 
-```powershell
-anna-speak `
-  --model-dir D:\Projects\Anna\models\Qwen\Qwen3-TTS-12Hz-1___7B-Base `
-  --device xpu `
-  --dtype bfloat16 `
-  --input "Anna CLI smoke test on Intel Arc." `
-  --output D:\Projects\Anna\.build\anna_tts_cli_smoke.wav `
-  --language English `
-  --ref-audio D:\Projects\Anna\.build\tts_ref.wav `
-  --ref-text "Hello Anna. This is a reference voice for local synthesis testing." `
-  --max-new-tokens 1024
+The server always exposes the same routes, but request success depends on the loaded model family.
+
+### Routes
+
+- `GET /healthz`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/completions`
+- `POST /v1/audio/speech`
+
+### Example requests
+
+List models:
+
+```bash
+curl http://127.0.0.1:8000/v1/models
 ```
 
-For `CustomVoice` models, replace the voice-clone arguments with `--speaker` and optional `--instruct`.
+Chat completion:
 
-For `VoiceDesign` models, provide `--instruct` without `--speaker`.
-
-### 6. Serve a Qwen3-TTS model
-
-```powershell
-anna-serve `
-  --model-dir D:\Projects\Anna\models\Qwen\Qwen3-TTS-12Hz-1___7B-Base `
-  --model-name Qwen3-TTS-1.7B-Base `
-  --device xpu `
-  --dtype bfloat16 `
-  --host 127.0.0.1 `
-  --port 8000
+```bash
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-model",
+    "messages": [{"role": "user", "content": "Write a haiku about Intel Arc."}],
+    "reasoning_format": "deepseek"
+  }'
 ```
 
-### 7. Call the speech API
+Text completion:
 
-The server returns raw audio bytes. For `Base` voice-clone models, include `ref_audio` and `ref_text`.
-
-In **PowerShell**, pass JSON with a **single-quoted** `-d` argument so the body is valid JSON: use `"` inside the JSON and **do not** write `\"` (those backslashes would be sent literally and break parsing). Prefer forward slashes in `ref_audio` paths on Windows.
-
-```powershell
-curl.exe http://127.0.0.1:8000/v1/audio/speech `
-  -H "Content-Type: application/json" `
-  --output speech.wav `
-  -d '{"model":"Qwen3-TTS-1.7B-Base","input":"This request goes through the Anna FastAPI speech route.","language":"English","ref_audio":"D:/Projects/Anna/.build/tts_ref.wav","ref_text":"Hello Anna. This is a reference voice for local synthesis testing.","response_format":"wav","max_new_tokens":1024}'
+```bash
+curl -X POST http://127.0.0.1:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-model",
+    "prompt": "Anna is",
+    "max_tokens": 64
+  }'
 ```
 
-Supported request fields include:
+Speech synthesis with a Base voice-clone TTS model:
 
-- `input`: text to synthesize
-- `response_format`: `wav`, `flac`, or `pcm`
-- `language`
-- `speaker` or `voice` for `CustomVoice`
-- `instruct` for `VoiceDesign` or optional style control on `CustomVoice`
-- `ref_audio`, `ref_text`, `x_vector_only_mode` for `Base`
-- `max_new_tokens`, `do_sample`, `temperature`, `top_p`, `top_k`, `repetition_penalty`
-- `subtalker_do_sample`, `subtalker_temperature`, `subtalker_top_p`, `subtalker_top_k`
-- `non_streaming_mode`
-
-## API Examples
-
-### Chat Completions
-
-```powershell
-curl.exe http://127.0.0.1:8000/v1/chat/completions `
-  -H "Content-Type: application/json" `
-  -d '{"model":"Qwen3.5-2B","messages":[{"role":"user","content":"Hello, please introduce yourself."}],"max_completion_tokens":128}'
+```bash
+curl -X POST http://127.0.0.1:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-model",
+    "input": "Hello from Anna.",
+    "ref_audio": "ref.wav",
+    "ref_text": "Reference transcript.",
+    "response_format": "wav"
+  }' \
+  --output speech.wav
 ```
 
-### Completions
+For `custom_voice` models, pass `speaker` or `voice`; for `voice_design` models, pass `instruct`.
 
-```powershell
-curl.exe http://127.0.0.1:8000/v1/completions `
-  -H "Content-Type: application/json" `
-  -d '{"model":"Qwen3.5-2B","prompt":"Hello","max_tokens":32}'
+Chat requests also accept:
+
+- multimodal `content` arrays with `text`, `image_url`, `video_url`, and `audio_url` parts
+- `tools`, `tool_choice`, and `parallel_tool_calls`
+- `enable_thinking` or `chat_template_kwargs.enable_thinking`
+
+## Useful Runtime Flags
+
+| Area | Options | Notes |
+| --- | --- | --- |
+| Common | `--device`, `--dtype`, `--compile-mode`, `--compile-fullgraph` | `device` supports `auto`, `cpu`, and `xpu`; `dtype` supports `auto`, `float32`, `float16`, and `bfloat16` |
+| Prefill and prompt cache | `--prefill-chunk-size`, `--prompt-cache-size`, `--prompt-cache-max-tokens`, `--profile-runtime` | Available on text-generation CLIs and server |
+| KV cache | `--kv-cache-quantization`, `--kv-cache-quant-bits`, `--kv-cache-residual-len` | TurboQuant is supported by the Qwen3.5 and Gemma4 runtimes |
+| Qwen large-model controls | `--offload-mode`, `--offload-vision`, `--expert-quant`, `--weight-quant`, `--resident-expert-layers`, `--resident-expert-layer-indices`, `--cached-experts-per-layer` | Mainly useful for large Qwen3.5 MoE or vision-capable checkpoints |
+| Server defaults and safety | `--enable-thinking`, `--disable-thinking`, `--reasoning-format`, `--max-completion-tokens`, `--min-free-memory-mib`, `--reserve-memory-mib`, `--max-estimated-usage-ratio`, `--generation-memory-safety-factor` | Controls default chat behavior and request admission |
+| Server batching and metrics | `--scheduler-max-batch-size`, `--scheduler-batch-wait-ms`, `--metrics-log-interval-seconds` | Continuous batching is enabled only when batch size is above `1` |
+| Speech synthesis | `--language`, `--speaker`, `--instruct`, `--ref-audio`, `--ref-text`, `--x-vector-only-mode`, `--response-format` | `anna-speak` supports `wav` and `flac`; the API also supports `pcm` |
+
+## Development
+
+Run the test suite:
+
+```bash
+python -m pytest
 ```
 
-### List models
-
-```powershell
-curl.exe http://127.0.0.1:8000/v1/models
-```
-
-### Health check
-
-```powershell
-curl.exe http://127.0.0.1:8000/healthz
-```
-
-## Troubleshooting
-
-### 1. `torch.xpu.is_available()` returns `False`
-
-Check these first:
-
-- Whether your PyTorch build really supports `xpu`
-- Whether the Intel GPU driver is installed correctly
-- Whether you accidentally installed a CPU-only `torch` in the current environment
-
-### 2. The fused op build fails
-
-Check these first:
-
-- Whether `ANNA_DPCPP` points to the right compiler, or `dpcpp` is on `PATH`
-- On Windows, whether `ANNA_VCVARS64` or `vcvars64.bat` is correct
-- Whether the required oneAPI runtime libraries are reachable; on Linux you can set `ANNA_ONEAPI_RUNTIME_PATHS` if the auto-detected directories are incomplete
-- On Windows, whether both oneAPI and MSVC are installed
-- Whether the active environment's `torch` includes the required headers and `torch_xpu` related libraries
-
-### 3. The server starts, but generation fails with fused-op related errors
-
-Rebuild the custom operator once:
-
-```powershell
-python tools/build_gated_delta_fused_op.py
-```
-
-Then restart the server.
-
-### 4. I do not want the metrics logs
-
-Disable them directly:
-
-```powershell
-anna-serve --model-dir D:\path\to\model --device xpu --dtype bfloat16 --metrics-log-interval-seconds 0
-```
-
-## Development Notes
-
-- After changing the SYCL source, rerun `python tools/build_gated_delta_fused_op.py`
-- Then run `pytest tests/test_fused_op_xpu.py -q`
-- Restart `anna-serve` after that
-
----
-
-# Thanks to [LinuxDO](https://linux.do/) community.
+If you are working on XPU fused kernels, build the custom operator first and then use the project CLIs or tests against the compiled library in `.build/anna_gated_delta_fused`.
