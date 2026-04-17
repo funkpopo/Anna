@@ -17,26 +17,19 @@ namespace anna {
 
 namespace {
 
-at::Tensor l2norm(const at::Tensor& x, double eps = 1e-6) {
-  auto squared = x * x;
-  return x * at::rsqrt(squared.sum(-1, true) + eps);
-}
-
-void validate_common_inputs(
+void validate_gated_delta_inputs(
     const at::Tensor& query_in,
     const at::Tensor& key_in,
     const at::Tensor& value_in,
     const at::Tensor& g_in,
     const at::Tensor& beta_in,
-    const at::Tensor& z_in,
-    const at::Tensor& norm_weight) {
+    const at::Tensor& state_in) {
   TORCH_CHECK(query_in.dim() == 4, "query must be [batch, seq, heads, head_dim]");
   TORCH_CHECK(key_in.dim() == 4, "key must be [batch, seq, heads, head_dim]");
   TORCH_CHECK(value_in.dim() == 4, "value must be [batch, seq, heads, head_dim]");
   TORCH_CHECK(g_in.dim() == 3, "g must be [batch, seq, heads]");
   TORCH_CHECK(beta_in.dim() == 3, "beta must be [batch, seq, heads]");
-  TORCH_CHECK(z_in.dim() == 4, "z must be [batch, seq, heads, head_dim]");
-  TORCH_CHECK(norm_weight.dim() == 1, "norm_weight must be [head_dim]");
+  TORCH_CHECK(state_in.dim() == 4, "state must be [batch, heads, key_head_dim, value_head_dim]");
 
   TORCH_CHECK(query_in.size(0) == key_in.size(0), "query/key batch size mismatch");
   TORCH_CHECK(query_in.size(0) == value_in.size(0), "query/value batch size mismatch");
@@ -45,44 +38,51 @@ void validate_common_inputs(
   TORCH_CHECK(query_in.size(2) == key_in.size(2), "query/key head count mismatch");
   TORCH_CHECK(query_in.size(2) == value_in.size(2), "query/value head count mismatch");
   TORCH_CHECK(query_in.size(3) == key_in.size(3), "query/key head dim mismatch");
+  TORCH_CHECK(query_in.size(2) > 0, "gated_delta head count must be positive");
+  TORCH_CHECK(query_in.size(3) > 0, "gated_delta key head dim must be positive");
+  TORCH_CHECK(value_in.size(3) > 0, "gated_delta value head dim must be positive");
+  TORCH_CHECK(query_in.size(2) == state_in.size(1), "query/state head count mismatch");
+  TORCH_CHECK(query_in.size(3) == state_in.size(2), "query/state key head dim mismatch");
+  TORCH_CHECK(value_in.size(3) == state_in.size(3), "value/state value head dim mismatch");
 
   TORCH_CHECK(g_in.size(0) == query_in.size(0), "g batch size mismatch");
   TORCH_CHECK(g_in.size(1) == query_in.size(1), "g sequence length mismatch");
   TORCH_CHECK(g_in.size(2) == query_in.size(2), "g head count mismatch");
   TORCH_CHECK(beta_in.sizes() == g_in.sizes(), "beta shape must match g");
 
-  TORCH_CHECK(z_in.size(0) == query_in.size(0), "z batch size mismatch");
-  TORCH_CHECK(z_in.size(1) == query_in.size(1), "z sequence length mismatch");
-  TORCH_CHECK(z_in.size(2) == query_in.size(2), "z head count mismatch");
-  TORCH_CHECK(z_in.size(3) == value_in.size(3), "z head dim must match value");
-  TORCH_CHECK(norm_weight.size(0) == value_in.size(3), "norm_weight head dim must match value");
-  TORCH_CHECK(at::isFloatingType(norm_weight.scalar_type()), "norm_weight must be a floating-point tensor");
+  TORCH_CHECK(
+      query_in.scalar_type() == key_in.scalar_type() &&
+          query_in.scalar_type() == value_in.scalar_type(),
+      "query, key, and value must share the same dtype");
+  TORCH_CHECK(
+      query_in.scalar_type() == at::kHalf || query_in.scalar_type() == at::kBFloat16 ||
+          query_in.scalar_type() == at::kFloat,
+      "gated_delta XPU kernel supports float16, bfloat16, and float32 query/key/value inputs");
+  TORCH_CHECK(g_in.scalar_type() == at::kFloat, "g must be float32");
+  TORCH_CHECK(beta_in.scalar_type() == at::kFloat, "beta must be float32");
+  TORCH_CHECK(state_in.scalar_type() == at::kFloat, "state must be float32");
 }
 
-void validate_xpu_inputs(
+void validate_gated_delta_xpu_inputs(
     const at::Tensor& query_in,
     const at::Tensor& key_in,
     const at::Tensor& value_in,
     const at::Tensor& g_in,
     const at::Tensor& beta_in,
-    const at::Tensor& z_in,
-    const at::Tensor& norm_weight,
-    const c10::optional<at::Tensor>& initial_state_opt,
-    const c10::optional<at::Tensor>& state_buffer_opt) {
+    const at::Tensor& state_in) {
   auto device = query_in.device();
   TORCH_CHECK(device.type() == c10::DeviceType::XPU, "query must be an XPU tensor");
   TORCH_CHECK(key_in.device() == device, "key must be on the same device as query");
   TORCH_CHECK(value_in.device() == device, "value must be on the same device as query");
   TORCH_CHECK(g_in.device() == device, "g must be on the same device as query");
   TORCH_CHECK(beta_in.device() == device, "beta must be on the same device as query");
-  TORCH_CHECK(z_in.device() == device, "z must be on the same device as query");
-  TORCH_CHECK(norm_weight.device() == device, "norm_weight must be on the same device as query");
-  if (initial_state_opt.has_value() && initial_state_opt->defined()) {
-    TORCH_CHECK(initial_state_opt->device() == device, "initial_state must be on the same device as query");
-  }
-  if (state_buffer_opt.has_value() && state_buffer_opt->defined()) {
-    TORCH_CHECK(state_buffer_opt->device() == device, "state_buffer must be on the same device as query");
-  }
+  TORCH_CHECK(state_in.device() == device, "state must be on the same device as query");
+  TORCH_CHECK(query_in.is_contiguous(), "query must be contiguous");
+  TORCH_CHECK(key_in.is_contiguous(), "key must be contiguous");
+  TORCH_CHECK(value_in.is_contiguous(), "value must be contiguous");
+  TORCH_CHECK(g_in.is_contiguous(), "g must be contiguous");
+  TORCH_CHECK(beta_in.is_contiguous(), "beta must be contiguous");
+  TORCH_CHECK(state_in.is_contiguous(), "state must be contiguous");
 }
 
 int64_t next_power_of_two(int64_t value) {
@@ -93,9 +93,169 @@ int64_t next_power_of_two(int64_t value) {
   return result;
 }
 
+bool is_power_of_two(int64_t value) {
+  return value > 0 && (value & (value - 1)) == 0;
+}
+
+int64_t gated_delta_local_memory_bytes_required(int64_t key_head_dim, int64_t local_size) {
+  return static_cast<int64_t>(sizeof(float)) * ((2 * local_size) + (2 * key_head_dim));
+}
+
+void validate_gated_delta_local_memory_requirements(
+    const sycl::device& device,
+    int64_t key_head_dim,
+    int64_t local_size) {
+  TORCH_CHECK(key_head_dim > 0, "gated_delta key head dim must be positive");
+  TORCH_CHECK(local_size > 0, "gated_delta local reduction size must be positive");
+  TORCH_CHECK(is_power_of_two(local_size), "gated_delta local reduction size must be a power of two");
+  const auto local_mem_size = static_cast<int64_t>(device.get_info<sycl::info::device::local_mem_size>());
+  const auto required_bytes = gated_delta_local_memory_bytes_required(key_head_dim, local_size);
+  TORCH_CHECK(
+      required_bytes <= local_mem_size,
+      "gated_delta local memory requirement exceeds device limit: required=",
+      required_bytes,
+      " bytes, available=",
+      local_mem_size,
+      " bytes");
+}
+
 template <typename scalar_t>
 inline float load_as_float(const scalar_t* ptr, int64_t idx) {
   return static_cast<float>(ptr[idx]);
+}
+
+template <typename scalar_t, typename PartialAccessor, typename VectorAccessor>
+inline void normalize_gated_delta_qk(
+    const scalar_t* query_ptr,
+    const scalar_t* key_ptr,
+    int64_t query_base,
+    int64_t key_base,
+    int64_t key_head_dim,
+    int64_t local_size,
+    float l2_eps_f,
+    float query_scale_base,
+    sycl::nd_item<2> item,
+    PartialAccessor& partial_sum,
+    PartialAccessor& partial_sum_aux,
+    VectorAccessor& normalized_query,
+    VectorAccessor& normalized_key) {
+  const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+  auto sg = item.get_sub_group();
+  const int64_t subgroup_lane = static_cast<int64_t>(sg.get_local_linear_id());
+  const int64_t subgroup_idx = static_cast<int64_t>(sg.get_group_linear_id());
+  const int64_t subgroup_size = static_cast<int64_t>(sg.get_local_linear_range());
+  const int64_t raw_subgroup_count = (local_size + subgroup_size - 1) / subgroup_size;
+  const int64_t subgroup_count = raw_subgroup_count < local_size ? raw_subgroup_count : local_size;
+
+  float local_query_sum_sq = 0.0f;
+  float local_key_sum_sq = 0.0f;
+  for (int64_t k_idx = lane; k_idx < key_head_dim; k_idx += local_size) {
+    const float raw_query = load_as_float(query_ptr, query_base + k_idx);
+    const float raw_key = load_as_float(key_ptr, key_base + k_idx);
+    normalized_query[k_idx] = raw_query;
+    normalized_key[k_idx] = raw_key;
+    local_query_sum_sq += raw_query * raw_query;
+    local_key_sum_sq += raw_key * raw_key;
+  }
+
+  const float subgroup_query_sum_sq = sycl::reduce_over_group(sg, local_query_sum_sq, sycl::plus<float>());
+  const float subgroup_key_sum_sq = sycl::reduce_over_group(sg, local_key_sum_sq, sycl::plus<float>());
+  if (subgroup_lane == 0 && subgroup_idx < local_size) {
+    partial_sum[subgroup_idx] = subgroup_query_sum_sq;
+    partial_sum_aux[subgroup_idx] = subgroup_key_sum_sq;
+  }
+  item.barrier(sycl::access::fence_space::local_space);
+
+  partial_sum[lane] = lane < subgroup_count ? partial_sum[lane] : 0.0f;
+  partial_sum_aux[lane] = lane < subgroup_count ? partial_sum_aux[lane] : 0.0f;
+  item.barrier(sycl::access::fence_space::local_space);
+
+  for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
+    if (lane < stride) {
+      partial_sum[lane] += partial_sum[lane + stride];
+      partial_sum_aux[lane] += partial_sum_aux[lane + stride];
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+  }
+
+  const float query_scale = sycl::rsqrt(partial_sum[0] + l2_eps_f) * query_scale_base;
+  const float key_scale = sycl::rsqrt(partial_sum_aux[0] + l2_eps_f);
+  for (int64_t k_idx = lane; k_idx < key_head_dim; k_idx += local_size) {
+    normalized_query[k_idx] *= query_scale;
+    normalized_key[k_idx] *= key_scale;
+  }
+  item.barrier(sycl::access::fence_space::local_space);
+}
+
+template <typename VectorAccessor>
+inline float gated_delta_decay_state_and_compute_kv_mem(
+    const float* state_source_ptr,
+    float* state_write_ptr,
+    int64_t state_base,
+    int64_t value_head_dim,
+    int64_t key_head_dim,
+    int64_t value_idx,
+    float g_scale,
+    VectorAccessor& normalized_key) {
+  float kv_mem = 0.0f;
+  for (int64_t k_idx = 0; k_idx < key_head_dim; ++k_idx) {
+    const int64_t state_index = state_base + k_idx * value_head_dim + value_idx;
+    const float decayed = state_source_ptr[state_index] * g_scale;
+    state_write_ptr[state_index] = decayed;
+    kv_mem += decayed * normalized_key[k_idx];
+  }
+  return kv_mem;
+}
+
+template <typename scalar_t>
+inline float gated_delta_compute_delta(
+    const scalar_t* value_ptr,
+    int64_t value_base,
+    int64_t value_idx,
+    float kv_mem,
+    float beta_value) {
+  const float value_item = load_as_float(value_ptr, value_base + value_idx);
+  return (value_item - kv_mem) * beta_value;
+}
+
+template <typename VectorAccessor>
+inline void gated_delta_apply_delta_update(
+    float* state_write_ptr,
+    int64_t state_base,
+    int64_t value_head_dim,
+    int64_t key_head_dim,
+    int64_t value_idx,
+    float delta,
+    VectorAccessor& normalized_key) {
+  for (int64_t k_idx = 0; k_idx < key_head_dim; ++k_idx) {
+    const int64_t state_index = state_base + k_idx * value_head_dim + value_idx;
+    const float updated = state_write_ptr[state_index] + normalized_key[k_idx] * delta;
+    state_write_ptr[state_index] = updated;
+  }
+}
+
+template <typename VectorAccessor>
+inline float gated_delta_accumulate_output(
+    const float* state_write_ptr,
+    int64_t state_base,
+    int64_t value_head_dim,
+    int64_t key_head_dim,
+    int64_t value_idx,
+    VectorAccessor& normalized_query) {
+  float out_value = 0.0f;
+  for (int64_t k_idx = 0; k_idx < key_head_dim; ++k_idx) {
+    const int64_t state_index = state_base + k_idx * value_head_dim + value_idx;
+    out_value += state_write_ptr[state_index] * normalized_query[k_idx];
+  }
+  return out_value;
+}
+
+template <typename scalar_t>
+inline void gated_delta_store_output(
+    scalar_t* output_ptr,
+    int64_t output_index,
+    float out_value) {
+  output_ptr[output_index] = static_cast<scalar_t>(out_value);
 }
 
 void validate_rmsnorm_inputs(
@@ -315,16 +475,131 @@ void validate_causal_conv_xpu_inputs(
   TORCH_CHECK(weight.device() == device, "weight must be on the same device as hidden_states");
   if (bias_opt.has_value() && bias_opt->defined()) {
     TORCH_CHECK(bias_opt->device() == device, "bias must be on the same device as hidden_states");
+    TORCH_CHECK(bias_opt->is_contiguous(), "bias must be contiguous");
   }
+  TORCH_CHECK(hidden_states.is_contiguous(), "hidden_states must be contiguous");
   TORCH_CHECK(conv_state.is_contiguous(), "conv_state must be contiguous");
+  TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
 }
 
-std::tuple<at::Tensor, at::Tensor> causal_conv1d_fused_meta(
+template <typename scalar_t>
+void launch_causal_conv1d_prefill_kernel(
+    sycl::queue& queue,
+    const scalar_t* hidden_ptr,
+    const scalar_t* state_read_ptr,
+    scalar_t* state_write_ptr,
+    const scalar_t* weight_ptr,
+    const scalar_t* bias_ptr,
+    bool has_bias,
+    scalar_t* output_ptr,
+    int64_t batch_size,
+    int64_t channels,
+    int64_t sequence_length,
+    int64_t kernel_size) {
+  const int64_t total_outputs = batch_size * channels * sequence_length;
+  const int64_t total_states = batch_size * channels;
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_outputs)), [=](sycl::item<1> item) {
+      const int64_t linear_idx = static_cast<int64_t>(item.get_id(0));
+      const int64_t t = linear_idx % sequence_length;
+      const int64_t batch_channel = linear_idx / sequence_length;
+      const int64_t b = batch_channel / channels;
+      const int64_t c = batch_channel % channels;
+      const int64_t hidden_base = (b * channels + c) * sequence_length;
+      const int64_t state_base = (b * channels + c) * kernel_size;
+      const int64_t weight_base = c * kernel_size;
+
+      float acc = has_bias ? load_as_float(bias_ptr, c) : 0.0f;
+      for (int64_t k = 0; k < kernel_size; ++k) {
+        const int64_t source_index = t + 1 + k;
+        const float input_value = source_index < kernel_size
+            ? load_as_float(state_read_ptr, state_base + source_index)
+            : load_as_float(hidden_ptr, hidden_base + (source_index - kernel_size));
+        acc += input_value * load_as_float(weight_ptr, weight_base + k);
+      }
+
+      const float silu = acc / (1.0f + sycl::exp(-acc));
+      output_ptr[hidden_base + t] = static_cast<scalar_t>(silu);
+    });
+  });
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_states)), [=](sycl::item<1> item) {
+      const int64_t batch_channel = static_cast<int64_t>(item.get_id(0));
+      const int64_t b = batch_channel / channels;
+      const int64_t c = batch_channel % channels;
+      const int64_t hidden_base = (b * channels + c) * sequence_length;
+      const int64_t state_base = (b * channels + c) * kernel_size;
+
+      if (sequence_length >= kernel_size) {
+        for (int64_t k = 0; k < kernel_size; ++k) {
+          state_write_ptr[state_base + k] = hidden_ptr[hidden_base + (sequence_length - kernel_size + k)];
+        }
+        return;
+      }
+
+      const int64_t retained = kernel_size - sequence_length;
+      for (int64_t k = 0; k < retained; ++k) {
+        state_write_ptr[state_base + k] = state_read_ptr[state_base + sequence_length + k];
+      }
+      for (int64_t k = 0; k < sequence_length; ++k) {
+        state_write_ptr[state_base + retained + k] = hidden_ptr[hidden_base + k];
+      }
+    });
+  });
+}
+
+template <typename scalar_t>
+void launch_causal_conv1d_decode_kernel(
+    sycl::queue& queue,
+    const scalar_t* hidden_ptr,
+    const scalar_t* state_read_ptr,
+    scalar_t* state_write_ptr,
+    const scalar_t* weight_ptr,
+    const scalar_t* bias_ptr,
+    bool has_bias,
+    scalar_t* output_ptr,
+    int64_t batch_size,
+    int64_t channels,
+    int64_t kernel_size) {
+  const int64_t total_channels = batch_size * channels;
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_channels)), [=](sycl::item<1> item) {
+      const int64_t batch_channel = static_cast<int64_t>(item.get_id(0));
+      const int64_t b = batch_channel / channels;
+      const int64_t c = batch_channel % channels;
+      const int64_t hidden_base = batch_channel;
+      const int64_t state_base = batch_channel * kernel_size;
+      const int64_t weight_base = c * kernel_size;
+
+      float acc = has_bias ? load_as_float(bias_ptr, c) : 0.0f;
+      for (int64_t k = 0; k < kernel_size; ++k) {
+        const float input_value = k + 1 < kernel_size
+            ? load_as_float(state_read_ptr, state_base + k + 1)
+            : load_as_float(hidden_ptr, hidden_base);
+        acc += input_value * load_as_float(weight_ptr, weight_base + k);
+      }
+
+      const float silu = acc / (1.0f + sycl::exp(-acc));
+      output_ptr[hidden_base] = static_cast<scalar_t>(silu);
+
+      for (int64_t k = 0; k < kernel_size - 1; ++k) {
+        state_write_ptr[state_base + k] = state_read_ptr[state_base + k + 1];
+      }
+      state_write_ptr[state_base + kernel_size - 1] = hidden_ptr[hidden_base];
+    });
+  });
+}
+
+std::tuple<at::Tensor, at::Tensor> causal_conv1d_prefill_meta(
     const at::Tensor& hidden_states,
     const at::Tensor& conv_state,
     const at::Tensor& weight,
     const c10::optional<at::Tensor>& bias_opt) {
   validate_causal_conv_inputs(hidden_states, conv_state, weight, bias_opt);
+  TORCH_CHECK(hidden_states.size(2) > 1, "causal_conv1d_prefill expects seq_len > 1");
   auto meta_options = hidden_states.options().device(c10::Device(c10::DeviceType::Meta));
   return {
       at::empty(hidden_states.sizes(), meta_options),
@@ -332,21 +607,25 @@ std::tuple<at::Tensor, at::Tensor> causal_conv1d_fused_meta(
   };
 }
 
-std::tuple<at::Tensor, at::Tensor> causal_conv1d_fused_xpu(
-    const at::Tensor& hidden_states_in,
-    const at::Tensor& conv_state_in,
-    const at::Tensor& weight_in,
+at::Tensor causal_conv1d_decode_meta(
+    const at::Tensor& hidden_states,
+    const at::Tensor& conv_state,
+    const at::Tensor& weight,
     const c10::optional<at::Tensor>& bias_opt) {
-  validate_causal_conv_inputs(hidden_states_in, conv_state_in, weight_in, bias_opt);
-  validate_causal_conv_xpu_inputs(hidden_states_in, conv_state_in, weight_in, bias_opt);
+  validate_causal_conv_inputs(hidden_states, conv_state, weight, bias_opt);
+  TORCH_CHECK(hidden_states.size(2) == 1, "causal_conv1d_decode expects seq_len == 1");
+  auto meta_options = hidden_states.options().device(c10::Device(c10::DeviceType::Meta));
+  return at::empty(hidden_states.sizes(), meta_options);
+}
 
-  auto hidden_states = hidden_states_in.contiguous();
-  auto conv_state = conv_state_in.contiguous();
-  auto weight = weight_in.contiguous();
-  c10::optional<at::Tensor> bias;
-  if (bias_opt.has_value() && bias_opt->defined()) {
-    bias = bias_opt->contiguous();
-  }
+std::tuple<at::Tensor, at::Tensor> causal_conv1d_prefill_xpu(
+    const at::Tensor& hidden_states,
+    const at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias_opt) {
+  validate_causal_conv_inputs(hidden_states, conv_state, weight, bias_opt);
+  validate_causal_conv_xpu_inputs(hidden_states, conv_state, weight, bias_opt);
+  TORCH_CHECK(hidden_states.size(2) > 1, "causal_conv1d_prefill expects seq_len > 1");
 
   const auto batch_size = hidden_states.size(0);
   const auto channels = hidden_states.size(1);
@@ -356,76 +635,83 @@ std::tuple<at::Tensor, at::Tensor> causal_conv1d_fused_xpu(
   auto output = at::empty(hidden_states.sizes(), hidden_states.options());
   auto final_state = at::empty(conv_state.sizes(), conv_state.options());
   auto stream = c10::xpu::getCurrentXPUStream(hidden_states.device().index());
-  const int64_t total_outputs = batch_size * channels * sequence_length;
-  const int64_t total_states = batch_size * channels;
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::kHalf,
       at::kBFloat16,
       hidden_states.scalar_type(),
-      "causal_conv1d_fused_xpu",
+      "causal_conv1d_prefill_xpu",
       [&] {
         const scalar_t* hidden_ptr = hidden_states.const_data_ptr<scalar_t>();
         const scalar_t* state_read_ptr = conv_state.const_data_ptr<scalar_t>();
         scalar_t* state_write_ptr = final_state.mutable_data_ptr<scalar_t>();
         const scalar_t* weight_ptr = weight.const_data_ptr<scalar_t>();
-        const bool has_bias = bias.has_value() && bias->defined();
-        const scalar_t* bias_ptr = has_bias ? bias->const_data_ptr<scalar_t>() : nullptr;
+        const bool has_bias = bias_opt.has_value() && bias_opt->defined();
+        const scalar_t* bias_ptr = has_bias ? bias_opt->const_data_ptr<scalar_t>() : nullptr;
         scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
-
-        stream.queue().submit([&](sycl::handler& cgh) {
-          cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_outputs)), [=](sycl::item<1> item) {
-            const int64_t linear_idx = static_cast<int64_t>(item.get_id(0));
-            const int64_t t = linear_idx % sequence_length;
-            const int64_t batch_channel = linear_idx / sequence_length;
-            const int64_t b = batch_channel / channels;
-            const int64_t c = batch_channel % channels;
-            const int64_t hidden_base = (b * channels + c) * sequence_length;
-            const int64_t state_base = (b * channels + c) * kernel_size;
-            const int64_t weight_base = c * kernel_size;
-
-            float acc = has_bias ? load_as_float(bias_ptr, c) : 0.0f;
-            for (int64_t k = 0; k < kernel_size; ++k) {
-              const int64_t source_index = t + 1 + k;
-              const float input_value = source_index < kernel_size
-                  ? load_as_float(state_read_ptr, state_base + source_index)
-                  : load_as_float(hidden_ptr, hidden_base + (source_index - kernel_size));
-              acc += input_value * load_as_float(weight_ptr, weight_base + k);
-            }
-
-            const float silu = acc / (1.0f + sycl::exp(-acc));
-            output_ptr[hidden_base + t] = static_cast<scalar_t>(silu);
-          });
-        });
-
-        stream.queue().submit([&](sycl::handler& cgh) {
-          cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_states)), [=](sycl::item<1> item) {
-            const int64_t batch_channel = static_cast<int64_t>(item.get_id(0));
-            const int64_t b = batch_channel / channels;
-            const int64_t c = batch_channel % channels;
-            const int64_t hidden_base = (b * channels + c) * sequence_length;
-            const int64_t state_base = (b * channels + c) * kernel_size;
-
-            if (sequence_length >= kernel_size) {
-              for (int64_t k = 0; k < kernel_size; ++k) {
-                state_write_ptr[state_base + k] =
-                    hidden_ptr[hidden_base + (sequence_length - kernel_size + k)];
-              }
-              return;
-            }
-
-            const int64_t retained = kernel_size - sequence_length;
-            for (int64_t k = 0; k < retained; ++k) {
-              state_write_ptr[state_base + k] = state_read_ptr[state_base + sequence_length + k];
-            }
-            for (int64_t k = 0; k < sequence_length; ++k) {
-              state_write_ptr[state_base + retained + k] = hidden_ptr[hidden_base + k];
-            }
-          });
-        });
+        launch_causal_conv1d_prefill_kernel(
+            stream.queue(),
+            hidden_ptr,
+            state_read_ptr,
+            state_write_ptr,
+            weight_ptr,
+            bias_ptr,
+            has_bias,
+            output_ptr,
+            batch_size,
+            channels,
+            sequence_length,
+            kernel_size);
       });
 
   return {output, final_state};
+}
+
+at::Tensor causal_conv1d_decode_xpu(
+    const at::Tensor& hidden_states,
+    const at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias_opt) {
+  validate_causal_conv_inputs(hidden_states, conv_state, weight, bias_opt);
+  validate_causal_conv_xpu_inputs(hidden_states, conv_state, weight, bias_opt);
+  TORCH_CHECK(hidden_states.size(2) == 1, "causal_conv1d_decode expects seq_len == 1");
+
+  const auto batch_size = hidden_states.size(0);
+  const auto channels = hidden_states.size(1);
+  const auto kernel_size = weight.size(1);
+
+  auto output = at::empty(hidden_states.sizes(), hidden_states.options());
+  auto stream = c10::xpu::getCurrentXPUStream(hidden_states.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      hidden_states.scalar_type(),
+      "causal_conv1d_decode_xpu",
+      [&] {
+        const scalar_t* hidden_ptr = hidden_states.const_data_ptr<scalar_t>();
+        const scalar_t* state_read_ptr = conv_state.const_data_ptr<scalar_t>();
+        scalar_t* state_write_ptr = conv_state.mutable_data_ptr<scalar_t>();
+        const scalar_t* weight_ptr = weight.const_data_ptr<scalar_t>();
+        const bool has_bias = bias_opt.has_value() && bias_opt->defined();
+        const scalar_t* bias_ptr = has_bias ? bias_opt->const_data_ptr<scalar_t>() : nullptr;
+        scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
+
+        launch_causal_conv1d_decode_kernel(
+            stream.queue(),
+            hidden_ptr,
+            state_read_ptr,
+            state_write_ptr,
+            weight_ptr,
+            bias_ptr,
+            has_bias,
+            output_ptr,
+            batch_size,
+            channels,
+            kernel_size);
+      });
+
+  return output;
 }
 
 at::Tensor rmsnorm_fused_meta(
@@ -1150,135 +1436,253 @@ at::Tensor paged_gqa_decode_fused_xpu(
   return output;
 }
 
-std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_meta(
+std::tuple<at::Tensor, at::Tensor> gated_delta_prefill_meta(
     const at::Tensor& query_in,
     const at::Tensor& key_in,
     const at::Tensor& value_in,
     const at::Tensor& g_in,
     const at::Tensor& beta_in,
-    const at::Tensor& z_in,
-    const at::Tensor& norm_weight,
-    double /*norm_eps*/,
-    const c10::optional<at::Tensor>& initial_state_opt,
-    bool output_final_state,
-    const c10::optional<at::Tensor>& state_buffer_opt) {
-  validate_common_inputs(query_in, key_in, value_in, g_in, beta_in, z_in, norm_weight);
-  if (initial_state_opt.has_value() && initial_state_opt->defined()) {
-    TORCH_CHECK(initial_state_opt->dim() == 4, "initial_state must be [batch, heads, key_head_dim, value_head_dim]");
-    TORCH_CHECK(initial_state_opt->size(0) == query_in.size(0), "initial_state batch size mismatch");
-    TORCH_CHECK(initial_state_opt->size(1) == query_in.size(2), "initial_state head count mismatch");
-    TORCH_CHECK(initial_state_opt->size(2) == query_in.size(3), "initial_state key head dim mismatch");
-    TORCH_CHECK(initial_state_opt->size(3) == value_in.size(3), "initial_state value head dim mismatch");
-  }
-  if (state_buffer_opt.has_value() && state_buffer_opt->defined()) {
-    TORCH_CHECK(state_buffer_opt->dim() == 4, "state_buffer must be [batch, heads, key_head_dim, value_head_dim]");
-    TORCH_CHECK(state_buffer_opt->size(0) == query_in.size(0), "state_buffer batch size mismatch");
-    TORCH_CHECK(state_buffer_opt->size(1) == query_in.size(2), "state_buffer head count mismatch");
-    TORCH_CHECK(state_buffer_opt->size(2) == query_in.size(3), "state_buffer key head dim mismatch");
-    TORCH_CHECK(state_buffer_opt->size(3) == value_in.size(3), "state_buffer value head dim mismatch");
-  }
-
+    const at::Tensor& state_in) {
+  validate_gated_delta_inputs(query_in, key_in, value_in, g_in, beta_in, state_in);
+  TORCH_CHECK(query_in.size(1) > 1, "gated_delta_prefill expects seq_len > 1");
   auto meta_options = query_in.options().device(c10::Device(c10::DeviceType::Meta));
   auto output = at::empty(
-      {query_in.size(0), query_in.size(1), query_in.size(2) * value_in.size(3)},
+      {query_in.size(0), query_in.size(1), query_in.size(2), value_in.size(3)},
       meta_options);
-  if (!output_final_state) {
-    return {output, c10::nullopt};
-  }
-  auto final_state = at::empty(
-      {query_in.size(0), query_in.size(2), query_in.size(3), value_in.size(3)},
-      meta_options.dtype(at::kFloat));
+  auto final_state = at::empty(state_in.sizes(), meta_options.dtype(at::kFloat));
   return {output, final_state};
 }
 
-std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_xpu(
+at::Tensor gated_delta_decode_meta(
     const at::Tensor& query_in,
     const at::Tensor& key_in,
     const at::Tensor& value_in,
     const at::Tensor& g_in,
     const at::Tensor& beta_in,
-    const at::Tensor& z_in,
-    const at::Tensor& norm_weight,
-    double norm_eps,
-    const c10::optional<at::Tensor>& initial_state_opt,
-    bool output_final_state,
-    const c10::optional<at::Tensor>& state_buffer_opt) {
-  validate_common_inputs(query_in, key_in, value_in, g_in, beta_in, z_in, norm_weight);
-  validate_xpu_inputs(query_in, key_in, value_in, g_in, beta_in, z_in, norm_weight, initial_state_opt, state_buffer_opt);
-
-  if (initial_state_opt.has_value() && initial_state_opt->defined()) {
-    TORCH_CHECK(initial_state_opt->dim() == 4, "initial_state must be [batch, heads, key_head_dim, value_head_dim]");
-    TORCH_CHECK(initial_state_opt->size(0) == query_in.size(0), "initial_state batch size mismatch");
-    TORCH_CHECK(initial_state_opt->size(1) == query_in.size(2), "initial_state head count mismatch");
-    TORCH_CHECK(initial_state_opt->size(2) == query_in.size(3), "initial_state key head dim mismatch");
-    TORCH_CHECK(initial_state_opt->size(3) == value_in.size(3), "initial_state value head dim mismatch");
-  }
-  if (state_buffer_opt.has_value() && state_buffer_opt->defined()) {
-    TORCH_CHECK(state_buffer_opt->dim() == 4, "state_buffer must be [batch, heads, key_head_dim, value_head_dim]");
-    TORCH_CHECK(state_buffer_opt->size(0) == query_in.size(0), "state_buffer batch size mismatch");
-    TORCH_CHECK(state_buffer_opt->size(1) == query_in.size(2), "state_buffer head count mismatch");
-    TORCH_CHECK(state_buffer_opt->size(2) == query_in.size(3), "state_buffer key head dim mismatch");
-    TORCH_CHECK(state_buffer_opt->size(3) == value_in.size(3), "state_buffer value head dim mismatch");
-    TORCH_CHECK(state_buffer_opt->scalar_type() == at::kFloat, "state_buffer must be float32");
-    TORCH_CHECK(state_buffer_opt->is_contiguous(), "state_buffer must be contiguous");
-  }
-
-  TORCH_CHECK(
-      query_in.scalar_type() == key_in.scalar_type() &&
-          query_in.scalar_type() == value_in.scalar_type() &&
-          query_in.scalar_type() == z_in.scalar_type(),
-      "query, key, value, and z must share the same dtype");
-
-  const auto initial_dtype = query_in.scalar_type();
-  TORCH_CHECK(
-      initial_dtype == at::kHalf || initial_dtype == at::kBFloat16 || initial_dtype == at::kFloat,
-      "gated_delta_fused XPU kernel supports float16, bfloat16, and float32 inputs");
-
-  auto query = query_in.contiguous();
-  auto key = key_in.contiguous();
-  auto value = value_in.contiguous();
-  auto beta = beta_in.to(at::kFloat).contiguous();
-  auto g = g_in.to(at::kFloat).contiguous();
-  auto z = z_in.contiguous();
-  auto norm = norm_weight.to(at::kFloat).contiguous();
-
-  const auto batch_size = query.size(0);
-  const auto sequence_length = query.size(1);
-  const auto num_heads = query.size(2);
-  const auto key_head_dim = query.size(3);
-  const auto value_head_dim = value.size(3);
-  const auto output_feature_dim = num_heads * value_head_dim;
-
-  at::Tensor working_state;
-  if (state_buffer_opt.has_value() && state_buffer_opt->defined()) {
-    working_state = *state_buffer_opt;
-    if (initial_state_opt.has_value() && initial_state_opt->defined()) {
-      if (!working_state.is_alias_of(*initial_state_opt)) {
-        working_state.copy_(initial_state_opt->to(at::kFloat).contiguous());
-      }
-    } else {
-      working_state.zero_();
-    }
-  } else if (initial_state_opt.has_value() && initial_state_opt->defined()) {
-    working_state = initial_state_opt->contiguous().to(at::kFloat).clone();
-  } else {
-    working_state = at::zeros(
-        {batch_size, num_heads, key_head_dim, value_head_dim},
-        value.options().dtype(at::kFloat));
-  }
-
+    const at::Tensor& state_in) {
+  validate_gated_delta_inputs(query_in, key_in, value_in, g_in, beta_in, state_in);
+  TORCH_CHECK(query_in.size(1) == 1, "gated_delta_decode expects seq_len == 1");
+  auto meta_options = query_in.options().device(c10::Device(c10::DeviceType::Meta));
   auto output = at::empty(
-      {batch_size, sequence_length, output_feature_dim},
-      query.options());
+      {query_in.size(0), query_in.size(1), query_in.size(2), value_in.size(3)},
+      meta_options);
+  return output;
+}
+
+template <typename scalar_t>
+void launch_gated_delta_prefill_kernel(
+    sycl::queue& queue,
+    const scalar_t* query_ptr,
+    const scalar_t* key_ptr,
+    const scalar_t* value_ptr,
+    const float* g_ptr,
+    const float* beta_ptr,
+    const float* state_read_ptr,
+    float* state_write_ptr,
+    scalar_t* output_ptr,
+    int64_t batch_size,
+    int64_t sequence_length,
+    int64_t num_heads,
+    int64_t key_head_dim,
+    int64_t value_head_dim,
+    int64_t local_size,
+    float l2_eps_f,
+    float query_scale_base) {
+  const size_t group_count = static_cast<size_t>(batch_size * num_heads);
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
+    sycl::local_accessor<float, 1> partial_sum_aux(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
+    sycl::local_accessor<float, 1> normalized_query(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
+    sycl::local_accessor<float, 1> normalized_key(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
+    cgh.parallel_for(
+        sycl::nd_range<2>(
+            sycl::range<2>(group_count, static_cast<size_t>(local_size)),
+            sycl::range<2>(1, static_cast<size_t>(local_size))),
+        [=](sycl::nd_item<2> item) {
+          const int64_t bh = static_cast<int64_t>(item.get_group(0));
+          const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+          const int64_t b = bh / num_heads;
+          const int64_t h = bh % num_heads;
+          const int64_t state_base = ((b * num_heads) + h) * key_head_dim * value_head_dim;
+
+          for (int64_t t = 0; t < sequence_length; ++t) {
+            const int64_t scalar_index = ((b * sequence_length + t) * num_heads) + h;
+            const float g_scale = sycl::exp(g_ptr[scalar_index]);
+            const float beta_value = beta_ptr[scalar_index];
+            const int64_t q_t_base = scalar_index * key_head_dim;
+            const int64_t k_t_base = scalar_index * key_head_dim;
+            const int64_t v_t_base = scalar_index * value_head_dim;
+
+            normalize_gated_delta_qk(
+                query_ptr,
+                key_ptr,
+                q_t_base,
+                k_t_base,
+                key_head_dim,
+                local_size,
+                l2_eps_f,
+                query_scale_base,
+                item,
+                partial_sum,
+                partial_sum_aux,
+                normalized_query,
+                normalized_key);
+
+            const float* state_source_ptr = t == 0 ? state_read_ptr : state_write_ptr;
+            for (int64_t v_idx = lane; v_idx < value_head_dim; v_idx += local_size) {
+              const float kv_mem = gated_delta_decay_state_and_compute_kv_mem(
+                  state_source_ptr,
+                  state_write_ptr,
+                  state_base,
+                  value_head_dim,
+                  key_head_dim,
+                  v_idx,
+                  g_scale,
+                  normalized_key);
+              const float delta = gated_delta_compute_delta(value_ptr, v_t_base, v_idx, kv_mem, beta_value);
+              gated_delta_apply_delta_update(
+                  state_write_ptr,
+                  state_base,
+                  value_head_dim,
+                  key_head_dim,
+                  v_idx,
+                  delta,
+                  normalized_key);
+              const float out_value = gated_delta_accumulate_output(
+                  state_write_ptr,
+                  state_base,
+                  value_head_dim,
+                  key_head_dim,
+                  v_idx,
+                  normalized_query);
+              const int64_t out_index = (((b * sequence_length + t) * num_heads) + h) * value_head_dim + v_idx;
+              gated_delta_store_output(output_ptr, out_index, out_value);
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+          }
+        });
+  });
+}
+
+template <typename scalar_t>
+void launch_gated_delta_decode_kernel(
+    sycl::queue& queue,
+    const scalar_t* query_ptr,
+    const scalar_t* key_ptr,
+    const scalar_t* value_ptr,
+    const float* g_ptr,
+    const float* beta_ptr,
+    const float* state_read_ptr,
+    float* state_write_ptr,
+    scalar_t* output_ptr,
+    int64_t batch_size,
+    int64_t num_heads,
+    int64_t key_head_dim,
+    int64_t value_head_dim,
+    int64_t local_size,
+    float l2_eps_f,
+    float query_scale_base) {
+  const size_t group_count = static_cast<size_t>(batch_size * num_heads);
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
+    sycl::local_accessor<float, 1> partial_sum_aux(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
+    sycl::local_accessor<float, 1> normalized_query(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
+    sycl::local_accessor<float, 1> normalized_key(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
+    cgh.parallel_for(
+        sycl::nd_range<2>(
+            sycl::range<2>(group_count, static_cast<size_t>(local_size)),
+            sycl::range<2>(1, static_cast<size_t>(local_size))),
+        [=](sycl::nd_item<2> item) {
+          const int64_t bh = static_cast<int64_t>(item.get_group(0));
+          const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+          const int64_t b = bh / num_heads;
+          const int64_t h = bh % num_heads;
+          const int64_t scalar_index = (b * num_heads) + h;
+          const int64_t state_base = ((b * num_heads) + h) * key_head_dim * value_head_dim;
+          const int64_t q_t_base = scalar_index * key_head_dim;
+          const int64_t k_t_base = scalar_index * key_head_dim;
+          const int64_t v_t_base = scalar_index * value_head_dim;
+
+          normalize_gated_delta_qk(
+              query_ptr,
+              key_ptr,
+              q_t_base,
+              k_t_base,
+              key_head_dim,
+              local_size,
+              l2_eps_f,
+              query_scale_base,
+              item,
+              partial_sum,
+              partial_sum_aux,
+              normalized_query,
+              normalized_key);
+
+          const float g_scale = sycl::exp(g_ptr[scalar_index]);
+          const float beta_value = beta_ptr[scalar_index];
+          for (int64_t v_idx = lane; v_idx < value_head_dim; v_idx += local_size) {
+            const float kv_mem = gated_delta_decay_state_and_compute_kv_mem(
+                state_read_ptr,
+                state_write_ptr,
+                state_base,
+                value_head_dim,
+                key_head_dim,
+                v_idx,
+                g_scale,
+                normalized_key);
+            const float delta = gated_delta_compute_delta(value_ptr, v_t_base, v_idx, kv_mem, beta_value);
+            gated_delta_apply_delta_update(
+                state_write_ptr,
+                state_base,
+                value_head_dim,
+                key_head_dim,
+                v_idx,
+                delta,
+                normalized_key);
+            const float out_value = gated_delta_accumulate_output(
+                state_write_ptr,
+                state_base,
+                value_head_dim,
+                key_head_dim,
+                v_idx,
+                normalized_query);
+            const int64_t out_index = ((b * num_heads) + h) * value_head_dim + v_idx;
+            gated_delta_store_output(output_ptr, out_index, out_value);
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+        });
+  });
+}
+
+std::tuple<at::Tensor, at::Tensor> gated_delta_prefill_xpu(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& g_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& state_in) {
+  validate_gated_delta_inputs(query_in, key_in, value_in, g_in, beta_in, state_in);
+  validate_gated_delta_xpu_inputs(query_in, key_in, value_in, g_in, beta_in, state_in);
+  TORCH_CHECK(query_in.size(1) > 1, "gated_delta_prefill expects seq_len > 1");
+  const auto initial_dtype = query_in.scalar_type();
+  const auto batch_size = query_in.size(0);
+  const auto sequence_length = query_in.size(1);
+  const auto num_heads = query_in.size(2);
+  const auto key_head_dim = query_in.size(3);
+  const auto value_head_dim = value_in.size(3);
+  auto output = at::empty(
+      {batch_size, sequence_length, num_heads, value_head_dim},
+      query_in.options());
+  auto final_state = at::empty(state_in.sizes(), state_in.options());
 
   auto stream = c10::xpu::getCurrentXPUStream(query_in.device().index());
   const int64_t local_size = std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, value_head_dim)), 256);
-  const size_t group_count = static_cast<size_t>(batch_size * num_heads);
+  validate_gated_delta_local_memory_requirements(stream.queue().get_device(), key_head_dim, local_size);
 
-  const float* beta_ptr = beta.const_data_ptr<float>();
-  const float* g_ptr = g.const_data_ptr<float>();
-  float* state_ptr = working_state.mutable_data_ptr<float>();
-  const float norm_eps_f = static_cast<float>(norm_eps);
+  const float* beta_ptr = beta_in.const_data_ptr<float>();
+  const float* g_ptr = g_in.const_data_ptr<float>();
+  const float* state_read_ptr = state_in.const_data_ptr<float>();
+  float* state_write_ptr = final_state.mutable_data_ptr<float>();
   const float l2_eps_f = 1e-6f;
   const float query_scale_base = 1.0f / std::sqrt(static_cast<float>(key_head_dim));
 
@@ -1286,146 +1690,93 @@ std::tuple<at::Tensor, c10::optional<at::Tensor>> gated_delta_fused_xpu(
       at::kHalf,
       at::kBFloat16,
       initial_dtype,
-      "gated_delta_fused_xpu",
+      "gated_delta_prefill_xpu",
       [&] {
-        const scalar_t* query_ptr = query.const_data_ptr<scalar_t>();
-        const scalar_t* key_ptr = key.const_data_ptr<scalar_t>();
-        const scalar_t* value_ptr = value.const_data_ptr<scalar_t>();
-        const scalar_t* z_ptr = z.const_data_ptr<scalar_t>();
-        const float* norm_ptr = norm.const_data_ptr<float>();
+        const scalar_t* query_ptr = query_in.const_data_ptr<scalar_t>();
+        const scalar_t* key_ptr = key_in.const_data_ptr<scalar_t>();
+        const scalar_t* value_ptr = value_in.const_data_ptr<scalar_t>();
         scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
-
-        stream.queue().submit([&](sycl::handler& cgh) {
-          sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
-          sycl::local_accessor<float, 1> partial_sum_aux(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
-          sycl::local_accessor<float, 1> normalized_query(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
-          sycl::local_accessor<float, 1> normalized_key(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
-          cgh.parallel_for(
-              sycl::nd_range<2>(
-                  sycl::range<2>(group_count, static_cast<size_t>(local_size)),
-                  sycl::range<2>(1, static_cast<size_t>(local_size))),
-              [=](sycl::nd_item<2> item) {
-                const int64_t bh = static_cast<int64_t>(item.get_group(0));
-                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
-                const int64_t b = bh / num_heads;
-                const int64_t h = bh % num_heads;
-
-                const int64_t s_base = ((b * num_heads) + h) * key_head_dim * value_head_dim;
-
-                for (int64_t t = 0; t < sequence_length; ++t) {
-                  const int64_t scalar_index = ((b * sequence_length + t) * num_heads) + h;
-                  const float g_scale = sycl::exp(g_ptr[scalar_index]);
-                  const float beta_value = beta_ptr[scalar_index];
-                  const int64_t q_t_base = scalar_index * key_head_dim;
-                  const int64_t k_t_base = scalar_index * key_head_dim;
-                  const int64_t v_t_base = scalar_index * value_head_dim;
-                  const int64_t z_t_base = scalar_index * value_head_dim;
-                  auto sg = item.get_sub_group();
-                  const int64_t subgroup_lane = static_cast<int64_t>(sg.get_local_linear_id());
-                  const int64_t subgroup_idx = static_cast<int64_t>(sg.get_group_linear_id());
-                  const int64_t subgroup_size = static_cast<int64_t>(sg.get_local_linear_range());
-                  const int64_t subgroup_count = (local_size + subgroup_size - 1) / subgroup_size;
-
-                  float local_query_sum_sq = 0.0f;
-                  float local_key_sum_sq = 0.0f;
-                  for (int64_t k_idx = lane; k_idx < key_head_dim; k_idx += local_size) {
-                    const float raw_query = load_as_float(query_ptr, q_t_base + k_idx);
-                    const float raw_key = load_as_float(key_ptr, k_t_base + k_idx);
-                    normalized_query[k_idx] = raw_query;
-                    normalized_key[k_idx] = raw_key;
-                    local_query_sum_sq += raw_query * raw_query;
-                    local_key_sum_sq += raw_key * raw_key;
-                  }
-
-                  const float subgroup_query_sum_sq =
-                      sycl::reduce_over_group(sg, local_query_sum_sq, sycl::plus<float>());
-                  const float subgroup_key_sum_sq =
-                      sycl::reduce_over_group(sg, local_key_sum_sq, sycl::plus<float>());
-                  if (subgroup_lane == 0) {
-                    partial_sum[subgroup_idx] = subgroup_query_sum_sq;
-                    partial_sum_aux[subgroup_idx] = subgroup_key_sum_sq;
-                  }
-                  item.barrier(sycl::access::fence_space::local_space);
-
-                  partial_sum[lane] = lane < subgroup_count ? partial_sum[lane] : 0.0f;
-                  partial_sum_aux[lane] = lane < subgroup_count ? partial_sum_aux[lane] : 0.0f;
-                  item.barrier(sycl::access::fence_space::local_space);
-
-                  for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
-                    if (lane < stride) {
-                      partial_sum[lane] += partial_sum[lane + stride];
-                      partial_sum_aux[lane] += partial_sum_aux[lane + stride];
-                    }
-                    item.barrier(sycl::access::fence_space::local_space);
-                  }
-
-                  const float query_scale = sycl::rsqrt(partial_sum[0] + l2_eps_f) * query_scale_base;
-                  const float key_scale = sycl::rsqrt(partial_sum_aux[0] + l2_eps_f);
-                  for (int64_t k_idx = lane; k_idx < key_head_dim; k_idx += local_size) {
-                    normalized_query[k_idx] *= query_scale;
-                    normalized_key[k_idx] *= key_scale;
-                  }
-                  item.barrier(sycl::access::fence_space::local_space);
-
-                  float local_sum_sq = 0.0f;
-                  for (int64_t v_idx = lane; v_idx < value_head_dim; v_idx += local_size) {
-                    float kv_mem = 0.0f;
-                    for (int64_t k_idx = 0; k_idx < key_head_dim; ++k_idx) {
-                      const int64_t state_index = s_base + k_idx * value_head_dim + v_idx;
-                      const float decayed = state_ptr[state_index] * g_scale;
-                      state_ptr[state_index] = decayed;
-                      kv_mem += decayed * normalized_key[k_idx];
-                    }
-
-                    const float value_item = load_as_float(value_ptr, v_t_base + v_idx);
-                    const float delta = (value_item - kv_mem) * beta_value;
-                    float out_value = 0.0f;
-                    for (int64_t k_idx = 0; k_idx < key_head_dim; ++k_idx) {
-                      const int64_t state_index = s_base + k_idx * value_head_dim + v_idx;
-                      const float updated = state_ptr[state_index] + normalized_key[k_idx] * delta;
-                      state_ptr[state_index] = updated;
-                      out_value += updated * normalized_query[k_idx];
-                    }
-
-                    const int64_t out_index = ((b * sequence_length + t) * output_feature_dim) + h * value_head_dim + v_idx;
-                    output_ptr[out_index] = static_cast<scalar_t>(out_value);
-                    local_sum_sq += out_value * out_value;
-                  }
-
-                  partial_sum[lane] = local_sum_sq;
-                  item.barrier(sycl::access::fence_space::local_space);
-
-                  for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
-                    if (lane < stride) {
-                      partial_sum[lane] += partial_sum[lane + stride];
-                    }
-                    item.barrier(sycl::access::fence_space::local_space);
-                  }
-
-                  const float inv_rms = sycl::rsqrt(partial_sum[0] / static_cast<float>(value_head_dim) + norm_eps_f);
-
-                  for (int64_t v_idx = lane; v_idx < value_head_dim; v_idx += local_size) {
-                    const int64_t out_index = ((b * sequence_length + t) * output_feature_dim) + h * value_head_dim + v_idx;
-                    const float z_value = load_as_float(z_ptr, z_t_base + v_idx);
-                    const float gate = z_value / (1.0f + sycl::exp(-z_value));
-                    const float norm_value = load_as_float(norm_ptr, v_idx);
-                    const float out_value = load_as_float(output_ptr, out_index) * inv_rms * norm_value * gate;
-                    output_ptr[out_index] = static_cast<scalar_t>(out_value);
-                  }
-                  item.barrier(sycl::access::fence_space::local_space);
-                }
-              });
-        });
+        launch_gated_delta_prefill_kernel(
+            stream.queue(),
+            query_ptr,
+            key_ptr,
+            value_ptr,
+            g_ptr,
+            beta_ptr,
+            state_read_ptr,
+            state_write_ptr,
+            output_ptr,
+            batch_size,
+            sequence_length,
+            num_heads,
+            key_head_dim,
+            value_head_dim,
+            local_size,
+            l2_eps_f,
+            query_scale_base);
       });
 
-  if (!output_final_state) {
-    working_state.record_stream(stream);
-  }
+  return {output, final_state};
+}
 
-  if (!output_final_state) {
-    return {output, c10::nullopt};
-  }
-  return {output, working_state};
+at::Tensor gated_delta_decode_xpu(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& g_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& state_in) {
+  validate_gated_delta_inputs(query_in, key_in, value_in, g_in, beta_in, state_in);
+  validate_gated_delta_xpu_inputs(query_in, key_in, value_in, g_in, beta_in, state_in);
+  TORCH_CHECK(query_in.size(1) == 1, "gated_delta_decode expects seq_len == 1");
+  const auto initial_dtype = query_in.scalar_type();
+  const auto batch_size = query_in.size(0);
+  const auto num_heads = query_in.size(2);
+  const auto key_head_dim = query_in.size(3);
+  const auto value_head_dim = value_in.size(3);
+  auto output = at::empty({batch_size, 1, num_heads, value_head_dim}, query_in.options());
+
+  auto stream = c10::xpu::getCurrentXPUStream(query_in.device().index());
+  const int64_t local_size = std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, value_head_dim)), 256);
+  validate_gated_delta_local_memory_requirements(stream.queue().get_device(), key_head_dim, local_size);
+
+  const float* beta_ptr = beta_in.const_data_ptr<float>();
+  const float* g_ptr = g_in.const_data_ptr<float>();
+  const float* state_read_ptr = state_in.const_data_ptr<float>();
+  float* state_write_ptr = state_in.mutable_data_ptr<float>();
+  const float l2_eps_f = 1e-6f;
+  const float query_scale_base = 1.0f / std::sqrt(static_cast<float>(key_head_dim));
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      initial_dtype,
+      "gated_delta_decode_xpu",
+      [&] {
+        const scalar_t* query_ptr = query_in.const_data_ptr<scalar_t>();
+        const scalar_t* key_ptr = key_in.const_data_ptr<scalar_t>();
+        const scalar_t* value_ptr = value_in.const_data_ptr<scalar_t>();
+        scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
+        launch_gated_delta_decode_kernel(
+            stream.queue(),
+            query_ptr,
+            key_ptr,
+            value_ptr,
+            g_ptr,
+            beta_ptr,
+            state_read_ptr,
+            state_write_ptr,
+            output_ptr,
+            batch_size,
+            num_heads,
+            key_head_dim,
+            value_head_dim,
+            local_size,
+            l2_eps_f,
+            query_scale_base);
+      });
+
+  return output;
 }
 
 } // namespace
@@ -1493,26 +1844,37 @@ TORCH_LIBRARY(anna, m) {
       "bool add_unit_offset=False"
       ") -> (Tensor, Tensor)");
   m.def(
-      "causal_conv1d_fused("
+      "causal_conv1d_prefill("
       "Tensor hidden_states, "
       "Tensor conv_state, "
       "Tensor weight, "
       "Tensor? bias=None"
       ") -> (Tensor, Tensor)");
   m.def(
-      "gated_delta_fused("
+      "causal_conv1d_decode("
+      "Tensor hidden_states, "
+      "Tensor(a!) conv_state, "
+      "Tensor weight, "
+      "Tensor? bias=None"
+      ") -> Tensor");
+  m.def(
+      "gated_delta_prefill("
       "Tensor query, "
       "Tensor key, "
       "Tensor value, "
       "Tensor g, "
       "Tensor beta, "
-      "Tensor z, "
-      "Tensor norm_weight, "
-      "float norm_eps, "
-      "Tensor? initial_state=None, "
-      "bool output_final_state=False, "
-      "Tensor? state_buffer=None"
-      ") -> (Tensor, Tensor?)");
+      "Tensor state"
+      ") -> (Tensor, Tensor)");
+  m.def(
+      "gated_delta_decode("
+      "Tensor query, "
+      "Tensor key, "
+      "Tensor value, "
+      "Tensor g, "
+      "Tensor beta, "
+      "Tensor(a!) state"
+      ") -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(anna, Meta, m) {
@@ -1523,8 +1885,10 @@ TORCH_LIBRARY_IMPL(anna, Meta, m) {
   m.impl("rmsnorm_fused_ex", anna::rmsnorm_fused_ex_meta);
   m.impl("qk_norm_rotary_fused", anna::qk_norm_rotary_fused_meta);
   m.impl("qk_norm_rotary_fused_ex", anna::qk_norm_rotary_fused_ex_meta);
-  m.impl("causal_conv1d_fused", anna::causal_conv1d_fused_meta);
-  m.impl("gated_delta_fused", anna::gated_delta_fused_meta);
+  m.impl("causal_conv1d_prefill", anna::causal_conv1d_prefill_meta);
+  m.impl("causal_conv1d_decode", anna::causal_conv1d_decode_meta);
+  m.impl("gated_delta_prefill", anna::gated_delta_prefill_meta);
+  m.impl("gated_delta_decode", anna::gated_delta_decode_meta);
 }
 
 TORCH_LIBRARY_IMPL(anna, XPU, m) {
@@ -1535,6 +1899,8 @@ TORCH_LIBRARY_IMPL(anna, XPU, m) {
   m.impl("rmsnorm_fused_ex", anna::rmsnorm_fused_ex_xpu);
   m.impl("qk_norm_rotary_fused", anna::qk_norm_rotary_fused_xpu);
   m.impl("qk_norm_rotary_fused_ex", anna::qk_norm_rotary_fused_ex_xpu);
-  m.impl("causal_conv1d_fused", anna::causal_conv1d_fused_xpu);
-  m.impl("gated_delta_fused", anna::gated_delta_fused_xpu);
+  m.impl("causal_conv1d_prefill", anna::causal_conv1d_prefill_xpu);
+  m.impl("causal_conv1d_decode", anna::causal_conv1d_decode_xpu);
+  m.impl("gated_delta_prefill", anna::gated_delta_prefill_xpu);
+  m.impl("gated_delta_decode", anna::gated_delta_decode_xpu);
 }
