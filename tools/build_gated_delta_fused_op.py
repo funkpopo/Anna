@@ -387,11 +387,15 @@ def main() -> None:
         gated_delta_fused_is_available,
         gqa_decode_fused_is_available,
         maybe_load_gated_delta_library,
+        moe_dispatch_fused_is_available,
+        moe_grouped_int4_mlp_fused_is_available,
         moe_router_fused_is_available,
+        moe_scatter_fused_is_available,
         paged_gqa_decode_fused_is_available,
         qk_norm_rotary_fused_ex_is_available,
         qk_norm_rotary_fused_is_available,
         rmsnorm_fused_ex_is_available,
+        rmsnorm_gated_fused_is_available,
         rmsnorm_fused_is_available,
     )
 
@@ -402,8 +406,12 @@ def main() -> None:
     print(f"gqa_decode_registered={gqa_decode_fused_is_available()}")
     print(f"paged_gqa_decode_registered={paged_gqa_decode_fused_is_available()}")
     print(f"moe_router_registered={moe_router_fused_is_available()}")
+    print(f"moe_dispatch_registered={moe_dispatch_fused_is_available()}")
+    print(f"moe_scatter_registered={moe_scatter_fused_is_available()}")
+    print(f"moe_grouped_int4_mlp_registered={moe_grouped_int4_mlp_fused_is_available()}")
     print(f"rmsnorm_registered={rmsnorm_fused_is_available()}")
     print(f"rmsnorm_ex_registered={rmsnorm_fused_ex_is_available()}")
+    print(f"rmsnorm_gated_registered={rmsnorm_gated_fused_is_available()}")
     print(f"qk_norm_rotary_registered={qk_norm_rotary_fused_is_available()}")
     print(f"qk_norm_rotary_ex_registered={qk_norm_rotary_fused_ex_is_available()}")
     print(f"gated_delta_registered={gated_delta_fused_is_available()}")

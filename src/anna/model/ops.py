@@ -4,6 +4,7 @@ import copy
 import logging
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -15,13 +16,19 @@ from anna.model.fused_ops import (
     run_causal_conv1d_decode_fused,
     run_causal_conv1d_prefill_fused,
     run_gated_delta_decode_fused,
+    run_gated_delta_prefill_fused,
+    run_gqa_decode_fused,
     run_paged_gqa_decode_fused,
+    run_moe_dispatch_fused,
+    run_moe_grouped_int4_mlp_fused,
     run_moe_router_fused,
+    run_moe_scatter_fused,
     run_qk_norm_rotary_fused,
+    run_rmsnorm_gated_fused,
     run_rmsnorm_fused,
     paged_gqa_decode_fused_is_available,
 )
-from anna.model.quantization import AWQLinear, AutoRoundGPTQLinear, convert_module_linears_to_xpu_int4
+from anna.model.quantization import AWQLinear, AutoRoundGPTQLinear, XPUInt4Linear, convert_module_linears_to_xpu_int4
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +48,25 @@ def _module_dtype(module: nn.Module) -> torch.dtype:
         if buffer.is_floating_point():
             return buffer.dtype
     return torch.float32
+
+
+@dataclass(slots=True)
+class _GroupedInt4ExpertBank:
+    capacity: int
+    hidden_dim: int
+    intermediate_dim: int
+    group_size: int
+    gate_qweight: torch.Tensor
+    gate_qscale: torch.Tensor
+    gate_qzeros: torch.Tensor
+    up_qweight: torch.Tensor
+    up_qscale: torch.Tensor
+    up_qzeros: torch.Tensor
+    down_qweight: torch.Tensor
+    down_qscale: torch.Tensor
+    down_qzeros: torch.Tensor
+    slot_to_expert: list[int | None]
+    expert_to_slot: dict[int, int]
 
 
 class Qwen3PagedLayerAllocator:
@@ -1080,6 +1106,13 @@ class Qwen3RMSNormGated(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        if hidden_states.device.type == "xpu":
+            return run_rmsnorm_gated_fused(
+                input=hidden_states,
+                gate=gate,
+                weight=self.weight,
+                eps=self.eps,
+            )
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.float()
         hidden_states = hidden_states * torch.rsqrt(hidden_states.pow(2).mean(dim=-1, keepdim=True) + self.eps)
@@ -1195,6 +1228,22 @@ def materialized_kv_single_token_decode_attention(
     num_key_value_groups: int,
     visible_lengths: torch.Tensor,
 ) -> torch.Tensor:
+    if query_states.device.type == "xpu":
+        if query_states.shape[2] != 1:
+            raise RuntimeError("fused materialized GQA decode expects a single-token query.")
+        if query_states.shape[1] != key_states.shape[1] * num_key_value_groups:
+            raise RuntimeError(
+                "fused materialized GQA decode head grouping mismatch: "
+                f"query_heads={query_states.shape[1]} kv_heads={key_states.shape[1]} groups={num_key_value_groups}"
+            )
+        return run_gqa_decode_fused(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            visible_lengths=visible_lengths,
+            scaling=scaling,
+        )
+
     key_positions = torch.arange(key_states.shape[-2], device=query_states.device)[None, :]
     visible_mask = key_positions < visible_lengths[:, None]
     if not bool(torch.all(visible_mask).item()):
@@ -1914,6 +1963,22 @@ class Qwen3GatedDeltaNet(nn.Module):
         beta: torch.Tensor,
         initial_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if query.device.type == "xpu":
+            state = initial_state
+            if state is None:
+                state = torch.zeros(
+                    (query.shape[0], self.recurrent_num_heads, self.head_k_dim, self.head_v_dim),
+                    device=query.device,
+                    dtype=torch.float32,
+                )
+            return run_gated_delta_prefill_fused(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                state=state,
+            )
         core_attn_out, recurrent_state = torch_chunk_gated_delta_rule(
             query=query,
             key=key,
@@ -2067,7 +2132,10 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.cached_experts_per_layer: int = max(self.top_k, 8)
         self.profile_runtime = False
         self.host_experts_pinned = False
+        self.host_prepacked_experts_pinned = False
         self._expert_cache: OrderedDict[int, Qwen3MLP] = OrderedDict()
+        self._host_prepacked_expert_cache: OrderedDict[int, Qwen3MLP] = OrderedDict()
+        self._grouped_int4_bank: _GroupedInt4ExpertBank | None = None
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList(
             [Qwen3MLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
@@ -2093,7 +2161,10 @@ class Qwen3SparseMoeBlock(nn.Module):
         if cached_experts_per_layer is not None:
             self.cached_experts_per_layer = max(0, min(int(cached_experts_per_layer), self.num_experts))
         self._expert_cache.clear()
+        self._host_prepacked_expert_cache.clear()
+        self._grouped_int4_bank = None
         self.host_experts_pinned = False
+        self.host_prepacked_experts_pinned = False
 
         if resident_experts and self._should_use_xpu_int4():
             for expert in self.experts:
@@ -2143,9 +2214,285 @@ class Qwen3SparseMoeBlock(nn.Module):
     def _new_expert_module(self) -> Qwen3MLP:
         return Qwen3MLP(self._config, intermediate_size=self._expert_intermediate_size)
 
+    def _new_meta_expert_module(self) -> Qwen3MLP:
+        with torch.device("meta"):
+            return self._new_expert_module()
+
+    @staticmethod
+    def _require_grouped_int4_linear(module: nn.Module, *, linear_name: str) -> XPUInt4Linear:
+        if not isinstance(module, XPUInt4Linear):
+            raise RuntimeError(
+                f"Grouped int4 expert GEMM requires {linear_name} to be XPUInt4Linear, got {type(module)!r}"
+            )
+        if module.bias is not None:
+            raise RuntimeError(f"Grouped int4 expert GEMM does not support bias on {linear_name}.")
+        if module.qweight.device.type != "xpu":
+            raise RuntimeError(f"Grouped int4 expert GEMM requires {linear_name} weights on XPU.")
+        return module
+
+    def _resolve_grouped_int4_bank(self, expert_layer: Qwen3MLP) -> _GroupedInt4ExpertBank:
+        if self.execution_device is None or self.execution_device.type != "xpu":
+            raise RuntimeError("Grouped int4 expert GEMM requires an XPU execution device.")
+        if self.cached_experts_per_layer <= 0:
+            raise RuntimeError("Grouped int4 expert GEMM requires cached_experts_per_layer > 0.")
+
+        gate_proj = self._require_grouped_int4_linear(expert_layer.gate_proj, linear_name="gate_proj")
+        up_proj = self._require_grouped_int4_linear(expert_layer.up_proj, linear_name="up_proj")
+        down_proj = self._require_grouped_int4_linear(expert_layer.down_proj, linear_name="down_proj")
+        hidden_dim = int(gate_proj.in_features)
+        intermediate_dim = int(gate_proj.out_features)
+        if up_proj.in_features != hidden_dim or up_proj.out_features != intermediate_dim:
+            raise RuntimeError("Grouped int4 expert GEMM requires gate_proj/up_proj to share the same shape.")
+        if down_proj.in_features != intermediate_dim or down_proj.out_features != hidden_dim:
+            raise RuntimeError("Grouped int4 expert GEMM requires down_proj to invert gate_proj dimensions.")
+        if gate_proj.group_size != up_proj.group_size or gate_proj.group_size != down_proj.group_size:
+            raise RuntimeError("Grouped int4 expert GEMM requires a shared int4 group size across all expert projections.")
+
+        bank = self._grouped_int4_bank
+        if bank is not None:
+            if (
+                bank.capacity != self.cached_experts_per_layer
+                or bank.hidden_dim != hidden_dim
+                or bank.intermediate_dim != intermediate_dim
+                or bank.group_size != gate_proj.group_size
+                or bank.gate_qweight.device != gate_proj.qweight.device
+            ):
+                raise RuntimeError(
+                    "Grouped int4 expert bank layout does not match the currently prepared MoE experts."
+                )
+            return bank
+
+        bank = _GroupedInt4ExpertBank(
+            capacity=self.cached_experts_per_layer,
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            group_size=gate_proj.group_size,
+            gate_qweight=torch.empty((self.cached_experts_per_layer, *gate_proj.qweight.shape), dtype=gate_proj.qweight.dtype, device=gate_proj.qweight.device),
+            gate_qscale=torch.empty((self.cached_experts_per_layer, *gate_proj.qscale.shape), dtype=gate_proj.qscale.dtype, device=gate_proj.qscale.device),
+            gate_qzeros=torch.empty((self.cached_experts_per_layer, *gate_proj.qzeros.shape), dtype=gate_proj.qzeros.dtype, device=gate_proj.qzeros.device),
+            up_qweight=torch.empty((self.cached_experts_per_layer, *up_proj.qweight.shape), dtype=up_proj.qweight.dtype, device=up_proj.qweight.device),
+            up_qscale=torch.empty((self.cached_experts_per_layer, *up_proj.qscale.shape), dtype=up_proj.qscale.dtype, device=up_proj.qscale.device),
+            up_qzeros=torch.empty((self.cached_experts_per_layer, *up_proj.qzeros.shape), dtype=up_proj.qzeros.dtype, device=up_proj.qzeros.device),
+            down_qweight=torch.empty((self.cached_experts_per_layer, *down_proj.qweight.shape), dtype=down_proj.qweight.dtype, device=down_proj.qweight.device),
+            down_qscale=torch.empty((self.cached_experts_per_layer, *down_proj.qscale.shape), dtype=down_proj.qscale.dtype, device=down_proj.qscale.device),
+            down_qzeros=torch.empty((self.cached_experts_per_layer, *down_proj.qzeros.shape), dtype=down_proj.qzeros.dtype, device=down_proj.qzeros.device),
+            slot_to_expert=[None] * self.cached_experts_per_layer,
+            expert_to_slot={},
+        )
+        self._grouped_int4_bank = bank
+        return bank
+
+    @staticmethod
+    def _copy_grouped_int4_linear_to_bank_(
+        *,
+        linear: XPUInt4Linear,
+        qweight_bank: torch.Tensor,
+        qscale_bank: torch.Tensor,
+        qzeros_bank: torch.Tensor,
+        slot: int,
+    ) -> None:
+        with torch.no_grad():
+            qweight_bank[slot].copy_(linear.qweight)
+            qscale_bank[slot].copy_(linear.qscale)
+            qzeros_bank[slot].copy_(linear.qzeros)
+
+    def _release_grouped_int4_bank_slot(self, expert_idx: int) -> None:
+        bank = self._grouped_int4_bank
+        if bank is None:
+            return
+        slot = bank.expert_to_slot.pop(int(expert_idx), None)
+        if slot is None:
+            return
+        if slot < 0 or slot >= bank.capacity:
+            raise RuntimeError(f"Grouped int4 expert bank slot {slot} is out of range.")
+        mapped_expert = bank.slot_to_expert[slot]
+        if mapped_expert != int(expert_idx):
+            raise RuntimeError(
+                f"Grouped int4 expert bank bookkeeping mismatch for slot {slot}: expected {expert_idx}, found {mapped_expert}."
+            )
+        bank.slot_to_expert[slot] = None
+
+    def _ensure_grouped_int4_bank_slot(self, expert_idx: int, expert_layer: Qwen3MLP) -> int:
+        bank = self._resolve_grouped_int4_bank(expert_layer)
+        existing_slot = bank.expert_to_slot.get(int(expert_idx))
+        if existing_slot is not None:
+            mapped_expert = bank.slot_to_expert[existing_slot]
+            if mapped_expert != int(expert_idx):
+                raise RuntimeError(
+                    f"Grouped int4 expert bank bookkeeping mismatch for slot {existing_slot}: expected {expert_idx}, found {mapped_expert}."
+                )
+            return existing_slot
+
+        try:
+            slot = next(slot_idx for slot_idx, mapped_expert in enumerate(bank.slot_to_expert) if mapped_expert is None)
+        except StopIteration as exc:
+            raise RuntimeError("Grouped int4 expert bank is full while staging a new cached expert.") from exc
+
+        gate_proj = self._require_grouped_int4_linear(expert_layer.gate_proj, linear_name="gate_proj")
+        up_proj = self._require_grouped_int4_linear(expert_layer.up_proj, linear_name="up_proj")
+        down_proj = self._require_grouped_int4_linear(expert_layer.down_proj, linear_name="down_proj")
+        self._copy_grouped_int4_linear_to_bank_(
+            linear=gate_proj,
+            qweight_bank=bank.gate_qweight,
+            qscale_bank=bank.gate_qscale,
+            qzeros_bank=bank.gate_qzeros,
+            slot=slot,
+        )
+        self._copy_grouped_int4_linear_to_bank_(
+            linear=up_proj,
+            qweight_bank=bank.up_qweight,
+            qscale_bank=bank.up_qscale,
+            qzeros_bank=bank.up_qzeros,
+            slot=slot,
+        )
+        self._copy_grouped_int4_linear_to_bank_(
+            linear=down_proj,
+            qweight_bank=bank.down_qweight,
+            qscale_bank=bank.down_qscale,
+            qzeros_bank=bank.down_qzeros,
+            slot=slot,
+        )
+        bank.slot_to_expert[slot] = int(expert_idx)
+        bank.expert_to_slot[int(expert_idx)] = slot
+        return slot
+
+    def _ensure_grouped_int4_bank_slots(
+        self,
+        *,
+        prepared: dict[int, Qwen3MLP],
+        expert_indices: list[int],
+    ) -> list[int]:
+        slots: list[int] = []
+        for expert_idx in expert_indices:
+            expert_layer = prepared.get(expert_idx)
+            if expert_layer is None:
+                raise RuntimeError(f"Grouped int4 expert GEMM expected expert {expert_idx} to be prepared on XPU.")
+            slots.append(self._ensure_grouped_int4_bank_slot(expert_idx, expert_layer))
+        return slots
+
     @staticmethod
     def _has_quantized_linear_payload(module: nn.Module) -> bool:
         return any(isinstance(child, (AutoRoundGPTQLinear, AWQLinear)) for child in module.modules())
+
+    def _host_prepacked_cache_capacity(self) -> int:
+        if not self.offload_experts or not self._should_use_xpu_int4() or self.cached_experts_per_layer <= 0:
+            return 0
+        # Keep a larger CPU-side prepacked working set so decode can revisit recent
+        # experts without paying the AutoRound -> XPUInt4 repack cost again.
+        return min(self.num_experts, max(self.cached_experts_per_layer * 2, self.top_k * 8))
+
+    def _build_host_prepacked_expert(self, expert_idx: int) -> Qwen3MLP:
+        source = self.experts[expert_idx]
+        prepacked = self._new_meta_expert_module()
+        for linear_name in ("gate_proj", "up_proj", "down_proj"):
+            source_linear = getattr(source, linear_name)
+            packed_linear = XPUInt4Linear.from_linear(source_linear, device=torch.device("cpu"))
+            setattr(prepacked, linear_name, packed_linear)
+        self.host_prepacked_experts_pinned = self._pin_module_host_memory(prepacked) or self.host_prepacked_experts_pinned
+        return prepacked
+
+    def _get_host_prepacked_expert(self, expert_idx: int) -> Qwen3MLP | None:
+        capacity = self._host_prepacked_cache_capacity()
+        if capacity <= 0:
+            return None
+        cached = self._host_prepacked_expert_cache.get(expert_idx)
+        if cached is not None:
+            self._host_prepacked_expert_cache.move_to_end(expert_idx)
+            return cached
+
+        if len(self._host_prepacked_expert_cache) >= capacity:
+            self._host_prepacked_expert_cache.popitem(last=False)
+        cached = self._build_host_prepacked_expert(expert_idx)
+        self._host_prepacked_expert_cache[expert_idx] = cached
+        return cached
+
+    def _clone_prepacked_linear_to_execution_device(self, source: XPUInt4Linear) -> XPUInt4Linear:
+        if self.execution_device is None:
+            raise RuntimeError("Cannot clone a prepacked expert linear without an execution device.")
+        cloned = XPUInt4Linear(
+            source.in_features,
+            source.out_features,
+            group_size=source.group_size,
+            bias=source.bias is not None,
+            compute_dtype=source.compute_dtype,
+            device=self.execution_device,
+            padded_in_features=source.padded_in_features,
+        )
+        with torch.no_grad():
+            cloned.qweight.copy_(
+                source.qweight.to(device=cloned.qweight.device, non_blocking=self.host_prepacked_experts_pinned)
+            )
+            cloned.qscale.copy_(
+                source.qscale.to(device=cloned.qscale.device, non_blocking=self.host_prepacked_experts_pinned)
+            )
+            cloned.qzeros.copy_(
+                source.qzeros.to(device=cloned.qzeros.device, non_blocking=self.host_prepacked_experts_pinned)
+            )
+            if source.bias is not None and cloned.bias is not None:
+                cloned.bias.copy_(
+                    source.bias.to(
+                        device=cloned.bias.device,
+                        dtype=cloned.bias.dtype,
+                        non_blocking=self.host_prepacked_experts_pinned,
+                    )
+                )
+        return cloned
+
+    def _copy_prepacked_linear_to_execution_device_(self, source: XPUInt4Linear, target: XPUInt4Linear) -> None:
+        if (
+            target.in_features != source.in_features
+            or target.out_features != source.out_features
+            or target.group_size != source.group_size
+            or target.padded_in_features != source.padded_in_features
+        ):
+            raise RuntimeError(
+                "Prepacked expert linear layout mismatch during XPU cache slot reuse: "
+                f"source=({source.in_features}, {source.out_features}, group={source.group_size}, padded={source.padded_in_features}) "
+                f"target=({target.in_features}, {target.out_features}, group={target.group_size}, padded={target.padded_in_features})"
+            )
+        with torch.no_grad():
+            target.qweight.copy_(
+                source.qweight.to(device=target.qweight.device, non_blocking=self.host_prepacked_experts_pinned)
+            )
+            target.qscale.copy_(
+                source.qscale.to(device=target.qscale.device, non_blocking=self.host_prepacked_experts_pinned)
+            )
+            target.qzeros.copy_(
+                source.qzeros.to(device=target.qzeros.device, non_blocking=self.host_prepacked_experts_pinned)
+            )
+            if source.bias is not None and target.bias is not None:
+                target.bias.copy_(
+                    source.bias.to(
+                        device=target.bias.device,
+                        dtype=target.bias.dtype,
+                        non_blocking=self.host_prepacked_experts_pinned,
+                    )
+                )
+
+    def _materialize_prepacked_expert(
+        self,
+        expert_idx: int,
+        prepacked: Qwen3MLP,
+        *,
+        reuse_target: Qwen3MLP | None = None,
+    ) -> Qwen3MLP:
+        cached = self._new_meta_expert_module() if reuse_target is None else reuse_target
+        for linear_name in ("gate_proj", "up_proj", "down_proj"):
+            source_linear = getattr(prepacked, linear_name)
+            if not isinstance(source_linear, XPUInt4Linear):
+                raise RuntimeError(
+                    f"Expected prepacked expert linear {linear_name} to be XPUInt4Linear, got {type(source_linear)!r}"
+                )
+            if reuse_target is None:
+                setattr(cached, linear_name, self._clone_prepacked_linear_to_execution_device(source_linear))
+                continue
+            target_linear = getattr(cached, linear_name)
+            if not isinstance(target_linear, XPUInt4Linear):
+                raise RuntimeError(
+                    f"Expected cached expert linear {linear_name} to be XPUInt4Linear during slot reuse, got {type(target_linear)!r}"
+                )
+            self._copy_prepacked_linear_to_execution_device_(source_linear, target_linear)
+        return cached
 
     @staticmethod
     def _copy_module_state_(
@@ -2175,47 +2522,45 @@ class Qwen3SparseMoeBlock(nn.Module):
                 )
                 target_buffer.copy_(copied)
 
-    def _materialize_cached_expert(self, expert_idx: int) -> Qwen3MLP:
+    def _materialize_cached_expert(self, expert_idx: int, *, reuse_target: Qwen3MLP | None = None) -> Qwen3MLP:
         if self.execution_device is None:
             raise RuntimeError("Cannot materialize cached expert without an execution device.")
 
         source = self.experts[expert_idx]
         started_at = time.perf_counter()
-        if self._has_quantized_linear_payload(source):
-            cached = copy.deepcopy(source)
-            if self._should_use_xpu_int4():
-                convert_module_linears_to_xpu_int4(
-                    cached,
-                    group_size=self.expert_quant_group_size,
-                    device=self.execution_device,
-                )
-            else:
+        if self._should_use_xpu_int4():
+            prepacked = self._get_host_prepacked_expert(expert_idx)
+            if prepacked is None:
+                raise RuntimeError("XPU int4 expert staging requires a host prepacked expert cache entry.")
+            cached = self._materialize_prepacked_expert(expert_idx, prepacked, reuse_target=reuse_target)
+        elif self._has_quantized_linear_payload(source):
+            if reuse_target is None:
+                cached = copy.deepcopy(source)
                 cached = cached.to(
                     device=self.execution_device,
                     dtype=_module_dtype(source),
                 )
-        elif self._should_use_xpu_int4():
-            cached = self._new_expert_module()
-            self._copy_module_state_(source, cached, non_blocking=False)
-            convert_module_linears_to_xpu_int4(
-                cached,
-                group_size=self.expert_quant_group_size,
-                device=self.execution_device,
-            )
+            else:
+                cached = reuse_target
+                self._copy_module_state_(source, cached, non_blocking=self.host_experts_pinned)
         else:
-            cached = self._new_expert_module().to(
-                device=self.execution_device,
-                dtype=_module_dtype(source),
-            )
+            cached = reuse_target
+            if cached is None:
+                cached = self._new_expert_module().to(
+                    device=self.execution_device,
+                    dtype=_module_dtype(source),
+                )
             self._copy_module_state_(source, cached, non_blocking=self.host_experts_pinned)
 
         if self.profile_runtime and self.execution_device.type == "xpu" and hasattr(torch, "xpu"):
             torch.xpu.synchronize()
             logger.info(
-                "MoE expert staged to XPU: expert=%s quant=%s pinned_host=%s elapsed=%.4f",
+                "MoE expert staged to XPU: expert=%s quant=%s pinned_host=%s pinned_prepacked=%s reused_slot=%s elapsed=%.4f",
                 expert_idx,
                 self.expert_quant,
                 self.host_experts_pinned,
+                self.host_prepacked_experts_pinned,
+                reuse_target is not None,
                 time.perf_counter() - started_at,
             )
         return cached
@@ -2228,9 +2573,11 @@ class Qwen3SparseMoeBlock(nn.Module):
             self._expert_cache.move_to_end(expert_idx)
             return cached
 
+        reuse_target = None
         if len(self._expert_cache) >= self.cached_experts_per_layer:
-            self._expert_cache.popitem(last=False)
-        cached = self._materialize_cached_expert(expert_idx)
+            evicted_expert_idx, reuse_target = self._expert_cache.popitem(last=False)
+            self._release_grouped_int4_bank_slot(evicted_expert_idx)
+        cached = self._materialize_cached_expert(expert_idx, reuse_target=reuse_target)
         self._expert_cache[expert_idx] = cached
         return cached
 
@@ -2260,17 +2607,29 @@ class Qwen3SparseMoeBlock(nn.Module):
         if missing:
             free_slots = max(0, self.cached_experts_per_layer - len(self._expert_cache))
             evictions_needed = max(0, len(missing) - free_slots)
+            recycled_slots: list[Qwen3MLP] = []
             if evictions_needed > 0:
                 eviction_candidates = [expert_idx for expert_idx in self._expert_cache.keys() if expert_idx not in protected]
                 if len(eviction_candidates) < evictions_needed:
                     evictions_needed = len(eviction_candidates)
                 for expert_idx in eviction_candidates[:evictions_needed]:
-                    self._expert_cache.pop(expert_idx, None)
+                    evicted = self._expert_cache.pop(expert_idx, None)
+                    if evicted is not None:
+                        self._release_grouped_int4_bank_slot(expert_idx)
+                        recycled_slots.append(evicted)
 
             for expert_idx in missing:
+                reuse_target = recycled_slots.pop() if recycled_slots else None
                 if len(self._expert_cache) >= self.cached_experts_per_layer:
-                    break
-                cached = self._materialize_cached_expert(expert_idx)
+                    if reuse_target is None:
+                        evicted_expert_idx, reuse_target = self._expert_cache.popitem(last=False)
+                        self._release_grouped_int4_bank_slot(evicted_expert_idx)
+                    else:
+                        raise RuntimeError(
+                            "MoE expert cache bookkeeping is inconsistent: a recycled XPU slot was available "
+                            "while the cache still reported itself as full."
+                        )
+                cached = self._materialize_cached_expert(expert_idx, reuse_target=reuse_target)
                 self._expert_cache[expert_idx] = cached
                 prepared[expert_idx] = cached
                 staged += 1
@@ -2343,6 +2702,50 @@ class Qwen3SparseMoeBlock(nn.Module):
         compact_routing_weights = routing_weights.index_select(0, sorted_token_idx).gather(1, sorted_route_idx[:, None])
         return compact_hidden_states, compact_routing_weights
 
+    def _dispatch_routing_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+        usage: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if hidden_states.device.type == "xpu":
+            return run_moe_dispatch_fused(
+                hidden_states=hidden_states,
+                routing_weights=routing_weights,
+                selected_experts=selected_experts,
+                expert_usage=usage,
+            )
+
+        sorted_token_idx, sorted_route_idx, expert_offsets = self._sorted_routing_assignments(selected_experts, usage)
+        compact_hidden_states, compact_routing_weights = self._compact_routing_inputs(
+            hidden_states,
+            routing_weights,
+            sorted_token_idx,
+            sorted_route_idx,
+        )
+        return sorted_token_idx, expert_offsets, compact_hidden_states, compact_routing_weights
+
+    @staticmethod
+    def _scatter_compact_outputs(
+        compact_outputs: torch.Tensor,
+        sorted_token_idx: torch.Tensor,
+        *,
+        num_tokens: int,
+        hidden_dim: int,
+    ) -> torch.Tensor:
+        if compact_outputs.device.type == "xpu":
+            return run_moe_scatter_fused(
+                compact_outputs=compact_outputs,
+                sorted_token_idx=sorted_token_idx,
+                num_tokens=num_tokens,
+            )
+
+        final_hidden_states = compact_outputs.new_zeros((num_tokens, hidden_dim))
+        if compact_outputs.numel() > 0:
+            final_hidden_states.index_add_(0, sorted_token_idx, compact_outputs)
+        return final_hidden_states
+
     def _execute_expert(
         self,
         *,
@@ -2372,6 +2775,60 @@ class Qwen3SparseMoeBlock(nn.Module):
             current_hidden_states = current_hidden_states.to(device=execution_device, dtype=hidden_dtype)
         compact_outputs[start_idx:end_idx] = current_hidden_states.to(dtype=hidden_dtype)
 
+    def _execute_grouped_int4_experts(
+        self,
+        *,
+        wave_indices: list[int],
+        wave_slots: list[int],
+        expert_offsets_host: torch.Tensor,
+        expert_offsets_device: torch.Tensor,
+        compact_hidden_states: torch.Tensor,
+        compact_routing_weights: torch.Tensor,
+        compact_outputs: torch.Tensor,
+    ) -> None:
+        bank = self._grouped_int4_bank
+        if bank is None:
+            raise RuntimeError("Grouped int4 expert GEMM requires an initialized expert bank.")
+        if len(wave_indices) != len(wave_slots):
+            raise RuntimeError("Grouped int4 expert GEMM requires wave_indices and wave_slots to have the same length.")
+
+        max_routes_per_expert = 0
+        for expert_idx, slot in zip(wave_indices, wave_slots, strict=True):
+            if expert_idx < 0 or expert_idx + 1 >= expert_offsets_host.numel():
+                raise RuntimeError(f"Grouped int4 expert GEMM received an out-of-range expert index: {expert_idx}")
+            mapped_slot = bank.expert_to_slot.get(int(expert_idx))
+            if mapped_slot != int(slot):
+                raise RuntimeError(
+                    f"Grouped int4 expert GEMM slot mapping mismatch for expert {expert_idx}: expected {mapped_slot}, got {slot}."
+                )
+            start_idx = int(expert_offsets_host[expert_idx].item())
+            end_idx = int(expert_offsets_host[expert_idx + 1].item())
+            max_routes_per_expert = max(max_routes_per_expert, end_idx - start_idx)
+        if max_routes_per_expert <= 0:
+            raise RuntimeError("Grouped int4 expert GEMM received an empty expert wave.")
+
+        active_experts = torch.tensor(wave_indices, device=compact_hidden_states.device, dtype=torch.long)
+        active_slots = torch.tensor(wave_slots, device=compact_hidden_states.device, dtype=torch.long)
+        run_moe_grouped_int4_mlp_fused(
+            compact_hidden_states=compact_hidden_states,
+            compact_routing_weights=compact_routing_weights,
+            compact_outputs=compact_outputs,
+            expert_offsets=expert_offsets_device,
+            active_experts=active_experts,
+            active_slots=active_slots,
+            gate_qweight=bank.gate_qweight,
+            gate_qscale=bank.gate_qscale,
+            gate_qzeros=bank.gate_qzeros,
+            up_qweight=bank.up_qweight,
+            up_qscale=bank.up_qscale,
+            up_qzeros=bank.up_qzeros,
+            down_qweight=bank.down_qweight,
+            down_qscale=bank.down_qscale,
+            down_qzeros=bank.down_qzeros,
+            group_size=bank.group_size,
+            max_routes_per_expert=max_routes_per_expert,
+        )
+
     def _execute_offloaded_experts(
         self,
         *,
@@ -2392,6 +2849,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         if wave_capacity <= 0:
             return
 
+        expert_offsets_host = expert_offsets.to(device="cpu") if expert_offsets.device.type == "xpu" else expert_offsets
         for wave_start in range(0, len(hit_experts), wave_capacity):
             wave_indices = hit_experts[wave_start : wave_start + wave_capacity]
             prepared = self._prepare_cached_experts(wave_indices)
@@ -2401,11 +2859,23 @@ class Qwen3SparseMoeBlock(nn.Module):
                     "Failed to stage all requested MoE experts onto the execution device: "
                     f"missing={missing} cache_capacity={self.cached_experts_per_layer}"
                 )
+            if self._should_use_xpu_int4():
+                wave_slots = self._ensure_grouped_int4_bank_slots(prepared=prepared, expert_indices=wave_indices)
+                self._execute_grouped_int4_experts(
+                    wave_indices=wave_indices,
+                    wave_slots=wave_slots,
+                    expert_offsets_host=expert_offsets_host,
+                    expert_offsets_device=expert_offsets,
+                    compact_hidden_states=compact_hidden_states,
+                    compact_routing_weights=compact_routing_weights,
+                    compact_outputs=compact_outputs,
+                )
+                continue
             for expert_idx in wave_indices:
                 self._execute_expert(
                     expert_idx=expert_idx,
                     expert_layer=prepared[expert_idx],
-                    expert_offsets=expert_offsets,
+                    expert_offsets=expert_offsets_host,
                     compact_hidden_states=compact_hidden_states,
                     compact_routing_weights=compact_routing_weights,
                     compact_outputs=compact_outputs,
@@ -2421,17 +2891,16 @@ class Qwen3SparseMoeBlock(nn.Module):
 
         routing_weights, selected_experts, usage = self._route_tokens(router_logits, hidden_dtype=hidden_states.dtype)
 
-        final_hidden_states = hidden_states.new_zeros((batch_size * sequence_length, hidden_dim))
+        num_tokens = batch_size * sequence_length
         usage = usage.to(device=selected_experts.device)
         hit_experts = usage.nonzero(as_tuple=False).flatten()
         hit_expert_list = [int(expert_idx) for expert_idx in hit_experts.tolist()]
 
-        sorted_token_idx, sorted_route_idx, expert_offsets = self._sorted_routing_assignments(selected_experts, usage)
-        compact_hidden_states, compact_routing_weights = self._compact_routing_inputs(
+        sorted_token_idx, expert_offsets, compact_hidden_states, compact_routing_weights = self._dispatch_routing_inputs(
             hidden_states,
             routing_weights,
-            sorted_token_idx,
-            sorted_route_idx,
+            selected_experts,
+            usage,
         )
         compact_outputs = hidden_states.new_empty((compact_hidden_states.shape[0], hidden_dim))
         if self.offload_experts and hit_expert_list:
@@ -2443,13 +2912,14 @@ class Qwen3SparseMoeBlock(nn.Module):
                 compact_outputs=compact_outputs,
                 execution_device=execution_device,
                 hidden_dtype=hidden_states.dtype,
-            )
+                )
         else:
+            expert_offsets_host = expert_offsets.to(device="cpu") if expert_offsets.device.type == "xpu" else expert_offsets
             for expert_idx in hit_expert_list:
                 self._execute_expert(
                     expert_idx=expert_idx,
                     expert_layer=self.experts[expert_idx],
-                    expert_offsets=expert_offsets,
+                    expert_offsets=expert_offsets_host,
                     compact_hidden_states=compact_hidden_states,
                     compact_routing_weights=compact_routing_weights,
                     compact_outputs=compact_outputs,
@@ -2457,8 +2927,12 @@ class Qwen3SparseMoeBlock(nn.Module):
                     hidden_dtype=hidden_states.dtype,
                 )
 
-        if compact_outputs.numel() > 0:
-            final_hidden_states.index_add_(0, sorted_token_idx, compact_outputs)
+        final_hidden_states = self._scatter_compact_outputs(
+            compact_outputs,
+            sorted_token_idx,
+            num_tokens=num_tokens,
+            hidden_dim=hidden_dim,
+        )
 
         shared_expert_device = _module_device(self.shared_expert)
         shared_gate_device = _module_device(self.shared_expert_gate)
