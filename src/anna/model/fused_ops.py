@@ -62,7 +62,7 @@ def _gated_delta_op():
     namespace = getattr(torch.ops, "anna", None)
     if namespace is None:
         return None
-    return getattr(namespace, "gated_delta_fused", None)
+    return getattr(namespace, "gated_delta_prefill", None)
 
 
 def _gqa_decode_op():
@@ -118,7 +118,21 @@ def _causal_conv1d_op():
     namespace = getattr(torch.ops, "anna", None)
     if namespace is None:
         return None
-    return getattr(namespace, "causal_conv1d_fused", None)
+    return getattr(namespace, "causal_conv1d_prefill", None)
+
+
+def _gated_delta_decode_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "gated_delta_decode", None)
+
+
+def _causal_conv1d_decode_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "causal_conv1d_decode", None)
 
 
 def gqa_decode_fused_is_available() -> bool:
@@ -146,11 +160,11 @@ def rmsnorm_fused_ex_is_available() -> bool:
 
 
 def gated_delta_fused_is_available() -> bool:
-    return _gated_delta_op() is not None
+    return _gated_delta_op() is not None and _gated_delta_decode_op() is not None
 
 
 def causal_conv1d_fused_is_available() -> bool:
-    return _causal_conv1d_op() is not None
+    return _causal_conv1d_op() is not None and _causal_conv1d_decode_op() is not None
 
 
 def qk_norm_rotary_fused_ex_is_available() -> bool:
@@ -356,7 +370,7 @@ def run_qk_norm_rotary_fused_ex(
     )
 
 
-def run_causal_conv1d_fused(
+def run_causal_conv1d_prefill_fused(
     *,
     hidden_states: torch.Tensor,
     conv_state: torch.Tensor,
@@ -369,7 +383,7 @@ def run_causal_conv1d_fused(
         op = _causal_conv1d_op()
     if op is None:
         raise RuntimeError(
-            "Anna causal_conv1d_fused op is not registered. Build/load the custom op first, "
+            "Anna causal_conv1d_prefill op is not registered. Build/load the custom op first, "
             "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
         )
     if bias is None:
@@ -377,39 +391,63 @@ def run_causal_conv1d_fused(
     return op(hidden_states, conv_state, weight, bias)
 
 
-def run_gated_delta_fused(
+def run_causal_conv1d_decode_fused(
+    *,
+    hidden_states: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    op = _causal_conv1d_decode_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _causal_conv1d_decode_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna causal_conv1d_decode op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    if bias is None:
+        return op(hidden_states, conv_state, weight)
+    return op(hidden_states, conv_state, weight, bias)
+
+
+def run_gated_delta_prefill_fused(
     *,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    z: torch.Tensor,
-    norm_weight: torch.Tensor,
-    norm_eps: float,
-    initial_state: torch.Tensor | None,
-    output_final_state: bool,
-    state_buffer: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+    state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     op = _gated_delta_op()
     if op is None:
         maybe_load_gated_delta_library()
         op = _gated_delta_op()
     if op is None:
         raise RuntimeError(
-            "Anna Gated DeltaNet fused op is not registered. Build/load the custom op first, "
+            "Anna gated_delta_prefill op is not registered. Build/load the custom op first, "
             "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
         )
-    return op(
-        query,
-        key,
-        value,
-        g,
-        beta,
-        z,
-        norm_weight,
-        float(norm_eps),
-        initial_state,
-        bool(output_final_state),
-        state_buffer,
-    )
+    return op(query, key, value, g, beta, state)
+
+def run_gated_delta_decode_fused(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+) -> torch.Tensor:
+    op = _gated_delta_decode_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _gated_delta_decode_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna gated_delta_decode op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(query, key, value, g, beta, state)

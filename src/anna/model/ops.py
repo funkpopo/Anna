@@ -12,8 +12,9 @@ from torch import nn
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.model.turboquant import TurboQuantKVRow
 from anna.model.fused_ops import (
-    run_causal_conv1d_fused,
-    run_gated_delta_fused,
+    run_causal_conv1d_decode_fused,
+    run_causal_conv1d_prefill_fused,
+    run_gated_delta_decode_fused,
     run_paged_gqa_decode_fused,
     run_moe_router_fused,
     run_qk_norm_rotary_fused,
@@ -1575,6 +1576,14 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_idx = layer_idx
         self.profile_runtime = False
+        if self.num_v_heads % self.num_k_heads != 0:
+            raise ValueError(
+                f"linear_num_value_heads must be divisible by linear_num_key_heads, "
+                f"got {self.num_v_heads} and {self.num_k_heads}"
+            )
+        self.recurrent_head_repeat = self.num_v_heads // self.num_k_heads
+        self.recurrent_num_heads = self.num_v_heads
+        self.recurrent_state_shape = (self.recurrent_num_heads, self.head_k_dim, self.head_v_dim)
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = nn.Conv1d(
@@ -1593,6 +1602,380 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.in_proj_z = nn.Linear(config.hidden_size, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(config.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(config.hidden_size, self.num_v_heads, bias=False)
+        self._cached_a_log_decay: torch.Tensor | None = None
+        self._cached_a_log_decay_key: tuple[int, int, torch.device, torch.dtype] | None = None
+
+    @staticmethod
+    def _require_tensor_contract(
+        name: str,
+        tensor: torch.Tensor,
+        *,
+        shape: tuple[int, ...] | None = None,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        contiguous: bool = False,
+    ) -> None:
+        if shape is not None and tuple(tensor.shape) != shape:
+            raise RuntimeError(f"{name} shape mismatch: expected {shape}, got {tuple(tensor.shape)}")
+        if dtype is not None and tensor.dtype != dtype:
+            raise RuntimeError(f"{name} dtype mismatch: expected {dtype}, got {tensor.dtype}")
+        if device is not None and tensor.device != device:
+            raise RuntimeError(f"{name} device mismatch: expected {device}, got {tensor.device}")
+        if contiguous and not tensor.is_contiguous():
+            raise RuntimeError(f"{name} must be contiguous")
+
+    def _project_inputs(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = hidden_states.shape
+        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2).contiguous()
+        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim).contiguous()
+        b = self.in_proj_b(hidden_states).contiguous()
+        a = self.in_proj_a(hidden_states).contiguous()
+        return mixed_qkv, z, b, a
+
+    def _conv_weight_and_bias(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        weight = self.conv1d.weight.squeeze(1).contiguous()
+        bias = None if self.conv1d.bias is None else self.conv1d.bias.contiguous()
+        return weight, bias
+
+    def _a_log_decay(self, device: torch.device) -> torch.Tensor:
+        if self.A_log.device != device:
+            raise RuntimeError(f"A_log device mismatch: expected {device}, got {self.A_log.device}")
+        cache_key = (self.A_log.data_ptr(), self.A_log._version, self.A_log.device, self.A_log.dtype)
+        if self._cached_a_log_decay is None or self._cached_a_log_decay_key != cache_key:
+            self._cached_a_log_decay = (-self.A_log.float().exp()).contiguous()
+            self._cached_a_log_decay_key = cache_key
+        self._require_tensor_contract(
+            "a_log_decay",
+            self._cached_a_log_decay,
+            shape=(self.num_v_heads,),
+            dtype=torch.float32,
+            device=device,
+            contiguous=True,
+        )
+        return self._cached_a_log_decay
+
+    def _prepare_conv_inputs(
+        self,
+        mixed_qkv: torch.Tensor,
+        cache_params: Qwen3DynamicCache | None,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        conv_state = None if cache_params is None else cache_params.conv_states[self.layer_idx]
+        expected_state_shape = (batch_size, self.conv_dim, self.conv_kernel_size)
+        if conv_state is None:
+            conv_state = mixed_qkv.new_zeros(expected_state_shape)
+        else:
+            self._require_tensor_contract(
+                "conv_state",
+                conv_state,
+                shape=expected_state_shape,
+                dtype=mixed_qkv.dtype,
+                device=mixed_qkv.device,
+                contiguous=True,
+            )
+        self._require_tensor_contract("mixed_qkv", mixed_qkv, contiguous=True)
+        weight, bias = self._conv_weight_and_bias()
+        self._require_tensor_contract(
+            "conv_weight",
+            weight,
+            shape=(self.conv_dim, self.conv_kernel_size),
+            dtype=mixed_qkv.dtype,
+            device=mixed_qkv.device,
+            contiguous=True,
+        )
+        if bias is not None:
+            self._require_tensor_contract(
+                "conv_bias",
+                bias,
+                shape=(self.conv_dim,),
+                dtype=mixed_qkv.dtype,
+                device=mixed_qkv.device,
+                contiguous=True,
+            )
+        return mixed_qkv, conv_state, weight, bias
+
+    def _run_conv_prefill(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if mixed_qkv.device.type == "xpu":
+            return run_causal_conv1d_prefill_fused(
+                hidden_states=mixed_qkv,
+                conv_state=conv_state,
+                weight=weight,
+                bias=bias,
+            )
+        return torch_causal_conv1d_update(mixed_qkv, conv_state, weight, bias), conv_state
+
+    def _run_conv_decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if mixed_qkv.device.type == "xpu":
+            mixed_qkv = run_causal_conv1d_decode_fused(
+                hidden_states=mixed_qkv,
+                conv_state=conv_state,
+                weight=weight,
+                bias=bias,
+            )
+            return mixed_qkv, conv_state
+        return torch_causal_conv1d_update(mixed_qkv, conv_state, weight, bias), conv_state
+
+    def _split_qkv(
+        self,
+        mixed_qkv: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mixed_qkv = mixed_qkv.transpose(1, 2).contiguous()
+        query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim).contiguous()
+        key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim).contiguous()
+        value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim).contiguous()
+        return query, key, value
+
+    def _validate_conv_outputs(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_state: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self._require_tensor_contract(
+            "mixed_qkv_after_conv",
+            mixed_qkv,
+            shape=(batch_size, self.conv_dim, seq_len),
+            dtype=dtype,
+            device=device,
+            contiguous=True,
+        )
+        self._require_tensor_contract(
+            "conv_state_after_conv",
+            conv_state,
+            shape=(batch_size, self.conv_dim, self.conv_kernel_size),
+            dtype=dtype,
+            device=device,
+            contiguous=True,
+        )
+
+    def _prepare_recurrent_inputs(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        z: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.recurrent_head_repeat > 1:
+            query = query.repeat_interleave(self.recurrent_head_repeat, dim=2)
+            key = key.repeat_interleave(self.recurrent_head_repeat, dim=2)
+        beta = b.sigmoid().to(dtype=torch.float32).contiguous()
+        g = (self._a_log_decay(a.device) * F.softplus(a.float() + self.dt_bias)).contiguous()
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        z = z.contiguous()
+        return query, key, value, z, beta, g
+
+    def _validate_recurrent_inputs(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        z: torch.Tensor,
+        beta: torch.Tensor,
+        g: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self._require_tensor_contract(
+            "query",
+            query,
+            shape=(batch_size, seq_len, self.recurrent_num_heads, self.head_k_dim),
+            dtype=dtype,
+            device=device,
+            contiguous=True,
+        )
+        self._require_tensor_contract(
+            "key",
+            key,
+            shape=(batch_size, seq_len, self.recurrent_num_heads, self.head_k_dim),
+            dtype=dtype,
+            device=device,
+            contiguous=True,
+        )
+        self._require_tensor_contract(
+            "value",
+            value,
+            shape=(batch_size, seq_len, self.recurrent_num_heads, self.head_v_dim),
+            dtype=dtype,
+            device=device,
+            contiguous=True,
+        )
+        self._require_tensor_contract(
+            "z",
+            z,
+            shape=(batch_size, seq_len, self.recurrent_num_heads, self.head_v_dim),
+            dtype=dtype,
+            device=device,
+            contiguous=True,
+        )
+        self._require_tensor_contract(
+            "beta",
+            beta,
+            shape=(batch_size, seq_len, self.recurrent_num_heads),
+            dtype=torch.float32,
+            device=device,
+            contiguous=True,
+        )
+        self._require_tensor_contract(
+            "g",
+            g,
+            shape=(batch_size, seq_len, self.recurrent_num_heads),
+            dtype=torch.float32,
+            device=device,
+            contiguous=True,
+        )
+
+    def _get_recurrent_state(
+        self,
+        cache_params: Qwen3DynamicCache | None,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        recurrent_state = None if cache_params is None else cache_params.recurrent_states[self.layer_idx]
+        expected_shape = (batch_size, *self.recurrent_state_shape)
+        if recurrent_state is None:
+            recurrent_state = torch.zeros(expected_shape, device=device, dtype=torch.float32)
+        else:
+            self._require_tensor_contract(
+                "recurrent_state",
+                recurrent_state,
+                shape=expected_shape,
+                dtype=torch.float32,
+                device=device,
+                contiguous=True,
+            )
+        return recurrent_state
+
+    def _validate_recurrent_outputs(
+        self,
+        core_attn_out: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self._require_tensor_contract(
+            "core_attn_out",
+            core_attn_out,
+            shape=(batch_size, seq_len, self.recurrent_num_heads, self.head_v_dim),
+            dtype=dtype,
+            device=device,
+            contiguous=True,
+        )
+        self._require_tensor_contract(
+            "recurrent_state_after_gated_delta",
+            recurrent_state,
+            shape=(batch_size, *self.recurrent_state_shape),
+            dtype=torch.float32,
+            device=device,
+            contiguous=True,
+        )
+
+    def _use_precomputed_states(
+        self,
+        cache_params: Qwen3DynamicCache | None,
+        seq_len: int,
+    ) -> bool:
+        return seq_len == 1 and cache_params is not None and cache_params.has_previous_state
+
+    def _run_chunk_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        core_attn_out, recurrent_state = torch_chunk_gated_delta_rule(
+            query=query,
+            key=key,
+            value=value,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+        )
+        if recurrent_state is None:
+            raise RuntimeError("chunk_gated_delta_rule must return the final recurrent state for prefill.")
+        return core_attn_out, recurrent_state
+
+    def _run_recurrent_decode(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        recurrent_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if query.device.type == "xpu":
+            core_attn_out = run_gated_delta_decode_fused(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                state=recurrent_state,
+            )
+            return core_attn_out, recurrent_state
+        return torch_recurrent_gated_delta_rule(
+            query=query,
+            key=key,
+            value=value,
+            g=g,
+            beta=beta,
+            initial_state=recurrent_state,
+            output_final_state=True,
+        )
+
+    def _write_cache(
+        self,
+        cache_params: Qwen3DynamicCache | None,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+    ) -> None:
+        if cache_params is None:
+            return
+        cache_params.conv_states[self.layer_idx] = conv_state
+        cache_params.recurrent_states[self.layer_idx] = recurrent_state
+
+    def _finalize_output(
+        self,
+        core_attn_out: torch.Tensor,
+        z: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        core_attn_out = self.norm(core_attn_out, z).reshape(batch_size, seq_len, self.value_dim).contiguous()
+        return self.out_proj(core_attn_out)
 
     def forward(
         self,
@@ -1602,80 +1985,58 @@ class Qwen3GatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
         batch_size, seq_len, _ = hidden_states.shape
-        use_precomputed_states = cache_params is not None and cache_params.has_previous_state
-        conv_state = None if cache_params is None else cache_params.conv_states[self.layer_idx]
-        recurrent_state = None if cache_params is None else cache_params.recurrent_states[self.layer_idx]
+        use_precomputed_states = self._use_precomputed_states(cache_params, seq_len)
+        mixed_qkv, z, b, a = self._project_inputs(hidden_states)
+        mixed_qkv, conv_state, conv_weight, conv_bias = self._prepare_conv_inputs(mixed_qkv, cache_params, batch_size)
 
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
-
-        if hidden_states.device.type == "xpu":
-            if conv_state is None:
-                conv_state = mixed_qkv.new_zeros((batch_size, self.conv_dim, self.conv_kernel_size))
-            mixed_qkv, conv_state = run_causal_conv1d_fused(
-                hidden_states=mixed_qkv,
-                conv_state=conv_state,
-                weight=self.conv1d.weight.squeeze(1),
-                bias=self.conv1d.bias,
-            )
-            if cache_params is not None:
-                cache_params.conv_states[self.layer_idx] = conv_state
+        if use_precomputed_states:
+            mixed_qkv, conv_state = self._run_conv_decode(mixed_qkv, conv_state, conv_weight, conv_bias)
         else:
-            if use_precomputed_states and conv_state is not None:
-                mixed_qkv = torch_causal_conv1d_update(
-                    mixed_qkv,
-                    conv_state,
-                    self.conv1d.weight.squeeze(1),
-                    self.conv1d.bias,
-                )
-            else:
-                if cache_params is not None:
-                    conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
-                    cache_params.conv_states[self.layer_idx] = conv_state
-                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+            mixed_qkv, conv_state = self._run_conv_prefill(mixed_qkv, conv_state, conv_weight, conv_bias)
+        self._validate_conv_outputs(mixed_qkv, conv_state, batch_size, seq_len, hidden_states.dtype, hidden_states.device)
 
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-        query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        if self.num_v_heads // self.num_k_heads > 1:
-            repeat_factor = self.num_v_heads // self.num_k_heads
-            query = query.repeat_interleave(repeat_factor, dim=2)
-            key = key.repeat_interleave(repeat_factor, dim=2)
-        output_final_state = cache_params is not None
-        state_buffer = None
-        if output_final_state:
-            state_buffer = recurrent_state
-            if state_buffer is None:
-                state_buffer = torch.empty(
-                    (batch_size, query.shape[2], query.shape[3], value.shape[3]),
-                    device=query.device,
-                    dtype=torch.float32,
-                )
-        core_attn_out, last_recurrent_state = run_gated_delta_fused(
-            query=query,
-            key=key,
-            value=value,
-            g=g,
-            beta=beta,
-            z=z,
-            norm_weight=self.norm.weight,
-            norm_eps=self.norm.eps,
-            initial_state=recurrent_state if use_precomputed_states else None,
-            output_final_state=output_final_state,
-            state_buffer=state_buffer,
+        query, key, value = self._split_qkv(mixed_qkv, batch_size, seq_len)
+        query, key, value, z, beta, g = self._prepare_recurrent_inputs(query, key, value, z, b, a)
+        self._validate_recurrent_inputs(
+            query,
+            key,
+            value,
+            z,
+            beta,
+            g,
+            batch_size,
+            seq_len,
+            hidden_states.dtype,
+            hidden_states.device,
         )
 
-        if cache_params is not None:
-            cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
+        recurrent_state = None
+        if cache_params is not None and cache_params.recurrent_states[self.layer_idx] is not None:
+            recurrent_state = self._get_recurrent_state(cache_params, batch_size, query.device)
+        if use_precomputed_states:
+            if recurrent_state is None:
+                recurrent_state = self._get_recurrent_state(cache_params, batch_size, query.device)
+            core_attn_out, recurrent_state = self._run_recurrent_decode(query, key, value, g, beta, recurrent_state)
+        else:
+            core_attn_out, recurrent_state = self._run_chunk_prefill(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                recurrent_state,
+            )
+        self._validate_recurrent_outputs(
+            core_attn_out,
+            recurrent_state,
+            batch_size,
+            seq_len,
+            hidden_states.dtype,
+            hidden_states.device,
+        )
 
-        return self.out_proj(core_attn_out)
+        self._write_cache(cache_params, conv_state, recurrent_state)
+        return self._finalize_output(core_attn_out, z, batch_size, seq_len)
 
 
 class Qwen3MLP(nn.Module):
@@ -1982,6 +2343,76 @@ class Qwen3SparseMoeBlock(nn.Module):
         compact_routing_weights = routing_weights.index_select(0, sorted_token_idx).gather(1, sorted_route_idx[:, None])
         return compact_hidden_states, compact_routing_weights
 
+    def _execute_expert(
+        self,
+        *,
+        expert_idx: int,
+        expert_layer: Qwen3MLP,
+        expert_offsets: torch.Tensor,
+        compact_hidden_states: torch.Tensor,
+        compact_routing_weights: torch.Tensor,
+        compact_outputs: torch.Tensor,
+        execution_device: torch.device,
+        hidden_dtype: torch.dtype,
+    ) -> None:
+        start_idx = int(expert_offsets[expert_idx].item())
+        end_idx = int(expert_offsets[expert_idx + 1].item())
+        if end_idx <= start_idx:
+            return
+
+        expert_device = _module_device(expert_layer)
+        current_state = compact_hidden_states[start_idx:end_idx]
+        current_routing_weights = compact_routing_weights[start_idx:end_idx]
+        if current_state.device != expert_device:
+            current_state = current_state.to(device=expert_device)
+        if current_routing_weights.device != expert_device:
+            current_routing_weights = current_routing_weights.to(device=expert_device)
+        current_hidden_states = expert_layer(current_state) * current_routing_weights
+        if current_hidden_states.device != execution_device:
+            current_hidden_states = current_hidden_states.to(device=execution_device, dtype=hidden_dtype)
+        compact_outputs[start_idx:end_idx] = current_hidden_states.to(dtype=hidden_dtype)
+
+    def _execute_offloaded_experts(
+        self,
+        *,
+        hit_experts: list[int],
+        expert_offsets: torch.Tensor,
+        compact_hidden_states: torch.Tensor,
+        compact_routing_weights: torch.Tensor,
+        compact_outputs: torch.Tensor,
+        execution_device: torch.device,
+        hidden_dtype: torch.dtype,
+    ) -> None:
+        if self.execution_device is None:
+            raise RuntimeError("Offloaded MoE execution requires an execution device.")
+        if self.cached_experts_per_layer <= 0:
+            raise RuntimeError("Offloaded MoE execution requires cached_experts_per_layer > 0.")
+
+        wave_capacity = min(self.cached_experts_per_layer, len(hit_experts))
+        if wave_capacity <= 0:
+            return
+
+        for wave_start in range(0, len(hit_experts), wave_capacity):
+            wave_indices = hit_experts[wave_start : wave_start + wave_capacity]
+            prepared = self._prepare_cached_experts(wave_indices)
+            missing = [expert_idx for expert_idx in wave_indices if expert_idx not in prepared]
+            if missing:
+                raise RuntimeError(
+                    "Failed to stage all requested MoE experts onto the execution device: "
+                    f"missing={missing} cache_capacity={self.cached_experts_per_layer}"
+                )
+            for expert_idx in wave_indices:
+                self._execute_expert(
+                    expert_idx=expert_idx,
+                    expert_layer=prepared[expert_idx],
+                    expert_offsets=expert_offsets,
+                    compact_hidden_states=compact_hidden_states,
+                    compact_routing_weights=compact_routing_weights,
+                    compact_outputs=compact_outputs,
+                    execution_device=execution_device,
+                    hidden_dtype=hidden_dtype,
+                )
+
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         execution_device = hidden_states.device
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -1993,15 +2424,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         final_hidden_states = hidden_states.new_zeros((batch_size * sequence_length, hidden_dim))
         usage = usage.to(device=selected_experts.device)
         hit_experts = usage.nonzero(as_tuple=False).flatten()
-        gpu_candidates: set[int] = set()
-        prepared_gpu_experts: dict[int, Qwen3MLP] = {}
-        if self.offload_experts and self.execution_device is not None and hit_experts.numel() > 0:
-            gpu_count = min(int(hit_experts.numel()), self.cached_experts_per_layer)
-            if gpu_count > 0:
-                _, candidate_idx = torch.topk(usage, k=gpu_count)
-                gpu_candidate_list = [int(idx) for idx in candidate_idx.tolist() if int(usage[idx].item()) > 0]
-                gpu_candidates = set(gpu_candidate_list)
-                prepared_gpu_experts = self._prepare_cached_experts(gpu_candidate_list)
+        hit_expert_list = [int(expert_idx) for expert_idx in hit_experts.tolist()]
 
         sorted_token_idx, sorted_route_idx, expert_offsets = self._sorted_routing_assignments(selected_experts, usage)
         compact_hidden_states, compact_routing_weights = self._compact_routing_inputs(
@@ -2011,25 +2434,28 @@ class Qwen3SparseMoeBlock(nn.Module):
             sorted_route_idx,
         )
         compact_outputs = hidden_states.new_empty((compact_hidden_states.shape[0], hidden_dim))
-        for expert_idx in hit_experts.tolist():
-            expert_layer = self.experts[expert_idx]
-            if expert_idx in gpu_candidates:
-                cached = prepared_gpu_experts.get(expert_idx)
-                if cached is not None:
-                    expert_layer = cached
-            start_idx = int(expert_offsets[expert_idx].item())
-            end_idx = int(expert_offsets[expert_idx + 1].item())
-            expert_device = _module_device(expert_layer)
-            current_state = compact_hidden_states[start_idx:end_idx]
-            current_routing_weights = compact_routing_weights[start_idx:end_idx]
-            if current_state.device != expert_device:
-                current_state = current_state.to(device=expert_device)
-            if current_routing_weights.device != expert_device:
-                current_routing_weights = current_routing_weights.to(device=expert_device)
-            current_hidden_states = expert_layer(current_state) * current_routing_weights
-            if current_hidden_states.device != execution_device:
-                current_hidden_states = current_hidden_states.to(device=execution_device, dtype=hidden_states.dtype)
-            compact_outputs[start_idx:end_idx] = current_hidden_states.to(dtype=hidden_states.dtype)
+        if self.offload_experts and hit_expert_list:
+            self._execute_offloaded_experts(
+                hit_experts=hit_expert_list,
+                expert_offsets=expert_offsets,
+                compact_hidden_states=compact_hidden_states,
+                compact_routing_weights=compact_routing_weights,
+                compact_outputs=compact_outputs,
+                execution_device=execution_device,
+                hidden_dtype=hidden_states.dtype,
+            )
+        else:
+            for expert_idx in hit_expert_list:
+                self._execute_expert(
+                    expert_idx=expert_idx,
+                    expert_layer=self.experts[expert_idx],
+                    expert_offsets=expert_offsets,
+                    compact_hidden_states=compact_hidden_states,
+                    compact_routing_weights=compact_routing_weights,
+                    compact_outputs=compact_outputs,
+                    execution_device=execution_device,
+                    hidden_dtype=hidden_states.dtype,
+                )
 
         if compact_outputs.numel() > 0:
             final_hidden_states.index_add_(0, sorted_token_idx, compact_outputs)

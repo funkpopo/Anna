@@ -79,7 +79,8 @@ class Qwen3_5TextTokenizer:
 
     @property
     def eos_token_ids(self) -> set[int]:
-        tokens = {"<|im_end|>", "<|endoftext|>"}
+        # Qwen chat templates should never surface a fresh role boundary in assistant content.
+        tokens = {"<|im_start|>", "<|im_end|>", "<|endoftext|>"}
         return {token_id for token in tokens if (token_id := self.token_id(token)) is not None}
 
     @staticmethod
