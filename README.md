@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-Anna is a local inference runtime and OpenAI-compatible API server focused on PyTorch/XPU execution for Intel Arc Alchemist . The current project can serve Qwen3.5 text-generation checkpoints, Gemma 4 multimodal checkpoints, and Qwen3-TTS speech synthesis checkpoints from local model directories.
+Anna is a local inference runtime and OpenAI-compatible API server focused on PyTorch/XPU execution for Intel Arc Alchemist . The current project can serve Qwen3.5 text-generation checkpoints, Gemma 4 multimodal checkpoints, and Qwen3-TTS speech synthesis checkpoints from local model directories. Qwen3.5 model directories can now be loaded either from Hugging Face-style configs / safetensors files or from GGUF checkpoints with an optional `mmproj-*.gguf` vision tower file.
 
 ## Features
 
@@ -56,7 +56,9 @@ Notes:
 ## Requirements
 
 - Python `3.11+`
-- A local model directory containing `config.json`, tokenizer files, and weights
+- A local model directory containing either:
+  - `config.json`, tokenizer files, and weights
+  - or a Qwen GGUF model file plus optional `mmproj-*.gguf`
 - PyTorch installed separately for your platform
   - CPU works for debugging and tests
   - Intel Arc + a PyTorch build with `xpu` support is the intended runtime path

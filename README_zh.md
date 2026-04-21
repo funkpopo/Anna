@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-Anna 是一个面向 Intel Arc Alchemist / PyTorch XPU 的本地推理运行时和 OpenAI 兼容 API 服务。当前项目已经可以直接从本地模型目录加载并运行 Qwen3.5 文本生成模型、Gemma 4 多模态模型，以及 Qwen3-TTS 语音合成模型。
+Anna 是一个面向 Intel Arc Alchemist / PyTorch XPU 的本地推理运行时和 OpenAI 兼容 API 服务。当前项目已经可以直接从本地模型目录加载并运行 Qwen3.5 文本生成模型、Gemma 4 多模态模型，以及 Qwen3-TTS 语音合成模型。Qwen3.5 模型目录现在既支持 Hugging Face 风格的 `config.json` / tokenizer / safetensors，也支持 GGUF 主模型文件，并可选配套 `mmproj-*.gguf` 视觉塔文件。
 
 ## 项目能力
 
@@ -56,7 +56,9 @@ Anna 根据 `config.json` 顶层的 `model_type` 自动选择运行时：
 ## 环境要求
 
 - Python `3.11+`
-- 一个本地模型目录，至少包含 `config.json`、tokenizer 文件和权重
+- 一个本地模型目录，满足以下任一形式：
+  - 包含 `config.json`、tokenizer 文件和权重
+  - 或包含一个 Qwen GGUF 主模型文件，并可选携带 `mmproj-*.gguf`
 - 单独安装与你环境匹配的 PyTorch
   - CPU 可用于调试和测试
   - Intel Arc + 带 `xpu` 的 PyTorch 是当前项目的目标运行路径

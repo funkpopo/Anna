@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
 
+from anna.core.gguf_model import has_gguf_model
 from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
-from anna.model.quantization import replace_linear_modules
+from anna.model.quantization import replace_linear_modules, replace_linear_modules_with_xpu_int4_placeholders
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,10 @@ def load_qwen3_5_text_model_config(model_dir: str | Path) -> Qwen3_5TextModelCon
     model_path = Path(model_dir)
     config_path = model_path / "config.json"
     if not config_path.exists():
+        if has_gguf_model(model_path):
+            from anna.weights.gguf_support import load_qwen3_5_text_model_config_from_gguf
+
+            return load_qwen3_5_text_model_config_from_gguf(model_path)
         raise FileNotFoundError(f"Missing config file: {config_path}")
     return Qwen3_5TextModelConfig.from_model_dir(model_path)
 
@@ -49,6 +55,10 @@ def _iter_weight_files(model_dir: Path) -> list[Path]:
 
 def estimate_qwen3_5_text_model_weight_bytes(model_dir: str | Path) -> int:
     model_path = Path(model_dir)
+    if has_gguf_model(model_path):
+        from anna.weights.gguf_support import estimate_qwen3_5_text_model_weight_bytes_from_gguf
+
+        return estimate_qwen3_5_text_model_weight_bytes_from_gguf(model_path)
     index_path = model_path / "model.safetensors.index.json"
     if index_path.exists():
         index_data = json.loads(index_path.read_text(encoding="utf-8"))
@@ -64,6 +74,7 @@ def build_qwen3_5_text_model(
     *,
     device: torch.device,
     dtype: torch.dtype,
+    int4_placeholder_predicate: Callable[[str, torch.nn.Module], bool] | None = None,
 ) -> tuple[Qwen3_5TextForConditionalGeneration, int]:
     default_dtype = torch.get_default_dtype()
     build_dtype = dtype if dtype in {torch.float16, torch.bfloat16, torch.float32} else torch.float32
@@ -77,20 +88,33 @@ def build_qwen3_5_text_model(
 
     logger.info("Replacing Qwen3.5 linear layers with quantized placeholders.")
     quantized_specs = replace_linear_modules(model, config.quantization_config, compute_dtype=dtype)
+    direct_int4_placeholders = 0
+    if int4_placeholder_predicate is not None:
+        logger.info("Replacing selected Qwen3.5 linear layers with direct XPU-int4 placeholders.")
+        direct_int4_placeholders = replace_linear_modules_with_xpu_int4_placeholders(
+            model,
+            compute_dtype=dtype,
+            device=torch.device("meta"),
+            include_predicate=int4_placeholder_predicate,
+        )
     if not hasattr(model, "to_empty"):
         raise RuntimeError("The current torch build does not support nn.Module.to_empty, which is required for low-memory model loading.")
     logger.info("Allocating empty Qwen3.5 tensors on %s.", device)
     model.to_empty(device=device)
     logger.info(
         "Constructed Qwen3.5 model skeleton: quantized_placeholders=%s target_device=%s",
-        len(quantized_specs),
+        len(quantized_specs) + direct_int4_placeholders,
         device,
     )
-    return model, len(quantized_specs)
+    return model, len(quantized_specs) + direct_int4_placeholders
 
 
 def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, model_dir: str | Path) -> WeightLoadReport:
     model_path = Path(model_dir)
+    if has_gguf_model(model_path):
+        from anna.weights.gguf_support import load_qwen3_5_text_model_weights_from_gguf
+
+        return load_qwen3_5_text_model_weights_from_gguf(model, model_path)
     tensor_targets = {name: tensor for name, tensor in model.named_parameters()}
     tensor_targets.update({name: tensor for name, tensor in model.named_buffers()})
     loaded = 0

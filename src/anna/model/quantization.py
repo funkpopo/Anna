@@ -642,6 +642,41 @@ def convert_module_linears_to_xpu_int4(
     return len(replacements)
 
 
+def replace_linear_modules_with_xpu_int4_placeholders(
+    model: nn.Module,
+    *,
+    group_size: int = 128,
+    compute_dtype: torch.dtype = torch.bfloat16,
+    device: torch.device | str | None = None,
+    include_predicate: Callable[[str, nn.Module], bool] | None = None,
+) -> int:
+    replacements: list[tuple[str, XPUInt4Linear]] = []
+    for module_name, module in list(model.named_modules()):
+        if not module_name:
+            continue
+        if not isinstance(module, nn.Linear):
+            continue
+        if include_predicate is not None and not include_predicate(module_name, module):
+            continue
+        replacements.append(
+            (
+                module_name,
+                XPUInt4Linear(
+                    module.in_features,
+                    module.out_features,
+                    group_size=group_size,
+                    bias=module.bias is not None,
+                    compute_dtype=compute_dtype,
+                    device=device,
+                ),
+            )
+        )
+
+    for module_name, replacement in replacements:
+        _set_submodule(model, module_name, replacement)
+    return len(replacements)
+
+
 def replace_linear_modules(
     model: nn.Module,
     quantization_config: QuantizationConfig,
