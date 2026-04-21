@@ -2527,7 +2527,29 @@ class Qwen3SparseMoeBlock(nn.Module):
         prepacked = self._new_meta_expert_module()
         for linear_name in ("gate_proj", "up_proj", "down_proj"):
             source_linear = getattr(source, linear_name)
-            packed_linear = XPUInt4Linear.from_linear(source_linear, device=torch.device("cpu"))
+            if isinstance(source_linear, XPUInt4Linear):
+                packed_linear = XPUInt4Linear(
+                    source_linear.in_features,
+                    source_linear.out_features,
+                    group_size=source_linear.group_size,
+                    bias=source_linear.bias is not None,
+                    compute_dtype=source_linear.compute_dtype,
+                    device=torch.device("cpu"),
+                    padded_in_features=source_linear.padded_in_features,
+                )
+                with torch.no_grad():
+                    packed_linear.qweight.copy_(source_linear.qweight.to(device=packed_linear.qweight.device))
+                    packed_linear.qscale.copy_(source_linear.qscale.to(device=packed_linear.qscale.device))
+                    packed_linear.qzeros.copy_(source_linear.qzeros.to(device=packed_linear.qzeros.device))
+                    if source_linear.bias is not None and packed_linear.bias is not None:
+                        packed_linear.bias.copy_(
+                            source_linear.bias.to(
+                                device=packed_linear.bias.device,
+                                dtype=packed_linear.bias.dtype,
+                            )
+                        )
+            else:
+                packed_linear = XPUInt4Linear.from_linear(source_linear, device=torch.device("cpu"))
             setattr(prepacked, linear_name, packed_linear)
         self.host_prepacked_experts_pinned = self._pin_module_host_memory(prepacked) or self.host_prepacked_experts_pinned
         return prepacked

@@ -9,6 +9,7 @@ description = "From-scratch Qwen3.5 inference service for Intel Arc with an Open
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.116,<1.0",
+    "gguf>=0.18,<1.0",
     "imageio>=2.37,<3.0",
     "imageio-ffmpeg>=0.6,<1.0",
     "numpy>=2.3,<3.0",

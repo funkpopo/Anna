@@ -12,6 +12,7 @@ from typing import Any, Iterator, Literal, cast
 import torch
 
 from anna.core.function_calling import ThinkingStreamParser, ToolCallDelta
+from anna.core.gguf_model import has_gguf_model
 from anna.mm.qwen3_5_text_processor import PreparedInputs, Qwen3_5TextMultimodalProcessor
 from anna.model.fused_ops import maybe_load_gated_delta_library, paged_gqa_decode_fused_is_available
 from anna.model.quantization import AutoRoundGPTQLinear, convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
@@ -459,6 +460,20 @@ class AnnaQwen3_5TextEngine:
             if resolved_offload_mode == "experts" or resolved_weight_quant == "int4"
             else device_context.device
         )
+        uses_gguf_weights = has_gguf_model(model_path)
+
+        def _gguf_int4_placeholder_predicate(module_name: str, _module: torch.nn.Module) -> bool:
+            normalized = module_name.replace("\\", "/")
+            if normalized == "lm_head":
+                return False
+            if ".visual." in normalized or normalized.startswith("model.visual."):
+                return False
+            if ".mlp._expert_cache." in normalized:
+                return False
+            if ".mlp.experts." in normalized:
+                return resolved_expert_quant == "int4"
+            return resolved_weight_quant == "int4"
+
         try:
             logger.info(
                 "Building Qwen3.5 runtime: model_dir=%s compute_device=%s load_device=%s offload=%s expert_quant=%s weight_quant=%s resident_expert_layers=%s cached_experts_per_layer=%s kv_cache=%s",
@@ -476,6 +491,7 @@ class AnnaQwen3_5TextEngine:
                 config,
                 device=model_device,
                 dtype=device_context.dtype,
+                int4_placeholder_predicate=(_gguf_int4_placeholder_predicate if uses_gguf_weights else None),
             )
             report = load_qwen3_5_text_model_weights(model, model_path)
             logger.info(

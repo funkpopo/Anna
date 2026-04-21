@@ -16,6 +16,7 @@ from anna.core.function_calling import (
     normalize_tool_choice,
     select_tools_for_choice,
 )
+from anna.core.gguf_model import has_gguf_model
 from tokenizers import Tokenizer
 
 
@@ -40,6 +41,11 @@ class Qwen3_5TextTokenizer:
         model_path = Path(model_dir)
         tokenizer_path = model_path / "tokenizer.json"
         if not tokenizer_path.exists():
+            if has_gguf_model(model_path):
+                from anna.weights.gguf_support import build_qwen3_5_text_tokenizer_backend_from_gguf
+
+                backend, metadata = build_qwen3_5_text_tokenizer_backend_from_gguf(model_path)
+                return cls(backend, metadata=metadata)
             raise FileNotFoundError(f"Missing tokenizer.json in {model_path}")
 
         metadata = None
