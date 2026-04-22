@@ -265,7 +265,10 @@ class AnnaQwen3_5TextEngine:
 
     def _resolve_prefill_chunk_size(self, requested_chunk_size: int) -> int:
         if requested_chunk_size > 0:
-            return requested_chunk_size
+            block = max(1, int(self.config.text_config.cache_block_size))
+            raw = max(1, int(requested_chunk_size))
+            aligned = max(block, (raw // block) * block)
+            return aligned
         device = getattr(self.device_context, "device", torch.device("cpu"))
         if device.type != "xpu":
             return 0
@@ -315,10 +318,14 @@ class AnnaQwen3_5TextEngine:
 
         auto_chunk = int(target_chunk_budget // estimated_bytes_per_token)
         resolved = max(128, min(2048, auto_chunk))
+        block = max(1, int(text_config.cache_block_size))
+        if block > 1:
+            resolved = max(block, (resolved // block) * block)
         logger.info(
-            "Enabled auto prefill chunking on %s: chunk_size=%s estimated_bytes_per_token=%s target_budget=%s",
+            "Enabled auto prefill chunking on %s: chunk_size=%s block_size=%s estimated_bytes_per_token=%s target_budget=%s",
             self.device_context.device,
             resolved,
+            block,
             _format_bytes(estimated_bytes_per_token),
             _format_bytes(target_chunk_budget),
         )
@@ -1168,6 +1175,7 @@ class AnnaQwen3_5TextEngine:
             kv_cache_residual_len=self.optimization_config.kv_cache_residual_len,
         )
         cache.reserve_sequence_capacity(int(prepared.input_ids.shape[1]))
+        cache.set_prompt_token_ids(prepared.input_ids)
         return cache
 
     def _trim_runtime_cache_if_idle(self) -> None:
@@ -1788,6 +1796,46 @@ class AnnaQwen3_5TextEngine:
             logits_to_keep=logits_to_keep,
             **model_kwargs,
         )
+
+    def warmup_inference_kernels(self) -> None:
+        from anna.model.fused_ops import maybe_load_gated_delta_library
+
+        maybe_load_gated_delta_library()
+        if self.device_context.device.type != "xpu":
+            return
+        cfg = self.config.text_config
+        pad = int(cfg.pad_token_id)
+        if not (0 <= pad < cfg.vocab_size):
+            pad = 0
+        bos = getattr(self.tokenizer, "bos_token_id", None)
+        token_id = int(bos) if bos is not None and 0 <= int(bos) < cfg.vocab_size else pad
+        device = self.device_context.device
+        try:
+            with torch.inference_mode():
+                input_ids = torch.tensor([[token_id]], device=device, dtype=torch.long)
+                attention_mask = torch.ones_like(input_ids)
+                outputs = self._forward_generation_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=None,
+                    model_kwargs={},
+                    use_cache=True,
+                    logits_to_keep=1,
+                )
+                past = outputs.past_key_values
+                if past is not None:
+                    self._forward_generation_model(
+                        input_ids=torch.tensor([[token_id]], device=device, dtype=torch.long),
+                        attention_mask=None,
+                        past_key_values=past,
+                        model_kwargs={},
+                        use_cache=True,
+                        logits_to_keep=1,
+                    )
+                    past.release()
+            logger.info("XPU inference warmup finished (1-token prefill + decode).")
+        except Exception:
+            logger.exception("XPU inference warmup failed; first request may load fused ops or pay extra JIT latency.")
 
     @staticmethod
     def _prune_trivial_attention_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:

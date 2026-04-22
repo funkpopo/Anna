@@ -152,6 +152,8 @@ class Qwen3TextModel(nn.Module):
                 kv_cache_quant_bits=self.kv_cache_quant_bits,
                 kv_cache_residual_len=self.kv_cache_residual_len,
             )
+            if input_ids is not None:
+                past_key_values.set_prompt_token_ids(input_ids)
 
         execution_device = self.execution_device or _module_device(self.norm)
         if inputs_embeds.device != execution_device:
@@ -174,13 +176,19 @@ class Qwen3TextModel(nn.Module):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for idx, decoder_layer in enumerate(self.layers):
-            hidden_states = decoder_layer(
-                hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-            )
+        if past_key_values is not None and input_ids is not None:
+            past_key_values.attach_prefill_input_ids(input_ids)
+        try:
+            for idx, decoder_layer in enumerate(self.layers):
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                )
+        finally:
+            if past_key_values is not None:
+                past_key_values.detach_prefill_input_ids()
 
         hidden_states = self.norm(hidden_states)
         return TextModelOutput(last_hidden_state=hidden_states, past_key_values=past_key_values)
@@ -683,6 +691,8 @@ class Qwen3Model(nn.Module):
                 kv_cache_quant_bits=self.language_model.kv_cache_quant_bits,
                 kv_cache_residual_len=self.language_model.kv_cache_residual_len,
             )
+            if input_ids is not None:
+                past_key_values.set_prompt_token_ids(input_ids)
 
         if inputs_embeds is None:
             embedding_device = self.get_input_embeddings().weight.device
