@@ -8,7 +8,7 @@ pub const SupportedModelFamily = enum {
 
 pub const RuntimeBackend = enum {
     cpu,
-    xpu_opencl,
+    xpu,
 };
 
 pub const RuntimeSafetyPolicy = struct {

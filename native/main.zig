@@ -52,19 +52,19 @@ fn printUsage(writer: anytype) !void {
         \\anna-native eval-token --model-dir <path> --tokens <id0,id1,...> [--top-k <n>]
         \\  Loads the native Qwen token runtime, runs prompt tokens through Zig-only
         \\  decode, and prints the highest logits for the last position.
-        \\  Optional: --backend cpu|xpu|xpu-opencl
+        \\  Optional: --backend cpu|xpu
         \\
         \\anna-native generate --model-dir <path> --prompt <text> [sampling options]
         \\  Runs native tokenizer + scheduler + token runtime and prints generated text.
-        \\  Optional: --backend cpu|xpu|xpu-opencl
+        \\  Optional: --backend cpu|xpu
         \\
         \\anna-native chat-json --model-dir <path> --user <text> [--system <text>] [sampling options]
         \\  Runs native chat generation and prints an OpenAI-compatible chat response JSON.
-        \\  Optional: --backend cpu|xpu|xpu-opencl
+        \\  Optional: --backend cpu|xpu
         \\
         \\anna-native completion-json --model-dir <path> --prompt <text> [sampling options]
         \\  Runs native text generation and prints an OpenAI-compatible completion JSON.
-        \\  Optional: --backend cpu|xpu|xpu-opencl
+        \\  Optional: --backend cpu|xpu
         \\
     );
 }
@@ -360,6 +360,6 @@ fn parseFloat32(text: []const u8) !f32 {
 
 fn parseBackend(text: []const u8) !anna.types.RuntimeBackend {
     if (std.mem.eql(u8, text, "cpu")) return .cpu;
-    if (std.mem.eql(u8, text, "xpu") or std.mem.eql(u8, text, "xpu-opencl")) return .xpu_opencl;
+    if (std.mem.eql(u8, text, "xpu")) return .xpu;
     return error.InvalidBackend;
 }

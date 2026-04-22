@@ -22,6 +22,21 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    const sycl_backend_cmd = b.addSystemCommand(&.{
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        b.pathFromRoot("native/xpu/build_xpu_backend.ps1"),
+        "-Source",
+        b.pathFromRoot("native/xpu/sycl_backend.cpp"),
+        "-OutDir",
+        b.pathFromRoot("zig-out/bin"),
+    });
+    const xpu_backend_step = b.step("xpu-backend", "Build the native XPU backend DLL");
+    xpu_backend_step.dependOn(&sycl_backend_cmd.step);
+
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {
         run_cmd.addArgs(args);

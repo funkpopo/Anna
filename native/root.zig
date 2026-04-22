@@ -17,7 +17,7 @@ pub const safetensors = @import("weights/safetensors.zig");
 pub const tensor = @import("tensor/tensor.zig");
 pub const qwen3_tokenizer = @import("tokenizer/qwen3_tokenizer.zig");
 pub const types = @import("runtime/types.zig");
-pub const xpu_opencl = @import("xpu/opencl_backend.zig");
+pub const xpu = @import("xpu/sycl_backend.zig");
 
 test {
     std.testing.refAllDecls(@This());

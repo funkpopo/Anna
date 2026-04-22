@@ -1,7 +1,7 @@
 const std = @import("std");
 const cfg = @import("qwen3_config.zig");
 const tensor = @import("../tensor/tensor.zig");
-const xpu = @import("../xpu/opencl_backend.zig");
+const xpu = @import("../xpu/sycl_backend.zig");
 
 pub const DenseLinear = struct {
     in_features: usize,
@@ -234,6 +234,26 @@ pub const Linear = union(enum) {
             .autoround => |linear| linear.releaseXpu(runtime),
         }
     }
+
+    pub fn xpuRuntime(self: Linear) ?*xpu.Runtime {
+        return switch (self) {
+            .dense => |linear| if (linear.xpu_weights) |weights| weights.runtime else null,
+            .autoround => |linear| if (linear.xpu_weights) |weights| weights.runtime else null,
+        };
+    }
+
+    pub fn forwardIntoBuffer(self: Linear, out: *const xpu.F32Buffer, input: *const xpu.F32Buffer) !void {
+        switch (self) {
+            .dense => |linear| {
+                const weights = linear.xpu_weights orelse return error.MissingXpuWeights;
+                try weights.runtime.runDenseToBuffer(&weights, out, input);
+            },
+            .autoround => |linear| {
+                const weights = linear.xpu_weights orelse return error.MissingXpuWeights;
+                try weights.runtime.runAutoRoundToBuffer(&weights, out, input);
+            },
+        }
+    }
 };
 
 pub const Mlp = struct {
@@ -242,6 +262,26 @@ pub const Mlp = struct {
     down_proj: Linear,
 
     pub fn forwardAlloc(self: Mlp, allocator: std.mem.Allocator, hidden: []const f32) ![]f32 {
+        if (self.gate_proj.xpuRuntime()) |runtime| {
+            const up_runtime = self.up_proj.xpuRuntime() orelse return error.MissingXpuWeights;
+            const down_runtime = self.down_proj.xpuRuntime() orelse return error.MissingXpuWeights;
+            if (runtime != up_runtime or runtime != down_runtime) return error.XpuRuntimeMismatch;
+            var input_buffer = try runtime.uploadF32(hidden);
+            defer runtime.releaseF32(&input_buffer);
+            var gate_buffer = try runtime.allocF32(self.gate_proj.outFeatures());
+            defer runtime.releaseF32(&gate_buffer);
+            var up_buffer = try runtime.allocF32(self.up_proj.outFeatures());
+            defer runtime.releaseF32(&up_buffer);
+            try self.gate_proj.forwardIntoBuffer(&gate_buffer, &input_buffer);
+            try self.up_proj.forwardIntoBuffer(&up_buffer, &input_buffer);
+            try runtime.siluMulInPlace(&gate_buffer, &up_buffer);
+            var out_buffer = try runtime.allocF32(self.down_proj.outFeatures());
+            defer runtime.releaseF32(&out_buffer);
+            try self.down_proj.forwardIntoBuffer(&out_buffer, &gate_buffer);
+            const out = try allocator.alloc(f32, self.down_proj.outFeatures());
+            try runtime.readF32(&out_buffer, out);
+            return out;
+        }
         const gate = try self.gate_proj.forwardAlloc(allocator, hidden);
         defer allocator.free(gate);
         const up = try self.up_proj.forwardAlloc(allocator, hidden);
@@ -348,12 +388,20 @@ pub const FullAttentionState = struct {
 };
 
 pub const FullAttention = struct {
+    const ProjectedQkv = struct {
+        q: []f32,
+        k: []f32,
+        v: []f32,
+    };
+
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
     q_norm_weight: []const f32,
     k_norm_weight: []const f32,
+    q_norm_weight_xpu: ?xpu.F32Buffer = null,
+    k_norm_weight_xpu: ?xpu.F32Buffer = null,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -362,29 +410,18 @@ pub const FullAttention = struct {
     eps: f32 = 1e-6,
 
     pub fn forwardStepAlloc(self: FullAttention, allocator: std.mem.Allocator, hidden: []const f32, state: *FullAttentionState, position: usize) ![]f32 {
-        const projected_q = try self.q_proj.forwardAlloc(allocator, hidden);
-        defer allocator.free(projected_q);
-        const projected_k = try self.k_proj.forwardAlloc(allocator, hidden);
-        defer allocator.free(projected_k);
-        const projected_v = try self.v_proj.forwardAlloc(allocator, hidden);
-        defer allocator.free(projected_v);
+        const projected = if (self.q_proj.xpuRuntime() != null)
+            try self.forwardQkvXpuAlloc(allocator, hidden, position)
+        else
+            try self.forwardQkvCpuAlloc(allocator, hidden, position);
+        defer allocator.free(projected.q);
+        defer allocator.free(projected.k);
+        defer allocator.free(projected.v);
 
-        const q_values = projected_q[0 .. self.num_heads * self.head_dim];
-        const gate = projected_q[self.num_heads * self.head_dim ..][0 .. self.num_heads * self.head_dim];
-
-        var q = try allocator.dupe(f32, q_values);
-        defer allocator.free(q);
-        var k = try allocator.dupe(f32, projected_k);
-        defer allocator.free(k);
-        for (0..self.num_heads) |head| {
-            tensor.rmsNormQwen(q[head * self.head_dim ..][0..self.head_dim], q[head * self.head_dim ..][0..self.head_dim], self.q_norm_weight, self.eps);
-            applyRope(q[head * self.head_dim ..][0..self.head_dim], position, self.rope_theta, self.partial_rotary_factor);
-        }
-        for (0..self.num_kv_heads) |head| {
-            tensor.rmsNormQwen(k[head * self.head_dim ..][0..self.head_dim], k[head * self.head_dim ..][0..self.head_dim], self.k_norm_weight, self.eps);
-            applyRope(k[head * self.head_dim ..][0..self.head_dim], position, self.rope_theta, self.partial_rotary_factor);
-        }
-        try state.append(k, projected_v);
+        const q_value_len = self.num_heads * self.head_dim;
+        const q_values = projected.q[0..q_value_len];
+        const gate = projected.q[q_value_len..][0..q_value_len];
+        try state.append(projected.k, projected.v);
 
         var attn_out = try allocator.alloc(f32, self.num_heads * self.head_dim);
         defer allocator.free(attn_out);
@@ -394,7 +431,7 @@ pub const FullAttention = struct {
         defer allocator.free(scores);
         for (0..self.num_heads) |head| {
             const kv_head = head / groups;
-            const query = q[head * self.head_dim ..][0..self.head_dim];
+            const query = q_values[head * self.head_dim ..][0..self.head_dim];
             for (scores, 0..) |*score, pos| {
                 score.* = tensor.dot(query, state.keyAt(pos, kv_head)) * scale;
             }
@@ -408,6 +445,77 @@ pub const FullAttention = struct {
         }
         for (attn_out, gate) |*value, g| value.* *= tensor.sigmoid(g);
         return try self.o_proj.forwardAlloc(allocator, attn_out);
+    }
+
+    fn forwardQkvCpuAlloc(self: FullAttention, allocator: std.mem.Allocator, hidden: []const f32, position: usize) !ProjectedQkv {
+        const projected_q = try self.q_proj.forwardAlloc(allocator, hidden);
+        errdefer allocator.free(projected_q);
+        const projected_k = try self.k_proj.forwardAlloc(allocator, hidden);
+        errdefer allocator.free(projected_k);
+        const projected_v = try self.v_proj.forwardAlloc(allocator, hidden);
+        errdefer allocator.free(projected_v);
+
+        const q_value_len = self.num_heads * self.head_dim;
+        const q_values = projected_q[0..q_value_len];
+        for (0..self.num_heads) |head| {
+            const head_values = q_values[head * self.head_dim ..][0..self.head_dim];
+            tensor.rmsNormQwen(head_values, head_values, self.q_norm_weight, self.eps);
+            applyRope(head_values, position, self.rope_theta, self.partial_rotary_factor);
+        }
+        for (0..self.num_kv_heads) |head| {
+            const head_values = projected_k[head * self.head_dim ..][0..self.head_dim];
+            tensor.rmsNormQwen(head_values, head_values, self.k_norm_weight, self.eps);
+            applyRope(head_values, position, self.rope_theta, self.partial_rotary_factor);
+        }
+        return .{
+            .q = projected_q,
+            .k = projected_k,
+            .v = projected_v,
+        };
+    }
+
+    fn forwardQkvXpuAlloc(self: FullAttention, allocator: std.mem.Allocator, hidden: []const f32, position: usize) !ProjectedQkv {
+        const runtime = self.q_proj.xpuRuntime() orelse return error.MissingXpuWeights;
+        const k_runtime = self.k_proj.xpuRuntime() orelse return error.MissingXpuWeights;
+        const v_runtime = self.v_proj.xpuRuntime() orelse return error.MissingXpuWeights;
+        if (runtime != k_runtime or runtime != v_runtime) return error.XpuRuntimeMismatch;
+
+        const q_norm_weight = self.q_norm_weight_xpu orelse return error.MissingXpuWeights;
+        const k_norm_weight = self.k_norm_weight_xpu orelse return error.MissingXpuWeights;
+        if (q_norm_weight.runtime != runtime or k_norm_weight.runtime != runtime) return error.XpuRuntimeMismatch;
+
+        var input_buffer = try runtime.uploadF32(hidden);
+        defer runtime.releaseF32(&input_buffer);
+        var q_buffer = try runtime.allocF32(self.q_proj.outFeatures());
+        defer runtime.releaseF32(&q_buffer);
+        var k_buffer = try runtime.allocF32(self.k_proj.outFeatures());
+        defer runtime.releaseF32(&k_buffer);
+        var v_buffer = try runtime.allocF32(self.v_proj.outFeatures());
+        defer runtime.releaseF32(&v_buffer);
+
+        try self.q_proj.forwardIntoBuffer(&q_buffer, &input_buffer);
+        try self.k_proj.forwardIntoBuffer(&k_buffer, &input_buffer);
+        try self.v_proj.forwardIntoBuffer(&v_buffer, &input_buffer);
+
+        const rotary_dim = computeRotaryDim(self.head_dim, self.partial_rotary_factor);
+        try runtime.qwenRmsNormRopeInPlace(&q_buffer, &q_norm_weight, self.num_heads, self.head_dim, position, self.rope_theta, rotary_dim, self.eps);
+        try runtime.qwenRmsNormRopeInPlace(&k_buffer, &k_norm_weight, self.num_kv_heads, self.head_dim, position, self.rope_theta, rotary_dim, self.eps);
+
+        const projected_q = try allocator.alloc(f32, self.q_proj.outFeatures());
+        errdefer allocator.free(projected_q);
+        const projected_k = try allocator.alloc(f32, self.k_proj.outFeatures());
+        errdefer allocator.free(projected_k);
+        const projected_v = try allocator.alloc(f32, self.v_proj.outFeatures());
+        errdefer allocator.free(projected_v);
+        try runtime.readF32(&q_buffer, projected_q);
+        try runtime.readF32(&k_buffer, projected_k);
+        try runtime.readF32(&v_buffer, projected_v);
+
+        return .{
+            .q = projected_q,
+            .k = projected_k,
+            .v = projected_v,
+        };
     }
 };
 
@@ -630,9 +738,7 @@ pub const TokenEngine = struct {
 };
 
 fn applyRope(values: []f32, position: usize, theta: f32, partial_rotary_factor: f32) void {
-    var rotary_dim: usize = @intFromFloat(@as(f32, @floatFromInt(values.len)) * partial_rotary_factor);
-    rotary_dim = @max(@as(usize, 2), rotary_dim - (rotary_dim % 2));
-    rotary_dim = @min(rotary_dim, values.len - (values.len % 2));
+    const rotary_dim = computeRotaryDim(values.len, partial_rotary_factor);
     const half = rotary_dim / 2;
     for (0..half) |idx| {
         const inv_freq = 1.0 / std.math.pow(f32, theta, @as(f32, @floatFromInt(idx * 2)) / @as(f32, @floatFromInt(rotary_dim)));
@@ -644,6 +750,13 @@ fn applyRope(values: []f32, position: usize, theta: f32, partial_rotary_factor: 
         values[idx] = x1 * cos - x2 * sin;
         values[idx + half] = x2 * cos + x1 * sin;
     }
+}
+
+fn computeRotaryDim(value_len: usize, partial_rotary_factor: f32) usize {
+    var rotary_dim: usize = @intFromFloat(@as(f32, @floatFromInt(value_len)) * partial_rotary_factor);
+    rotary_dim = @max(@as(usize, 2), rotary_dim - (rotary_dim % 2));
+    rotary_dim = @min(rotary_dim, value_len - (value_len % 2));
+    return rotary_dim;
 }
 
 fn topK(allocator: std.mem.Allocator, values: []const f32, k: usize) ![]usize {
@@ -785,4 +898,84 @@ test "full attention step appends kv cache and returns hidden output" {
     defer std.testing.allocator.free(out);
     try std.testing.expectEqual(@as(usize, 1), state.len);
     try std.testing.expectEqual(@as(usize, 2), out.len);
+}
+
+test "full attention xpu qk postprocess matches cpu path" {
+    var runtime = xpu.Runtime.init(std.testing.allocator) catch |err| switch (err) {
+        error.SyclBackendUnavailable, error.MissingSyclBackendSymbol, error.XpuDeviceNotFound, error.SyclRuntimeError => return error.SkipZigTest,
+        else => return err,
+    };
+    defer runtime.deinit();
+
+    const q_w = [_]f32{
+        0.5,  -0.25,
+        0.75, 1.0,
+        0.1,  -0.2,
+        0.3,  0.4,
+    };
+    const kv_w = [_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    };
+    const o_w = [_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    };
+    const q_norm = [_]f32{ 0.1, -0.05 };
+    const k_norm = [_]f32{ -0.1, 0.2 };
+    const hidden = [_]f32{ 1.0, -0.5 };
+
+    const cpu_attention: FullAttention = .{
+        .q_proj = .{ .dense = .{ .in_features = 2, .out_features = 4, .weight = &q_w } },
+        .k_proj = .{ .dense = .{ .in_features = 2, .out_features = 2, .weight = &kv_w } },
+        .v_proj = .{ .dense = .{ .in_features = 2, .out_features = 2, .weight = &kv_w } },
+        .o_proj = .{ .dense = .{ .in_features = 2, .out_features = 2, .weight = &o_w } },
+        .q_norm_weight = &q_norm,
+        .k_norm_weight = &k_norm,
+        .num_heads = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+        .partial_rotary_factor = 1.0,
+    };
+
+    var xpu_attention = cpu_attention;
+    xpu_attention.q_proj.dense.xpu_weights = try runtime.createDenseWeights(&q_w, null, 4, 2);
+    defer xpu_attention.q_proj.releaseXpu(&runtime);
+    xpu_attention.k_proj.dense.xpu_weights = try runtime.createDenseWeights(&kv_w, null, 2, 2);
+    defer xpu_attention.k_proj.releaseXpu(&runtime);
+    xpu_attention.v_proj.dense.xpu_weights = try runtime.createDenseWeights(&kv_w, null, 2, 2);
+    defer xpu_attention.v_proj.releaseXpu(&runtime);
+    xpu_attention.o_proj.dense.xpu_weights = try runtime.createDenseWeights(&o_w, null, 2, 2);
+    defer xpu_attention.o_proj.releaseXpu(&runtime);
+    xpu_attention.q_norm_weight_xpu = try runtime.uploadF32(&q_norm);
+    defer if (xpu_attention.q_norm_weight_xpu) |buffer| {
+        var release_buffer = buffer;
+        runtime.releaseF32(&release_buffer);
+    };
+    xpu_attention.k_norm_weight_xpu = try runtime.uploadF32(&k_norm);
+    defer if (xpu_attention.k_norm_weight_xpu) |buffer| {
+        var release_buffer = buffer;
+        runtime.releaseF32(&release_buffer);
+    };
+
+    var cpu_state = FullAttentionState.init(std.testing.allocator, 1, 2);
+    defer cpu_state.deinit();
+    var xpu_state = FullAttentionState.init(std.testing.allocator, 1, 2);
+    defer xpu_state.deinit();
+
+    const cpu_out = try cpu_attention.forwardStepAlloc(std.testing.allocator, &hidden, &cpu_state, 2);
+    defer std.testing.allocator.free(cpu_out);
+    const xpu_out = try xpu_attention.forwardStepAlloc(std.testing.allocator, &hidden, &xpu_state, 2);
+    defer std.testing.allocator.free(xpu_out);
+
+    try std.testing.expectEqual(cpu_state.len, xpu_state.len);
+    for (cpu_state.keys.items, xpu_state.keys.items) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+    for (cpu_state.values.items, xpu_state.values.items) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+    for (cpu_out, xpu_out) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
 }

@@ -3,7 +3,7 @@ const cfg = @import("qwen3_config.zig");
 const engine = @import("qwen3_engine.zig");
 const types = @import("../runtime/types.zig");
 const safetensors = @import("../weights/safetensors.zig");
-const xpu = @import("../xpu/opencl_backend.zig");
+const xpu = @import("../xpu/sycl_backend.zig");
 
 pub const LoadOptions = struct {
     backend: types.RuntimeBackend = .cpu,
@@ -35,7 +35,7 @@ pub const QwenTextRuntime = struct {
         };
         switch (options.backend) {
             .cpu => {},
-            .xpu_opencl => {
+            .xpu => {
                 const runtime = try runtime_allocator.create(xpu.Runtime);
                 runtime.* = try xpu.Runtime.init(runtime_allocator);
                 xpu_runtime = runtime;
@@ -290,6 +290,38 @@ fn loadFullAttention(
     const o_proj_prefix = try std.fmt.allocPrint(temp_allocator, "{s}.o_proj", .{prefix});
     defer temp_allocator.free(o_proj_prefix);
 
+    const q_norm_weight = try loadTensorF32(
+        weights_allocator,
+        temp_allocator,
+        store,
+        io,
+        q_norm_name,
+        &.{config.head_dim},
+    );
+    const k_norm_weight = try loadTensorF32(
+        weights_allocator,
+        temp_allocator,
+        store,
+        io,
+        k_norm_name,
+        &.{config.head_dim},
+    );
+
+    var q_norm_weight_xpu: ?xpu.F32Buffer = null;
+    var k_norm_weight_xpu: ?xpu.F32Buffer = null;
+    if (xpu_runtime) |runtime| {
+        q_norm_weight_xpu = try runtime.uploadF32(q_norm_weight);
+        errdefer if (q_norm_weight_xpu) |buffer| {
+            var release_buffer = buffer;
+            runtime.releaseF32(&release_buffer);
+        };
+        k_norm_weight_xpu = try runtime.uploadF32(k_norm_weight);
+        errdefer if (k_norm_weight_xpu) |buffer| {
+            var release_buffer = buffer;
+            runtime.releaseF32(&release_buffer);
+        };
+    }
+
     return .{
         .q_proj = try loadLinear(
             weights_allocator,
@@ -331,22 +363,10 @@ fn loadFullAttention(
             config.hidden_size,
             xpu_runtime,
         ),
-        .q_norm_weight = try loadTensorF32(
-            weights_allocator,
-            temp_allocator,
-            store,
-            io,
-            q_norm_name,
-            &.{config.head_dim},
-        ),
-        .k_norm_weight = try loadTensorF32(
-            weights_allocator,
-            temp_allocator,
-            store,
-            io,
-            k_norm_name,
-            &.{config.head_dim},
-        ),
+        .q_norm_weight = q_norm_weight,
+        .k_norm_weight = k_norm_weight,
+        .q_norm_weight_xpu = q_norm_weight_xpu,
+        .k_norm_weight_xpu = k_norm_weight_xpu,
         .num_heads = config.num_attention_heads,
         .num_kv_heads = config.num_key_value_heads,
         .head_dim = config.head_dim,
@@ -863,6 +883,14 @@ fn deinitDecoderLayerXpu(layer: *const engine.DecoderLayer, runtime: *xpu.Runtim
             attention.k_proj.releaseXpu(runtime);
             attention.v_proj.releaseXpu(runtime);
             attention.o_proj.releaseXpu(runtime);
+            if (attention.q_norm_weight_xpu) |buffer| {
+                var release_buffer = buffer;
+                runtime.releaseF32(&release_buffer);
+            }
+            if (attention.k_norm_weight_xpu) |buffer| {
+                var release_buffer = buffer;
+                runtime.releaseF32(&release_buffer);
+            }
         },
         .linear => |*attention| {
             attention.in_proj_qkv.releaseXpu(runtime);
