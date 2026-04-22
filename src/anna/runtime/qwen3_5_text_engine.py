@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -366,16 +367,45 @@ class AnnaQwen3_5TextEngine:
         if compile_mode == "none" or not hasattr(torch, "compile") or not hasattr(self.model, "forward_text_only"):
             return
         try:
-            self._compiled_text_forward = torch.compile(
-                self.model.forward_text_only,
-                mode=compile_mode,
-                fullgraph=self.optimization_config.compile_fullgraph,
-            )
-            logger.info(
-                "Enabled torch.compile for text generation path: mode=%s fullgraph=%s",
-                compile_mode,
-                self.optimization_config.compile_fullgraph,
-            )
+            # dynamic=True avoids seq_len prefill/decode recompiles on Linux, but on Windows it can send Inductor
+            # through a CPU vector ISA path that dry-runs MSVC (cl); without Visual Studio Build Tools that fails.
+            if sys.platform == "win32":
+                self._compiled_text_forward = torch.compile(
+                    self.model.forward_text_only,
+                    mode=compile_mode,
+                    fullgraph=self.optimization_config.compile_fullgraph,
+                )
+                logger.info(
+                    "Enabled torch.compile for text generation path: mode=%s fullgraph=%s dynamic_shapes=False "
+                    "(Windows: dynamic=True often requires MSVC cl for Inductor CPU codegen)",
+                    compile_mode,
+                    self.optimization_config.compile_fullgraph,
+                )
+            else:
+                try:
+                    self._compiled_text_forward = torch.compile(
+                        self.model.forward_text_only,
+                        mode=compile_mode,
+                        fullgraph=self.optimization_config.compile_fullgraph,
+                        dynamic=True,
+                    )
+                    logger.info(
+                        "Enabled torch.compile for text generation path: mode=%s fullgraph=%s dynamic_shapes=True",
+                        compile_mode,
+                        self.optimization_config.compile_fullgraph,
+                    )
+                except TypeError:
+                    self._compiled_text_forward = torch.compile(
+                        self.model.forward_text_only,
+                        mode=compile_mode,
+                        fullgraph=self.optimization_config.compile_fullgraph,
+                    )
+                    logger.info(
+                        "Enabled torch.compile for text generation path: mode=%s fullgraph=%s dynamic_shapes=False "
+                        "(PyTorch build rejected dynamic=; prefill/decode may recompile)",
+                        compile_mode,
+                        self.optimization_config.compile_fullgraph,
+                    )
         except Exception:
             logger.exception("Failed to enable torch.compile for text generation path; falling back to eager mode.")
             self._compiled_text_forward = None
@@ -1805,14 +1835,29 @@ class AnnaQwen3_5TextEngine:
             not has_multimodal_inputs
             and hasattr(self.model, "forward_text_only")
         ):
-            forward_text_only = getattr(self, "_compiled_text_forward", None) or self.model.forward_text_only
-            return forward_text_only(
+            compiled = getattr(self, "_compiled_text_forward", None)
+            eager = self.model.forward_text_only
+            forward_kwargs = dict(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 logits_to_keep=logits_to_keep,
             )
+            if compiled is None:
+                return eager(**forward_kwargs)
+            try:
+                return compiled(**forward_kwargs)
+            except Exception as exc:
+                if self._is_torch_compile_runtime_failure(exc):
+                    logger.warning(
+                        "torch.compile forward failed (%s: %s); disabling compiled path for this engine.",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    self._compiled_text_forward = None
+                    return eager(**forward_kwargs)
+                raise
         return self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1821,6 +1866,21 @@ class AnnaQwen3_5TextEngine:
             logits_to_keep=logits_to_keep,
             **model_kwargs,
         )
+
+    @staticmethod
+    def _is_torch_compile_runtime_failure(exc: BaseException) -> bool:
+        """Inductor/dynamo failures often surface on the first real forward, not at torch.compile() call time."""
+        if type(exc).__name__ in ("InductorError", "BackendCompilerFailed"):
+            return True
+        cause = exc.__cause__
+        if cause is not None and AnnaQwen3_5TextEngine._is_torch_compile_runtime_failure(cause):
+            return True
+        msg = str(exc).lower()
+        if "compiler:" in msg and "not found" in msg:
+            return True
+        if "inductor" in msg and "compiler" in msg:
+            return True
+        return False
 
     def warmup_inference_kernels(self) -> None:
         from anna.model.fused_ops import maybe_load_gated_delta_library

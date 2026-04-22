@@ -36,6 +36,19 @@ from anna.model.quantization import AWQLinear, AutoRoundGPTQLinear, XPUInt4Linea
 logger = logging.getLogger(__name__)
 
 
+def _compiler_disable(fn: Callable[..., object]) -> Callable[..., object]:
+    """Avoid torch.compile / Dynamo tracing through cache-mutating Python state.
+
+    KV and linear-attention caches use Python lists and custom objects; guards on
+    those values force recompilation every decode step and hit recompile_limit.
+    """
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is None:
+        return fn
+    disable = getattr(dynamo, "disable", None)
+    return disable(fn) if callable(disable) else fn
+
+
 def _module_device(module: nn.Module) -> torch.device:
     for parameter in module.parameters():
         return parameter.device
@@ -628,6 +641,7 @@ class Qwen3DynamicCache:
         padded_value = self._pad_cache_rows(materialized_values, device=value_states.device, dtype=value_states.dtype)
         return padded_key, padded_value, past_lengths
 
+    @_compiler_disable
     def update(
         self,
         key_states: torch.Tensor,
@@ -1672,6 +1686,7 @@ class Qwen3Attention(nn.Module):
         k_positions = torch.arange(key_len, device=device)[None, None, :]
         return k_positions > q_positions[:, :, None]
 
+    @_compiler_disable
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2243,6 +2258,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out, z).reshape(batch_size, seq_len, self.value_dim).contiguous()
         return self.out_proj(core_attn_out)
 
+    @_compiler_disable
     def forward(
         self,
         hidden_states: torch.Tensor,
