@@ -5,6 +5,7 @@ const types = @import("types.zig");
 
 pub const PreparedInputs = struct {
     prompt_tokens: []const u32,
+    generation_config: ?types.GenerationConfig = null,
 };
 
 pub const RequestSpec = struct {

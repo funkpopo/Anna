@@ -88,8 +88,26 @@ pub const QwenTextRuntime = struct {
 
     pub fn reset(self: *QwenTextRuntime) !void {
         self.engine.deinitStates();
-        self.engine.states = try initLayerStates(self.runtime_allocator, self.config, self.engine.layers);
+        self.engine.states = try self.spawnStates();
         self.engine.position = 0;
+    }
+
+    pub fn spawnStates(self: *QwenTextRuntime) ![]engine.LayerState {
+        return try initLayerStates(self.runtime_allocator, self.config, self.engine.layers);
+    }
+
+    pub fn spawnEngine(self: *QwenTextRuntime) !engine.TokenEngine {
+        return .{
+            .allocator = self.runtime_allocator,
+            .hidden_size = self.engine.hidden_size,
+            .embeddings = self.engine.embeddings,
+            .vocab_size = self.engine.vocab_size,
+            .layers = self.engine.layers,
+            .norm_weight = self.engine.norm_weight,
+            .lm_head = self.engine.lm_head,
+            .states = try self.spawnStates(),
+            .position = 0,
+        };
     }
 
     pub fn isEosToken(self: *const QwenTextRuntime, token_id: u32) bool {

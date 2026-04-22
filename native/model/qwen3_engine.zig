@@ -14,7 +14,7 @@ pub const DenseLinear = struct {
         for (out, 0..) |*dst, row| {
             var sum: f32 = if (self.bias) |bias| bias[row] else 0.0;
             const weights = self.weight[row * self.in_features ..][0..self.in_features];
-            for (weights, input) |w, x| sum += w * x;
+            sum += dotF32(weights, input);
             dst.* = sum;
         }
     }
@@ -32,10 +32,87 @@ pub const AutoRoundLinear = struct {
     pub fn forwardInto(self: AutoRoundLinear, out: []f32, input: []const f32) void {
         std.debug.assert(input.len == self.in_features);
         std.debug.assert(out.len == self.out_features);
-        for (out, 0..) |*dst, row| {
+        const packed_in = (self.in_features + 7) / 8;
+        const packed_out = (self.out_features + 7) / 8;
+        const group_count = (self.in_features + self.group_size - 1) / self.group_size;
+        const vector_width = 8;
+        const VecF32 = @Vector(vector_width, f32);
+        const VecI32 = @Vector(vector_width, i32);
+        const VecU32 = @Vector(vector_width, u32);
+        const vector_rows = self.out_features - (self.out_features % vector_width);
+
+        var row_base: usize = 0;
+        while (row_base < vector_rows) : (row_base += vector_width) {
+            var acc: VecF32 = if (self.bias) |bias|
+                bias[row_base..][0..vector_width].*
+            else
+                @splat(0.0);
+
+            const zero_pack = row_base / vector_width;
+            for (0..packed_in) |pack| {
+                const base_col = pack * vector_width;
+                const lanes = @min(@as(usize, vector_width), self.in_features - base_col);
+                const first_group = @min(base_col / self.group_size, group_count - 1);
+                const last_group = @min((base_col + lanes - 1) / self.group_size, group_count - 1);
+                const qwords_i32: VecI32 = self.qweight[pack * self.out_features + row_base ..][0..vector_width].*;
+                const qwords: VecU32 = @bitCast(qwords_i32);
+
+                if (first_group == last_group) {
+                    const zword: u32 = @bitCast(self.qzeros[first_group * packed_out + zero_pack]);
+                    const zeros = zeroVector8(zword);
+                    const scales: VecF32 = self.scales[first_group * self.out_features + row_base ..][0..vector_width].*;
+                    inline for (0..vector_width) |lane| {
+                        if (lane < lanes) {
+                            const q_shift: u5 = @intCast(lane * 4);
+                            const qvalues_u32 = (qwords >> @as(VecU32, @splat(q_shift))) & @as(VecU32, @splat(0xF));
+                            const qvalues: VecI32 = @intCast(qvalues_u32);
+                            const lane_values: VecF32 = @floatFromInt(qvalues - zeros);
+                            acc += @as(VecF32, @splat(input[base_col + lane])) * lane_values * scales;
+                        }
+                    }
+                } else {
+                    inline for (0..vector_width) |lane| {
+                        if (lane < lanes) {
+                            const col = base_col + lane;
+                            const group = @min(col / self.group_size, group_count - 1);
+                            const zword: u32 = @bitCast(self.qzeros[group * packed_out + zero_pack]);
+                            const zeros = zeroVector8(zword);
+                            const scales: VecF32 = self.scales[group * self.out_features + row_base ..][0..vector_width].*;
+                            const q_shift: u5 = @intCast(lane * 4);
+                            const qvalues_u32 = (qwords >> @as(VecU32, @splat(q_shift))) & @as(VecU32, @splat(0xF));
+                            const qvalues: VecI32 = @intCast(qvalues_u32);
+                            const lane_values: VecF32 = @floatFromInt(qvalues - zeros);
+                            acc += @as(VecF32, @splat(input[col])) * lane_values * scales;
+                        }
+                    }
+                }
+            }
+
+            inline for (0..vector_width) |lane| {
+                out[row_base + lane] = acc[lane];
+            }
+        }
+
+        for (out[vector_rows..], vector_rows..) |*dst, row| {
             var sum: f32 = if (self.bias) |bias| bias[row] else 0.0;
-            for (input, 0..) |x, col| {
-                sum += x * self.dequant(row, col);
+            const zero_pack = row / vector_width;
+            const zero_shift: u5 = @intCast((row % vector_width) * 4);
+            for (0..packed_in) |pack| {
+                const qword: u32 = @bitCast(self.qweight[pack * self.out_features + row]);
+                const base_col = pack * vector_width;
+                const lanes = @min(@as(usize, vector_width), self.in_features - base_col);
+                inline for (0..vector_width) |lane| {
+                    if (lane < lanes) {
+                        const col = base_col + lane;
+                        const group = @min(col / self.group_size, group_count - 1);
+                        const zword: u32 = @bitCast(self.qzeros[group * packed_out + zero_pack]);
+                        const zero: i32 = @as(i32, @intCast((zword >> zero_shift) & 0xF)) + 1;
+                        const q_shift: u5 = @intCast(lane * 4);
+                        const qvalue: i32 = @intCast((qword >> q_shift) & 0xF);
+                        const scale = self.scales[group * self.out_features + row];
+                        sum += input[col] * @as(f32, @floatFromInt(qvalue - zero)) * scale;
+                    }
+                }
             }
             dst.* = sum;
         }
@@ -54,6 +131,33 @@ pub const AutoRoundLinear = struct {
         return @as(f32, @floatFromInt(qvalue - zero)) * scale;
     }
 };
+
+fn zeroVector8(zword: u32) @Vector(8, i32) {
+    var zeros: @Vector(8, i32) = undefined;
+    inline for (0..8) |lane| {
+        const shift: u5 = @intCast(lane * 4);
+        zeros[lane] = @as(i32, @intCast((zword >> shift) & 0xF)) + 1;
+    }
+    return zeros;
+}
+
+fn dotF32(left: []const f32, right: []const f32) f32 {
+    std.debug.assert(left.len == right.len);
+    const lanes = 8;
+    const Vec = @Vector(lanes, f32);
+    var sum_vec: Vec = @splat(0.0);
+    var index: usize = 0;
+    while (index + lanes <= left.len) : (index += lanes) {
+        const left_vec: Vec = left[index..][0..lanes].*;
+        const right_vec: Vec = right[index..][0..lanes].*;
+        sum_vec += left_vec * right_vec;
+    }
+    var sum: f32 = @reduce(.Add, sum_vec);
+    while (index < left.len) : (index += 1) {
+        sum += left[index] * right[index];
+    }
+    return sum;
+}
 
 pub const Linear = union(enum) {
     dense: DenseLinear,
@@ -336,42 +440,44 @@ pub const LinearAttention = struct {
 
         var core = try allocator.alloc(f32, value_dim);
         defer allocator.free(core);
+        const q_buf = try allocator.alloc(f32, self.head_k_dim);
+        defer allocator.free(q_buf);
+        const k_buf = try allocator.alloc(f32, self.head_k_dim);
+        defer allocator.free(k_buf);
+        const delta = try allocator.alloc(f32, self.head_v_dim);
+        defer allocator.free(delta);
         for (0..self.num_v_heads) |head| {
             const source_head = head / repeat;
-            const q = try allocator.dupe(f32, raw_q[source_head * self.head_k_dim ..][0..self.head_k_dim]);
-            defer allocator.free(q);
-            const k = try allocator.dupe(f32, raw_k[source_head * self.head_k_dim ..][0..self.head_k_dim]);
-            defer allocator.free(k);
-            tensor.l2NormalizeInPlace(q, 1e-6);
-            tensor.l2NormalizeInPlace(k, 1e-6);
+            @memcpy(q_buf, raw_q[source_head * self.head_k_dim ..][0..self.head_k_dim]);
+            @memcpy(k_buf, raw_k[source_head * self.head_k_dim ..][0..self.head_k_dim]);
+            tensor.l2NormalizeInPlace(q_buf, 1e-6);
+            tensor.l2NormalizeInPlace(k_buf, 1e-6);
             const q_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_k_dim)));
-            for (q) |*value| value.* *= q_scale;
+            for (q_buf) |*value| value.* *= q_scale;
             const value = raw_v[head * self.head_v_dim ..][0..self.head_v_dim];
             const beta = tensor.sigmoid(b[head]);
             const g = -@exp(self.a_log[head]) * tensor.softplus(a[head] + self.dt_bias[head]);
             const decay = @exp(g);
             const recurrent = state.recurrent_state[head * self.head_k_dim * self.head_v_dim ..][0 .. self.head_k_dim * self.head_v_dim];
             for (recurrent) |*entry| entry.* *= decay;
-            var delta = try allocator.alloc(f32, self.head_v_dim);
-            defer allocator.free(delta);
             @memset(delta, 0.0);
             for (0..self.head_v_dim) |v_idx| {
                 var kv_mem: f32 = 0.0;
                 for (0..self.head_k_dim) |k_idx| {
-                    kv_mem += recurrent[k_idx * self.head_v_dim + v_idx] * k[k_idx];
+                    kv_mem += recurrent[k_idx * self.head_v_dim + v_idx] * k_buf[k_idx];
                 }
                 delta[v_idx] = (value[v_idx] - kv_mem) * beta;
             }
             for (0..self.head_k_dim) |k_idx| {
                 for (0..self.head_v_dim) |v_idx| {
-                    recurrent[k_idx * self.head_v_dim + v_idx] += k[k_idx] * delta[v_idx];
+                    recurrent[k_idx * self.head_v_dim + v_idx] += k_buf[k_idx] * delta[v_idx];
                 }
             }
             const head_core = core[head * self.head_v_dim ..][0..self.head_v_dim];
             @memset(head_core, 0.0);
             for (0..self.head_v_dim) |v_idx| {
                 for (0..self.head_k_dim) |k_idx| {
-                    head_core[v_idx] += recurrent[k_idx * self.head_v_dim + v_idx] * q[k_idx];
+                    head_core[v_idx] += recurrent[k_idx * self.head_v_dim + v_idx] * q_buf[k_idx];
                 }
             }
         }
@@ -529,6 +635,37 @@ test "autoround int4 matvec dequantizes autogptq packing" {
     var out: [1]f32 = undefined;
     linear.forwardInto(&out, &input);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[0], 1e-6);
+}
+
+test "autoround int4 matvec vectorizes eight output rows" {
+    const qweight = [_]i32{
+        0x00000021, 0x00000032, 0x00000043, 0x00000054,
+        0x00000065, 0x00000076, 0x00000087, 0x00000098,
+    };
+    const qzeros = [_]i32{0x00000000};
+    const scales = [_]f32{
+        0.5, 0.5, 0.5, 0.5,
+        0.5, 0.5, 0.5, 0.5,
+    };
+    const linear: AutoRoundLinear = .{
+        .in_features = 2,
+        .out_features = 8,
+        .group_size = 128,
+        .qweight = &qweight,
+        .qzeros = &qzeros,
+        .scales = &scales,
+    };
+    const input = [_]f32{ 2.0, 4.0 };
+    var out: [8]f32 = undefined;
+    linear.forwardInto(&out, &input);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), out[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 11.0), out[3], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 14.0), out[4], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 17.0), out[5], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 20.0), out[6], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 23.0), out[7], 1e-6);
 }
 
 test "mlp forward uses silu gated product" {

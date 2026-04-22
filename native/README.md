@@ -15,6 +15,9 @@ Current scope:
 - native token-engine state machine for decoder-only inference
 - native Qwen3.5 weight binding from real safetensors shards
 - token-level end-to-end runtime loading via `anna-native eval-token`
+- native Qwen ByteLevel-BPE tokenizer runtime with chat-template rendering
+- scheduler-backed text generation via `anna-native generate`
+- OpenAI-compatible chat/completion JSON payloads via `anna-native chat-json` and `anna-native completion-json`
 - OpenAI response/error payload encoding
 - service metrics accounting and interval formatting
 - incremental text assembly and stop-string handling
@@ -29,8 +32,7 @@ Intentional non-goals of this first rewrite chunk:
 
 The remaining heavy migration work is the model runtime itself:
 
-- tokenizer runtime
 - GGUF tensor loading
-- text-generation orchestration on top of the native token runtime
+- HTTP serving loop and request JSON parsing
 - Gemma4 / Qwen3-TTS kernels
-- XPU memory management and fused ops integration
+- XPU memory management, fused kernels, and backend dispatch integration

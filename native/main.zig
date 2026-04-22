@@ -25,6 +25,18 @@ pub fn main(init: std.process.Init) !void {
         try runEvalToken(arena, io, args[2..]);
         return;
     }
+    if (std.mem.eql(u8, command, "generate")) {
+        try runGenerate(arena, io, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, command, "chat-json")) {
+        try runChatJson(arena, io, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, command, "completion-json")) {
+        try runCompletionJson(arena, io, args[2..]);
+        return;
+    }
 
     try stderr_writer.print("unknown subcommand: {s}\n\n", .{command});
     try printUsage(stderr_writer);
@@ -40,6 +52,15 @@ fn printUsage(writer: anytype) !void {
         \\anna-native eval-token --model-dir <path> --tokens <id0,id1,...> [--top-k <n>]
         \\  Loads the native Qwen token runtime, runs prompt tokens through Zig-only
         \\  decode, and prints the highest logits for the last position.
+        \\
+        \\anna-native generate --model-dir <path> --prompt <text> [sampling options]
+        \\  Runs native tokenizer + scheduler + token runtime and prints generated text.
+        \\
+        \\anna-native chat-json --model-dir <path> --user <text> [--system <text>] [sampling options]
+        \\  Runs native chat generation and prints an OpenAI-compatible chat response JSON.
+        \\
+        \\anna-native completion-json --model-dir <path> --prompt <text> [sampling options]
+        \\  Runs native text generation and prints an OpenAI-compatible completion JSON.
         \\
     );
 }
@@ -199,4 +220,128 @@ fn parsePositiveInt(text: []const u8) !usize {
     const value = std.fmt.parseInt(usize, text, 10) catch return error.InvalidInteger;
     if (value == 0) return error.InvalidInteger;
     return value;
+}
+
+const GenerateSettings = struct {
+    model_dir: []const u8,
+    prompt: []const u8,
+    system: ?[]const u8 = null,
+    max_new_tokens: ?usize = null,
+    temperature: f32 = 0.7,
+    top_p: f32 = 0.95,
+    top_k: usize = 50,
+    repetition_penalty: f32 = 1.0,
+};
+
+fn runGenerate(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []const u8) !void {
+    const settings = try parseGenerateArgs(raw_args);
+    var service = try anna.qwen_text_service.NativeQwenTextService.load(allocator, io, settings.model_dir, settings.model_dir);
+    defer service.deinit();
+
+    const result = try service.generateTextAlloc(settings.prompt, generationConfig(settings));
+    defer allocator.free(result.text);
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const writer = &stdout_file_writer.interface;
+    try writer.writeAll(result.text);
+    try writer.writeByte('\n');
+    try writer.flush();
+}
+
+fn runChatJson(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []const u8) !void {
+    const settings = try parseGenerateArgs(raw_args);
+    var service = try anna.qwen_text_service.NativeQwenTextService.load(allocator, io, settings.model_dir, settings.model_dir);
+    defer service.deinit();
+
+    var messages = std.array_list.Managed(anna.qwen3_tokenizer.ChatMessage).init(allocator);
+    defer messages.deinit();
+    if (settings.system) |system| try messages.append(.{ .role = .system, .content = system });
+    try messages.append(.{ .role = .user, .content = settings.prompt });
+
+    const result = try service.generateChatAlloc(messages.items, generationConfig(settings), true);
+    defer allocator.free(result.text);
+    if (result.reasoning_text) |reasoning| allocator.free(reasoning);
+    defer {
+        for (result.tool_calls) |tool_call| {
+            allocator.free(tool_call.name);
+            allocator.free(tool_call.arguments_json);
+        }
+        allocator.free(result.tool_calls);
+    }
+
+    const payload = try anna.openai.chatResponsePayload(allocator, "chatcmpl-native", 0, service.model_id, result);
+    defer allocator.free(payload);
+
+    var stdout_buffer: [8192]u8 = undefined;
+    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const writer = &stdout_file_writer.interface;
+    try writer.writeAll(payload);
+    try writer.writeByte('\n');
+    try writer.flush();
+}
+
+fn runCompletionJson(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []const u8) !void {
+    const settings = try parseGenerateArgs(raw_args);
+    var service = try anna.qwen_text_service.NativeQwenTextService.load(allocator, io, settings.model_dir, settings.model_dir);
+    defer service.deinit();
+
+    const result = try service.generateTextAlloc(settings.prompt, generationConfig(settings));
+    defer allocator.free(result.text);
+
+    const payload = try anna.openai.completionResponsePayload(allocator, "cmpl-native", 0, service.model_id, result);
+    defer allocator.free(payload);
+
+    var stdout_buffer: [8192]u8 = undefined;
+    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const writer = &stdout_file_writer.interface;
+    try writer.writeAll(payload);
+    try writer.writeByte('\n');
+    try writer.flush();
+}
+
+fn parseGenerateArgs(args: []const []const u8) !GenerateSettings {
+    var settings: GenerateSettings = .{ .model_dir = "", .prompt = "" };
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--model-dir")) {
+            settings.model_dir = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, arg, "--prompt")) {
+            settings.prompt = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, arg, "--user")) {
+            settings.prompt = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, arg, "--system")) {
+            settings.system = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, arg, "--max-new-tokens")) {
+            settings.max_new_tokens = try parsePositiveInt(try nextValue(args, &index));
+        } else if (std.mem.eql(u8, arg, "--temperature")) {
+            settings.temperature = try parseFloat32(try nextValue(args, &index));
+        } else if (std.mem.eql(u8, arg, "--top-p")) {
+            settings.top_p = try parseFloat32(try nextValue(args, &index));
+        } else if (std.mem.eql(u8, arg, "--top-k")) {
+            settings.top_k = try parsePositiveInt(try nextValue(args, &index));
+        } else if (std.mem.eql(u8, arg, "--repetition-penalty")) {
+            settings.repetition_penalty = try parseFloat32(try nextValue(args, &index));
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    if (settings.model_dir.len == 0) return error.MissingModelDir;
+    if (settings.prompt.len == 0) return error.MissingPrompt;
+    return settings;
+}
+
+fn generationConfig(settings: GenerateSettings) anna.types.GenerationConfig {
+    return .{
+        .max_new_tokens = settings.max_new_tokens,
+        .temperature = settings.temperature,
+        .top_p = settings.top_p,
+        .top_k = settings.top_k,
+        .repetition_penalty = settings.repetition_penalty,
+    };
+}
+
+fn parseFloat32(text: []const u8) !f32 {
+    return std.fmt.parseFloat(f32, text) catch error.InvalidFloat;
 }
