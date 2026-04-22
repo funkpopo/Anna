@@ -52,15 +52,19 @@ fn printUsage(writer: anytype) !void {
         \\anna-native eval-token --model-dir <path> --tokens <id0,id1,...> [--top-k <n>]
         \\  Loads the native Qwen token runtime, runs prompt tokens through Zig-only
         \\  decode, and prints the highest logits for the last position.
+        \\  Optional: --backend cpu|xpu|xpu-opencl
         \\
         \\anna-native generate --model-dir <path> --prompt <text> [sampling options]
         \\  Runs native tokenizer + scheduler + token runtime and prints generated text.
+        \\  Optional: --backend cpu|xpu|xpu-opencl
         \\
         \\anna-native chat-json --model-dir <path> --user <text> [--system <text>] [sampling options]
         \\  Runs native chat generation and prints an OpenAI-compatible chat response JSON.
+        \\  Optional: --backend cpu|xpu|xpu-opencl
         \\
         \\anna-native completion-json --model-dir <path> --prompt <text> [sampling options]
         \\  Runs native text generation and prints an OpenAI-compatible completion JSON.
+        \\  Optional: --backend cpu|xpu|xpu-opencl
         \\
     );
 }
@@ -122,13 +126,14 @@ const EvalSettings = struct {
     model_dir: []const u8,
     tokens: []const u32,
     top_k: usize = 8,
+    backend: anna.types.RuntimeBackend = .cpu,
 };
 
 fn runEvalToken(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []const u8) !void {
     const settings = try parseEvalArgs(allocator, raw_args);
     const runtime_allocator = std.heap.page_allocator;
 
-    var runtime = try anna.qwen3_loader.QwenTextRuntime.load(runtime_allocator, io, settings.model_dir);
+    var runtime = try anna.qwen3_loader.QwenTextRuntime.loadWithOptions(runtime_allocator, io, settings.model_dir, .{ .backend = settings.backend });
     defer runtime.deinit();
 
     const logits = try runtime.forwardPromptAlloc(settings.tokens);
@@ -152,6 +157,7 @@ fn parseEvalArgs(allocator: std.mem.Allocator, args: []const []const u8) !EvalSe
     var model_dir: []const u8 = "";
     var tokens_text: ?[]const u8 = null;
     var top_k: usize = 8;
+    var backend: anna.types.RuntimeBackend = .cpu;
 
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
@@ -162,6 +168,8 @@ fn parseEvalArgs(allocator: std.mem.Allocator, args: []const []const u8) !EvalSe
             tokens_text = try nextValue(args, &index);
         } else if (std.mem.eql(u8, arg, "--top-k")) {
             top_k = try parsePositiveInt(try nextValue(args, &index));
+        } else if (std.mem.eql(u8, arg, "--backend")) {
+            backend = try parseBackend(try nextValue(args, &index));
         } else {
             return error.UnknownFlag;
         }
@@ -174,6 +182,7 @@ fn parseEvalArgs(allocator: std.mem.Allocator, args: []const []const u8) !EvalSe
         .model_dir = model_dir,
         .tokens = tokens,
         .top_k = top_k,
+        .backend = backend,
     };
 }
 
@@ -231,11 +240,12 @@ const GenerateSettings = struct {
     top_p: f32 = 0.95,
     top_k: usize = 50,
     repetition_penalty: f32 = 1.0,
+    backend: anna.types.RuntimeBackend = .cpu,
 };
 
 fn runGenerate(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []const u8) !void {
     const settings = try parseGenerateArgs(raw_args);
-    var service = try anna.qwen_text_service.NativeQwenTextService.load(allocator, io, settings.model_dir, settings.model_dir);
+    var service = try anna.qwen_text_service.NativeQwenTextService.loadWithOptions(allocator, io, settings.model_dir, settings.model_dir, .{ .backend = settings.backend });
     defer service.deinit();
 
     const result = try service.generateTextAlloc(settings.prompt, generationConfig(settings));
@@ -251,7 +261,7 @@ fn runGenerate(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []con
 
 fn runChatJson(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []const u8) !void {
     const settings = try parseGenerateArgs(raw_args);
-    var service = try anna.qwen_text_service.NativeQwenTextService.load(allocator, io, settings.model_dir, settings.model_dir);
+    var service = try anna.qwen_text_service.NativeQwenTextService.loadWithOptions(allocator, io, settings.model_dir, settings.model_dir, .{ .backend = settings.backend });
     defer service.deinit();
 
     var messages = std.array_list.Managed(anna.qwen3_tokenizer.ChatMessage).init(allocator);
@@ -283,7 +293,7 @@ fn runChatJson(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []con
 
 fn runCompletionJson(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []const u8) !void {
     const settings = try parseGenerateArgs(raw_args);
-    var service = try anna.qwen_text_service.NativeQwenTextService.load(allocator, io, settings.model_dir, settings.model_dir);
+    var service = try anna.qwen_text_service.NativeQwenTextService.loadWithOptions(allocator, io, settings.model_dir, settings.model_dir, .{ .backend = settings.backend });
     defer service.deinit();
 
     const result = try service.generateTextAlloc(settings.prompt, generationConfig(settings));
@@ -323,6 +333,8 @@ fn parseGenerateArgs(args: []const []const u8) !GenerateSettings {
             settings.top_k = try parsePositiveInt(try nextValue(args, &index));
         } else if (std.mem.eql(u8, arg, "--repetition-penalty")) {
             settings.repetition_penalty = try parseFloat32(try nextValue(args, &index));
+        } else if (std.mem.eql(u8, arg, "--backend")) {
+            settings.backend = try parseBackend(try nextValue(args, &index));
         } else {
             return error.UnknownFlag;
         }
@@ -344,4 +356,10 @@ fn generationConfig(settings: GenerateSettings) anna.types.GenerationConfig {
 
 fn parseFloat32(text: []const u8) !f32 {
     return std.fmt.parseFloat(f32, text) catch error.InvalidFloat;
+}
+
+fn parseBackend(text: []const u8) !anna.types.RuntimeBackend {
+    if (std.mem.eql(u8, text, "cpu")) return .cpu;
+    if (std.mem.eql(u8, text, "xpu") or std.mem.eql(u8, text, "xpu-opencl")) return .xpu_opencl;
+    return error.InvalidBackend;
 }

@@ -6,6 +6,11 @@ pub const SupportedModelFamily = enum {
     gemma4,
 };
 
+pub const RuntimeBackend = enum {
+    cpu,
+    xpu_opencl,
+};
+
 pub const RuntimeSafetyPolicy = struct {
     min_free_bytes: u64 = 1 << 30,
     reserve_margin_bytes: u64 = 512 << 20,

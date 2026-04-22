@@ -18,6 +18,7 @@ Current scope:
 - native Qwen ByteLevel-BPE tokenizer runtime with chat-template rendering
 - scheduler-backed text generation via `anna-native generate`
 - OpenAI-compatible chat/completion JSON payloads via `anna-native chat-json` and `anna-native completion-json`
+- explicit `--backend xpu` / `--backend xpu-opencl` path backed by Zig-native OpenCL kernels
 - OpenAI response/error payload encoding
 - service metrics accounting and interval formatting
 - incremental text assembly and stop-string handling
@@ -35,4 +36,4 @@ The remaining heavy migration work is the model runtime itself:
 - GGUF tensor loading
 - HTTP serving loop and request JSON parsing
 - Gemma4 / Qwen3-TTS kernels
-- XPU memory management, fused kernels, and backend dispatch integration
+- deeper XPU memory management and fused-kernel coverage beyond linear kernels

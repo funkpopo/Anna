@@ -1,21 +1,46 @@
 const std = @import("std");
 const cfg = @import("qwen3_config.zig");
 const engine = @import("qwen3_engine.zig");
+const types = @import("../runtime/types.zig");
 const safetensors = @import("../weights/safetensors.zig");
+const xpu = @import("../xpu/opencl_backend.zig");
+
+pub const LoadOptions = struct {
+    backend: types.RuntimeBackend = .cpu,
+};
 
 pub const QwenTextRuntime = struct {
     runtime_allocator: std.mem.Allocator,
     weights_arena: *std.heap.ArenaAllocator,
+    backend: types.RuntimeBackend,
+    xpu_runtime: ?*xpu.Runtime,
     config: cfg.QwenTextConfig,
     store: safetensors.SafeTensorStore,
     engine: engine.TokenEngine,
 
     pub fn load(runtime_allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !QwenTextRuntime {
+        return try loadWithOptions(runtime_allocator, io, model_dir, .{});
+    }
+
+    pub fn loadWithOptions(runtime_allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, options: LoadOptions) !QwenTextRuntime {
         const weights_arena = try runtime_allocator.create(std.heap.ArenaAllocator);
         errdefer runtime_allocator.destroy(weights_arena);
         weights_arena.* = std.heap.ArenaAllocator.init(runtime_allocator);
         errdefer weights_arena.deinit();
         const weights_allocator = weights_arena.allocator();
+        var xpu_runtime: ?*xpu.Runtime = null;
+        errdefer if (xpu_runtime) |runtime| {
+            runtime.deinit();
+            runtime_allocator.destroy(runtime);
+        };
+        switch (options.backend) {
+            .cpu => {},
+            .xpu_opencl => {
+                const runtime = try runtime_allocator.create(xpu.Runtime);
+                runtime.* = try xpu.Runtime.init(runtime_allocator);
+                xpu_runtime = runtime;
+            },
+        }
 
         var config = try cfg.loadQwenTextConfigFromModelDir(weights_allocator, io, model_dir);
         errdefer config.deinit(weights_allocator);
@@ -40,8 +65,13 @@ pub const QwenTextRuntime = struct {
         );
 
         const layers = try weights_allocator.alloc(engine.DecoderLayer, config.num_hidden_layers);
+        var loaded_layers: usize = 0;
+        errdefer if (xpu_runtime) |runtime| {
+            for (layers[0..loaded_layers]) |*layer| deinitDecoderLayerXpu(layer, runtime);
+        };
         for (0..config.num_hidden_layers) |layer_idx| {
-            layers[layer_idx] = try loadDecoderLayer(weights_allocator, runtime_allocator, io, &store, config, layer_idx);
+            layers[layer_idx] = try loadDecoderLayer(weights_allocator, runtime_allocator, io, &store, config, layer_idx, if (xpu_runtime) |runtime| runtime else null);
+            loaded_layers += 1;
         }
 
         const lm_head = try loadLmHead(
@@ -51,7 +81,12 @@ pub const QwenTextRuntime = struct {
             &store,
             config,
             embeddings,
+            if (xpu_runtime) |runtime| runtime else null,
         );
+        errdefer if (xpu_runtime) |runtime| {
+            var lm_head_copy = lm_head;
+            lm_head_copy.deinitXpu(runtime);
+        };
 
         const states = try initLayerStates(runtime_allocator, config, layers);
         errdefer {
@@ -62,6 +97,8 @@ pub const QwenTextRuntime = struct {
         return .{
             .runtime_allocator = runtime_allocator,
             .weights_arena = weights_arena,
+            .backend = options.backend,
+            .xpu_runtime = xpu_runtime,
             .config = config,
             .store = store,
             .engine = .{
@@ -79,6 +116,13 @@ pub const QwenTextRuntime = struct {
 
     pub fn deinit(self: *QwenTextRuntime) void {
         self.engine.deinitStates();
+        if (self.xpu_runtime) |runtime| {
+            for (self.engine.layers) |*layer| deinitDecoderLayerXpu(layer, runtime);
+            self.engine.lm_head.deinitXpu(runtime);
+            runtime.deinit();
+            self.runtime_allocator.destroy(runtime);
+            self.xpu_runtime = null;
+        }
         self.store.deinit();
         self.config.deinit(self.weights_arena.allocator());
         self.weights_arena.deinit();
@@ -178,6 +222,7 @@ fn loadDecoderLayer(
     store: *const safetensors.SafeTensorStore,
     config: cfg.QwenTextConfig,
     layer_idx: usize,
+    xpu_runtime: ?*xpu.Runtime,
 ) !engine.DecoderLayer {
     const base = try std.fmt.allocPrint(temp_allocator, "model.language_model.layers.{d}", .{layer_idx});
     defer temp_allocator.free(base);
@@ -188,14 +233,14 @@ fn loadDecoderLayer(
     defer temp_allocator.free(post_norm_name);
 
     const attention: engine.Attention = switch (config.layer_types[layer_idx]) {
-        .full_attention => .{ .full = try loadFullAttention(weights_allocator, temp_allocator, io, store, config, base) },
-        .linear_attention => .{ .linear = try loadLinearAttention(weights_allocator, temp_allocator, io, store, config, base) },
+        .full_attention => .{ .full = try loadFullAttention(weights_allocator, temp_allocator, io, store, config, base, xpu_runtime) },
+        .linear_attention => .{ .linear = try loadLinearAttention(weights_allocator, temp_allocator, io, store, config, base, xpu_runtime) },
     };
 
     const feed_forward: engine.FeedForward = if (config.usesSparseMoe(layer_idx))
-        .{ .moe = try loadMoeBlock(weights_allocator, temp_allocator, io, store, config, base) }
+        .{ .moe = try loadMoeBlock(weights_allocator, temp_allocator, io, store, config, base, xpu_runtime) }
     else
-        .{ .mlp = try loadMlp(weights_allocator, temp_allocator, io, store, config, base, config.intermediate_size) };
+        .{ .mlp = try loadMlp(weights_allocator, temp_allocator, io, store, config, base, config.intermediate_size, xpu_runtime) };
 
     return .{
         .attention = attention,
@@ -227,6 +272,7 @@ fn loadFullAttention(
     store: *const safetensors.SafeTensorStore,
     config: cfg.QwenTextConfig,
     layer_base: []const u8,
+    xpu_runtime: ?*xpu.Runtime,
 ) !engine.FullAttention {
     const prefix = try std.fmt.allocPrint(temp_allocator, "{s}.self_attn", .{layer_base});
     defer temp_allocator.free(prefix);
@@ -253,6 +299,7 @@ fn loadFullAttention(
             q_proj_prefix,
             config.hidden_size,
             config.num_attention_heads * config.head_dim * 2,
+            xpu_runtime,
         ),
         .k_proj = try loadLinear(
             weights_allocator,
@@ -262,6 +309,7 @@ fn loadFullAttention(
             k_proj_prefix,
             config.hidden_size,
             config.num_key_value_heads * config.head_dim,
+            xpu_runtime,
         ),
         .v_proj = try loadLinear(
             weights_allocator,
@@ -271,6 +319,7 @@ fn loadFullAttention(
             v_proj_prefix,
             config.hidden_size,
             config.num_key_value_heads * config.head_dim,
+            xpu_runtime,
         ),
         .o_proj = try loadLinear(
             weights_allocator,
@@ -280,6 +329,7 @@ fn loadFullAttention(
             o_proj_prefix,
             config.num_attention_heads * config.head_dim,
             config.hidden_size,
+            xpu_runtime,
         ),
         .q_norm_weight = try loadTensorF32(
             weights_allocator,
@@ -313,6 +363,7 @@ fn loadLinearAttention(
     store: *const safetensors.SafeTensorStore,
     config: cfg.QwenTextConfig,
     layer_base: []const u8,
+    xpu_runtime: ?*xpu.Runtime,
 ) !engine.LinearAttention {
     const prefix = try std.fmt.allocPrint(temp_allocator, "{s}.linear_attn", .{layer_base});
     defer temp_allocator.free(prefix);
@@ -345,6 +396,7 @@ fn loadLinearAttention(
             in_proj_qkv_prefix,
             config.hidden_size,
             linearConvDim(config),
+            xpu_runtime,
         ),
         .in_proj_z = try loadLinear(
             weights_allocator,
@@ -354,6 +406,7 @@ fn loadLinearAttention(
             in_proj_z_prefix,
             config.hidden_size,
             config.linear_num_value_heads * config.linear_value_head_dim,
+            xpu_runtime,
         ),
         .in_proj_b = try loadLinear(
             weights_allocator,
@@ -363,6 +416,7 @@ fn loadLinearAttention(
             in_proj_b_prefix,
             config.hidden_size,
             config.linear_num_value_heads,
+            xpu_runtime,
         ),
         .in_proj_a = try loadLinear(
             weights_allocator,
@@ -372,6 +426,7 @@ fn loadLinearAttention(
             in_proj_a_prefix,
             config.hidden_size,
             config.linear_num_value_heads,
+            xpu_runtime,
         ),
         .out_proj = try loadLinear(
             weights_allocator,
@@ -381,6 +436,7 @@ fn loadLinearAttention(
             out_proj_prefix,
             config.linear_num_value_heads * config.linear_value_head_dim,
             config.hidden_size,
+            xpu_runtime,
         ),
         .conv_weight = try loadConvWeight(
             weights_allocator,
@@ -432,10 +488,11 @@ fn loadMlp(
     config: cfg.QwenTextConfig,
     layer_base: []const u8,
     intermediate_size: usize,
+    xpu_runtime: ?*xpu.Runtime,
 ) !engine.Mlp {
     const prefix = try std.fmt.allocPrint(temp_allocator, "{s}.mlp", .{layer_base});
     defer temp_allocator.free(prefix);
-    return try loadMlpPrefix(weights_allocator, temp_allocator, io, store, config, prefix, intermediate_size);
+    return try loadMlpPrefix(weights_allocator, temp_allocator, io, store, config, prefix, intermediate_size, xpu_runtime);
 }
 
 fn loadMlpPrefix(
@@ -446,6 +503,7 @@ fn loadMlpPrefix(
     config: cfg.QwenTextConfig,
     prefix: []const u8,
     intermediate_size: usize,
+    xpu_runtime: ?*xpu.Runtime,
 ) !engine.Mlp {
     const gate_proj_prefix = try std.fmt.allocPrint(temp_allocator, "{s}.gate_proj", .{prefix});
     defer temp_allocator.free(gate_proj_prefix);
@@ -462,6 +520,7 @@ fn loadMlpPrefix(
             gate_proj_prefix,
             config.hidden_size,
             intermediate_size,
+            xpu_runtime,
         ),
         .up_proj = try loadLinear(
             weights_allocator,
@@ -471,6 +530,7 @@ fn loadMlpPrefix(
             up_proj_prefix,
             config.hidden_size,
             intermediate_size,
+            xpu_runtime,
         ),
         .down_proj = try loadLinear(
             weights_allocator,
@@ -480,6 +540,7 @@ fn loadMlpPrefix(
             down_proj_prefix,
             intermediate_size,
             config.hidden_size,
+            xpu_runtime,
         ),
     };
 }
@@ -491,6 +552,7 @@ fn loadMoeBlock(
     store: *const safetensors.SafeTensorStore,
     config: cfg.QwenTextConfig,
     layer_base: []const u8,
+    xpu_runtime: ?*xpu.Runtime,
 ) !engine.MoeBlock {
     const prefix = try std.fmt.allocPrint(temp_allocator, "{s}.mlp", .{layer_base});
     defer temp_allocator.free(prefix);
@@ -510,6 +572,7 @@ fn loadMoeBlock(
             config,
             expert_prefix,
             config.moe_intermediate_size,
+            xpu_runtime,
         );
     }
 
@@ -524,6 +587,7 @@ fn loadMoeBlock(
             gate_prefix,
             config.hidden_size,
             config.num_experts,
+            xpu_runtime,
         ),
         .experts = experts,
         .shared_expert = try loadMlpPrefix(
@@ -534,6 +598,7 @@ fn loadMoeBlock(
             config,
             shared_expert_prefix,
             config.shared_expert_intermediate_size,
+            xpu_runtime,
         ),
         .shared_expert_gate = try loadLinear(
             weights_allocator,
@@ -543,6 +608,7 @@ fn loadMoeBlock(
             shared_gate_prefix,
             config.hidden_size,
             1,
+            xpu_runtime,
         ),
         .top_k = config.num_experts_per_tok,
         .norm_topk_prob = config.norm_topk_prob,
@@ -556,6 +622,7 @@ fn loadLmHead(
     store: *const safetensors.SafeTensorStore,
     config: cfg.QwenTextConfig,
     embeddings: []const f32,
+    xpu_runtime: ?*xpu.Runtime,
 ) !engine.Linear {
     const lm_head_prefix = "lm_head";
     const lm_head_weight = "lm_head.weight";
@@ -568,16 +635,19 @@ fn loadLmHead(
             lm_head_prefix,
             config.hidden_size,
             config.vocab_size,
+            xpu_runtime,
         );
     }
     if (config.tie_word_embeddings) {
-        return .{
-            .dense = .{
-                .in_features = config.hidden_size,
-                .out_features = config.vocab_size,
-                .weight = embeddings,
-            },
+        var dense: engine.DenseLinear = .{
+            .in_features = config.hidden_size,
+            .out_features = config.vocab_size,
+            .weight = embeddings,
         };
+        if (xpu_runtime) |runtime| {
+            dense.xpu_weights = try runtime.createDenseWeights(embeddings, null, config.vocab_size, config.hidden_size);
+        }
+        return .{ .dense = dense };
     }
     return error.MissingLmHeadWeights;
 }
@@ -590,34 +660,39 @@ fn loadLinear(
     prefix: []const u8,
     in_features: usize,
     out_features: usize,
+    xpu_runtime: ?*xpu.Runtime,
 ) !engine.Linear {
     const weight_name = try std.fmt.allocPrint(temp_allocator, "{s}.weight", .{prefix});
     defer temp_allocator.free(weight_name);
     if (store.has(weight_name)) {
         const bias_name = try std.fmt.allocPrint(temp_allocator, "{s}.bias", .{prefix});
         defer temp_allocator.free(bias_name);
-        return .{
-            .dense = .{
-                .in_features = in_features,
-                .out_features = out_features,
-                .weight = try loadTensorF32(
-                    weights_allocator,
-                    temp_allocator,
-                    store,
-                    io,
-                    weight_name,
-                    &.{ out_features, in_features },
-                ),
-                .bias = try loadOptionalTensorF32(
-                    weights_allocator,
-                    temp_allocator,
-                    store,
-                    io,
-                    bias_name,
-                    &.{out_features},
-                ),
-            },
+        const weight = try loadTensorF32(
+            weights_allocator,
+            temp_allocator,
+            store,
+            io,
+            weight_name,
+            &.{ out_features, in_features },
+        );
+        const bias = try loadOptionalTensorF32(
+            weights_allocator,
+            temp_allocator,
+            store,
+            io,
+            bias_name,
+            &.{out_features},
+        );
+        var dense: engine.DenseLinear = .{
+            .in_features = in_features,
+            .out_features = out_features,
+            .weight = weight,
+            .bias = bias,
         };
+        if (xpu_runtime) |runtime| {
+            dense.xpu_weights = try runtime.createDenseWeights(weight, bias, out_features, in_features);
+        }
+        return .{ .dense = dense };
     }
 
     const qweight_name = try std.fmt.allocPrint(temp_allocator, "{s}.qweight", .{prefix});
@@ -659,24 +734,28 @@ fn loadLinear(
     const bias_name = try std.fmt.allocPrint(temp_allocator, "{s}.bias", .{prefix});
     defer temp_allocator.free(bias_name);
 
-    return .{
-        .autoround = .{
-            .in_features = in_features,
-            .out_features = out_features,
-            .group_size = @max(@as(usize, 1), (in_features + group_count - 1) / group_count),
-            .qweight = qweight,
-            .qzeros = qzeros,
-            .scales = scales,
-            .bias = try loadOptionalTensorF32(
-                weights_allocator,
-                temp_allocator,
-                store,
-                io,
-                bias_name,
-                &.{out_features},
-            ),
-        },
+    const bias = try loadOptionalTensorF32(
+        weights_allocator,
+        temp_allocator,
+        store,
+        io,
+        bias_name,
+        &.{out_features},
+    );
+    const group_size = @max(@as(usize, 1), (in_features + group_count - 1) / group_count);
+    var autoround: engine.AutoRoundLinear = .{
+        .in_features = in_features,
+        .out_features = out_features,
+        .group_size = group_size,
+        .qweight = qweight,
+        .qzeros = qzeros,
+        .scales = scales,
+        .bias = bias,
     };
+    if (xpu_runtime) |runtime| {
+        autoround.xpu_weights = try runtime.createAutoRoundWeights(qweight, qzeros, scales, bias, out_features, in_features, group_size);
+    }
+    return .{ .autoround = autoround };
 }
 
 fn loadTensorF32(
@@ -775,6 +854,40 @@ fn shapeEquals(actual: []const usize, expected: []const usize) bool {
 fn linearConvDim(config: cfg.QwenTextConfig) usize {
     return config.linear_num_key_heads * config.linear_key_head_dim * 2 +
         config.linear_num_value_heads * config.linear_value_head_dim;
+}
+
+fn deinitDecoderLayerXpu(layer: *const engine.DecoderLayer, runtime: *xpu.Runtime) void {
+    switch (layer.attention) {
+        .full => |*attention| {
+            attention.q_proj.releaseXpu(runtime);
+            attention.k_proj.releaseXpu(runtime);
+            attention.v_proj.releaseXpu(runtime);
+            attention.o_proj.releaseXpu(runtime);
+        },
+        .linear => |*attention| {
+            attention.in_proj_qkv.releaseXpu(runtime);
+            attention.in_proj_z.releaseXpu(runtime);
+            attention.in_proj_b.releaseXpu(runtime);
+            attention.in_proj_a.releaseXpu(runtime);
+            attention.out_proj.releaseXpu(runtime);
+        },
+    }
+
+    switch (layer.feed_forward) {
+        .mlp => |*mlp| deinitMlpXpu(mlp, runtime),
+        .moe => |*moe| {
+            moe.gate.releaseXpu(runtime);
+            for (moe.experts) |*expert| deinitMlpXpu(expert, runtime);
+            deinitMlpXpu(&moe.shared_expert, runtime);
+            moe.shared_expert_gate.releaseXpu(runtime);
+        },
+    }
+}
+
+fn deinitMlpXpu(mlp: *const engine.Mlp, runtime: *xpu.Runtime) void {
+    mlp.gate_proj.releaseXpu(runtime);
+    mlp.up_proj.releaseXpu(runtime);
+    mlp.down_proj.releaseXpu(runtime);
 }
 
 test "qwen runtime loads tied embeddings and produces logits" {

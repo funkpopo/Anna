@@ -1,21 +1,37 @@
 const std = @import("std");
 const cfg = @import("qwen3_config.zig");
 const tensor = @import("../tensor/tensor.zig");
+const xpu = @import("../xpu/opencl_backend.zig");
 
 pub const DenseLinear = struct {
     in_features: usize,
     out_features: usize,
     weight: []const f32,
     bias: ?[]const f32 = null,
+    xpu_weights: ?xpu.DenseLinearWeights = null,
 
-    pub fn forwardInto(self: DenseLinear, out: []f32, input: []const f32) void {
+    pub fn forwardInto(self: DenseLinear, out: []f32, input: []const f32) !void {
         std.debug.assert(input.len == self.in_features);
         std.debug.assert(out.len == self.out_features);
+        if (self.xpu_weights) |*weights| {
+            return try weights.runtime.runDense(weights, out, input);
+        }
         for (out, 0..) |*dst, row| {
             var sum: f32 = if (self.bias) |bias| bias[row] else 0.0;
             const weights = self.weight[row * self.in_features ..][0..self.in_features];
             sum += dotF32(weights, input);
             dst.* = sum;
+        }
+    }
+
+    pub fn deinitXpu(self: *DenseLinear, runtime: *xpu.Runtime) void {
+        self.releaseXpu(runtime);
+        self.xpu_weights = null;
+    }
+
+    pub fn releaseXpu(self: DenseLinear, runtime: *xpu.Runtime) void {
+        if (self.xpu_weights) |*weights| {
+            runtime.releaseDenseWeights(weights);
         }
     }
 };
@@ -28,10 +44,14 @@ pub const AutoRoundLinear = struct {
     qzeros: []const i32,
     scales: []const f32,
     bias: ?[]const f32 = null,
+    xpu_weights: ?xpu.AutoRoundLinearWeights = null,
 
-    pub fn forwardInto(self: AutoRoundLinear, out: []f32, input: []const f32) void {
+    pub fn forwardInto(self: AutoRoundLinear, out: []f32, input: []const f32) !void {
         std.debug.assert(input.len == self.in_features);
         std.debug.assert(out.len == self.out_features);
+        if (self.xpu_weights) |*weights| {
+            return try weights.runtime.runAutoRound(weights, out, input);
+        }
         const packed_in = (self.in_features + 7) / 8;
         const packed_out = (self.out_features + 7) / 8;
         const group_count = (self.in_features + self.group_size - 1) / self.group_size;
@@ -118,6 +138,17 @@ pub const AutoRoundLinear = struct {
         }
     }
 
+    pub fn deinitXpu(self: *AutoRoundLinear, runtime: *xpu.Runtime) void {
+        self.releaseXpu(runtime);
+        self.xpu_weights = null;
+    }
+
+    pub fn releaseXpu(self: AutoRoundLinear, runtime: *xpu.Runtime) void {
+        if (self.xpu_weights) |*weights| {
+            runtime.releaseAutoRoundWeights(weights);
+        }
+    }
+
     pub fn dequant(self: AutoRoundLinear, out_index: usize, in_index: usize) f32 {
         const packed_in = (self.in_features + 7) / 8;
         const packed_out = (self.out_features + 7) / 8;
@@ -179,14 +210,28 @@ pub const Linear = union(enum) {
 
     pub fn forwardAlloc(self: Linear, allocator: std.mem.Allocator, input: []const f32) ![]f32 {
         const out = try allocator.alloc(f32, self.outFeatures());
-        self.forwardInto(out, input);
+        try self.forwardInto(out, input);
         return out;
     }
 
-    pub fn forwardInto(self: Linear, out: []f32, input: []const f32) void {
+    pub fn forwardInto(self: Linear, out: []f32, input: []const f32) !void {
         switch (self) {
-            .dense => |linear| linear.forwardInto(out, input),
-            .autoround => |linear| linear.forwardInto(out, input),
+            .dense => |linear| try linear.forwardInto(out, input),
+            .autoround => |linear| try linear.forwardInto(out, input),
+        }
+    }
+
+    pub fn deinitXpu(self: *Linear, runtime: *xpu.Runtime) void {
+        switch (self.*) {
+            .dense => |*linear| linear.deinitXpu(runtime),
+            .autoround => |*linear| linear.deinitXpu(runtime),
+        }
+    }
+
+    pub fn releaseXpu(self: Linear, runtime: *xpu.Runtime) void {
+        switch (self) {
+            .dense => |linear| linear.releaseXpu(runtime),
+            .autoround => |linear| linear.releaseXpu(runtime),
         }
     }
 };
@@ -633,7 +678,7 @@ test "autoround int4 matvec dequantizes autogptq packing" {
     };
     const input = [_]f32{ 2.0, 4.0 };
     var out: [1]f32 = undefined;
-    linear.forwardInto(&out, &input);
+    try linear.forwardInto(&out, &input);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[0], 1e-6);
 }
 
@@ -657,7 +702,7 @@ test "autoround int4 matvec vectorizes eight output rows" {
     };
     const input = [_]f32{ 2.0, 4.0 };
     var out: [8]f32 = undefined;
-    linear.forwardInto(&out, &input);
+    try linear.forwardInto(&out, &input);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 5.0), out[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 8.0), out[2], 1e-6);

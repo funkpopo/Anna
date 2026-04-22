@@ -49,9 +49,19 @@ pub const NativeQwenTextService = struct {
     default_max_completion_tokens: usize = 256,
 
     pub fn load(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, model_id: []const u8) !NativeQwenTextService {
+        return try loadWithOptions(allocator, io, model_dir, model_id, .{});
+    }
+
+    pub fn loadWithOptions(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model_dir: []const u8,
+        model_id: []const u8,
+        options: loader.LoadOptions,
+    ) !NativeQwenTextService {
         return .{
             .allocator = allocator,
-            .runtime = try loader.QwenTextRuntime.load(allocator, io, model_dir),
+            .runtime = try loader.QwenTextRuntime.loadWithOptions(allocator, io, model_dir, options),
             .tokenizer = try tokenizer_mod.QwenTokenizer.loadFromModelDir(allocator, io, model_dir),
             .model_id = try allocator.dupe(u8, model_id),
             .sessions = std.AutoHashMap(usize, Session).init(allocator),
