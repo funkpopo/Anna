@@ -33,9 +33,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument(
         "--compile-mode",
-        choices=("none", "default", "reduce-overhead", "max-autotune"),
+        choices=("none", "auto", "default", "reduce-overhead", "max-autotune"),
         default="none",
-        help="Optional torch.compile mode for the text generation path.",
+        help="torch.compile mode; 'auto' uses reduce-overhead on XPU only.",
     )
     parser.add_argument(
         "--compile-fullgraph",

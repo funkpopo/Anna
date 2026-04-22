@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 ReasoningFormat = Literal["none", "deepseek"]
 _REASONING_FORMAT_VALUES = frozenset({"none", "deepseek"})
 _DEFAULT_REASONING_FORMAT: ReasoningFormat = "deepseek"
-_COMPILE_MODE_VALUES = frozenset({"none", "default", "reduce-overhead", "max-autotune"})
+_COMPILE_MODE_VALUES = frozenset({"none", "auto", "default", "reduce-overhead", "max-autotune"})
 _KV_CACHE_QUANTIZATION_VALUES = frozenset({"none", "turboquant"})
 
 
@@ -76,6 +76,17 @@ def normalize_compile_mode(value: str | None) -> str:
         allowed = ", ".join(sorted(_COMPILE_MODE_VALUES))
         raise ValueError(f"Unsupported compile mode: {value}. Expected one of: {allowed}.")
     return normalized
+
+
+def _qwen3_paged_full_attention_decode_enabled(*, device_type: str, kv_cache_quantization: str) -> tuple[bool, bool]:
+    """Return (use_paged_full_attention_decode, maintain_full_attention_mirror) for Qwen3PageAllocator."""
+    turboquant_kv_enabled = kv_cache_quantization == "turboquant"
+    use_paged_full_attention_decode = False
+    if device_type == "xpu" and not turboquant_kv_enabled:
+        maybe_load_gated_delta_library()
+        use_paged_full_attention_decode = paged_gqa_decode_fused_is_available()
+    maintain_full_attention_mirror = not use_paged_full_attention_decode and not turboquant_kv_enabled
+    return use_paged_full_attention_decode, maintain_full_attention_mirror
 
 
 def normalize_kv_cache_quantization(value: str | None) -> str:
@@ -220,17 +231,16 @@ class AnnaQwen3_5TextEngine:
         self.resident_expert_layers = len(self.resident_expert_layer_indices)
         self.cached_experts_per_layer = max(0, int(cached_experts_per_layer))
         self.optimization_config = self._normalize_optimization_config(optimization_config)
-        turboquant_kv_enabled = self.optimization_config.kv_cache_quantization == "turboquant"
-        use_paged_full_attention_decode = False
-        if self.device_context.device.type == "xpu" and not turboquant_kv_enabled:
-            maybe_load_gated_delta_library()
-            use_paged_full_attention_decode = paged_gqa_decode_fused_is_available()
+        _, maintain_full_attention_mirror = _qwen3_paged_full_attention_decode_enabled(
+            device_type=self.device_context.device.type,
+            kv_cache_quantization=self.optimization_config.kv_cache_quantization,
+        )
         self.cache_allocator = Qwen3PageAllocator(
             self.config.text_config,
-            maintain_full_attention_mirror=not use_paged_full_attention_decode and not turboquant_kv_enabled,
+            maintain_full_attention_mirror=maintain_full_attention_mirror,
         )
-        self.full_attention_cache_mirror = (
-            self.cache_allocator.maintain_full_attention_mirror and bool(self.cache_allocator.full_attention_layer_indices)
+        self.full_attention_cache_mirror = maintain_full_attention_mirror and bool(
+            self.cache_allocator.full_attention_layer_indices
         )
         self.optimization_config = replace(
             self.optimization_config,
@@ -346,6 +356,13 @@ class AnnaQwen3_5TextEngine:
     def _maybe_compile_text_model(self) -> None:
         self._compiled_text_forward = None
         compile_mode = self.optimization_config.compile_mode
+        if compile_mode == "auto":
+            compile_mode = "reduce-overhead" if self.device_context.device.type == "xpu" else "none"
+            logger.info(
+                "compile_mode=auto resolved to %s (device=%s)",
+                compile_mode,
+                self.device_context.device.type,
+            )
         if compile_mode == "none" or not hasattr(torch, "compile") or not hasattr(self.model, "forward_text_only"):
             return
         try:
@@ -651,6 +668,14 @@ class AnnaQwen3_5TextEngine:
         if resolved_default_max_completion_tokens is not None:
             resolved_default_max_completion_tokens = max(1, int(resolved_default_max_completion_tokens))
 
+        _, _maintain_full_attn_mirror = _qwen3_paged_full_attention_decode_enabled(
+            device_type=device_context.device.type,
+            kv_cache_quantization=resolved_kv_cache_quantization,
+        )
+        _logged_full_attention_cache_mirror = _maintain_full_attn_mirror and bool(
+            config.text_config.layer_types and "full_attention" in config.text_config.layer_types
+        )
+
         logger.info(
             "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, default_enable_thinking=%s, reasoning_format=%s, offload=%s, offload_vision=%s, expert_quant=%s, weight_quant=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, full_attention_cache_mirror=%s, weight_load_device=%s); tensors loaded=%s skipped=%s quantized=%s",
             resolved_model_id,
@@ -667,7 +692,7 @@ class AnnaQwen3_5TextEngine:
             len(resolved_resident_expert_layer_indices or ()),
             list(resolved_resident_expert_layer_indices or ()),
             resolved_cached_experts_per_layer,
-            bool(config.text_config.layer_types and "full_attention" in config.text_config.layer_types),
+            _logged_full_attention_cache_mirror,
             model_device,
             report.loaded,
             report.skipped,

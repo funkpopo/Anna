@@ -159,9 +159,9 @@ class AnnaServiceMetricsLogger:
         prompt_cache_hit_rate = 0.0 if cache_queries <= 0 else (cache_hits / cache_queries) * 100.0
         kv_cache_usage = current.kv_cache_usage_ratio * 100.0
         return (
-            "Engine metrics: Avg prompt throughput: "
-            f"{prompt_tokens_per_second:.1f} tokens/s, Avg generation throughput: "
-            f"{generation_tokens_per_second:.1f} tokens/s, Running: {current.running_requests} reqs, "
+            "Engine metrics: Interval prompt: "
+            f"{prompt_tokens_per_second:.1f} tok/s, Interval generation: "
+            f"{generation_tokens_per_second:.1f} tok/s, Running: {current.running_requests} reqs, "
             f"Waiting: {current.waiting_requests} reqs, GPU KV cache usage: {kv_cache_usage:.1f}% "
             f"({current.kv_cache_used_pages}/{current.kv_cache_total_pages} pages), "
             f"Prompt cache hit rate: {prompt_cache_hit_rate:.1f}%"
