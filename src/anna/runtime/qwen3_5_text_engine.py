@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import itertools
 import logging
-import sys
 import threading
 import time
 from collections import OrderedDict
@@ -280,10 +279,6 @@ class AnnaQwen3_5TextEngine:
             raw = max(1, int(requested_chunk_size))
             aligned = max(block, (raw // block) * block)
             return aligned
-        device = getattr(self.device_context, "device", torch.device("cpu"))
-        if device.type != "xpu":
-            return 0
-
         text_config = self.config.text_config
         bytes_per_elem = self.device_context.element_size(self.device_context.dtype)
         full_layers = sum(1 for layer_type in text_config.layer_types if layer_type == "full_attention")
@@ -358,57 +353,21 @@ class AnnaQwen3_5TextEngine:
         self._compiled_text_forward = None
         compile_mode = self.optimization_config.compile_mode
         if compile_mode == "auto":
-            compile_mode = "reduce-overhead" if self.device_context.device.type == "xpu" else "none"
-            logger.info(
-                "compile_mode=auto resolved to %s (device=%s)",
-                compile_mode,
-                self.device_context.device.type,
-            )
+            compile_mode = "reduce-overhead"
+            logger.info("compile_mode=auto resolved to %s", compile_mode)
         if compile_mode == "none" or not hasattr(torch, "compile") or not hasattr(self.model, "forward_text_only"):
             return
-        try:
-            # dynamic=True avoids seq_len prefill/decode recompiles on Linux, but on Windows it can send Inductor
-            # through a CPU vector ISA path that dry-runs MSVC (cl); without Visual Studio Build Tools that fails.
-            if sys.platform == "win32":
-                self._compiled_text_forward = torch.compile(
-                    self.model.forward_text_only,
-                    mode=compile_mode,
-                    fullgraph=self.optimization_config.compile_fullgraph,
-                )
-                logger.info(
-                    "Enabled torch.compile for text generation path: mode=%s fullgraph=%s dynamic_shapes=False "
-                    "(Windows: dynamic=True often requires MSVC cl for Inductor CPU codegen)",
-                    compile_mode,
-                    self.optimization_config.compile_fullgraph,
-                )
-            else:
-                try:
-                    self._compiled_text_forward = torch.compile(
-                        self.model.forward_text_only,
-                        mode=compile_mode,
-                        fullgraph=self.optimization_config.compile_fullgraph,
-                        dynamic=True,
-                    )
-                    logger.info(
-                        "Enabled torch.compile for text generation path: mode=%s fullgraph=%s dynamic_shapes=True",
-                        compile_mode,
-                        self.optimization_config.compile_fullgraph,
-                    )
-                except TypeError:
-                    self._compiled_text_forward = torch.compile(
-                        self.model.forward_text_only,
-                        mode=compile_mode,
-                        fullgraph=self.optimization_config.compile_fullgraph,
-                    )
-                    logger.info(
-                        "Enabled torch.compile for text generation path: mode=%s fullgraph=%s dynamic_shapes=False "
-                        "(PyTorch build rejected dynamic=; prefill/decode may recompile)",
-                        compile_mode,
-                        self.optimization_config.compile_fullgraph,
-                    )
-        except Exception:
-            logger.exception("Failed to enable torch.compile for text generation path; falling back to eager mode.")
-            self._compiled_text_forward = None
+        # XPU-only: Inductor dynamic_shapes pulls in Triton kernels that use fp64 (unsupported on XPU).
+        self._compiled_text_forward = torch.compile(
+            self.model.forward_text_only,
+            mode=compile_mode,
+            fullgraph=self.optimization_config.compile_fullgraph,
+        )
+        logger.info(
+            "Enabled torch.compile for XPU text path: mode=%s fullgraph=%s",
+            compile_mode,
+            self.optimization_config.compile_fullgraph,
+        )
 
     def _kv_cache_runtime_info(self) -> dict[str, object]:
         info_getter = getattr(self.model, "kv_cache_runtime_info", None)
@@ -470,6 +429,11 @@ class AnnaQwen3_5TextEngine:
             dtype=dtype,
             model_dtype=config.text_config.dtype,
         )
+        if device_context.device.type != "xpu":
+            raise ValueError(
+                "AnnaQwen3_5TextEngine requires Intel XPU (device='xpu', or device='auto' when torch.xpu is available). "
+                f"Resolved device {device_context.device!r} from device={device!r}."
+            )
         if safety_policy is not None:
             device_context.safety_policy = safety_policy
         resolved_kv_cache_quantization = cls._resolve_kv_cache_quantization(
@@ -486,12 +450,10 @@ class AnnaQwen3_5TextEngine:
             requested_offload_vision=offload_vision,
             resolved_offload_mode=resolved_offload_mode,
             config=config,
-            device_context=device_context,
         )
         resolved_expert_quant = cls._resolve_expert_quant(
             requested_quant=expert_quant,
             resolved_offload_mode=resolved_offload_mode,
-            device_context=device_context,
         )
         resolved_weight_quant = cls._resolve_weight_quant(
             requested_quant=weight_quant,
@@ -780,8 +742,6 @@ class AnnaQwen3_5TextEngine:
         normalized = requested_mode.lower()
         if normalized not in {"auto", "none", "experts"}:
             raise ValueError(f"Unsupported offload mode: {requested_mode}")
-        if device_context.device.type != "xpu":
-            return "none"
         if normalized != "auto":
             return normalized
 
@@ -813,10 +773,7 @@ class AnnaQwen3_5TextEngine:
         requested_offload_vision: bool,
         resolved_offload_mode: str,
         config: object,
-        device_context: DeviceContext,
     ) -> bool:
-        if device_context.device.type != "xpu":
-            return False
         if getattr(config, "vision_config", None) is None:
             return False
         return bool(requested_offload_vision or resolved_offload_mode == "experts")
@@ -826,12 +783,11 @@ class AnnaQwen3_5TextEngine:
         *,
         requested_quant: str,
         resolved_offload_mode: str,
-        device_context: DeviceContext,
     ) -> str:
         normalized = requested_quant.lower()
         if normalized not in {"auto", "none", "int4"}:
             raise ValueError(f"Unsupported expert quant mode: {requested_quant}")
-        if resolved_offload_mode != "experts" or device_context.device.type != "xpu":
+        if resolved_offload_mode != "experts":
             return "none"
         if normalized == "auto":
             return "int4"
@@ -849,8 +805,6 @@ class AnnaQwen3_5TextEngine:
         normalized = requested_quant.lower()
         if normalized not in {"auto", "none", "int4"}:
             raise ValueError(f"Unsupported weight quant mode: {requested_quant}")
-        if device_context.device.type != "xpu":
-            return "none"
         if normalized != "auto":
             return normalized
         if getattr(config, "quantization_config", None) is not None and config.quantization_config.is_enabled:
@@ -907,7 +861,7 @@ class AnnaQwen3_5TextEngine:
     ) -> int:
         quantization_config = getattr(config, "quantization_config", None)
         quant_method = (getattr(quantization_config, "quant_method", None) or "").strip().lower()
-        if device.type != "xpu" or quant_method not in {"auto-round", "auto_round"}:
+        if quant_method not in {"auto-round", "auto_round"}:
             return 0
 
         packing_format = (getattr(quantization_config, "packing_format", None) or "").strip().lower()
@@ -1072,9 +1026,6 @@ class AnnaQwen3_5TextEngine:
         device_context: DeviceContext,
         expert_quant: str,
     ) -> tuple[int, ...]:
-        if device_context.device.type != "xpu":
-            return ()
-
         device_context.synchronize()
         memory_info = device_context.get_memory_info()
         if memory_info is None:
@@ -1139,9 +1090,6 @@ class AnnaQwen3_5TextEngine:
         device_context: DeviceContext,
         expert_quant: str,
     ) -> int:
-        if device_context.device.type != "xpu":
-            return 0
-
         offloaded_blocks = cls._offloaded_sparse_moe_blocks(model)
         if not offloaded_blocks:
             return 0
@@ -1831,33 +1779,19 @@ class AnnaQwen3_5TextEngine:
             model_kwargs.get(key) is not None
             for key in self._forward_multimodal_input_keys()
         )
-        if (
-            not has_multimodal_inputs
-            and hasattr(self.model, "forward_text_only")
-        ):
-            compiled = getattr(self, "_compiled_text_forward", None)
-            eager = self.model.forward_text_only
-            forward_kwargs = dict(
+        if not has_multimodal_inputs:
+            forward_fn = getattr(self, "_compiled_text_forward", None)
+            if forward_fn is None:
+                if not hasattr(self.model, "forward_text_only"):
+                    raise RuntimeError("Text-only generation requires Qwen3_5TextForConditionalGeneration.forward_text_only")
+                forward_fn = self.model.forward_text_only
+            return forward_fn(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 logits_to_keep=logits_to_keep,
             )
-            if compiled is None:
-                return eager(**forward_kwargs)
-            try:
-                return compiled(**forward_kwargs)
-            except Exception as exc:
-                if self._is_torch_compile_runtime_failure(exc):
-                    logger.warning(
-                        "torch.compile forward failed (%s: %s); disabling compiled path for this engine.",
-                        type(exc).__name__,
-                        exc,
-                    )
-                    self._compiled_text_forward = None
-                    return eager(**forward_kwargs)
-                raise
         return self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1867,27 +1801,10 @@ class AnnaQwen3_5TextEngine:
             **model_kwargs,
         )
 
-    @staticmethod
-    def _is_torch_compile_runtime_failure(exc: BaseException) -> bool:
-        """Inductor/dynamo failures often surface on the first real forward, not at torch.compile() call time."""
-        if type(exc).__name__ in ("InductorError", "BackendCompilerFailed"):
-            return True
-        cause = exc.__cause__
-        if cause is not None and AnnaQwen3_5TextEngine._is_torch_compile_runtime_failure(cause):
-            return True
-        msg = str(exc).lower()
-        if "compiler:" in msg and "not found" in msg:
-            return True
-        if "inductor" in msg and "compiler" in msg:
-            return True
-        return False
-
     def warmup_inference_kernels(self) -> None:
         from anna.model.fused_ops import maybe_load_gated_delta_library
 
         maybe_load_gated_delta_library()
-        if self.device_context.device.type != "xpu":
-            return
         cfg = self.config.text_config
         pad = int(cfg.pad_token_id)
         if not (0 <= pad < cfg.vocab_size):
@@ -1895,33 +1812,30 @@ class AnnaQwen3_5TextEngine:
         bos = getattr(self.tokenizer, "bos_token_id", None)
         token_id = int(bos) if bos is not None and 0 <= int(bos) < cfg.vocab_size else pad
         device = self.device_context.device
-        try:
-            with torch.inference_mode():
-                # Fused causal_conv1d_prefill / gated_delta_prefill require seq_len > 1 (see SYCL TORCH_CHECK).
-                input_ids = torch.tensor([[token_id, token_id]], device=device, dtype=torch.long)
-                attention_mask = torch.ones_like(input_ids)
-                outputs = self._forward_generation_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    past_key_values=None,
+        with torch.inference_mode():
+            # Fused causal_conv1d_prefill / gated_delta_prefill require seq_len > 1 (see SYCL TORCH_CHECK).
+            input_ids = torch.tensor([[token_id, token_id]], device=device, dtype=torch.long)
+            attention_mask = torch.ones_like(input_ids)
+            outputs = self._forward_generation_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                model_kwargs={},
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            past = outputs.past_key_values
+            if past is not None:
+                self._forward_generation_model(
+                    input_ids=torch.tensor([[token_id]], device=device, dtype=torch.long),
+                    attention_mask=None,
+                    past_key_values=past,
                     model_kwargs={},
                     use_cache=True,
                     logits_to_keep=1,
                 )
-                past = outputs.past_key_values
-                if past is not None:
-                    self._forward_generation_model(
-                        input_ids=torch.tensor([[token_id]], device=device, dtype=torch.long),
-                        attention_mask=None,
-                        past_key_values=past,
-                        model_kwargs={},
-                        use_cache=True,
-                        logits_to_keep=1,
-                    )
-                    past.release()
-            logger.info("XPU inference warmup finished (2-token prefill + 1-token decode).")
-        except Exception:
-            logger.exception("XPU inference warmup failed; first request may load fused ops or pay extra JIT latency.")
+                past.release()
+        logger.info("XPU inference warmup finished (2-token prefill + 1-token decode).")
 
     @staticmethod
     def _prune_trivial_attention_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
