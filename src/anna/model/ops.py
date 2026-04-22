@@ -1952,7 +1952,8 @@ class Qwen3GatedDeltaNet(nn.Module):
         weight: torch.Tensor,
         bias: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if mixed_qkv.device.type == "xpu":
+        seq_len = int(mixed_qkv.shape[-1])
+        if mixed_qkv.device.type == "xpu" and seq_len > 1:
             return run_causal_conv1d_prefill_fused(
                 hidden_states=mixed_qkv,
                 conv_state=conv_state,
@@ -2162,7 +2163,8 @@ class Qwen3GatedDeltaNet(nn.Module):
         beta: torch.Tensor,
         initial_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if query.device.type == "xpu":
+        seq_len = int(query.shape[1])
+        if query.device.type == "xpu" and seq_len > 1:
             state = initial_state
             if state is None:
                 state = torch.zeros(

@@ -1812,7 +1812,8 @@ class AnnaQwen3_5TextEngine:
         device = self.device_context.device
         try:
             with torch.inference_mode():
-                input_ids = torch.tensor([[token_id]], device=device, dtype=torch.long)
+                # Fused causal_conv1d_prefill / gated_delta_prefill require seq_len > 1 (see SYCL TORCH_CHECK).
+                input_ids = torch.tensor([[token_id, token_id]], device=device, dtype=torch.long)
                 attention_mask = torch.ones_like(input_ids)
                 outputs = self._forward_generation_model(
                     input_ids=input_ids,
@@ -1833,7 +1834,7 @@ class AnnaQwen3_5TextEngine:
                         logits_to_keep=1,
                     )
                     past.release()
-            logger.info("XPU inference warmup finished (1-token prefill + decode).")
+            logger.info("XPU inference warmup finished (2-token prefill + 1-token decode).")
         except Exception:
             logger.exception("XPU inference warmup failed; first request may load fused ops or pay extra JIT latency.")
 
