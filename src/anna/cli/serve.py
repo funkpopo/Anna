@@ -158,7 +158,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--prompt-cache-max-tokens",
         type=_non_negative_int,
         default=0,
-        help="Only cache prompts up to N tokens. Set 0 to disable this token threshold.",
+        help="Only cache prompts up to N tokens (reduces RAM/clone cost for long prompts). Set 0 for no limit.",
+    )
+    parser.add_argument(
+        "--no-inference-warmup",
+        action="store_true",
+        help="Skip a tiny XPU prefill+decode after load (fused ops may load on first client request instead).",
     )
     parser.add_argument(
         "--profile-runtime",
@@ -355,6 +360,8 @@ def main() -> None:
         resident_expert_layer_indices=settings.resident_expert_layer_indices,
         cached_experts_per_layer=settings.cached_experts_per_layer,
     )
+    if not args.no_inference_warmup and hasattr(engine, "warmup_inference_kernels"):
+        engine.warmup_inference_kernels()
     scheduler = _build_scheduler(engine, settings)
     metrics_logger = _build_metrics_logger(engine, settings)
     app = create_app(engine, scheduler=scheduler)

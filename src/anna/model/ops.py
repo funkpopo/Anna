@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from anna.model.prefix_block_cache import PrefixBlockPool
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.model.turboquant import TurboQuantKVRow
 from anna.model.fused_ops import (
@@ -70,11 +73,20 @@ class _GroupedInt4ExpertBank:
 
 
 class Qwen3PagedLayerAllocator:
-    def __init__(self, block_size: int) -> None:
+    def __init__(
+        self,
+        block_size: int,
+        *,
+        on_page_freed: Callable[[int], None] | None = None,
+        on_trim: Callable[[], None] | None = None,
+    ) -> None:
         self.block_size = block_size
+        self._on_page_freed = on_page_freed
+        self._on_trim = on_trim
         self.key_pages: torch.Tensor | None = None
         self.value_pages: torch.Tensor | None = None
         self.free_pages: list[int] = []
+        self._refcount: dict[int, int] = {}
 
     def allocate(
         self,
@@ -85,16 +97,45 @@ class Qwen3PagedLayerAllocator:
     ) -> list[int]:
         page_ids: list[int] = []
         while self.free_pages and len(page_ids) < num_pages:
-            page_ids.append(self.free_pages.pop())
+            page_id = self.free_pages.pop()
+            if self._refcount.get(page_id, 0) != 0:
+                raise RuntimeError(f"Invariant violated: free list page {page_id} has non-zero refcount.")
+            self._refcount[page_id] = 1
+            page_ids.append(page_id)
 
         missing = num_pages - len(page_ids)
         if missing > 0:
-            page_ids.extend(self._grow(missing, key_template=key_template, value_template=value_template))
+            new_ids = self._grow(missing, key_template=key_template, value_template=value_template)
+            for page_id in new_ids:
+                self._refcount[page_id] = 1
+            page_ids.extend(new_ids)
         return page_ids
 
-    def free(self, page_ids: list[int]) -> None:
-        for page_id in reversed(page_ids):
+    def retain_page(self, page_id: int) -> None:
+        cap = self.capacity()
+        if page_id < 0 or (cap > 0 and page_id >= cap):
+            raise ValueError(f"retain_page: invalid page_id={page_id} capacity={cap}.")
+        self._refcount[page_id] = self._refcount.get(page_id, 0) + 1
+
+    def release_page(self, page_id: int) -> None:
+        rc = self._refcount.get(page_id, 0)
+        if rc <= 0:
+            return
+        rc -= 1
+        if rc == 0:
+            self._refcount.pop(page_id, None)
             self.free_pages.append(page_id)
+            if self._on_page_freed is not None:
+                self._on_page_freed(page_id)
+        else:
+            self._refcount[page_id] = rc
+
+    def release_pages(self, page_ids: list[int]) -> None:
+        for page_id in reversed(page_ids):
+            self.release_page(page_id)
+
+    def free(self, page_ids: list[int]) -> None:
+        self.release_pages(page_ids)
 
     def capacity(self) -> int:
         if self.key_pages is None:
@@ -129,6 +170,9 @@ class Qwen3PagedLayerAllocator:
         capacity = self.capacity()
         if capacity <= 0 or self.used_pages() > 0:
             return 0
+        if self._on_trim is not None:
+            self._on_trim()
+        self._refcount.clear()
         self.key_pages = None
         self.value_pages = None
         self.free_pages.clear()
@@ -185,10 +229,24 @@ class Qwen3PagedLayerAllocator:
 
 
 class Qwen3PageAllocator:
+    """Paged KV storage per layer. Block size matches ``config.cache_block_size``.
+
+    vLLM-style *prefix block reuse* across requests needs refcounted physical pages and
+    coordination in :class:`Qwen3DynamicCache.update` (see ``prefix_block_cache`` helpers).
+    """
+
     def __init__(self, config: Qwen3_5TextConfig, *, maintain_full_attention_mirror: bool = True):
         self.config = config
         self.block_size = max(1, int(config.cache_block_size))
-        self.layers = [Qwen3PagedLayerAllocator(self.block_size) for _ in range(config.num_hidden_layers)]
+        self.prefix_block_pool = PrefixBlockPool()
+        self.layers = [
+            Qwen3PagedLayerAllocator(
+                self.block_size,
+                on_page_freed=lambda pid, li=layer_idx: self.prefix_block_pool.discard_page(li, pid),
+                on_trim=lambda li=layer_idx: self.prefix_block_pool.clear_layer(li),
+            )
+            for layer_idx in range(config.num_hidden_layers)
+        ]
         self.maintain_full_attention_mirror = bool(maintain_full_attention_mirror)
         self.full_attention_layer_indices = tuple(
             layer_idx for layer_idx, layer_type in enumerate(config.layer_types) if layer_type == "full_attention"
@@ -212,9 +270,15 @@ class Qwen3PageAllocator:
             value_template=value_template,
         )
 
-    def free(self, layer_idx: int, page_ids: list[int]) -> None:
+    def release_pages(self, layer_idx: int, page_ids: list[int]) -> None:
         if page_ids:
-            self.layers[layer_idx].free(page_ids)
+            self.layers[layer_idx].release_pages(page_ids)
+
+    def free(self, layer_idx: int, page_ids: list[int]) -> None:
+        self.release_pages(layer_idx, page_ids)
+
+    def retain_shared_page(self, layer_idx: int, page_id: int) -> None:
+        self.layers[layer_idx].retain_page(page_id)
 
     def ensure_capacity(
         self,
@@ -296,6 +360,29 @@ class Qwen3DynamicCache:
         self.rope_deltas: torch.Tensor | None = None
         self.reserved_seq_capacity = 0
         self._released = False
+        self._prefill_input_ids: torch.LongTensor | None = None
+        self._prompt_token_ids: list[int] | None = None
+        self._prefix_kv_share = os.environ.get("ANNA_PREFIX_KV_SHARE", "1") != "0"
+
+    def attach_prefill_input_ids(self, input_ids: torch.LongTensor | None) -> None:
+        self._prefill_input_ids = input_ids
+
+    def detach_prefill_input_ids(self) -> None:
+        self._prefill_input_ids = None
+
+    def set_prompt_token_ids(self, input_ids: torch.LongTensor | None) -> None:
+        if input_ids is None or not self._prefix_kv_share:
+            return
+        if self._prompt_token_ids is not None:
+            return
+        if int(input_ids.shape[0]) != 1:
+            return
+        if self.get_seq_length() != 0:
+            return
+        seq = int(input_ids.shape[1])
+        if seq <= 0:
+            return
+        self._prompt_token_ids = [int(t) for t in input_ids[0].tolist()]
 
     def reserve_sequence_capacity(self, seq_length: int) -> None:
         self.reserved_seq_capacity = max(0, int(seq_length))
@@ -569,7 +656,22 @@ class Qwen3DynamicCache:
                 value_template=value_states,
             )
 
+        use_prefix_share = (
+            self._prefix_kv_share
+            and batch_size == 1
+            and self._prompt_token_ids is not None
+        )
         for batch_idx in range(batch_size):
+            if use_prefix_share:
+                self._update_paged_row_with_prefix_sharing(
+                    key_states,
+                    value_states,
+                    layer_idx,
+                    batch_idx,
+                    append_length,
+                )
+                continue
+
             current_length = self.layer_lengths[layer_idx][batch_idx]
             required_length = current_length + append_length
             reserved_required_length = max(required_length, self.reserved_seq_capacity)
@@ -641,6 +743,86 @@ class Qwen3DynamicCache:
             current_position += take
             src_offset += take
             remaining -= take
+
+    def _update_paged_row_with_prefix_sharing(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        batch_idx: int,
+        append_length: int,
+    ) -> None:
+        prompt = self._prompt_token_ids
+        if prompt is None:
+            raise RuntimeError("prefix sharing requires prompt token ids.")
+        current_length = self.layer_lengths[layer_idx][batch_idx]
+        required_length = current_length + append_length
+        page_table = self.page_tables[layer_idx][batch_idx]
+        pool = self.allocator.prefix_block_pool
+        bs = self.block_size
+
+        pos = current_length
+        while pos < required_length:
+            b = pos // bs
+            glob_lo = pos
+            glob_hi = min(required_length, (b + 1) * bs)
+            ntok = glob_hi - glob_lo
+            full_block = ntok == bs and glob_lo == b * bs
+
+            first_touch = len(page_table) <= b
+            hit: int | None = None
+            if first_touch and full_block and glob_hi <= len(prompt):
+                token_block = tuple(prompt[glob_lo:glob_hi])
+                hit = pool.lookup(layer_idx, token_block)
+            else:
+                token_block = None
+
+            while len(page_table) <= b:
+                if hit is not None:
+                    self.allocator.retain_shared_page(layer_idx, hit)
+                    page_table.append(hit)
+                else:
+                    page_table.append(
+                        self.allocator.allocate(
+                            layer_idx,
+                            1,
+                            key_template=key_states,
+                            value_template=value_states,
+                        )[0]
+                    )
+                break
+
+            pid = page_table[b]
+            skipped_shared = full_block and hit is not None and pid == hit
+
+            if not skipped_shared:
+                loc_lo = glob_lo - current_length
+                loc_hi = glob_hi - current_length
+                self._write_pages(
+                    layer_idx=layer_idx,
+                    page_ids=page_table,
+                    start_position=glob_lo,
+                    key_states=key_states[batch_idx, :, loc_lo:loc_hi, :],
+                    value_states=value_states[batch_idx, :, loc_lo:loc_hi, :],
+                )
+                if full_block and first_touch and hit is None and glob_hi <= len(prompt):
+                    pool.register(layer_idx, tuple(prompt[glob_lo:glob_hi]), pid)
+
+            pos = glob_hi
+
+        self.layer_lengths[layer_idx][batch_idx] = required_length
+
+        reserved_required_length = max(required_length, self.reserved_seq_capacity)
+        required_blocks_reserved = (reserved_required_length + self.block_size - 1) // self.block_size
+        while len(page_table) < required_blocks_reserved:
+            page_table.append(
+                self.allocator.allocate(
+                    layer_idx,
+                    1,
+                    key_template=key_states,
+                    value_template=value_states,
+                )[0]
+            )
 
     def get_batch_size(self) -> int:
         if self.layer_lengths and self.layer_lengths[0]:
@@ -820,20 +1002,32 @@ class Qwen3DynamicCache:
             raise ValueError(
                 "TurboQuant decode attention expects query_states shaped [batch, query_heads, 1, head_dim]."
             )
-        outputs: list[torch.Tensor] = []
-        for batch_idx in range(int(query_states.shape[0])):
+        batch = int(query_states.shape[0])
+        if batch == 1:
+            row = self.turboquant_rows[layer_idx][0]
+            if row is None or row.length <= 0:
+                return query_states.new_zeros((1, int(query_states.shape[1]), 1, int(query_states.shape[3])))
+            return row.decode_attention(
+                query_states[0],
+                scaling=scaling,
+                num_key_value_groups=num_key_value_groups,
+            ).unsqueeze(0)
+        n_head = int(query_states.shape[1])
+        head_dim = int(query_states.shape[3])
+        out = query_states.new_empty((batch, n_head, 1, head_dim))
+        for batch_idx in range(batch):
             row = self.turboquant_rows[layer_idx][batch_idx]
             if row is None or row.length <= 0:
-                outputs.append(query_states.new_zeros((int(query_states.shape[1]), 1, int(query_states.shape[3]))))
+                out[batch_idx].zero_()
                 continue
-            outputs.append(
+            out[batch_idx].copy_(
                 row.decode_attention(
                     query_states[batch_idx],
                     scaling=scaling,
                     num_key_value_groups=num_key_value_groups,
                 )
             )
-        return torch.stack(outputs, dim=0)
+        return out
 
     @classmethod
     def stack(cls, caches: list["Qwen3DynamicCache"], config: Qwen3_5TextConfig) -> "Qwen3DynamicCache":
@@ -1025,19 +1219,24 @@ class Qwen3DynamicCache:
                     layer.value_pages[new_page_id].copy_(layer.value_pages[old_page_id])
                 cloned.page_tables[layer_idx][batch_idx] = list(new_page_ids)
 
+        cloned._prefill_input_ids = None
+        if self._prompt_token_ids is not None:
+            cloned._prompt_token_ids = list(self._prompt_token_ids)
         return cloned
 
     def release(self) -> None:
         if self._released:
             return
 
+        self._prefill_input_ids = None
+        self._prompt_token_ids = None
         for layer_idx in range(self.config.num_hidden_layers):
             if self.uses_turboquant_for_layer(layer_idx):
                 for batch_idx in range(len(self.turboquant_rows[layer_idx])):
                     self.turboquant_rows[layer_idx][batch_idx] = None
             else:
                 for page_ids in self.page_tables[layer_idx]:
-                    self.allocator.free(layer_idx, page_ids)
+                    self.allocator.release_pages(layer_idx, page_ids)
                     page_ids.clear()
             for batch_idx in range(len(self.layer_lengths[layer_idx])):
                 self.layer_lengths[layer_idx][batch_idx] = 0
