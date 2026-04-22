@@ -7,6 +7,14 @@ Current scope:
 - full native serve-CLI option parsing
 - model-path resolution and model-family inspection
 - artifact manifest scanning for local model directories
+- safetensors tensor-metadata parsing and typed tensor views
+- safetensors multi-shard index parsing and shard resolution
+- Qwen text-config parsing for hybrid linear/full attention stacks
+- native dense/AutoRound-int4 linear kernels
+- native Qwen full-attention decode, gated-delta linear-attention decode, MLP/MoE blocks
+- native token-engine state machine for decoder-only inference
+- native Qwen3.5 weight binding from real safetensors shards
+- token-level end-to-end runtime loading via `anna-native eval-token`
 - OpenAI response/error payload encoding
 - service metrics accounting and interval formatting
 - incremental text assembly and stop-string handling
@@ -21,7 +29,8 @@ Intentional non-goals of this first rewrite chunk:
 
 The remaining heavy migration work is the model runtime itself:
 
-- safetensors / GGUF tensor loading
 - tokenizer runtime
-- Qwen3.5 / Gemma4 / Qwen3-TTS kernels
+- GGUF tensor loading
+- text-generation orchestration on top of the native token runtime
+- Gemma4 / Qwen3-TTS kernels
 - XPU memory management and fused ops integration
