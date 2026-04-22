@@ -9,6 +9,8 @@ __pycache__/
 .pytest_cache/
 .coverage
 .coverage.*
+.zig-cache/
+zig-out/
 htmlcov/
 
 # Build and packaging artifacts
