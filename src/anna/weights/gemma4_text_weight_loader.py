@@ -9,6 +9,7 @@ from safetensors import safe_open
 
 from anna.model.gemma4_config import Gemma4Config
 from anna.model.gemma4_text_model import Gemma4ForConditionalGeneration
+from anna.weights.safetensors_device import safetensors_pt_device_str
 
 
 @dataclass(slots=True)
@@ -87,9 +88,10 @@ def load_gemma4_text_model_weights(
     tensor_targets.update({name: tensor for name, tensor in model.named_buffers()})
     loaded = 0
     skipped = 0
+    st_device = safetensors_pt_device_str(tensor_targets)
 
     for weight_file in _iter_weight_files(model_path):
-        with safe_open(str(weight_file), framework="pt", device="cpu") as handle:
+        with safe_open(str(weight_file), framework="pt", device=st_device) as handle:
             for key in handle.keys():
                 if key not in tensor_targets:
                     skipped += 1

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -148,25 +149,26 @@ class AutoRoundGPTQLinear(nn.Module):
         if padded_in_features < self.in_features:
             raise ValueError("AutoRound packed weight cannot shrink in_features during conversion.")
 
-        packed_weight_cpu = _unpack_int4_first_dim(self.qweight.to(device="cpu", dtype=torch.int32))[
+        dev = self.qweight.device
+        packed_weight = _unpack_int4_first_dim(self.qweight.to(dtype=torch.int32))[
             : self.in_features, : self.out_features
         ]
-        zeros_cpu = self._unpack_qzeros().to(device="cpu", dtype=torch.int32)
-        scales_cpu = self.scales.to(device="cpu", dtype=torch.float32)
+        zeros_u = self._unpack_qzeros().to(dtype=torch.int32)
+        scales_f = self.scales.to(dtype=torch.float32)
 
-        padded_weight = torch.empty((padded_in_features, self.out_features), dtype=torch.int32, device="cpu")
-        padded_weight[: self.in_features].copy_(packed_weight_cpu)
+        padded = torch.empty((padded_in_features, self.out_features), dtype=torch.int32, device=dev)
+        padded[: self.in_features].copy_(packed_weight)
         if padded_in_features > self.in_features:
-            tail_group_idx = min(zeros_cpu.shape[0] - 1, self.in_features // self.group_size)
-            fill_value = zeros_cpu[tail_group_idx].unsqueeze(0).expand(padded_in_features - self.in_features, -1)
-            padded_weight[self.in_features :].copy_(fill_value)
+            tail_group_idx = min(zeros_u.shape[0] - 1, self.in_features // self.group_size)
+            fill_value = zeros_u[tail_group_idx].unsqueeze(0).expand(padded_in_features - self.in_features, -1)
+            padded[self.in_features :].copy_(fill_value)
 
-        transposed = padded_weight.transpose(0, 1).contiguous()
+        transposed = padded.transpose(0, 1).contiguous()
         reshaped = transposed.reshape(self.out_features, padded_in_features // _INT4_VALUES_PER_PACK, _INT4_VALUES_PER_PACK)
-        shifts = (_int4_shifts(device="cpu").view(1, 1, _INT4_VALUES_PER_PACK))
+        shifts = _int4_shifts(device=dev).view(1, 1, _INT4_VALUES_PER_PACK)
         qweight = torch.bitwise_left_shift(reshaped & 0xF, shifts).sum(dim=-1, dtype=torch.int32).contiguous()
-        qzeros = zeros_cpu.to(dtype=torch.int8).contiguous()
-        return qweight, scales_cpu.contiguous(), qzeros
+        qzeros = zeros_u.to(dtype=torch.int8).contiguous()
+        return qweight, scales_f.contiguous(), qzeros
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = self._dequantize_weight().to(device=x.device, dtype=self.compute_dtype)
@@ -346,10 +348,11 @@ class XPUInt4Linear(nn.Module):
         group_size: int,
         padded_in_features: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        weight = weight.to(dtype=torch.float32, device="cpu")
+        dev = weight.device
+        weight = weight.to(dtype=torch.float32, device=dev)
         out_features, in_features = weight.shape
         if padded_in_features > in_features:
-            padded_weight = torch.zeros((out_features, padded_in_features), dtype=torch.float32)
+            padded_weight = torch.zeros((out_features, padded_in_features), dtype=torch.float32, device=dev)
             padded_weight[:, :in_features] = weight
             weight = padded_weight
 
@@ -359,11 +362,11 @@ class XPUInt4Linear(nn.Module):
         scale = torch.where(max_abs > 0, max_abs / 7.0, torch.ones_like(max_abs))
         q = torch.round(grouped / scale.unsqueeze(-1) + 8.0).clamp_(0.0, 15.0).to(torch.int32)
         q = q.reshape(out_features, padded_in_features)
-        qzeros = torch.full((group_count, out_features), 8, dtype=torch.int8)
+        qzeros = torch.full((group_count, out_features), 8, dtype=torch.int8, device=dev)
         qscale = scale.transpose(0, 1).contiguous().to(dtype=torch.float32)
 
         q_reshaped = q.reshape(out_features, padded_in_features // _INT4_VALUES_PER_PACK, _INT4_VALUES_PER_PACK)
-        shifts = (_int4_shifts(device="cpu").view(1, 1, _INT4_VALUES_PER_PACK))
+        shifts = _int4_shifts(device=dev).view(1, 1, _INT4_VALUES_PER_PACK)
         packed = torch.bitwise_left_shift(q_reshaped & 0xF, shifts).sum(dim=-1, dtype=torch.int32)
         return packed.contiguous(), qscale, qzeros
 
@@ -614,7 +617,8 @@ def convert_module_linears_to_xpu_int4(
     device: torch.device | str = torch.device("xpu"),
     include_predicate: Callable[[str, nn.Module], bool] | None = None,
 ) -> int:
-    replacements: list[tuple[str, XPUInt4Linear]] = []
+    count = 0
+    gc_every = 16
     for module_name, child in list(module.named_modules()):
         if not module_name:
             continue
@@ -625,21 +629,19 @@ def convert_module_linears_to_xpu_int4(
         if include_predicate is not None and not include_predicate(module_name, child):
             continue
         resolved_group_size = int(getattr(child, "group_size", group_size))
-        replacements.append(
-            (
-                module_name,
-                XPUInt4Linear.from_linear(
-                    child,
-                    group_size=resolved_group_size,
-                    compute_dtype=compute_dtype or getattr(child, "compute_dtype", torch.bfloat16),
-                    device=device,
-                ),
-            )
+        replacement = XPUInt4Linear.from_linear(
+            child,
+            group_size=resolved_group_size,
+            compute_dtype=compute_dtype or getattr(child, "compute_dtype", torch.bfloat16),
+            device=device,
         )
-
-    for module_name, replacement in replacements:
         _set_submodule(module, module_name, replacement)
-    return len(replacements)
+        count += 1
+        if gc_every > 0 and count % gc_every == 0:
+            gc.collect()
+
+    gc.collect()
+    return count
 
 
 def replace_linear_modules_with_xpu_int4_placeholders(

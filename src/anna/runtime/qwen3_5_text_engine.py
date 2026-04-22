@@ -20,6 +20,7 @@ from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.model.turboquant import turboquant_is_available
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
+from anna.runtime.memory_release import release_conversion_artifacts
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
 from anna.sampling.sampler import sample_next_token
@@ -507,6 +508,7 @@ class AnnaQwen3_5TextEngine:
                     device=device_context.device,
                     compute_dtype=device_context.dtype,
                 )
+                release_conversion_artifacts(device_context.device)
             total_quantized_replacements = model_quantized_replacements + runtime_weight_quantized_replacements
             report.quantized_replacements = total_quantized_replacements
             auto_resident_indices = resolved_resident_expert_layer_indices is None
@@ -622,6 +624,7 @@ class AnnaQwen3_5TextEngine:
                     )
             resolved_cached_experts_per_layer = cls._effective_cached_experts_per_layer(model)
             model.eval()
+            release_conversion_artifacts(device_context.device)
         except RuntimeError as exc:
             if device_context.should_recover(exc):
                 try:
@@ -642,7 +645,7 @@ class AnnaQwen3_5TextEngine:
             resolved_default_max_completion_tokens = max(1, int(resolved_default_max_completion_tokens))
 
         logger.info(
-            "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, default_enable_thinking=%s, reasoning_format=%s, offload=%s, offload_vision=%s, expert_quant=%s, weight_quant=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, full_attention_cache_mirror=%s, weights=%s); tensors loaded=%s skipped=%s quantized=%s",
+            "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, default_enable_thinking=%s, reasoning_format=%s, offload=%s, offload_vision=%s, expert_quant=%s, weight_quant=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, full_attention_cache_mirror=%s, weight_load_device=%s); tensors loaded=%s skipped=%s quantized=%s",
             resolved_model_id,
             device_context.device,
             device_context.dtype,

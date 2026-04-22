@@ -13,6 +13,7 @@ from anna.model.gemma4_text_model import Gemma4DynamicCache, Gemma4ForConditiona
 from anna.model.quantization import convert_module_linears_to_xpu_int4
 from anna.model.turboquant import turboquant_is_available
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
+from anna.runtime.memory_release import release_conversion_artifacts
 from anna.runtime.qwen3_5_text_engine import (
     _DEFAULT_REASONING_FORMAT,
     _format_bytes,
@@ -236,6 +237,7 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             kv_cache_residual_len=kv_cache_residual_len,
         )
         model.eval()
+        release_conversion_artifacts(device_context.device)
 
         tokenizer = Gemma4Tokenizer.from_model_dir(model_path)
         processor = Gemma4TextProcessor.from_model_dir(model_path, tokenizer=tokenizer)

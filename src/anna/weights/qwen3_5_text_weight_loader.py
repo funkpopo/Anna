@@ -13,6 +13,7 @@ from anna.core.gguf_model import has_gguf_model
 from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.quantization import replace_linear_modules, replace_linear_modules_with_xpu_int4_placeholders
+from anna.weights.safetensors_device import safetensors_pt_device_str
 
 logger = logging.getLogger(__name__)
 
@@ -123,12 +124,14 @@ def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, 
     total_shards = len(weight_files)
     total_bytes = sum(weight_file.stat().st_size for weight_file in weight_files)
     loaded_bytes = 0
+    st_device = safetensors_pt_device_str(tensor_targets)
 
     logger.info(
-        "Loading Qwen3.5 weights from %s shard(s), total=%s bytes, model_dir=%s",
+        "Loading Qwen3.5 weights from %s shard(s), total=%s bytes, model_dir=%s, safetensors_device=%s",
         total_shards,
         total_bytes,
         model_path,
+        st_device,
     )
 
     for shard_idx, weight_file in enumerate(weight_files, start=1):
@@ -140,7 +143,7 @@ def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, 
             weight_file.name,
             shard_size,
         )
-        with safe_open(str(weight_file), framework="pt", device="cpu") as handle:
+        with safe_open(str(weight_file), framework="pt", device=st_device) as handle:
             for key in handle.keys():
                 if key not in tensor_targets:
                     skipped += 1
