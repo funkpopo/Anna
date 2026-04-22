@@ -4,6 +4,7 @@ const types = @import("../runtime/types.zig");
 pub const ServeSettings = struct {
     model_dir: []const u8,
     model_id: ?[]const u8 = null,
+    backend: types.RuntimeBackend = .cpu,
     device: []const u8 = "auto",
     dtype: []const u8 = "auto",
     compile_mode: []const u8 = "none",
@@ -96,6 +97,8 @@ pub fn parseServeArgs(allocator: std.mem.Allocator, args: []const []const u8) Pa
             settings.model_dir = try nextValue(args, &index);
         } else if (std.mem.eql(u8, arg, "--model-name")) {
             settings.model_id = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, arg, "--backend")) {
+            settings.backend = try parseBackend(try nextValue(args, &index));
         } else if (std.mem.eql(u8, arg, "--device")) {
             settings.device = try nextValue(args, &index);
         } else if (std.mem.eql(u8, arg, "--dtype")) {
@@ -226,6 +229,12 @@ fn expectChoice(value: []const u8, choices: []const []const u8) ParseError!void 
     return error.InvalidChoice;
 }
 
+fn parseBackend(value: []const u8) ParseError!types.RuntimeBackend {
+    if (std.mem.eql(u8, value, "cpu")) return .cpu;
+    if (std.mem.eql(u8, value, "xpu")) return .xpu;
+    return error.InvalidChoice;
+}
+
 test "build safety policy uses custom serve overrides" {
     const settings: ServeSettings = .{
         .model_dir = "dummy",
@@ -249,6 +258,8 @@ test "serve parser accepts memory guard arguments" {
     const args = [_][]const u8{
         "--model-dir",
         "model",
+        "--backend",
+        "xpu",
         "--disable-thinking",
         "--max-completion-tokens",
         "1024",
@@ -276,6 +287,7 @@ test "serve parser accepts memory guard arguments" {
     };
 
     const parsed = try parseServeArgs(arena_state.allocator(), &args);
+    try std.testing.expectEqual(types.RuntimeBackend.xpu, parsed.backend);
     try std.testing.expect(parsed.default_enable_thinking == false);
     try std.testing.expectEqual(@as(?usize, 1024), parsed.default_max_completion_tokens);
     try std.testing.expectEqualStrings("deepseek", parsed.reasoning_format);
@@ -296,6 +308,7 @@ test "serve parser defaults to direct generation" {
     defer arena_state.deinit();
     const args = [_][]const u8{ "--model-dir", "model" };
     const parsed = try parseServeArgs(arena_state.allocator(), &args);
+    try std.testing.expectEqual(types.RuntimeBackend.cpu, parsed.backend);
     try std.testing.expectEqual(@as(usize, 1), parsed.scheduler_max_batch_size);
     try std.testing.expectEqual(@as(f64, 10.0), parsed.metrics_log_interval_seconds);
 }

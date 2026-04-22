@@ -3,6 +3,7 @@ const loader = @import("../model/qwen3_loader.zig");
 const model_engine = @import("../model/qwen3_engine.zig");
 const tokenizer_mod = @import("../tokenizer/qwen3_tokenizer.zig");
 const scheduler_mod = @import("scheduler.zig");
+const streaming = @import("streaming.zig");
 const sampler = @import("../sampling/sampler.zig");
 const types = @import("types.zig");
 
@@ -47,6 +48,13 @@ pub const NativeQwenTextService = struct {
     prng: std.Random.DefaultPrng,
     prefill_chunk_size: usize = 0,
     default_max_completion_tokens: usize = 256,
+
+    pub const RawTextDeltaCallback = *const fn (ctx: *anyopaque, delta: []const u8) anyerror!void;
+    pub const StreamSummary = struct {
+        finish_reason: []const u8,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    };
 
     pub fn load(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, model_id: []const u8) !NativeQwenTextService {
         return try loadWithOptions(allocator, io, model_dir, model_id, .{});
@@ -100,6 +108,18 @@ pub const NativeQwenTextService = struct {
         return try self.generatePromptTokensAlloc(prompt_tokens, config);
     }
 
+    pub fn generateTextStream(
+        self: *NativeQwenTextService,
+        prompt: []const u8,
+        config: types.GenerationConfig,
+        ctx: *anyopaque,
+        on_delta: RawTextDeltaCallback,
+    ) !StreamSummary {
+        const prompt_tokens = try self.tokenizer.encodeAlloc(self.allocator, prompt);
+        defer self.allocator.free(prompt_tokens);
+        return try self.generatePromptTokensStream(prompt_tokens, config, ctx, on_delta);
+    }
+
     pub fn generateChatAlloc(
         self: *NativeQwenTextService,
         messages: []const tokenizer_mod.ChatMessage,
@@ -131,6 +151,19 @@ pub const NativeQwenTextService = struct {
         };
     }
 
+    pub fn generateChatRawStream(
+        self: *NativeQwenTextService,
+        messages: []const tokenizer_mod.ChatMessage,
+        config: types.GenerationConfig,
+        enable_thinking: bool,
+        ctx: *anyopaque,
+        on_delta: RawTextDeltaCallback,
+    ) !StreamSummary {
+        const rendered = try self.tokenizer.renderMessagesAlloc(self.allocator, messages, true, enable_thinking);
+        defer self.allocator.free(rendered);
+        return try self.generateTextStream(rendered, config, ctx, on_delta);
+    }
+
     pub fn generatePromptTokensAlloc(self: *NativeQwenTextService, prompt_tokens: []const u32, config: types.GenerationConfig) !types.TextGenerationResult {
         var request_config = config;
         if (request_config.max_new_tokens == null) request_config.max_new_tokens = self.default_max_completion_tokens;
@@ -154,7 +187,101 @@ pub const NativeQwenTextService = struct {
         defer self.allocator.free(results);
         return results[0];
     }
+
+    pub fn generatePromptTokensStream(
+        self: *NativeQwenTextService,
+        prompt_tokens: []const u32,
+        config: types.GenerationConfig,
+        ctx: *anyopaque,
+        on_delta: RawTextDeltaCallback,
+    ) !StreamSummary {
+        var request_config = config;
+        if (request_config.max_new_tokens == null) request_config.max_new_tokens = self.default_max_completion_tokens;
+        if (prompt_tokens.len == 0) return error.EmptyPrompt;
+
+        var session = try Session.init(
+            self.allocator,
+            try self.runtime.spawnEngine(),
+            request_config,
+            prompt_tokens,
+        );
+        defer session.deinit(self.allocator);
+
+        var assembler = streaming.IncrementalTextAssembler.init(
+            self.allocator,
+            .{ .ctx = self, .decode_tokens = decodeTokens },
+            request_config.stop_strings,
+        );
+        defer assembler.deinit();
+
+        for (prompt_tokens) |token_id| {
+            if (session.last_logits) |previous| self.allocator.free(previous);
+            session.last_logits = try session.engine.forwardTokenAlloc(token_id);
+        }
+
+        const first_logits = session.last_logits orelse return error.EmptyPrompt;
+        var rng = self.prng.random();
+        session.pending_token = try sampler.sampleNextToken(
+            self.allocator,
+            first_logits,
+            session.repetition_history.items,
+            session.generation_config.temperature,
+            session.generation_config.top_p,
+            session.generation_config.top_k,
+            session.generation_config.repetition_penalty,
+            &rng,
+        );
+        try session.repetition_history.append(session.pending_token.?);
+
+        var completion_tokens: usize = 0;
+        var finish_reason: []const u8 = "stop";
+
+        while (session.pending_token) |token| {
+            if (self.runtime.isEosToken(token) or self.tokenizer.isEosToken(token)) break;
+
+            completion_tokens += 1;
+            const feed = try assembler.feedToken(token);
+            defer self.allocator.free(feed.delta);
+            if (feed.delta.len > 0) try on_delta(ctx, feed.delta);
+
+            if (feed.stopped) break;
+            if (limitReached(request_config.max_new_tokens, completion_tokens)) {
+                finish_reason = "length";
+                break;
+            }
+
+            if (session.last_logits) |previous| self.allocator.free(previous);
+            session.last_logits = try session.engine.forwardTokenAlloc(token);
+            const logits = session.last_logits.?;
+            var decode_rng = self.prng.random();
+            session.pending_token = try sampler.sampleNextToken(
+                self.allocator,
+                logits,
+                session.repetition_history.items,
+                session.generation_config.temperature,
+                session.generation_config.top_p,
+                session.generation_config.top_k,
+                session.generation_config.repetition_penalty,
+                &decode_rng,
+            );
+            try session.repetition_history.append(session.pending_token.?);
+        }
+
+        const flush = try assembler.flush();
+        defer self.allocator.free(flush.delta);
+        if (flush.delta.len > 0) try on_delta(ctx, flush.delta);
+
+        return .{
+            .finish_reason = finish_reason,
+            .prompt_tokens = prompt_tokens.len,
+            .completion_tokens = completion_tokens,
+        };
+    }
 };
+
+fn limitReached(limit: ?usize, current: usize) bool {
+    return if (limit) |value| current >= value else false;
+}
 
 fn prefillChunkBatch(
     ctx: *anyopaque,
@@ -340,4 +467,85 @@ test "native qwen text service generates from tiny tokenizer and runtime" {
     try std.testing.expectEqualStrings("A", result.text);
     try std.testing.expectEqual(@as(usize, 1), result.prompt_tokens);
     try std.testing.expectEqual(@as(usize, 1), result.completion_tokens);
+}
+
+test "native qwen text service streams token deltas from tiny runtime" {
+    const Harness = struct {
+        text: std.array_list.Managed(u8),
+
+        fn onDelta(ctx: *anyopaque, delta: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.text.appendSlice(delta);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "text_config": {
+        \\    "hidden_size": 2,
+        \\    "intermediate_size": 4,
+        \\    "num_hidden_layers": 0,
+        \\    "num_attention_heads": 1,
+        \\    "num_key_value_heads": 1,
+        \\    "head_dim": 2,
+        \\    "vocab_size": 3,
+        \\    "tie_word_embeddings": true,
+        \\    "eos_token_id": 2,
+        \\    "layer_types": []
+        \\  }
+        \\}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = config_json });
+
+    const tokenizer_json =
+        \\{
+        \\  "added_tokens": [{"id":2,"content":"<|endoftext|>","special":true}],
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"A":0, "B":1, "<|endoftext|>":2},
+        \\    "merges": []
+        \\  }
+        \\}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data = tokenizer_json });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer_config.json", .data = "{}" });
+
+    const header =
+        \\{"model.language_model.embed_tokens.weight":{"dtype":"F32","shape":[3,2],"data_offsets":[0,24]},"model.language_model.norm.weight":{"dtype":"F32","shape":[2],"data_offsets":[24,32]}}
+    ;
+    var bytes = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer bytes.deinit();
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, header.len, .little);
+    try bytes.appendSlice(&len_buf);
+    try bytes.appendSlice(header);
+    const values = [_]f32{
+        2.0, 0.0,
+        0.0, 1.0,
+        0.0, 0.0,
+        0.0, 0.0,
+    };
+    for (values) |value| {
+        var raw: [4]u8 = undefined;
+        std.mem.writeInt(u32, &raw, @bitCast(value), .little);
+        try bytes.appendSlice(&raw);
+    }
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = bytes.items });
+
+    const model_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(model_dir);
+    var service = try NativeQwenTextService.load(std.testing.allocator, std.testing.io, model_dir, "tiny");
+    defer service.deinit();
+
+    var harness = Harness{ .text = std.array_list.Managed(u8).init(std.testing.allocator) };
+    defer harness.text.deinit();
+
+    const summary = try service.generateTextStream("A", .{ .max_new_tokens = 1, .temperature = 0.0, .top_p = 1.0, .top_k = 0 }, &harness, Harness.onDelta);
+    try std.testing.expectEqualStrings("A", harness.text.items);
+    try std.testing.expectEqualStrings("length", summary.finish_reason);
+    try std.testing.expectEqual(@as(usize, 1), summary.prompt_tokens);
+    try std.testing.expectEqual(@as(usize, 1), summary.completion_tokens);
 }

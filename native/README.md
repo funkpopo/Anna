@@ -18,6 +18,8 @@ Current scope:
 - native Qwen ByteLevel-BPE tokenizer runtime with chat-template rendering
 - scheduler-backed text generation via `anna-native generate`
 - OpenAI-compatible chat/completion JSON payloads via `anna-native chat-json` and `anna-native completion-json`
+- OpenAI-compatible HTTP service via `anna-native serve`
+- OpenAI-compatible SSE streaming on `/v1/completions` and `/v1/chat/completions` with default `stream=true`
 - explicit `--backend xpu` path backed by Zig-loaded native SYCL kernels
 - device-side MLP chaining with buffer reuse and fused SiLU-gate multiply on the SYCL path
 - device-side Q/K RMSNorm + RoPE postprocessing on the SYCL full-attention path
@@ -42,6 +44,6 @@ SYCL XPU backend:
 The remaining heavy migration work is the model runtime itself:
 
 - GGUF tensor loading
-- HTTP serving loop and request JSON parsing
 - Gemma4 / Qwen3-TTS kernels
+- speech synthesis serving and richer OpenAI request-surface coverage
 - deeper XPU memory management and fused-kernel coverage beyond current projection/MLP/attention-postprocess kernels

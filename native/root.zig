@@ -13,6 +13,7 @@ pub const qwen_text_service = @import("runtime/qwen_text_service.zig");
 pub const scheduler = @import("runtime/scheduler.zig");
 pub const service_metrics = @import("runtime/service_metrics.zig");
 pub const streaming = @import("runtime/streaming.zig");
+pub const http_server = @import("runtime/http_server.zig");
 pub const safetensors = @import("weights/safetensors.zig");
 pub const tensor = @import("tensor/tensor.zig");
 pub const qwen3_tokenizer = @import("tokenizer/qwen3_tokenizer.zig");

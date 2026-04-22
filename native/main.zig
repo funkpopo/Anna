@@ -17,6 +17,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const command = args[1];
+    if (std.mem.eql(u8, command, "serve")) {
+        try runServe(arena, io, args[2..]);
+        return;
+    }
     if (std.mem.eql(u8, command, "inspect")) {
         try runInspect(arena, io, args[2..]);
         return;
@@ -45,6 +49,10 @@ pub fn main(init: std.process.Init) !void {
 
 fn printUsage(writer: anytype) !void {
     try writer.writeAll(
+        \\anna-native serve --model-dir <path> [serve options]
+        \\  Starts the native Zig HTTP service with OpenAI-compatible routes.
+        \\  Optional: --backend cpu|xpu
+        \\
         \\anna-native inspect --model-dir <path> [serve options]
         \\  Validates native serve settings, resolves model metadata, and prints the
         \\  route surface that the Zig control plane will expose.
@@ -69,6 +77,13 @@ fn printUsage(writer: anytype) !void {
     );
 }
 
+fn runServe(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []const u8) !void {
+    const settings = try anna.config.parseServeArgs(allocator, raw_args);
+    var server = try anna.http_server.AnnaHttpServer.init(std.heap.page_allocator, io, settings);
+    defer server.deinit();
+    try server.serve();
+}
+
 fn runInspect(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -87,6 +102,7 @@ fn runInspect(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []cons
     try writer.writeAll("Anna native inspect\n");
     try writer.print("Model dir: {s}\n", .{manifest.model_dir});
     try writer.print("Model id:  {s}\n", .{manifest.model_name});
+    try writer.print("Backend:   {s}\n", .{@tagName(settings.backend)});
     if (manifest.family) |family| {
         try writer.print("Family:    {s} ({s})\n", .{ @tagName(family.model_family), family.model_type });
     } else {
