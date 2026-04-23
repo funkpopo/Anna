@@ -271,6 +271,27 @@ def test_gqa_decode_fused_xpu_long_qwen35_shape_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gqa_decode_fused_xpu_with_gate_matches_sigmoid_fusion() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gqa_decode_fused"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(1)
+    device = "xpu"
+    query = torch.randn(2, 8, 1, 32, device=device, dtype=torch.bfloat16)
+    key = torch.randn(2, 2, 19, 32, device=device, dtype=torch.bfloat16)
+    value = torch.randn(2, 2, 19, 32, device=device, dtype=torch.bfloat16)
+    visible_lengths = torch.tensor([19, 13], device=device, dtype=torch.long)
+    gate = torch.randn(2, 1, 8 * 32, device=device, dtype=torch.bfloat16)
+
+    fused = torch.ops.anna.gqa_decode_fused(query, key, value, visible_lengths, 32**-0.5, gate)
+    base = torch.ops.anna.gqa_decode_fused(query, key, value, visible_lengths, 32**-0.5)
+    expected = base * torch.sigmoid(gate).view(2, 8, 1, 32)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(fused.float().cpu(), expected.float().cpu(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
 def test_paged_gqa_decode_fused_xpu_long_qwen35_shape_matches_reference() -> None:
     if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "paged_gqa_decode_fused"):
         pytest.skip("Anna fused-op library is not built")
@@ -305,6 +326,34 @@ def test_paged_gqa_decode_fused_xpu_long_qwen35_shape_matches_reference() -> Non
 
     torch.xpu.synchronize()
     assert torch.allclose(fused_output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_paged_gqa_decode_fused_xpu_with_gate_matches_sigmoid_fusion() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "paged_gqa_decode_fused"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(2)
+    device = "xpu"
+    head_dim = 128
+    key_len = 512
+    block_size = 32
+    query = torch.randn(1, 8, 1, head_dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(1, 2, key_len, head_dim, device=device, dtype=torch.bfloat16)
+    value = torch.randn(1, 2, key_len, head_dim, device=device, dtype=torch.bfloat16)
+    key_pages, value_pages, page_table = _pack_paged_kv(key, value, block_size=block_size)
+    visible_lengths = torch.tensor([key_len], device=device, dtype=torch.long)
+    gate = torch.randn(1, 1, 8 * head_dim, device=device, dtype=torch.bfloat16)
+    scale = head_dim**-0.5
+
+    fused = torch.ops.anna.paged_gqa_decode_fused(
+        query, key_pages, value_pages, page_table, visible_lengths, scale, gate
+    )
+    base = torch.ops.anna.paged_gqa_decode_fused(query, key_pages, value_pages, page_table, visible_lengths, scale)
+    expected = base * torch.sigmoid(gate).view(1, 8, 1, head_dim)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(fused.float().cpu(), expected.float().cpu(), atol=3e-2, rtol=3e-2)
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
@@ -621,6 +670,7 @@ def test_qwen3_attention_xpu_single_token_decode_uses_paged_kv_path(monkeypatch:
         *,
         scaling: float,
         visible_lengths: torch.Tensor,
+        gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         calls.append(
             (
@@ -637,6 +687,7 @@ def test_qwen3_attention_xpu_single_token_decode_uses_paged_kv_path(monkeypatch:
             page_table,
             scaling=scaling,
             visible_lengths=visible_lengths,
+            gate=gate,
         )
 
     monkeypatch.setattr(model_ops, "paged_kv_single_token_decode_attention", _stub_paged_decode)

@@ -259,6 +259,7 @@ def run_gqa_decode_fused(
     value: torch.Tensor,
     visible_lengths: torch.Tensor,
     scaling: float,
+    gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     op = _gqa_decode_op()
     if op is None:
@@ -269,7 +270,9 @@ def run_gqa_decode_fused(
             "Anna gqa_decode_fused op is not registered. Build/load the custom op first, "
             "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
         )
-    return op(query, key, value, visible_lengths, float(scaling))
+    if gate is None:
+        return op(query, key, value, visible_lengths, float(scaling))
+    return op(query, key, value, visible_lengths, float(scaling), gate)
 
 
 def run_paged_gqa_decode_fused(
@@ -280,6 +283,7 @@ def run_paged_gqa_decode_fused(
     page_table: torch.Tensor,
     visible_lengths: torch.Tensor,
     scaling: float,
+    gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     op = _paged_gqa_decode_op()
     if op is None:
@@ -290,7 +294,9 @@ def run_paged_gqa_decode_fused(
             "Anna paged_gqa_decode_fused op is not registered. Build/load the custom op first, "
             "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
         )
-    return op(query, key_pages, value_pages, page_table, visible_lengths, float(scaling))
+    if gate is None:
+        return op(query, key_pages, value_pages, page_table, visible_lengths, float(scaling))
+    return op(query, key_pages, value_pages, page_table, visible_lengths, float(scaling), gate)
 
 
 def run_moe_router_fused(

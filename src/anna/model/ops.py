@@ -8,6 +8,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -29,9 +30,9 @@ from anna.model.fused_ops import (
     run_qk_norm_rotary_fused,
     run_rmsnorm_gated_fused,
     run_rmsnorm_fused,
-    paged_gqa_decode_fused_is_available,
 )
 from anna.model.quantization import AWQLinear, AutoRoundGPTQLinear, XPUInt4Linear, convert_module_linears_to_xpu_int4
+from anna.model.xpu_decode_profile import xpu_profile_region
 
 logger = logging.getLogger(__name__)
 
@@ -897,7 +898,8 @@ class Qwen3DynamicCache:
             return None
 
         required_blocks = max((len(page_ids) for page_ids in self.page_tables[layer_idx]), default=0)
-        if required_blocks <= 0 or int(visible_lengths.max().item()) <= 0:
+        layer_seq_max = max(self.layer_lengths[layer_idx], default=0)
+        if required_blocks <= 0 or layer_seq_max <= 0:
             return None
 
         page_table = self._sync_page_table_layer_buffer(
@@ -916,7 +918,7 @@ class Qwen3DynamicCache:
                 empty_lengths = torch.zeros(0, dtype=torch.long)
                 return None, None, empty_lengths
             visible_lengths = torch.tensor(self.layer_lengths[layer_idx], dtype=torch.long)
-            max_length = int(visible_lengths.max().item()) if visible_lengths.numel() > 0 else 0
+            max_length = max(self.layer_lengths[layer_idx], default=0)
             if max_length <= 0:
                 return None, None, visible_lengths
             materialized_keys: list[torch.Tensor] = []
@@ -956,7 +958,7 @@ class Qwen3DynamicCache:
         value_buffer = self.visible_value_caches[layer_idx]
         visible_lengths_device = None if key_buffer is None else key_buffer.device
         visible_lengths = torch.tensor(self.layer_lengths[layer_idx], dtype=torch.long, device=visible_lengths_device)
-        max_length = int(visible_lengths.max().item()) if visible_lengths.numel() > 0 else 0
+        max_length = max(self.layer_lengths[layer_idx], default=0)
         if max_length <= 0:
             return None, None, visible_lengths
 
@@ -1440,6 +1442,7 @@ def materialized_kv_single_token_decode_attention(
     scaling: float,
     num_key_value_groups: int,
     visible_lengths: torch.Tensor,
+    gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if query_states.device.type == "xpu":
         if query_states.shape[2] != 1:
@@ -1455,6 +1458,7 @@ def materialized_kv_single_token_decode_attention(
             value=value_states,
             visible_lengths=visible_lengths,
             scaling=scaling,
+            gate=gate,
         )
 
     key_positions = torch.arange(key_states.shape[-2], device=query_states.device)[None, :]
@@ -1479,6 +1483,7 @@ def paged_kv_single_token_decode_attention(
     *,
     scaling: float,
     visible_lengths: torch.Tensor,
+    gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return run_paged_gqa_decode_fused(
         query=query_states,
@@ -1487,6 +1492,7 @@ def paged_kv_single_token_decode_attention(
         page_table=page_table,
         visible_lengths=visible_lengths,
         scaling=scaling,
+        gate=gate,
     )
 
 
@@ -1663,6 +1669,7 @@ class Qwen3Attention(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
+        self.profile_runtime = False
         self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim ** -0.5
@@ -1695,6 +1702,29 @@ class Qwen3Attention(nn.Module):
         past_key_values: Qwen3DynamicCache | None = None,
     ) -> torch.Tensor:
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+        if self.profile_runtime:
+            with xpu_profile_region("attention"):
+                return self._forward_attention(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                )
+        return self._forward_attention(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+        )
+
+    def _forward_attention(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Qwen3DynamicCache | None = None,
+    ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -1734,7 +1764,6 @@ class Qwen3Attention(nn.Module):
             and attention_mask is None
             and past_key_values is not None
             and not use_turboquant_cache
-            and paged_gqa_decode_fused_is_available()
         )
         if past_key_values is not None:
             require_dense_cache = not prefer_paged_decode
@@ -1775,6 +1804,7 @@ class Qwen3Attention(nn.Module):
                 paged_state = past_key_values.paged_attention_state(self.layer_idx)
                 if paged_state is not None:
                     key_pages, value_pages, page_table, _ = paged_state
+                    gate_fused = gate.contiguous()
                     attn_output = paged_kv_single_token_decode_attention(
                         query_states,
                         key_pages,
@@ -1782,9 +1812,9 @@ class Qwen3Attention(nn.Module):
                         page_table,
                         scaling=self.scaling,
                         visible_lengths=visible_lengths,
+                        gate=gate_fused,
                     )
                     attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
-                    attn_output = attn_output * torch.sigmoid(gate)
                     return self.o_proj(attn_output)
             if attention_mask is None and past_key_values is not None and seq_len == 1 and hidden_states.device.type == "xpu":
                 if key_states is None or value_states is None:
@@ -1792,6 +1822,7 @@ class Qwen3Attention(nn.Module):
                     if key_states is None or value_states is None:
                         raise RuntimeError("Failed to materialize KV cache for Qwen single-token decode.")
                 visible_lengths = past_lengths + seq_len
+                gate_fused = gate.contiguous()
                 attn_output = materialized_kv_single_token_decode_attention(
                     query_states,
                     key_states,
@@ -1799,9 +1830,9 @@ class Qwen3Attention(nn.Module):
                     scaling=self.scaling,
                     num_key_value_groups=self.num_key_value_groups,
                     visible_lengths=visible_lengths,
+                    gate=gate_fused,
                 )
                 attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
-                attn_output = attn_output * torch.sigmoid(gate)
                 return self.o_proj(attn_output)
             # Multi-token decode and masked full-attention stay on the explicit grouped path.
             if not (batch_size == 1 and seq_len == 1 and attention_mask is None and past_key_values is not None):
@@ -2268,57 +2299,69 @@ class Qwen3GatedDeltaNet(nn.Module):
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
         batch_size, seq_len, _ = hidden_states.shape
         use_precomputed_states = self._use_precomputed_states(cache_params, seq_len)
-        mixed_qkv, z, b, a = self._project_inputs(hidden_states)
+        mixed_qkv, z_proj, b, a = self._project_inputs(hidden_states)
         mixed_qkv, conv_state, conv_weight, conv_bias = self._prepare_conv_inputs(mixed_qkv, cache_params, batch_size)
 
-        if use_precomputed_states:
+        if self.profile_runtime:
+            with xpu_profile_region("conv"):
+                if use_precomputed_states:
+                    mixed_qkv, conv_state = self._run_conv_decode(mixed_qkv, conv_state, conv_weight, conv_bias)
+                else:
+                    mixed_qkv, conv_state = self._run_conv_prefill(mixed_qkv, conv_state, conv_weight, conv_bias)
+        elif use_precomputed_states:
             mixed_qkv, conv_state = self._run_conv_decode(mixed_qkv, conv_state, conv_weight, conv_bias)
         else:
             mixed_qkv, conv_state = self._run_conv_prefill(mixed_qkv, conv_state, conv_weight, conv_bias)
         self._validate_conv_outputs(mixed_qkv, conv_state, batch_size, seq_len, hidden_states.dtype, hidden_states.device)
 
-        query, key, value = self._split_qkv(mixed_qkv, batch_size, seq_len)
-        query, key, value, z, beta, g = self._prepare_recurrent_inputs(query, key, value, z, b, a)
-        self._validate_recurrent_inputs(
-            query,
-            key,
-            value,
-            z,
-            beta,
-            g,
-            batch_size,
-            seq_len,
-            hidden_states.dtype,
-            hidden_states.device,
-        )
-
-        recurrent_state = None
-        if cache_params is not None and cache_params.recurrent_states[self.layer_idx] is not None:
-            recurrent_state = self._get_recurrent_state(cache_params, batch_size, query.device)
-        if use_precomputed_states:
-            if recurrent_state is None:
-                recurrent_state = self._get_recurrent_state(cache_params, batch_size, query.device)
-            core_attn_out, recurrent_state = self._run_recurrent_decode(query, key, value, g, beta, recurrent_state)
-        else:
-            core_attn_out, recurrent_state = self._run_chunk_prefill(
+        def _gated_delta_body() -> torch.Tensor:
+            query, key, value = self._split_qkv(mixed_qkv, batch_size, seq_len)
+            query, key, value, z, beta, g = self._prepare_recurrent_inputs(query, key, value, z_proj, b, a)
+            self._validate_recurrent_inputs(
                 query,
                 key,
                 value,
-                g,
+                z,
                 beta,
-                recurrent_state,
+                g,
+                batch_size,
+                seq_len,
+                hidden_states.dtype,
+                hidden_states.device,
             )
-        self._validate_recurrent_outputs(
-            core_attn_out,
-            recurrent_state,
-            batch_size,
-            seq_len,
-            hidden_states.dtype,
-            hidden_states.device,
-        )
 
-        self._write_cache(cache_params, conv_state, recurrent_state)
-        return self._finalize_output(core_attn_out, z, batch_size, seq_len)
+            recurrent_state = None
+            if cache_params is not None and cache_params.recurrent_states[self.layer_idx] is not None:
+                recurrent_state = self._get_recurrent_state(cache_params, batch_size, query.device)
+            if use_precomputed_states:
+                if recurrent_state is None:
+                    recurrent_state = self._get_recurrent_state(cache_params, batch_size, query.device)
+                core_attn_out, recurrent_state = self._run_recurrent_decode(query, key, value, g, beta, recurrent_state)
+            else:
+                core_attn_out, recurrent_state = self._run_chunk_prefill(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    recurrent_state,
+                )
+            self._validate_recurrent_outputs(
+                core_attn_out,
+                recurrent_state,
+                batch_size,
+                seq_len,
+                hidden_states.dtype,
+                hidden_states.device,
+            )
+
+            self._write_cache(cache_params, conv_state, recurrent_state)
+            return self._finalize_output(core_attn_out, z, batch_size, seq_len)
+
+        if self.profile_runtime:
+            with xpu_profile_region("gated_delta"):
+                return _gated_delta_body()
+        return _gated_delta_body()
 
 
 class Qwen3MLP(nn.Module):
@@ -3129,17 +3172,15 @@ class Qwen3SparseMoeBlock(nn.Module):
     def _execute_expert(
         self,
         *,
-        expert_idx: int,
         expert_layer: Qwen3MLP,
-        expert_offsets: torch.Tensor,
+        start_idx: int,
+        end_idx: int,
         compact_hidden_states: torch.Tensor,
         compact_routing_weights: torch.Tensor,
         compact_outputs: torch.Tensor,
         execution_device: torch.device,
         hidden_dtype: torch.dtype,
     ) -> None:
-        start_idx = int(expert_offsets[expert_idx].item())
-        end_idx = int(expert_offsets[expert_idx + 1].item())
         if end_idx <= start_idx:
             return
 
@@ -3160,7 +3201,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         *,
         wave_indices: list[int],
         wave_slots: list[int],
-        expert_offsets_host: torch.Tensor,
+        offsets_np: np.ndarray,
         expert_offsets_device: torch.Tensor,
         compact_hidden_states: torch.Tensor,
         compact_routing_weights: torch.Tensor,
@@ -3174,15 +3215,15 @@ class Qwen3SparseMoeBlock(nn.Module):
 
         max_routes_per_expert = 0
         for expert_idx, slot in zip(wave_indices, wave_slots, strict=True):
-            if expert_idx < 0 or expert_idx + 1 >= expert_offsets_host.numel():
+            if expert_idx < 0 or expert_idx + 1 >= int(expert_offsets_device.numel()):
                 raise RuntimeError(f"Grouped int4 expert GEMM received an out-of-range expert index: {expert_idx}")
             mapped_slot = bank.expert_to_slot.get(int(expert_idx))
             if mapped_slot != int(slot):
                 raise RuntimeError(
                     f"Grouped int4 expert GEMM slot mapping mismatch for expert {expert_idx}: expected {mapped_slot}, got {slot}."
                 )
-            start_idx = int(expert_offsets_host[expert_idx].item())
-            end_idx = int(expert_offsets_host[expert_idx + 1].item())
+            start_idx = int(offsets_np[expert_idx])
+            end_idx = int(offsets_np[expert_idx + 1])
             max_routes_per_expert = max(max_routes_per_expert, end_idx - start_idx)
         if max_routes_per_expert <= 0:
             raise RuntimeError("Grouped int4 expert GEMM received an empty expert wave.")
@@ -3214,6 +3255,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         *,
         hit_experts: list[int],
         expert_offsets: torch.Tensor,
+        expert_offsets_host: torch.Tensor,
         compact_hidden_states: torch.Tensor,
         compact_routing_weights: torch.Tensor,
         compact_outputs: torch.Tensor,
@@ -3229,7 +3271,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         if wave_capacity <= 0:
             return
 
-        expert_offsets_host = expert_offsets.to(device="cpu") if expert_offsets.device.type == "xpu" else expert_offsets
+        offsets_np = expert_offsets_host.detach().numpy()
         for wave_start in range(0, len(hit_experts), wave_capacity):
             wave_indices = hit_experts[wave_start : wave_start + wave_capacity]
             if self._should_use_xpu_int4():
@@ -3237,7 +3279,7 @@ class Qwen3SparseMoeBlock(nn.Module):
                 self._execute_grouped_int4_experts(
                     wave_indices=wave_indices,
                     wave_slots=wave_slots,
-                    expert_offsets_host=expert_offsets_host,
+                    offsets_np=offsets_np,
                     expert_offsets_device=expert_offsets,
                     compact_hidden_states=compact_hidden_states,
                     compact_routing_weights=compact_routing_weights,
@@ -3253,10 +3295,12 @@ class Qwen3SparseMoeBlock(nn.Module):
                     f"missing={missing} cache_capacity={self.cached_experts_per_layer}"
                 )
             for expert_idx in wave_indices:
+                start_idx = int(offsets_np[expert_idx])
+                end_idx = int(offsets_np[expert_idx + 1])
                 self._execute_expert(
-                    expert_idx=expert_idx,
                     expert_layer=prepared[expert_idx],
-                    expert_offsets=expert_offsets_host,
+                    start_idx=start_idx,
+                    end_idx=end_idx,
                     compact_hidden_states=compact_hidden_states,
                     compact_routing_weights=compact_routing_weights,
                     compact_outputs=compact_outputs,
@@ -3270,61 +3314,71 @@ class Qwen3SparseMoeBlock(nn.Module):
         hidden_states = hidden_states.reshape(-1, hidden_dim)
         router_logits = self.gate(hidden_states)
 
-        routing_weights, selected_experts, usage = self._route_tokens(router_logits, hidden_dtype=hidden_states.dtype)
+        def _moe_body() -> tuple[torch.Tensor, torch.Tensor]:
+            routing_weights, selected_experts, usage = self._route_tokens(router_logits, hidden_dtype=hidden_states.dtype)
 
-        num_tokens = batch_size * sequence_length
-        usage = usage.to(device=selected_experts.device)
-        hit_experts = usage.nonzero(as_tuple=False).flatten()
-        hit_expert_list = [int(expert_idx) for expert_idx in hit_experts.tolist()]
+            num_tokens = batch_size * sequence_length
+            usage = usage.to(device=selected_experts.device)
+            hit_experts = usage.nonzero(as_tuple=False).flatten()
+            hit_expert_list = [int(expert_idx) for expert_idx in hit_experts.tolist()]
 
-        sorted_token_idx, expert_offsets, compact_hidden_states, compact_routing_weights = self._dispatch_routing_inputs(
-            hidden_states,
-            routing_weights,
-            selected_experts,
-            usage,
-        )
-        compact_outputs = hidden_states.new_empty((compact_hidden_states.shape[0], hidden_dim))
-        if self.offload_experts and hit_expert_list:
-            self._execute_offloaded_experts(
-                hit_experts=hit_expert_list,
-                expert_offsets=expert_offsets,
-                compact_hidden_states=compact_hidden_states,
-                compact_routing_weights=compact_routing_weights,
-                compact_outputs=compact_outputs,
-                execution_device=execution_device,
-                hidden_dtype=hidden_states.dtype,
-                )
-        else:
+            sorted_token_idx, expert_offsets, compact_hidden_states, compact_routing_weights = self._dispatch_routing_inputs(
+                hidden_states,
+                routing_weights,
+                selected_experts,
+                usage,
+            )
+            compact_outputs = hidden_states.new_empty((compact_hidden_states.shape[0], hidden_dim))
             expert_offsets_host = expert_offsets.to(device="cpu") if expert_offsets.device.type == "xpu" else expert_offsets
-            for expert_idx in hit_expert_list:
-                self._execute_expert(
-                    expert_idx=expert_idx,
-                    expert_layer=self.experts[expert_idx],
-                    expert_offsets=expert_offsets_host,
+            if self.offload_experts and hit_expert_list:
+                self._execute_offloaded_experts(
+                    hit_experts=hit_expert_list,
+                    expert_offsets=expert_offsets,
+                    expert_offsets_host=expert_offsets_host,
                     compact_hidden_states=compact_hidden_states,
                     compact_routing_weights=compact_routing_weights,
                     compact_outputs=compact_outputs,
                     execution_device=execution_device,
                     hidden_dtype=hidden_states.dtype,
                 )
+            else:
+                offsets_np = expert_offsets_host.detach().numpy()
+                for expert_idx in hit_expert_list:
+                    start_idx = int(offsets_np[expert_idx])
+                    end_idx = int(offsets_np[expert_idx + 1])
+                    self._execute_expert(
+                        expert_layer=self.experts[expert_idx],
+                        start_idx=start_idx,
+                        end_idx=end_idx,
+                        compact_hidden_states=compact_hidden_states,
+                        compact_routing_weights=compact_routing_weights,
+                        compact_outputs=compact_outputs,
+                        execution_device=execution_device,
+                        hidden_dtype=hidden_states.dtype,
+                    )
 
-        final_hidden_states = self._scatter_compact_outputs(
-            compact_outputs,
-            sorted_token_idx,
-            num_tokens=num_tokens,
-            hidden_dim=hidden_dim,
-        )
+            final_hidden_states = self._scatter_compact_outputs(
+                compact_outputs,
+                sorted_token_idx,
+                num_tokens=num_tokens,
+                hidden_dim=hidden_dim,
+            )
 
-        shared_expert_device = _module_device(self.shared_expert)
-        shared_gate_device = _module_device(self.shared_expert_gate)
-        shared_input = hidden_states if hidden_states.device == shared_expert_device else hidden_states.to(device=shared_expert_device)
-        gate_input = hidden_states if hidden_states.device == shared_gate_device else hidden_states.to(device=shared_gate_device)
-        shared_expert_output = self.shared_expert(shared_input)
-        shared_expert_output = torch.sigmoid(self.shared_expert_gate(gate_input).to(device=shared_expert_output.device)) * shared_expert_output
-        if shared_expert_output.device != execution_device:
-            shared_expert_output = shared_expert_output.to(device=execution_device, dtype=hidden_states.dtype)
-        final_hidden_states = final_hidden_states + shared_expert_output
-        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim), router_logits
+            shared_expert_device = _module_device(self.shared_expert)
+            shared_gate_device = _module_device(self.shared_expert_gate)
+            shared_input = hidden_states if hidden_states.device == shared_expert_device else hidden_states.to(device=shared_expert_device)
+            gate_input = hidden_states if hidden_states.device == shared_gate_device else hidden_states.to(device=shared_gate_device)
+            shared_expert_output = self.shared_expert(shared_input)
+            shared_expert_output = torch.sigmoid(self.shared_expert_gate(gate_input).to(device=shared_expert_output.device)) * shared_expert_output
+            if shared_expert_output.device != execution_device:
+                shared_expert_output = shared_expert_output.to(device=execution_device, dtype=hidden_states.dtype)
+            final_hidden_states = final_hidden_states + shared_expert_output
+            return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim), router_logits
+
+        if self.profile_runtime:
+            with xpu_profile_region("moe"):
+                return _moe_body()
+        return _moe_body()
 
 
 class Qwen3DecoderLayer(nn.Module):
