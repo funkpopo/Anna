@@ -98,7 +98,8 @@ bool is_power_of_two(int64_t value) {
 }
 
 int64_t gated_delta_local_memory_bytes_required(int64_t key_head_dim, int64_t local_size) {
-  return static_cast<int64_t>(sizeof(float)) * ((2 * local_size) + (2 * key_head_dim));
+  (void)local_size;
+  return static_cast<int64_t>(sizeof(float)) * (2 * key_head_dim);
 }
 
 void validate_gated_delta_local_memory_requirements(
@@ -147,7 +148,7 @@ inline float load_grouped_int4_weight(
   return (static_cast<float>(qvalue - zero_point)) * qscale_ptr[scale_offset];
 }
 
-template <typename scalar_t, typename PartialAccessor, typename VectorAccessor>
+template <typename scalar_t, typename VectorAccessor>
 inline void normalize_gated_delta_qk(
     const scalar_t* query_ptr,
     const scalar_t* key_ptr,
@@ -158,17 +159,9 @@ inline void normalize_gated_delta_qk(
     float l2_eps_f,
     float query_scale_base,
     sycl::nd_item<2> item,
-    PartialAccessor& partial_sum,
-    PartialAccessor& partial_sum_aux,
     VectorAccessor& normalized_query,
     VectorAccessor& normalized_key) {
   const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
-  auto sg = item.get_sub_group();
-  const int64_t subgroup_lane = static_cast<int64_t>(sg.get_local_linear_id());
-  const int64_t subgroup_idx = static_cast<int64_t>(sg.get_group_linear_id());
-  const int64_t subgroup_size = static_cast<int64_t>(sg.get_local_linear_range());
-  const int64_t raw_subgroup_count = (local_size + subgroup_size - 1) / subgroup_size;
-  const int64_t subgroup_count = raw_subgroup_count < local_size ? raw_subgroup_count : local_size;
 
   float local_query_sum_sq = 0.0f;
   float local_key_sum_sq = 0.0f;
@@ -181,28 +174,13 @@ inline void normalize_gated_delta_qk(
     local_key_sum_sq += raw_key * raw_key;
   }
 
-  const float subgroup_query_sum_sq = sycl::reduce_over_group(sg, local_query_sum_sq, sycl::plus<float>());
-  const float subgroup_key_sum_sq = sycl::reduce_over_group(sg, local_key_sum_sq, sycl::plus<float>());
-  if (subgroup_lane == 0 && subgroup_idx < local_size) {
-    partial_sum[subgroup_idx] = subgroup_query_sum_sq;
-    partial_sum_aux[subgroup_idx] = subgroup_key_sum_sq;
-  }
-  item.barrier(sycl::access::fence_space::local_space);
+  const float total_query_sum_sq =
+      sycl::reduce_over_group(item.get_group(), local_query_sum_sq, sycl::plus<float>());
+  const float total_key_sum_sq =
+      sycl::reduce_over_group(item.get_group(), local_key_sum_sq, sycl::plus<float>());
 
-  partial_sum[lane] = lane < subgroup_count ? partial_sum[lane] : 0.0f;
-  partial_sum_aux[lane] = lane < subgroup_count ? partial_sum_aux[lane] : 0.0f;
-  item.barrier(sycl::access::fence_space::local_space);
-
-  for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
-    if (lane < stride) {
-      partial_sum[lane] += partial_sum[lane + stride];
-      partial_sum_aux[lane] += partial_sum_aux[lane + stride];
-    }
-    item.barrier(sycl::access::fence_space::local_space);
-  }
-
-  const float query_scale = sycl::rsqrt(partial_sum[0] + l2_eps_f) * query_scale_base;
-  const float key_scale = sycl::rsqrt(partial_sum_aux[0] + l2_eps_f);
+  const float query_scale = sycl::rsqrt(total_query_sum_sq + l2_eps_f) * query_scale_base;
+  const float key_scale = sycl::rsqrt(total_key_sum_sq + l2_eps_f);
   for (int64_t k_idx = lane; k_idx < key_head_dim; k_idx += local_size) {
     normalized_query[k_idx] *= query_scale;
     normalized_key[k_idx] *= key_scale;
@@ -619,6 +597,19 @@ void validate_gqa_decode_xpu_inputs(
   TORCH_CHECK(visible_lengths.device() == device, "visible_lengths must be on the same device as query");
 }
 
+void validate_gqa_query_cache_local_memory(const sycl::device& device, int64_t head_dim) {
+  const auto local_mem_size = static_cast<int64_t>(device.get_info<sycl::info::device::local_mem_size>());
+  const int64_t slm_bytes = static_cast<int64_t>(sizeof(float)) * head_dim;
+  TORCH_CHECK(
+      slm_bytes <= local_mem_size,
+      "GQA decode caches query in local memory (",
+      slm_bytes,
+      " bytes for head_dim=",
+      head_dim,
+      ") but device local_mem_size is ",
+      local_mem_size);
+}
+
 void validate_gqa_decode_optional_gate(const at::Tensor& query, const c10::optional<at::Tensor>& gate_opt) {
   if (!gate_opt.has_value() || !gate_opt->defined()) {
     return;
@@ -742,7 +733,6 @@ void launch_causal_conv1d_prefill_kernel(
     int64_t sequence_length,
     int64_t kernel_size) {
   const int64_t total_outputs = batch_size * channels * sequence_length;
-  const int64_t total_states = batch_size * channels;
 
   queue.submit([&](sycl::handler& cgh) {
     cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_outputs)), [=](sycl::item<1> item) {
@@ -763,19 +753,12 @@ void launch_causal_conv1d_prefill_kernel(
             : load_as_float(hidden_ptr, hidden_base + (source_index - kernel_size));
         acc += input_value * load_as_float(weight_ptr, weight_base + k);
       }
-
       const float silu = acc / (1.0f + sycl::exp(-acc));
       output_ptr[hidden_base + t] = static_cast<scalar_t>(silu);
-    });
-  });
 
-  queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_states)), [=](sycl::item<1> item) {
-      const int64_t batch_channel = static_cast<int64_t>(item.get_id(0));
-      const int64_t b = batch_channel / channels;
-      const int64_t c = batch_channel % channels;
-      const int64_t hidden_base = (b * channels + c) * sequence_length;
-      const int64_t state_base = (b * channels + c) * kernel_size;
+      if (t != sequence_length - 1) {
+        return;
+      }
 
       if (sequence_length >= kernel_size) {
         for (int64_t k = 0; k < kernel_size; ++k) {
@@ -783,7 +766,6 @@ void launch_causal_conv1d_prefill_kernel(
         }
         return;
       }
-
       const int64_t retained = kernel_size - sequence_length;
       for (int64_t k = 0; k < retained; ++k) {
         state_write_ptr[state_base + k] = state_read_ptr[state_base + sequence_length + k];
@@ -1018,7 +1000,6 @@ at::Tensor rmsnorm_fused_xpu_impl(
         scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
 
         stream.queue().submit([&](sycl::handler& cgh) {
-          sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
           cgh.parallel_for(
               sycl::nd_range<2>(
                   sycl::range<2>(static_cast<size_t>(row_count), static_cast<size_t>(local_size)),
@@ -1034,17 +1015,9 @@ at::Tensor rmsnorm_fused_xpu_impl(
                   local_sum_sq += value * value;
                 }
 
-                partial_sum[lane] = local_sum_sq;
-                item.barrier(sycl::access::fence_space::local_space);
-
-                for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
-                  if (lane < stride) {
-                    partial_sum[lane] += partial_sum[lane + stride];
-                  }
-                  item.barrier(sycl::access::fence_space::local_space);
-                }
-
-                const float inv_rms = sycl::rsqrt(partial_sum[0] / static_cast<float>(hidden_size) + eps_f);
+                const float sum_sq =
+                    sycl::reduce_over_group(item.get_group(), local_sum_sq, sycl::plus<float>());
+                const float inv_rms = sycl::rsqrt(sum_sq / static_cast<float>(hidden_size) + eps_f);
                 for (int64_t idx = lane; idx < hidden_size; idx += local_size) {
                   const float value = load_as_float(input_ptr, row_base + idx);
                   const float weight_value = AddUnitOffset ? (1.0f + weight_ptr[idx]) : weight_ptr[idx];
@@ -1090,7 +1063,6 @@ at::Tensor rmsnorm_gated_fused_xpu(
         scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
 
         stream.queue().submit([&](sycl::handler& cgh) {
-          sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
           cgh.parallel_for(
               sycl::nd_range<2>(
                   sycl::range<2>(static_cast<size_t>(row_count), static_cast<size_t>(local_size)),
@@ -1106,17 +1078,9 @@ at::Tensor rmsnorm_gated_fused_xpu(
                   local_sum_sq += value * value;
                 }
 
-                partial_sum[lane] = local_sum_sq;
-                item.barrier(sycl::access::fence_space::local_space);
-
-                for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
-                  if (lane < stride) {
-                    partial_sum[lane] += partial_sum[lane + stride];
-                  }
-                  item.barrier(sycl::access::fence_space::local_space);
-                }
-
-                const float inv_rms = sycl::rsqrt(partial_sum[0] / static_cast<float>(hidden_size) + eps_f);
+                const float sum_sq =
+                    sycl::reduce_over_group(item.get_group(), local_sum_sq, sycl::plus<float>());
+                const float inv_rms = sycl::rsqrt(sum_sq / static_cast<float>(hidden_size) + eps_f);
                 for (int64_t idx = lane; idx < hidden_size; idx += local_size) {
                   const int64_t offset = row_base + idx;
                   const float value = load_as_float(input_ptr, offset);
@@ -1238,7 +1202,6 @@ std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_xpu_impl(
             static_cast<size_t>(batch_size) * static_cast<size_t>(total_num_heads) * static_cast<size_t>(sequence_length);
 
         stream.queue().submit([&](sycl::handler& cgh) {
-          sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
           sycl::local_accessor<float, 1> normalized_values(sycl::range<1>(static_cast<size_t>(head_dim)), cgh);
           cgh.parallel_for(
               sycl::nd_range<2>(
@@ -1268,17 +1231,9 @@ std::tuple<at::Tensor, at::Tensor> qk_norm_rotary_fused_xpu_impl(
                   local_sum_sq += value * value;
                 }
 
-                partial_sum[lane] = local_sum_sq;
-                item.barrier(sycl::access::fence_space::local_space);
-
-                for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
-                  if (lane < stride) {
-                    partial_sum[lane] += partial_sum[lane + stride];
-                  }
-                  item.barrier(sycl::access::fence_space::local_space);
-                }
-
-                const float inv_rms = sycl::rsqrt(partial_sum[0] / static_cast<float>(head_dim) + norm_eps_f);
+                const float sum_sq =
+                    sycl::reduce_over_group(item.get_group(), local_sum_sq, sycl::plus<float>());
+                const float inv_rms = sycl::rsqrt(sum_sq / static_cast<float>(head_dim) + norm_eps_f);
                 for (int64_t idx = lane; idx < head_dim; idx += local_size) {
                   const float value = load_as_float(input_ptr, row_base + idx);
                   const float weight_value = AddUnitOffset ? (1.0f + weight_ptr[idx]) : weight_ptr[idx];
@@ -1402,8 +1357,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_router_fused_xpu(
         const bool normalize_topk_prob_value = normalize_topk_prob;
 
         stream.queue().submit([&](sycl::handler& cgh) {
-          sycl::local_accessor<float, 1> partial_max(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
-          sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
           sycl::local_accessor<float, 1> probabilities(sycl::range<1>(static_cast<size_t>(num_experts)), cgh);
           sycl::local_accessor<float, 1> top_values(sycl::range<1>(static_cast<size_t>(top_k)), cgh);
           sycl::local_accessor<int64_t, 1> top_indices(sycl::range<1>(static_cast<size_t>(top_k)), cgh);
@@ -1422,34 +1375,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_router_fused_xpu(
                   const float value = load_as_float(logits_ptr, row_base + expert_idx);
                   local_max = sycl::fmax(local_max, value);
                 }
-                partial_max[lane] = local_max;
-                item.barrier(sycl::access::fence_space::local_space);
-
-                for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
-                  if (lane < stride) {
-                    partial_max[lane] = sycl::fmax(partial_max[lane], partial_max[lane + stride]);
-                  }
-                  item.barrier(sycl::access::fence_space::local_space);
-                }
-
-                const float max_value = partial_max[0];
+                const float max_value =
+                    sycl::reduce_over_group(item.get_group(), local_max, sycl::maximum<float>());
                 float local_sum = 0.0f;
                 for (int64_t expert_idx = lane; expert_idx < num_experts; expert_idx += local_size) {
                   const float exp_value = sycl::exp(load_as_float(logits_ptr, row_base + expert_idx) - max_value);
                   probabilities[expert_idx] = exp_value;
                   local_sum += exp_value;
                 }
-                partial_sum[lane] = local_sum;
-                item.barrier(sycl::access::fence_space::local_space);
-
-                for (int64_t stride = local_size / 2; stride > 0; stride >>= 1) {
-                  if (lane < stride) {
-                    partial_sum[lane] += partial_sum[lane + stride];
-                  }
-                  item.barrier(sycl::access::fence_space::local_space);
-                }
-
-                const float inv_sum = 1.0f / partial_sum[0];
+                const float total_sum =
+                    sycl::reduce_over_group(item.get_group(), local_sum, sycl::plus<float>());
+                const float inv_sum = 1.0f / total_sum;
                 for (int64_t expert_idx = lane; expert_idx < num_experts; expert_idx += local_size) {
                   probabilities[expert_idx] *= inv_sum;
                 }
@@ -1851,8 +1787,6 @@ at::Tensor moe_grouped_int4_mlp_fused_xpu(
         float* activation_ptr = activation.mutable_data_ptr<float>();
 
         stream.queue().submit([&](sycl::handler& cgh) {
-          sycl::local_accessor<float, 1> partial_gate(sycl::range<1>(static_cast<size_t>(gate_local_size)), cgh);
-          sycl::local_accessor<float, 1> partial_up(sycl::range<1>(static_cast<size_t>(gate_local_size)), cgh);
           cgh.parallel_for(
               sycl::nd_range<2>(
                   sycl::range<2>(active_range, gate_group_range * static_cast<size_t>(gate_local_size)),
@@ -1904,20 +1838,13 @@ at::Tensor moe_grouped_int4_mlp_fused_xpu(
                           group_size);
                 }
 
-                partial_gate[lane] = gate_acc;
-                partial_up[lane] = up_acc;
-                item.barrier(sycl::access::fence_space::local_space);
-                for (int64_t stride = gate_local_size / 2; stride > 0; stride >>= 1) {
-                  if (lane < stride) {
-                    partial_gate[lane] += partial_gate[lane + stride];
-                    partial_up[lane] += partial_up[lane + stride];
-                  }
-                  item.barrier(sycl::access::fence_space::local_space);
-                }
+                const float gate_total =
+                    sycl::reduce_over_group(item.get_group(), gate_acc, sycl::plus<float>());
+                const float up_total =
+                    sycl::reduce_over_group(item.get_group(), up_acc, sycl::plus<float>());
                 if (lane == 0) {
-                  const float gate_value = partial_gate[0];
-                  const float silu_gate = gate_value / (1.0f + sycl::exp(-gate_value));
-                  activation_ptr[route_idx * intermediate_dim + intermediate_idx] = silu_gate * partial_up[0];
+                  const float silu_gate = gate_total / (1.0f + sycl::exp(-gate_total));
+                  activation_ptr[route_idx * intermediate_dim + intermediate_idx] = silu_gate * up_total;
                 }
               });
         });
@@ -1940,7 +1867,6 @@ at::Tensor moe_grouped_int4_mlp_fused_xpu(
         scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
 
         stream.queue().submit([&](sycl::handler& cgh) {
-          sycl::local_accessor<float, 1> partial_down(sycl::range<1>(static_cast<size_t>(down_local_size)), cgh);
           cgh.parallel_for(
               sycl::nd_range<2>(
                   sycl::range<2>(active_range, down_group_range * static_cast<size_t>(down_local_size)),
@@ -1978,18 +1904,12 @@ at::Tensor moe_grouped_int4_mlp_fused_xpu(
                           group_size);
                 }
 
-                partial_down[lane] = down_acc;
-                item.barrier(sycl::access::fence_space::local_space);
-                for (int64_t stride = down_local_size / 2; stride > 0; stride >>= 1) {
-                  if (lane < stride) {
-                    partial_down[lane] += partial_down[lane + stride];
-                  }
-                  item.barrier(sycl::access::fence_space::local_space);
-                }
+                const float down_total =
+                    sycl::reduce_over_group(item.get_group(), down_acc, sycl::plus<float>());
                 if (lane == 0) {
                   const float route_weight = load_as_float(routing_ptr, route_idx);
                   output_ptr[route_idx * hidden_dim + hidden_idx] =
-                      static_cast<scalar_t>(partial_down[0] * route_weight);
+                      static_cast<scalar_t>(down_total * route_weight);
                 }
               });
         });
@@ -2049,9 +1969,10 @@ at::Tensor gqa_decode_fused_xpu(
       "gqa_decode_fused_xpu head_dim is too large for the current accumulator configuration");
   const float scaling_f = static_cast<float>(scaling);
   auto stream = c10::xpu::getCurrentXPUStream(query.device().index());
+  validate_gqa_query_cache_local_memory(stream.queue().get_device(), head_dim);
 
-  // Dot-product reduction: one reduce_over_group over the 1×local_size work-group per (batch, head)
-  // replaces local memory + log2(local_size) barriers per key position (online softmax loop).
+  // Query is loaded once into SLM per (batch, head); K/V stay in global. Dot uses reduce_over_group
+  // on the 1×local_size work-group per key step (online softmax).
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::kHalf,
       at::kBFloat16,
@@ -2068,6 +1989,7 @@ at::Tensor gqa_decode_fused_xpu(
         const size_t group_count = static_cast<size_t>(batch_size * num_heads);
 
         stream.queue().submit([&](sycl::handler& cgh) {
+          sycl::local_accessor<float, 1> query_slm(sycl::range<1>(static_cast<size_t>(head_dim)), cgh);
           cgh.parallel_for(
               sycl::nd_range<2>(
                   sycl::range<2>(group_count, static_cast<size_t>(local_size)),
@@ -2082,6 +2004,11 @@ at::Tensor gqa_decode_fused_xpu(
                 const int64_t key_base = ((batch_idx * num_kv_heads + kv_head_idx) * key_len) * head_dim;
                 const int64_t output_base = query_base;
 
+                for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size) {
+                  query_slm[dim_idx] = load_as_float(query_ptr, query_base + dim_idx);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
                 int64_t visible_len = visible_lengths_ptr[batch_idx];
                 visible_len = sycl::max<int64_t>(0, sycl::min<int64_t>(visible_len, key_len));
                 float running_max = -std::numeric_limits<float>::infinity();
@@ -2095,7 +2022,7 @@ at::Tensor gqa_decode_fused_xpu(
                   float local_dot = 0.0f;
                   for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size) {
                     local_dot +=
-                        load_as_float(query_ptr, query_base + dim_idx) *
+                        query_slm[dim_idx] *
                         load_as_float(key_ptr, key_base + key_idx * head_dim + dim_idx);
                   }
                   const float dot_sum =
@@ -2188,8 +2115,9 @@ at::Tensor paged_gqa_decode_fused_xpu(
       "paged_gqa_decode_fused_xpu head_dim is too large for the current accumulator configuration");
   const float scaling_f = static_cast<float>(scaling);
   auto stream = c10::xpu::getCurrentXPUStream(query.device().index());
+  validate_gqa_query_cache_local_memory(stream.queue().get_device(), head_dim);
 
-  // Same reduction strategy as gqa_decode_fused_xpu (see comment there).
+  // Same as gqa_decode_fused_xpu: query in SLM, K/V paged in global, reduce_over_group per key step.
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::kHalf,
       at::kBFloat16,
@@ -2207,6 +2135,7 @@ at::Tensor paged_gqa_decode_fused_xpu(
         const size_t group_count = static_cast<size_t>(batch_size * num_heads);
 
         stream.queue().submit([&](sycl::handler& cgh) {
+          sycl::local_accessor<float, 1> query_slm(sycl::range<1>(static_cast<size_t>(head_dim)), cgh);
           cgh.parallel_for(
               sycl::nd_range<2>(
                   sycl::range<2>(group_count, static_cast<size_t>(local_size)),
@@ -2219,6 +2148,11 @@ at::Tensor paged_gqa_decode_fused_xpu(
                 const int64_t kv_head_idx = head_idx / groups_per_kv_head;
                 const int64_t query_base = ((batch_idx * num_heads + head_idx) * head_dim);
                 const int64_t output_base = query_base;
+
+                for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size) {
+                  query_slm[dim_idx] = load_as_float(query_ptr, query_base + dim_idx);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
 
                 int64_t visible_len = visible_lengths_ptr[batch_idx];
                 visible_len = sycl::max<int64_t>(0, sycl::min<int64_t>(visible_len, max_visible_len));
@@ -2243,7 +2177,7 @@ at::Tensor paged_gqa_decode_fused_xpu(
                   float local_dot = 0.0f;
                   for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size) {
                     local_dot +=
-                        load_as_float(query_ptr, query_base + dim_idx) *
+                        query_slm[dim_idx] *
                         load_as_float(key_pages_ptr, page_base + dim_idx);
                   }
                   const float dot_sum =
@@ -2333,8 +2267,6 @@ void launch_gated_delta_prefill_kernel(
     float query_scale_base) {
   const size_t group_count = static_cast<size_t>(batch_size * num_heads);
   queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
-    sycl::local_accessor<float, 1> partial_sum_aux(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
     sycl::local_accessor<float, 1> normalized_query(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
     sycl::local_accessor<float, 1> normalized_key(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
     cgh.parallel_for(
@@ -2366,8 +2298,6 @@ void launch_gated_delta_prefill_kernel(
                 l2_eps_f,
                 query_scale_base,
                 item,
-                partial_sum,
-                partial_sum_aux,
                 normalized_query,
                 normalized_key);
 
@@ -2427,8 +2357,6 @@ void launch_gated_delta_decode_kernel(
     float query_scale_base) {
   const size_t group_count = static_cast<size_t>(batch_size * num_heads);
   queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> partial_sum(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
-    sycl::local_accessor<float, 1> partial_sum_aux(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
     sycl::local_accessor<float, 1> normalized_query(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
     sycl::local_accessor<float, 1> normalized_key(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
     cgh.parallel_for(
@@ -2456,8 +2384,6 @@ void launch_gated_delta_decode_kernel(
               l2_eps_f,
               query_scale_base,
               item,
-              partial_sum,
-              partial_sum_aux,
               normalized_query,
               normalized_key);
 
@@ -2492,7 +2418,6 @@ void launch_gated_delta_decode_kernel(
             const int64_t out_index = ((b * num_heads) + h) * value_head_dim + v_idx;
             gated_delta_store_output(output_ptr, out_index, out_value);
           }
-          item.barrier(sycl::access::fence_space::local_space);
         });
   });
 }

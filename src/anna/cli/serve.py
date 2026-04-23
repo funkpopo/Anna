@@ -280,9 +280,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--scheduler-max-batch-size",
         type=_positive_int,
         default=1,
-        help="Enable continuous batching only when set above 1. Defaults to 1, which serves requests directly.",
+        help="Enable continuous batching when > 1: decode steps run batched, amortizing XPU "
+        "fused kernel launches. Defaults to 1 (per-request, lower latency, more launches).",
     )
-    parser.add_argument("--scheduler-batch-wait-ms", type=float, default=2.0)
+    parser.add_argument(
+        "--scheduler-batch-wait-ms",
+        type=float,
+        default=2.0,
+        help="When max batch > 1, how long to wait to fill a batch (ms). Higher values increase "
+        "coalescing at the cost of tail latency. Ignored if max batch is 1.",
+    )
     parser.add_argument(
         "--metrics-log-interval-seconds",
         type=_non_negative_float,

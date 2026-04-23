@@ -628,17 +628,47 @@ class TurboQuantKVRow:
         values_to_quantize = residual_values[:, :overflow, :]
         assert self.device is not None
         assert self.value_group_size is not None
+        prior_quant_len = self.quantized_length
         quantized_keys = _quantize_turboquant_keys(keys_to_quantize, bits=self.bits, device=self.device)
         quantized_values = quantize_turboquant_values(
             values_to_quantize,
             bits=self.bits,
             group_size=self.value_group_size,
         )
+        new_decode_keys = dequantize_turboquant_keys(
+            quantized_keys,
+            bits=self.bits,
+            device=self.device,
+            dtype=self.dtype,
+        ).contiguous()
+        new_decode_values = dequantize_turboquant_values(
+            quantized_values,
+            device=self.device,
+            dtype=self.dtype,
+        ).contiguous()
         self._quantized_keys = _concat_key_states(self._quantized_keys, quantized_keys)
         self._quantized_values = _concat_value_states(self._quantized_values, quantized_values)
         self._residual_keys = residual_keys[:, overflow:, :].contiguous()
         self._residual_values = residual_values[:, overflow:, :].contiguous()
-        self._invalidate_decode_cache()
+
+        # Incrementally extend decode tensors instead of invalidating the full prefix. A full
+        # re-dequant on every append was O(total_quantized_tokens) per layer per decode step.
+        if self._decode_quantized_keys is None:
+            if prior_quant_len == 0:
+                self._decode_quantized_keys = new_decode_keys
+                self._decode_quantized_values = new_decode_values
+                self._decode_quantized_length = self.quantized_length
+            else:
+                self._invalidate_decode_cache()
+        elif self._decode_quantized_length != prior_quant_len:
+            self._invalidate_decode_cache()
+        else:
+            self._decode_quantized_keys = torch.cat((self._decode_quantized_keys, new_decode_keys), dim=1).contiguous()
+            self._decode_quantized_values = torch.cat(
+                (self._decode_quantized_values, new_decode_values),
+                dim=1,
+            ).contiguous()
+            self._decode_quantized_length = self.quantized_length
 
     def materialize(
         self,
@@ -701,8 +731,15 @@ class TurboQuantKVRow:
                 f"TurboQuantKVRow decode head_dim mismatch: expected {self.head_dim}, got {int(query.shape[-1])}"
             )
 
+        # FP16/BF16 matmul on XPU/GPU is typically much faster than promoting everything to FP32; keep softmax in
+        # FP32 for stability on long contexts.
+        compute_dtype = (
+            query.dtype
+            if query.dtype in (torch.float16, torch.bfloat16)
+            else torch.float32
+        )
         grouped_shape = (self.num_heads, num_key_value_groups, int(query.shape[1]), self.head_dim)
-        grouped_query = query.float().reshape(grouped_shape)
+        grouped_query = query.to(dtype=compute_dtype).reshape(grouped_shape)
         score_parts: list[torch.Tensor] = []
         quantized_len = self.quantized_length
         residual_len = self.residual_length
@@ -714,13 +751,13 @@ class TurboQuantKVRow:
             if quantized_keys is not None:
                 quantized_scores = torch.matmul(
                     grouped_query,
-                    quantized_keys.float().unsqueeze(1).transpose(-1, -2),
+                    quantized_keys.to(dtype=compute_dtype).unsqueeze(1).transpose(-1, -2),
                 ) * scaling
                 score_parts.append(quantized_scores)
         if self._residual_keys is not None and self._residual_values is not None and residual_len > 0:
             residual_scores = torch.matmul(
                 grouped_query,
-                self._residual_keys.float().unsqueeze(1).transpose(-1, -2),
+                self._residual_keys.to(dtype=compute_dtype).unsqueeze(1).transpose(-1, -2),
             ) * scaling
             score_parts.append(residual_scores)
 
@@ -728,21 +765,21 @@ class TurboQuantKVRow:
             return query.new_zeros((int(query.shape[0]), 1, self.head_dim))
 
         attn_scores = torch.cat(score_parts, dim=-1)
-        attn_probs = torch.softmax(attn_scores.float(), dim=-1)
-        attn_output = query.new_zeros(grouped_shape)
+        attn_probs = torch.softmax(attn_scores.to(torch.float32), dim=-1).to(dtype=compute_dtype)
+        attn_output = torch.zeros(grouped_shape, device=query.device, dtype=compute_dtype)
         offset = 0
         if quantized_values is not None and quantized_len > 0:
             attn_output = attn_output + torch.matmul(
                 attn_probs[..., offset : offset + quantized_len],
-                quantized_values.float().unsqueeze(1),
-            ).to(dtype=query.dtype)
+                quantized_values.to(dtype=compute_dtype).unsqueeze(1),
+            )
             offset += quantized_len
         if self._residual_values is not None and residual_len > 0:
             attn_output = attn_output + torch.matmul(
                 attn_probs[..., offset : offset + residual_len],
-                self._residual_values.float().unsqueeze(1),
-            ).to(dtype=query.dtype)
-        return attn_output.reshape(int(query.shape[0]), 1, self.head_dim)
+                self._residual_values.to(dtype=compute_dtype).unsqueeze(1),
+            )
+        return attn_output.reshape(int(query.shape[0]), 1, self.head_dim).to(dtype=query.dtype)
 
     def clone(self) -> "TurboQuantKVRow":
         cloned = TurboQuantKVRow(
