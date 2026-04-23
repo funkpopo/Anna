@@ -84,7 +84,12 @@ def _qwen3_paged_full_attention_decode_enabled(*, device_type: str, kv_cache_qua
     use_paged_full_attention_decode = False
     if device_type == "xpu" and not turboquant_kv_enabled:
         maybe_load_gated_delta_library()
-        use_paged_full_attention_decode = paged_gqa_decode_fused_is_available()
+        if not paged_gqa_decode_fused_is_available():
+            raise RuntimeError(
+                "Anna Qwen3.5 on Intel XPU requires the native fused-op library with paged_gqa_decode_fused. "
+                "Build anna_gated_delta_fused (see tools/build_gated_delta_fused_op.py) or set ANNA_GATED_DELTA_OP_LIB."
+            )
+        use_paged_full_attention_decode = True
     maintain_full_attention_mirror = not use_paged_full_attention_decode and not turboquant_kv_enabled
     return use_paged_full_attention_decode, maintain_full_attention_mirror
 
@@ -344,6 +349,9 @@ class AnnaQwen3_5TextEngine:
                 linear_attn = getattr(layer, "linear_attn", None)
                 if linear_attn is not None:
                     linear_attn.profile_runtime = self.optimization_config.profile_runtime
+                self_attn = getattr(layer, "self_attn", None)
+                if self_attn is not None and hasattr(self_attn, "profile_runtime"):
+                    self_attn.profile_runtime = self.optimization_config.profile_runtime
                 mlp = getattr(layer, "mlp", None)
                 if isinstance(mlp, Qwen3SparseMoeBlock):
                     mlp.profile_runtime = self.optimization_config.profile_runtime
@@ -1576,20 +1584,25 @@ class AnnaQwen3_5TextEngine:
                 logits_to_keep=logits_to_keep,
             )
 
+        from anna.model.xpu_decode_profile import decode_profile_session
+
         self.device_context.synchronize()
         memory_before = self.device_context.get_memory_info()
         stats_before = self._profile_memory_stats_snapshot(self.device_context.get_memory_stats())
         started_at = time.perf_counter()
-        outputs = self._forward_generation_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            model_kwargs=model_kwargs,
-            use_cache=use_cache,
-            logits_to_keep=logits_to_keep,
-        )
-        self.device_context.synchronize()
+        with decode_profile_session() as decode_prof:
+            outputs = self._forward_generation_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                model_kwargs=model_kwargs,
+                use_cache=use_cache,
+                logits_to_keep=logits_to_keep,
+            )
+            self.device_context.synchronize()
+            decode_prof.log_summary(log=logger)
         elapsed_seconds = time.perf_counter() - started_at
+        self.device_context.synchronize()
         memory_after = self.device_context.get_memory_info()
         stats_after = self._profile_memory_stats_snapshot(self.device_context.get_memory_stats())
         self._log_profiled_forward(
