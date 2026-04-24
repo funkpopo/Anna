@@ -85,6 +85,21 @@ def test_serve_parser_defaults_to_direct_generation() -> None:
     assert args.metrics_log_interval_seconds == 10.0
 
 
+def test_serve_parser_accepts_kv_cache_quant_bits_two() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--model-dir",
+            "model",
+            "--kv-cache-quantization",
+            "turboquant",
+            "--kv-cache-quant-bits",
+            "2",
+        ]
+    )
+    assert args.kv_cache_quant_bits == 2
+
+
 class _FakeEngine:
     def __init__(self) -> None:
         self.scheduler = "sentinel"

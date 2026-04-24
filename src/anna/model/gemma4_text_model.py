@@ -16,7 +16,7 @@ from anna.model.ops import (
     grouped_query_attention,
     rotate_half,
 )
-from anna.model.turboquant import TurboQuantTensorRow
+from anna.model.turboquant import VALID_KV_CACHE_QUANT_BITS, TurboQuantTensorRow
 
 
 @dataclass(slots=True)
@@ -213,8 +213,11 @@ class Gemma4DynamicCache:
         if self.kv_cache_quantization not in {"none", "turboquant"}:
             raise ValueError(f"Unsupported Gemma4 KV-cache quantization mode: {kv_cache_quantization}")
         self.kv_cache_quant_bits = int(kv_cache_quant_bits)
-        if self.kv_cache_quant_bits not in {3, 4}:
-            raise ValueError(f"Unsupported Gemma4 TurboQuant bit-width: {kv_cache_quant_bits}")
+        if self.kv_cache_quant_bits not in VALID_KV_CACHE_QUANT_BITS:
+            raise ValueError(
+                f"Unsupported Gemma4 TurboQuant bit-width: {kv_cache_quant_bits}. "
+                f"Expected one of {sorted(VALID_KV_CACHE_QUANT_BITS)}."
+            )
         self.kv_cache_residual_len = max(1, int(kv_cache_residual_len))
         self.request_lengths: list[int] = [0 for _ in range(batch_size)]
         self.key_rows: list[list[Gemma4CacheRow | None]] = [

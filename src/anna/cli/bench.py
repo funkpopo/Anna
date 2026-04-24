@@ -78,9 +78,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--kv-cache-quant-bits",
         type=int,
-        choices=(3, 4),
+        choices=(2, 3, 4),
         default=4,
-        help="TurboQuant KV-cache bit-width for compatible runtimes.",
+        help="TurboQuant KV-cache bit-width for compatible runtimes (2, 3, or 4).",
     )
     parser.add_argument(
         "--kv-cache-residual-len",

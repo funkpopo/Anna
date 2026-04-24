@@ -15,7 +15,7 @@ from torch import nn
 
 from anna.model.prefix_block_cache import PrefixBlockPool
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
-from anna.model.turboquant import TurboQuantKVRow
+from anna.model.turboquant import VALID_KV_CACHE_QUANT_BITS, TurboQuantKVRow
 from anna.model.fused_ops import (
     run_causal_conv1d_decode_fused,
     run_causal_conv1d_prefill_fused,
@@ -342,8 +342,11 @@ class Qwen3DynamicCache:
         if self.kv_cache_quantization not in {"none", "turboquant"}:
             raise ValueError(f"Unsupported Qwen3 KV-cache quantization mode: {kv_cache_quantization}")
         self.kv_cache_quant_bits = int(kv_cache_quant_bits)
-        if self.kv_cache_quant_bits not in {3, 4}:
-            raise ValueError(f"Unsupported Qwen3 TurboQuant bit-width: {kv_cache_quant_bits}")
+        if self.kv_cache_quant_bits not in VALID_KV_CACHE_QUANT_BITS:
+            raise ValueError(
+                f"Unsupported Qwen3 TurboQuant bit-width: {kv_cache_quant_bits}. "
+                f"Expected one of {sorted(VALID_KV_CACHE_QUANT_BITS)}."
+            )
         self.kv_cache_residual_len = max(1, int(kv_cache_residual_len))
         self._turboquant_layer_index_set = {
             layer_idx

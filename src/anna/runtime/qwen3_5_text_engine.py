@@ -18,7 +18,8 @@ from anna.model.fused_ops import maybe_load_gated_delta_library, paged_gqa_decod
 from anna.model.quantization import AutoRoundGPTQLinear, convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
-from anna.model.turboquant import turboquant_is_available
+from anna.model.turboquant import VALID_KV_CACHE_QUANT_BITS, turboquant_is_available
+from anna.model.xpu_decode_profile import record_steady_decode_step_if_applicable, steady_decode_accumulation
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.memory_release import release_conversion_artifacts
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
@@ -264,8 +265,11 @@ class AnnaQwen3_5TextEngine:
         if config is None:
             return EngineOptimizationConfig()
         kv_cache_quant_bits = int(config.kv_cache_quant_bits)
-        if kv_cache_quant_bits not in {3, 4}:
-            raise ValueError(f"Unsupported TurboQuant KV-cache bit-width: {config.kv_cache_quant_bits}. Expected 3 or 4.")
+        if kv_cache_quant_bits not in VALID_KV_CACHE_QUANT_BITS:
+            raise ValueError(
+                f"Unsupported TurboQuant KV-cache bit-width: {config.kv_cache_quant_bits}. "
+                f"Expected one of {sorted(VALID_KV_CACHE_QUANT_BITS)}."
+            )
         return EngineOptimizationConfig(
             compile_mode=normalize_compile_mode(config.compile_mode),
             compile_fullgraph=bool(config.compile_fullgraph),
@@ -1600,7 +1604,8 @@ class AnnaQwen3_5TextEngine:
                 logits_to_keep=logits_to_keep,
             )
             self.device_context.synchronize()
-            decode_prof.log_summary(log=logger)
+            ms = decode_prof.log_summary(log=logger)
+        record_steady_decode_step_if_applicable(stage, ms)
         elapsed_seconds = time.perf_counter() - started_at
         self.device_context.synchronize()
         memory_after = self.device_context.get_memory_info()
@@ -2316,89 +2321,90 @@ class AnnaQwen3_5TextEngine:
         past_key_values = None
 
         try:
-            try:
-                prefill = self._prefill_generation_prompt(prepared)
-            except RuntimeError as exc:
-                raise self._handle_runtime_failure(exc) from exc
-            past_key_values = prefill.past_key_values
-            current_logits = prefill.logits
+            with steady_decode_accumulation(enabled=self.optimization_config.profile_runtime, log=logger):
+                try:
+                    prefill = self._prefill_generation_prompt(prepared)
+                except RuntimeError as exc:
+                    raise self._handle_runtime_failure(exc) from exc
+                past_key_values = prefill.past_key_values
+                current_logits = prefill.logits
 
-            for step_idx in range(config.max_new_tokens):
-                if step_idx > 0:
-                    try:
-                        with self.execution_lock:
-                            outputs = self._profiled_forward_generation_model(
-                                stage=f"decode[{step_idx}]",
-                                input_ids=input_ids,
-                                attention_mask=None,
-                                past_key_values=past_key_values,
-                                use_cache=True,
-                                logits_to_keep=1,
-                            )
-                        current_logits = outputs.logits[0, -1]
-                        past_key_values = outputs.past_key_values
-                    except RuntimeError as exc:
-                        raise self._handle_runtime_failure(exc) from exc
+                for step_idx in range(config.max_new_tokens):
+                    if step_idx > 0:
+                        try:
+                            with self.execution_lock:
+                                outputs = self._profiled_forward_generation_model(
+                                    stage=f"decode[{step_idx}]",
+                                    input_ids=input_ids,
+                                    attention_mask=None,
+                                    past_key_values=past_key_values,
+                                    use_cache=True,
+                                    logits_to_keep=1,
+                                )
+                            current_logits = outputs.logits[0, -1]
+                            past_key_values = outputs.past_key_values
+                        except RuntimeError as exc:
+                            raise self._handle_runtime_failure(exc) from exc
 
-                next_token = sample_next_token(
-                    current_logits,
-                    generated_ids=repetition_history,
-                    temperature=config.temperature,
-                    top_p=config.top_p,
-                    top_k=config.top_k,
-                    repetition_penalty=config.repetition_penalty,
-                )
-                token_id = int(next_token.item())
-                if first_token_at is None:
-                    first_token_at = time.perf_counter()
+                    next_token = sample_next_token(
+                        current_logits,
+                        generated_ids=repetition_history,
+                        temperature=config.temperature,
+                        top_p=config.top_p,
+                        top_k=config.top_k,
+                        repetition_penalty=config.repetition_penalty,
+                    )
+                    token_id = int(next_token.item())
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
 
-                if token_id in stop_token_ids:
-                    total_seconds = time.perf_counter() - started_at
-                    prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
-                    return (
-                        completion_ids,
-                        "stop",
-                        prompt_length,
-                        len(completion_ids),
-                        self._build_generation_perf_stats(
-                            prompt_tokens=prompt_length,
-                            completion_tokens=len(completion_ids),
-                            total_seconds=total_seconds,
-                            prefill_seconds=prefill_seconds,
-                            decode_seconds=max(0.0, total_seconds - prefill_seconds),
-                        ),
+                    if token_id in stop_token_ids:
+                        total_seconds = time.perf_counter() - started_at
+                        prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
+                        return (
+                            completion_ids,
+                            "stop",
+                            prompt_length,
+                            len(completion_ids),
+                            self._build_generation_perf_stats(
+                                prompt_tokens=prompt_length,
+                                completion_tokens=len(completion_ids),
+                                total_seconds=total_seconds,
+                                prefill_seconds=prefill_seconds,
+                                decode_seconds=max(0.0, total_seconds - prefill_seconds),
+                            ),
+                        )
+
+                    completion_ids.append(token_id)
+                    metrics = getattr(self, "metrics", None)
+                    if metrics is not None:
+                        metrics.record_generation_tokens(1)
+                    repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
+                        history_tensor=repetition_history,
+                        history_ids=repetition_history_ids,
+                        next_token=next_token,
                     )
 
-                completion_ids.append(token_id)
-                metrics = getattr(self, "metrics", None)
-                if metrics is not None:
-                    metrics.record_generation_tokens(1)
-                repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
-                    history_tensor=repetition_history,
-                    history_ids=repetition_history_ids,
-                    next_token=next_token,
+                    input_ids = next_token.view(1, 1)
+
+                    if step_idx + 1 >= config.max_new_tokens:
+                        break
+
+                total_seconds = time.perf_counter() - started_at
+                prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
+                return (
+                    completion_ids,
+                    "length",
+                    prompt_length,
+                    len(completion_ids),
+                    self._build_generation_perf_stats(
+                        prompt_tokens=prompt_length,
+                        completion_tokens=len(completion_ids),
+                        total_seconds=total_seconds,
+                        prefill_seconds=prefill_seconds,
+                        decode_seconds=max(0.0, total_seconds - prefill_seconds),
+                    ),
                 )
-
-                input_ids = next_token.view(1, 1)
-
-                if step_idx + 1 >= config.max_new_tokens:
-                    break
-
-            total_seconds = time.perf_counter() - started_at
-            prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
-            return (
-                completion_ids,
-                "length",
-                prompt_length,
-                len(completion_ids),
-                self._build_generation_perf_stats(
-                    prompt_tokens=prompt_length,
-                    completion_tokens=len(completion_ids),
-                    total_seconds=total_seconds,
-                    prefill_seconds=prefill_seconds,
-                    decode_seconds=max(0.0, total_seconds - prefill_seconds),
-                ),
-            )
         finally:
             if past_key_values is not None:
                 past_key_values.release()
@@ -2428,121 +2434,122 @@ class AnnaQwen3_5TextEngine:
         past_key_values = None
 
         try:
-            try:
-                prefill = self._prefill_generation_prompt(prepared)
-            except RuntimeError as exc:
-                raise self._handle_runtime_failure(exc) from exc
-            past_key_values = prefill.past_key_values
-            current_logits = prefill.logits
+            with steady_decode_accumulation(enabled=self.optimization_config.profile_runtime, log=logger):
+                try:
+                    prefill = self._prefill_generation_prompt(prepared)
+                except RuntimeError as exc:
+                    raise self._handle_runtime_failure(exc) from exc
+                past_key_values = prefill.past_key_values
+                current_logits = prefill.logits
 
-            for step_idx in range(config.max_new_tokens):
-                if step_idx > 0:
-                    try:
-                        with self.execution_lock:
-                            outputs = self._profiled_forward_generation_model(
-                                stage=f"decode[{step_idx}]",
-                                input_ids=input_ids,
-                                attention_mask=None,
-                                past_key_values=past_key_values,
-                                use_cache=True,
-                                logits_to_keep=1,
-                            )
-                        current_logits = outputs.logits[0, -1]
-                        past_key_values = outputs.past_key_values
-                    except RuntimeError as exc:
-                        raise self._handle_runtime_failure(exc) from exc
+                for step_idx in range(config.max_new_tokens):
+                    if step_idx > 0:
+                        try:
+                            with self.execution_lock:
+                                outputs = self._profiled_forward_generation_model(
+                                    stage=f"decode[{step_idx}]",
+                                    input_ids=input_ids,
+                                    attention_mask=None,
+                                    past_key_values=past_key_values,
+                                    use_cache=True,
+                                    logits_to_keep=1,
+                                )
+                            current_logits = outputs.logits[0, -1]
+                            past_key_values = outputs.past_key_values
+                        except RuntimeError as exc:
+                            raise self._handle_runtime_failure(exc) from exc
 
-                next_token = sample_next_token(
-                    current_logits,
-                    generated_ids=repetition_history,
-                    temperature=config.temperature,
-                    top_p=config.top_p,
-                    top_k=config.top_k,
-                    repetition_penalty=config.repetition_penalty,
-                )
-                token_id = int(next_token.item())
-                if first_token_at is None:
-                    first_token_at = time.perf_counter()
-
-                if token_id in stop_token_ids:
-                    tail, _ = text_assembler.flush()
-                    if tail:
-                        yield tail, False, None, prompt_length, len(completion_ids), None
-                    total_seconds = time.perf_counter() - started_at
-                    prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
-                    yield (
-                        "",
-                        True,
-                        "stop",
-                        prompt_length,
-                        len(completion_ids),
-                        self._build_generation_perf_stats(
-                            prompt_tokens=prompt_length,
-                            completion_tokens=len(completion_ids),
-                            total_seconds=total_seconds,
-                            prefill_seconds=prefill_seconds,
-                            decode_seconds=max(0.0, total_seconds - prefill_seconds),
-                        ),
+                    next_token = sample_next_token(
+                        current_logits,
+                        generated_ids=repetition_history,
+                        temperature=config.temperature,
+                        top_p=config.top_p,
+                        top_k=config.top_k,
+                        repetition_penalty=config.repetition_penalty,
                     )
-                    return
+                    token_id = int(next_token.item())
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
 
-                completion_ids.append(token_id)
-                metrics = getattr(self, "metrics", None)
-                if metrics is not None:
-                    metrics.record_generation_tokens(1)
-                repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
-                    history_tensor=repetition_history,
-                    history_ids=repetition_history_ids,
-                    next_token=next_token,
-                )
-                delta, hit_stop_string = text_assembler.feed_token(token_id)
+                    if token_id in stop_token_ids:
+                        tail, _ = text_assembler.flush()
+                        if tail:
+                            yield tail, False, None, prompt_length, len(completion_ids), None
+                        total_seconds = time.perf_counter() - started_at
+                        prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
+                        yield (
+                            "",
+                            True,
+                            "stop",
+                            prompt_length,
+                            len(completion_ids),
+                            self._build_generation_perf_stats(
+                                prompt_tokens=prompt_length,
+                                completion_tokens=len(completion_ids),
+                                total_seconds=total_seconds,
+                                prefill_seconds=prefill_seconds,
+                                decode_seconds=max(0.0, total_seconds - prefill_seconds),
+                            ),
+                        )
+                        return
 
-                input_ids = next_token.view(1, 1)
-
-                if delta:
-                    yield delta, False, None, prompt_length, len(completion_ids), None
-
-                if hit_stop_string:
-                    total_seconds = time.perf_counter() - started_at
-                    prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
-                    yield (
-                        "",
-                        True,
-                        "stop",
-                        prompt_length,
-                        len(completion_ids),
-                        self._build_generation_perf_stats(
-                            prompt_tokens=prompt_length,
-                            completion_tokens=len(completion_ids),
-                            total_seconds=total_seconds,
-                            prefill_seconds=prefill_seconds,
-                            decode_seconds=max(0.0, total_seconds - prefill_seconds),
-                        ),
+                    completion_ids.append(token_id)
+                    metrics = getattr(self, "metrics", None)
+                    if metrics is not None:
+                        metrics.record_generation_tokens(1)
+                    repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
+                        history_tensor=repetition_history,
+                        history_ids=repetition_history_ids,
+                        next_token=next_token,
                     )
-                    return
+                    delta, hit_stop_string = text_assembler.feed_token(token_id)
 
-                if step_idx + 1 >= config.max_new_tokens:
-                    break
+                    input_ids = next_token.view(1, 1)
 
-            tail, _ = text_assembler.flush()
-            if tail:
-                yield tail, False, None, prompt_length, len(completion_ids), None
-            total_seconds = time.perf_counter() - started_at
-            prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
-            yield (
-                "",
-                True,
-                "length",
-                prompt_length,
-                len(completion_ids),
-                self._build_generation_perf_stats(
-                    prompt_tokens=prompt_length,
-                    completion_tokens=len(completion_ids),
-                    total_seconds=total_seconds,
-                    prefill_seconds=prefill_seconds,
-                    decode_seconds=max(0.0, total_seconds - prefill_seconds),
-                ),
-            )
+                    if delta:
+                        yield delta, False, None, prompt_length, len(completion_ids), None
+
+                    if hit_stop_string:
+                        total_seconds = time.perf_counter() - started_at
+                        prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
+                        yield (
+                            "",
+                            True,
+                            "stop",
+                            prompt_length,
+                            len(completion_ids),
+                            self._build_generation_perf_stats(
+                                prompt_tokens=prompt_length,
+                                completion_tokens=len(completion_ids),
+                                total_seconds=total_seconds,
+                                prefill_seconds=prefill_seconds,
+                                decode_seconds=max(0.0, total_seconds - prefill_seconds),
+                            ),
+                        )
+                        return
+
+                    if step_idx + 1 >= config.max_new_tokens:
+                        break
+
+                tail, _ = text_assembler.flush()
+                if tail:
+                    yield tail, False, None, prompt_length, len(completion_ids), None
+                total_seconds = time.perf_counter() - started_at
+                prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
+                yield (
+                    "",
+                    True,
+                    "length",
+                    prompt_length,
+                    len(completion_ids),
+                    self._build_generation_perf_stats(
+                        prompt_tokens=prompt_length,
+                        completion_tokens=len(completion_ids),
+                        total_seconds=total_seconds,
+                        prefill_seconds=prefill_seconds,
+                        decode_seconds=max(0.0, total_seconds - prefill_seconds),
+                    ),
+                )
         finally:
             if past_key_values is not None:
                 past_key_values.release()
