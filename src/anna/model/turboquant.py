@@ -36,6 +36,10 @@ def turboquant_is_available() -> bool:
     return True
 
 
+# KV-cache TurboQuant bit-widths allowed by Anna runtimes (value packing supports 2/3/4 in this module).
+VALID_KV_CACHE_QUANT_BITS: frozenset[int] = frozenset((2, 3, 4))
+
+
 def _require_turboquant_core() -> tuple[Any, Any]:
     try:
         from turboquant.core import TurboQuantIP, TurboQuantMSE
