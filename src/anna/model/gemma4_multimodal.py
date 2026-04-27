@@ -586,7 +586,7 @@ class Gemma4VisionAttention(nn.Module):
         if self.attention_dropout > 0.0 and self.training:
             attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=True)
         attn_output = torch.matmul(attn_weights, value_states)
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
         if attention_mask is not None:
             attn_output = attn_output.masked_fill(~attention_mask.unsqueeze(-1), 0.0)
         return self.o_proj(attn_output)

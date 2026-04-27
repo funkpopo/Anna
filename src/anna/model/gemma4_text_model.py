@@ -1029,7 +1029,7 @@ class Gemma4TextAttention(nn.Module):
                 key_padding_mask=key_padding_mask,
             )
 
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
         return self.o_proj(attn_output)
 
 

@@ -1499,6 +1499,23 @@ def paged_kv_single_token_decode_attention(
     )
 
 
+def _reshape_decode_gate_to_query_layout(
+    gate: torch.Tensor,
+    *,
+    num_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    # Fused decode accepts either flat [B, 1, H * D] or query-aligned [B, H, 1, D]. Keep the latter at call sites
+    # so future changes do not regress back to ad hoc contiguous() handling.
+    batch_size, seq_len, flat_dim = gate.shape
+    if flat_dim != num_heads * head_dim:
+        raise RuntimeError(
+            "decode gate shape mismatch: "
+            f"expected last dim {num_heads * head_dim}, got {flat_dim}"
+        )
+    return gate.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+
+
 def apply_mask_to_padding_states(hidden_states: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
     if attention_mask is not None and attention_mask.ndim == 2 and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
         hidden_states = hidden_states * attention_mask[:, :, None].to(dtype=hidden_states.dtype)
@@ -1799,7 +1816,7 @@ class Qwen3Attention(nn.Module):
                     scaling=self.scaling,
                     num_key_value_groups=self.num_key_value_groups,
                 )
-                attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
+                attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
                 attn_output = attn_output * torch.sigmoid(gate)
                 return self.o_proj(attn_output)
             if prefer_paged_decode and past_key_values is not None:
@@ -1807,7 +1824,11 @@ class Qwen3Attention(nn.Module):
                 paged_state = past_key_values.paged_attention_state(self.layer_idx)
                 if paged_state is not None:
                     key_pages, value_pages, page_table, _ = paged_state
-                    gate_fused = gate.contiguous()
+                    gate_fused = _reshape_decode_gate_to_query_layout(
+                        gate,
+                        num_heads=query_states.size(1),
+                        head_dim=self.head_dim,
+                    )
                     attn_output = paged_kv_single_token_decode_attention(
                         query_states,
                         key_pages,
@@ -1817,7 +1838,7 @@ class Qwen3Attention(nn.Module):
                         visible_lengths=visible_lengths,
                         gate=gate_fused,
                     )
-                    attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
+                    attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
                     return self.o_proj(attn_output)
             if attention_mask is None and past_key_values is not None and seq_len == 1 and hidden_states.device.type == "xpu":
                 if key_states is None or value_states is None:
@@ -1825,7 +1846,11 @@ class Qwen3Attention(nn.Module):
                     if key_states is None or value_states is None:
                         raise RuntimeError("Failed to materialize KV cache for Qwen single-token decode.")
                 visible_lengths = past_lengths + seq_len
-                gate_fused = gate.contiguous()
+                gate_fused = _reshape_decode_gate_to_query_layout(
+                    gate,
+                    num_heads=query_states.size(1),
+                    head_dim=self.head_dim,
+                )
                 attn_output = materialized_kv_single_token_decode_attention(
                     query_states,
                     key_states,
@@ -1835,7 +1860,7 @@ class Qwen3Attention(nn.Module):
                     visible_lengths=visible_lengths,
                     gate=gate_fused,
                 )
-                attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
+                attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
                 return self.o_proj(attn_output)
             # Multi-token decode and masked full-attention stay on the explicit grouped path.
             if not (batch_size == 1 and seq_len == 1 and attention_mask is None and past_key_values is not None):
@@ -1856,7 +1881,7 @@ class Qwen3Attention(nn.Module):
                 visible_mask=visible_mask,
                 key_padding_mask=key_padding_mask,
             )
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)
 

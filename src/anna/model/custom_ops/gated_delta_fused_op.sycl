@@ -615,14 +615,65 @@ void validate_gqa_decode_optional_gate(const at::Tensor& query, const c10::optio
     return;
   }
   const auto& gate = *gate_opt;
-  TORCH_CHECK(gate.dim() == 3, "gqa_decode gate must be [batch, 1, num_heads * head_dim]");
-  TORCH_CHECK(gate.size(0) == query.size(0), "gate batch size mismatch");
-  TORCH_CHECK(gate.size(1) == 1, "gqa_decode gate expects seq_len==1 (shape [batch, 1, ...])");
-  TORCH_CHECK(
-      gate.size(2) == query.size(1) * query.size(3),
-      "gate last dim must equal num_heads * head_dim");
+  const int64_t hflat = query.size(1) * query.size(3);
   TORCH_CHECK(gate.scalar_type() == query.scalar_type(), "gate must match query dtype");
-  TORCH_CHECK(gate.is_contiguous(), "gate must be contiguous");
+  TORCH_CHECK(gate.size(0) == query.size(0), "gate batch size mismatch");
+  if (gate.dim() == 3) {
+    TORCH_CHECK(gate.size(1) == 1, "gqa_decode 3D gate expects seq_len==1 (shape [batch, 1, ...])");
+    TORCH_CHECK(
+        gate.size(2) == hflat, "3D gqa_decode gate last dim must equal num_heads * head_dim");
+  } else if (gate.dim() == 4) {
+    TORCH_CHECK(gate.size(1) == query.size(1), "4D gqa_decode gate must match query head count [batch, heads, 1, head_dim]");
+    TORCH_CHECK(gate.size(2) == 1, "4D gqa_decode gate expects seq_len==1");
+    TORCH_CHECK(gate.size(3) == query.size(3), "4D gqa_decode gate head_dim must match query");
+  } else {
+    TORCH_CHECK(
+        false,
+        "gqa_decode gate must be 3D [batch, 1, num_heads * head_dim] or 4D [batch, heads, 1, head_dim] (query layout)");
+  }
+}
+
+// Returns a tensor to pass to the kernel and indexing parameters. Avoids a contiguous() copy when gate is already
+// row-major 3D [B,1,H*D] with stride(2)==1, stride(0)==H*D, or 4D [B,H,1,D] with query-matching strides (e.g. same
+// layout as query after transpose(1,2)).
+static at::Tensor prepare_gqa_decode_gate(
+    const at::Tensor& gate,
+    int64_t num_heads,
+    int64_t head_dim,
+    bool& gate_is_4d,
+    int64_t& g_stride_batch,
+    int64_t& g_stride_h_or_inner,
+    int64_t& g_stride_d) {
+  const int64_t hflat = num_heads * head_dim;
+  if (gate.dim() == 3) {
+    if (gate.size(1) == 1 && gate.size(2) == hflat && gate.stride(2) == 1 && gate.stride(0) == hflat) {
+      gate_is_4d = false;
+      g_stride_batch = gate.stride(0);
+      g_stride_h_or_inner = gate.stride(2);
+      g_stride_d = 0;
+      return gate;
+    }
+  } else if (gate.dim() == 4) {
+    if (gate.size(1) == num_heads && gate.size(2) == 1 && gate.size(3) == head_dim && gate.stride(3) == 1 &&
+        gate.stride(1) == head_dim && gate.stride(0) == hflat) {
+      gate_is_4d = true;
+      g_stride_batch = gate.stride(0);
+      g_stride_h_or_inner = gate.stride(1);
+      g_stride_d = gate.stride(3);
+      return gate;
+    }
+  }
+  at::Tensor g = gate.contiguous();
+  gate_is_4d = (g.dim() == 4);
+  g_stride_batch = hflat;
+  if (gate_is_4d) {
+    g_stride_h_or_inner = head_dim;
+    g_stride_d = 1;
+  } else {
+    g_stride_h_or_inner = 1;
+    g_stride_d = 0;
+  }
+  return g;
 }
 
 void validate_paged_gqa_decode_inputs(
@@ -1946,13 +1997,6 @@ at::Tensor gqa_decode_fused_xpu(
   auto key = key_in.contiguous();
   auto value = value_in.contiguous();
   auto visible_lengths = visible_lengths_in.contiguous();
-  c10::optional<at::Tensor> gate_contig = c10::nullopt;
-  if (gate_opt.has_value() && gate_opt->defined()) {
-    TORCH_CHECK(
-        gate_opt->device() == query.device(),
-        "gate must be on the same XPU device as query");
-    gate_contig = gate_opt->contiguous();
-  }
   auto output = at::empty(query.sizes(), query.options());
 
   const auto batch_size = query.size(0);
@@ -1960,6 +2004,19 @@ at::Tensor gqa_decode_fused_xpu(
   const auto num_kv_heads = key.size(1);
   const auto key_len = key.size(2);
   const auto head_dim = query.size(3);
+
+  c10::optional<at::Tensor> gate_prepared;
+  bool gate_is_4d = false;
+  int64_t g_stride_batch = 0;
+  int64_t g_stride_h_or_inner = 1;
+  int64_t g_stride_d = 0;
+  if (gate_opt.has_value() && gate_opt->defined()) {
+    TORCH_CHECK(
+        gate_opt->device() == query.device(),
+        "gate must be on the same XPU device as query");
+    gate_prepared = prepare_gqa_decode_gate(
+        *gate_opt, num_heads, head_dim, gate_is_4d, g_stride_batch, g_stride_h_or_inner, g_stride_d);
+  }
   const auto groups_per_kv_head = num_heads / num_kv_heads;
   const int64_t local_size =
       std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(head_dim, 128))), 128);
@@ -1985,7 +2042,7 @@ at::Tensor gqa_decode_fused_xpu(
         const int64_t* visible_lengths_ptr = visible_lengths.const_data_ptr<int64_t>();
         scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
         const scalar_t* gate_ptr =
-            (gate_contig.has_value() && gate_contig->defined()) ? gate_contig->const_data_ptr<scalar_t>() : nullptr;
+            (gate_prepared.has_value() && gate_prepared->defined()) ? gate_prepared->const_data_ptr<scalar_t>() : nullptr;
         const size_t group_count = static_cast<size_t>(batch_size * num_heads);
 
         stream.queue().submit([&](sycl::handler& cgh) {
@@ -2003,6 +2060,10 @@ at::Tensor gqa_decode_fused_xpu(
                 const int64_t query_base = ((batch_idx * num_heads + head_idx) * head_dim);
                 const int64_t key_base = ((batch_idx * num_kv_heads + kv_head_idx) * key_len) * head_dim;
                 const int64_t output_base = query_base;
+                const bool use_4d_gate = gate_is_4d;
+                const int64_t g_sb = g_stride_batch;
+                const int64_t g_sh = g_stride_h_or_inner;
+                const int64_t g_sd = g_stride_d;
 
                 for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size) {
                   query_slm[dim_idx] = load_as_float(query_ptr, query_base + dim_idx);
@@ -2045,7 +2106,12 @@ at::Tensor gqa_decode_fused_xpu(
                 for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size, ++slot) {
                   float out_value = denom > 0.0f ? accumulators[slot] / denom : 0.0f;
                   if (gate_ptr != nullptr) {
-                    const int64_t gate_off = (batch_idx * num_heads + head_idx) * head_dim + dim_idx;
+                    int64_t gate_off;
+                    if (use_4d_gate) {
+                      gate_off = batch_idx * g_sb + head_idx * g_sh + dim_idx * g_sd;
+                    } else {
+                      gate_off = batch_idx * g_sb + (head_idx * head_dim + dim_idx) * g_sh;
+                    }
                     const float gpre = load_as_float(gate_ptr, gate_off);
                     out_value *= (1.0f / (1.0f + sycl::exp(-gpre)));
                   }
@@ -2089,13 +2155,6 @@ at::Tensor paged_gqa_decode_fused_xpu(
   auto value_pages = value_pages_in.contiguous();
   auto page_table = page_table_in.contiguous();
   auto visible_lengths = visible_lengths_in.contiguous();
-  c10::optional<at::Tensor> gate_contig = c10::nullopt;
-  if (gate_opt.has_value() && gate_opt->defined()) {
-    TORCH_CHECK(
-        gate_opt->device() == query.device(),
-        "gate must be on the same XPU device as query");
-    gate_contig = gate_opt->contiguous();
-  }
   auto output = at::empty(query.sizes(), query.options());
 
   const auto batch_size = query.size(0);
@@ -2103,6 +2162,19 @@ at::Tensor paged_gqa_decode_fused_xpu(
   const auto num_kv_heads = key_pages.size(1);
   const auto block_size = key_pages.size(2);
   const auto head_dim = query.size(3);
+
+  c10::optional<at::Tensor> gate_prepared;
+  bool gate_is_4d = false;
+  int64_t g_stride_batch = 0;
+  int64_t g_stride_h_or_inner = 1;
+  int64_t g_stride_d = 0;
+  if (gate_opt.has_value() && gate_opt->defined()) {
+    TORCH_CHECK(
+        gate_opt->device() == query.device(),
+        "gate must be on the same XPU device as query");
+    gate_prepared = prepare_gqa_decode_gate(
+        *gate_opt, num_heads, head_dim, gate_is_4d, g_stride_batch, g_stride_h_or_inner, g_stride_d);
+  }
   const auto max_blocks = page_table.size(1);
   const auto max_visible_len = max_blocks * block_size;
   const auto total_pages = key_pages.size(0);
@@ -2131,7 +2203,7 @@ at::Tensor paged_gqa_decode_fused_xpu(
         const int64_t* visible_lengths_ptr = visible_lengths.const_data_ptr<int64_t>();
         scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
         const scalar_t* gate_ptr =
-            (gate_contig.has_value() && gate_contig->defined()) ? gate_contig->const_data_ptr<scalar_t>() : nullptr;
+            (gate_prepared.has_value() && gate_prepared->defined()) ? gate_prepared->const_data_ptr<scalar_t>() : nullptr;
         const size_t group_count = static_cast<size_t>(batch_size * num_heads);
 
         stream.queue().submit([&](sycl::handler& cgh) {
@@ -2148,6 +2220,10 @@ at::Tensor paged_gqa_decode_fused_xpu(
                 const int64_t kv_head_idx = head_idx / groups_per_kv_head;
                 const int64_t query_base = ((batch_idx * num_heads + head_idx) * head_dim);
                 const int64_t output_base = query_base;
+                const bool use_4d_gate = gate_is_4d;
+                const int64_t g_sb = g_stride_batch;
+                const int64_t g_sh = g_stride_h_or_inner;
+                const int64_t g_sd = g_stride_d;
 
                 for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size) {
                   query_slm[dim_idx] = load_as_float(query_ptr, query_base + dim_idx);
@@ -2200,7 +2276,12 @@ at::Tensor paged_gqa_decode_fused_xpu(
                 for (int64_t dim_idx = lane; dim_idx < head_dim; dim_idx += local_size, ++slot) {
                   float out_value = denom > 0.0f ? accumulators[slot] / denom : 0.0f;
                   if (gate_ptr != nullptr) {
-                    const int64_t gate_off = (batch_idx * num_heads + head_idx) * head_dim + dim_idx;
+                    int64_t gate_off;
+                    if (use_4d_gate) {
+                      gate_off = batch_idx * g_sb + head_idx * g_sh + dim_idx * g_sd;
+                    } else {
+                      gate_off = batch_idx * g_sb + (head_idx * head_dim + dim_idx) * g_sh;
+                    }
                     const float gpre = load_as_float(gate_ptr, gate_off);
                     out_value *= (1.0f / (1.0f + sycl::exp(-gpre)));
                   }
