@@ -63,6 +63,12 @@ class ChatTemplateKwargs(BaseModel):
     enable_thinking: bool | None = None
 
 
+class StreamOptions(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    include_usage: bool | None = None
+
+
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[ChatMessage]
@@ -79,6 +85,8 @@ class ChatCompletionRequest(BaseModel):
     top_k: int = Field(default=50, ge=0)
     repetition_penalty: float = Field(default=1.0, ge=0.1)
     stream: bool = False
+    stream_options: StreamOptions | None = None
+    stream_include_usage: bool | None = None
     stop: str | list[str] | None = None
 
 
@@ -91,6 +99,8 @@ class CompletionRequest(BaseModel):
     top_k: int = Field(default=50, ge=0)
     repetition_penalty: float = Field(default=1.0, ge=0.1)
     stream: bool = False
+    stream_options: StreamOptions | None = None
+    stream_include_usage: bool | None = None
     stop: str | list[str] | None = None
 
 

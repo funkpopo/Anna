@@ -30,10 +30,14 @@ class _FakeTokenizer:
 class _FakeDeviceContext:
     def __init__(self) -> None:
         self.device = torch.device("cpu")
+        self.dtype = torch.float32
         self.safety_policy = RuntimeSafetyPolicy()
 
     def get_memory_info(self):
         return None
+
+    def element_size(self, dtype: torch.dtype) -> int:
+        return torch.empty((), dtype=dtype).element_size()
 
     def move_prepared_inputs(self, prepared: PreparedInputs) -> PreparedInputs:
         return prepared
@@ -188,6 +192,7 @@ def test_scheduler_batches_same_length_requests() -> None:
             vocab_size=16,
             eos_token_id=9,
             pad_token_id=0,
+            cache_block_size=2,
             layer_types=["full_attention"],
         )
     )
@@ -246,6 +251,7 @@ def test_scheduler_chunks_long_same_length_prefills() -> None:
             vocab_size=16,
             eos_token_id=9,
             pad_token_id=0,
+            cache_block_size=2,
             layer_types=["full_attention"],
         )
     )
@@ -300,6 +306,7 @@ def test_scheduler_batches_mixed_length_requests_during_decode() -> None:
             vocab_size=16,
             eos_token_id=9,
             pad_token_id=0,
+            cache_block_size=2,
             layer_types=["full_attention"],
         )
     )
@@ -342,6 +349,54 @@ def test_scheduler_batches_mixed_length_requests_during_decode() -> None:
         assert snapshot.generation_tokens_total == 2
         assert snapshot.running_requests == 0
         assert snapshot.waiting_requests == 0
+    finally:
+        scheduler.shutdown()
+
+
+def test_scheduler_streaming_final_event_includes_usage_stats() -> None:
+    config = Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            vocab_size=16,
+            eos_token_id=9,
+            pad_token_id=0,
+            cache_block_size=2,
+            layer_types=["full_attention"],
+        )
+    )
+    fake_model = _FakeModel(config)
+    engine = AnnaQwen3_5TextEngine(
+        model=fake_model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="fake",
+        device_context=_FakeDeviceContext(),
+    )
+    scheduler = AnnaScheduler(engine, max_batch_size=4, batch_wait_ms=20.0)
+    engine.set_scheduler(scheduler)
+
+    try:
+        events = list(
+            scheduler.stream(
+                _prepared([4, 5]),
+                config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            )
+        )
+
+        assert [event.text for event in events] == ["A", ""]
+        assert events[-1].finish_reason == "stop"
+        assert events[-1].prompt_tokens == 2
+        assert events[-1].completion_tokens == 1
+        assert events[-1].perf is not None
     finally:
         scheduler.shutdown()
 

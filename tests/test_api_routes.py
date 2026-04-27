@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 
 from fastapi.testclient import TestClient
@@ -420,6 +421,98 @@ def test_streaming_chat_emits_content_deltas_immediately() -> None:
     assert response.text.count('"content"') == 2
     assert '"content": "夏天"' in response.text
     assert '"content": "到了。"' in response.text
+
+
+def test_streaming_chat_include_usage_emits_openai_final_usage_chunk() -> None:
+    class _ChunkedStreamEngine:
+        default_model_id = "fake-model"
+        default_max_completion_tokens = None
+        reasoning_format = "deepseek"
+
+        def health(self) -> dict[str, str]:
+            return {"status": "ok"}
+
+        def list_models(self) -> list[str]:
+            return [self.default_model_id]
+
+        def stream_chat(self, *_args, **_kwargs):
+            from anna.runtime.qwen3_5_text_engine import StreamEvent
+
+            yield StreamEvent(text="夏天", finish_reason=None)
+            yield StreamEvent(text="", finish_reason="stop", prompt_tokens=16, completion_tokens=4)
+
+    client = TestClient(create_app(_ChunkedStreamEngine()))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+    )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    assert chunks[0]["usage"] is None
+    assert chunks[1]["usage"] is None
+    assert chunks[2]["usage"] is None
+    assert chunks[-1]["choices"] == []
+    assert chunks[-1]["usage"] == {
+        "prompt_tokens": 16,
+        "completion_tokens": 4,
+        "total_tokens": 20,
+    }
+
+
+def test_streaming_completion_include_usage_accepts_vllm_flat_field() -> None:
+    class _ChunkedCompletionEngine:
+        default_model_id = "fake-model"
+        default_max_completion_tokens = None
+
+        def health(self) -> dict[str, str]:
+            return {"status": "ok"}
+
+        def list_models(self) -> list[str]:
+            return [self.default_model_id]
+
+        def stream_text(self, *_args, **_kwargs):
+            from anna.runtime.qwen3_5_text_engine import StreamEvent
+
+            yield StreamEvent(text="Hello", finish_reason=None)
+            yield StreamEvent(text="", finish_reason="stop", prompt_tokens=8, completion_tokens=2)
+
+    client = TestClient(create_app(_ChunkedCompletionEngine()))
+
+    response = client.post(
+        "/v1/completions",
+        json={
+            "model": "fake-model",
+            "prompt": "hello",
+            "stream": True,
+            "stream_include_usage": True,
+        },
+    )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    assert chunks[0]["usage"] is None
+    assert chunks[1]["usage"] is None
+    assert chunks[-1]["choices"] == []
+    assert chunks[-1]["usage"] == {
+        "prompt_tokens": 8,
+        "completion_tokens": 2,
+        "total_tokens": 10,
+    }
 
 
 def test_chat_completion_uses_engine_default_reasoning_format_when_request_omits_it() -> None:

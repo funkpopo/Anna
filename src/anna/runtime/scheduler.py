@@ -416,10 +416,19 @@ class AnnaScheduler:
             request.past_key_values.release()
             request.past_key_values = None
 
+        perf = self._build_perf_stats(request)
         if request.stream:
             from anna.runtime.qwen3_5_text_engine import StreamEvent
 
-            request.events.put(StreamEvent(text="", finish_reason=finish_reason))
+            request.events.put(
+                StreamEvent(
+                    text="",
+                    finish_reason=finish_reason,
+                    prompt_tokens=request.prompt_length,
+                    completion_tokens=len(request.completion_ids),
+                    perf=perf,
+                )
+            )
             request.events.put(_DONE)
             request.done.set()
             if metrics is not None:
@@ -434,7 +443,7 @@ class AnnaScheduler:
             finish_reason=finish_reason,
             prompt_tokens=request.prompt_length,
             completion_tokens=len(request.completion_ids),
-            perf=self._build_perf_stats(request),
+            perf=perf,
         )
         request.done.set()
         if metrics is not None:

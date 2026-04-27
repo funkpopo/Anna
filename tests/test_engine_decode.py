@@ -8,7 +8,7 @@ import torch
 
 from anna.core.function_calling import ParsedToolCall
 from anna.mm.qwen3_5_text_processor import PreparedInputs
-from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, GenerationConfig, ThinkingStreamParser
+from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, GenerationConfig, GenerationPerfStats, ThinkingStreamParser
 from anna.runtime.qwen3_5_text_engine import EngineOptimizationConfig, StreamEvent, TextGenerationResult
 from anna.runtime.streaming import IncrementalTextAssembler
 
@@ -467,6 +467,79 @@ def test_stream_chat_separates_reasoning_and_content_in_deepseek_format() -> Non
         ("最终答案。", None, None),
         ("", None, "stop"),
     ]
+
+
+def test_stream_chat_preserves_final_usage_stats() -> None:
+    perf = GenerationPerfStats(
+        total_seconds=1.0,
+        prefill_seconds=0.4,
+        ttft_seconds=0.4,
+        decode_seconds=0.6,
+        prompt_tokens=7,
+        completion_tokens=3,
+        prefill_tokens_per_second=17.5,
+        decode_tokens=2,
+        decode_tokens_per_second=3.33,
+        total_tokens_per_second=3.0,
+    )
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
+    engine.tokenizer = _EngineChatTokenizer()
+    engine._stream = MethodType(
+        lambda self, prepared, *, config: iter(
+            [
+                StreamEvent(text="最终答案。", finish_reason=None),
+                StreamEvent(text="", finish_reason="stop", prompt_tokens=7, completion_tokens=3, perf=perf),
+            ]
+        ),
+        engine,
+    )
+
+    events = list(
+        engine.stream_chat(
+            [{"role": "user", "content": "你好"}],
+            config=GenerationConfig(),
+            reasoning_format="none",
+        )
+    )
+
+    assert events[-1].finish_reason == "stop"
+    assert events[-1].prompt_tokens == 7
+    assert events[-1].completion_tokens == 3
+    assert events[-1].perf == perf
+
+
+def test_stream_direct_emits_final_usage_stats() -> None:
+    perf = GenerationPerfStats(
+        total_seconds=0.8,
+        prefill_seconds=0.3,
+        ttft_seconds=0.3,
+        decode_seconds=0.5,
+        prompt_tokens=5,
+        completion_tokens=2,
+        prefill_tokens_per_second=16.67,
+        decode_tokens=1,
+        decode_tokens_per_second=2.0,
+        total_tokens_per_second=2.5,
+    )
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine._iter_generation = MethodType(
+        lambda self, prepared, config: iter(
+            [
+                ("答案", False, None, 5, 1, None),
+                ("", True, "stop", 5, 2, perf),
+            ]
+        ),
+        engine,
+    )
+
+    events = list(engine._stream_direct(object(), config=GenerationConfig()))
+
+    assert [event.text for event in events] == ["答案", ""]
+    assert events[-1].finish_reason == "stop"
+    assert events[-1].prompt_tokens == 5
+    assert events[-1].completion_tokens == 2
+    assert events[-1].perf == perf
 
 
 def test_generate_chat_keeps_incomplete_think_block_when_length_limited() -> None:
