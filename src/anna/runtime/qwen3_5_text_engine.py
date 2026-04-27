@@ -178,6 +178,9 @@ class StreamEvent:
     reasoning_text: str | None = None
     tool_calls: list[ToolCallDelta] | None = None
     finish_reason: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    perf: GenerationPerfStats | None = None
 
 
 @dataclass(slots=True)
@@ -1429,7 +1432,13 @@ class AnnaQwen3_5TextEngine:
                 finish_reason = (
                     "tool_calls" if event.finish_reason == "stop" and tool_call_parser.saw_tool_calls else event.finish_reason
                 )
-                yield StreamEvent(text="", finish_reason=finish_reason)
+                yield StreamEvent(
+                    text="",
+                    finish_reason=finish_reason,
+                    prompt_tokens=event.prompt_tokens,
+                    completion_tokens=event.completion_tokens,
+                    perf=event.perf,
+                )
                 continue
 
             for output in outputs:
@@ -2232,11 +2241,17 @@ class AnnaQwen3_5TextEngine:
             self._trim_runtime_cache_if_idle()
 
     def _stream_direct(self, prepared: PreparedInputs, *, config: GenerationConfig) -> Iterator[StreamEvent]:
-        for delta, finished, reason, _, _, _ in self._iter_generation(prepared, config):
+        for delta, finished, reason, prompt_tokens, completion_tokens, perf in self._iter_generation(prepared, config):
             if delta:
                 yield StreamEvent(text=delta, finish_reason=None)
             if finished:
-                yield StreamEvent(text="", finish_reason=reason or "stop")
+                yield StreamEvent(
+                    text="",
+                    finish_reason=reason or "stop",
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    perf=perf,
+                )
                 return
 
     def _trim_stop_strings(self, text: str, stop_strings: list[str]) -> tuple[str, bool]:

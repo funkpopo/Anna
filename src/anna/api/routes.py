@@ -25,6 +25,7 @@ from anna.runtime.qwen3_tts_engine import Qwen3TTSSynthesisConfig
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+_MISSING = object()
 
 
 def _engine(request: Request):
@@ -70,6 +71,11 @@ def _default_reasoning_format(engine: object) -> ReasoningFormat:
 
 def _default_enable_thinking(engine: object) -> bool:
     return getattr(engine, "default_enable_thinking", True) is not False
+
+
+def _stream_usage_requested(payload: ChatCompletionRequest | CompletionRequest) -> bool:
+    stream_options = getattr(payload, "stream_options", None)
+    return bool(getattr(stream_options, "include_usage", False) or getattr(payload, "stream_include_usage", False))
 
 
 def _require_method(engine: object, method_name: str, *, message: str, code: str):
@@ -178,6 +184,14 @@ def _chat_response_payload(
     }
 
 
+def _usage_payload(prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
 def _completion_response_payload(
     *,
     response_id: str,
@@ -197,11 +211,7 @@ def _completion_response_payload(
                 "finish_reason": result.finish_reason,
             }
         ],
-        "usage": {
-            "prompt_tokens": result.prompt_tokens,
-            "completion_tokens": result.completion_tokens,
-            "total_tokens": result.prompt_tokens + result.completion_tokens,
-        },
+        "usage": _usage_payload(result.prompt_tokens, result.completion_tokens),
     }
 
 
@@ -247,6 +257,7 @@ def _chat_chunk_payload(
     reasoning: str,
     tool_calls: list[dict[str, object]] | None,
     finish_reason: str | None,
+    usage: dict[str, int] | None | object = _MISSING,
 ) -> dict:
     delta: dict[str, object] = {}
     if reasoning:
@@ -255,7 +266,7 @@ def _chat_chunk_payload(
         delta["content"] = content
     if tool_calls:
         delta["tool_calls"] = tool_calls
-    return {
+    payload = {
         "id": response_id,
         "object": "chat.completion.chunk",
         "created": created,
@@ -268,6 +279,9 @@ def _chat_chunk_payload(
             }
         ],
     }
+    if usage is not _MISSING:
+        payload["usage"] = usage
+    return payload
 
 
 def _stream_sse_chat(
@@ -276,6 +290,7 @@ def _stream_sse_chat(
     created: int,
     model: str,
     events: Iterator[StreamEvent],
+    include_usage: bool,
 ) -> Iterator[str]:
     role_chunk = {
         "id": response_id,
@@ -284,12 +299,17 @@ def _stream_sse_chat(
         "model": model,
         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
     }
+    if include_usage:
+        role_chunk["usage"] = None
     yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
 
+    final_usage = None
     try:
         for event in events:
             if not event.text and not event.reasoning_text and not event.tool_calls and event.finish_reason is None:
                 continue
+            if event.finish_reason is not None and event.prompt_tokens is not None and event.completion_tokens is not None:
+                final_usage = _usage_payload(event.prompt_tokens, event.completion_tokens)
             payload = _chat_chunk_payload(
                 response_id=response_id,
                 created=created,
@@ -298,6 +318,7 @@ def _stream_sse_chat(
                 reasoning=event.reasoning_text or "",
                 tool_calls=None if event.tool_calls is None else [tool_call.to_openai_dict() for tool_call in event.tool_calls],
                 finish_reason=event.finish_reason,
+                usage=None if include_usage else _MISSING,
             )
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
     except AnnaEngineError as exc:
@@ -313,6 +334,17 @@ def _stream_sse_chat(
             )
         )
 
+    if include_usage and final_usage is not None:
+        usage_chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": final_usage,
+        }
+        yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
+
     yield "data: [DONE]\n\n"
 
 
@@ -322,7 +354,9 @@ def _stream_sse_completion(
     created: int,
     model: str,
     events: Iterator[StreamEvent],
+    include_usage: bool,
 ) -> Iterator[str]:
+    final_usage = None
     try:
         for event in events:
             payload = {
@@ -332,6 +366,10 @@ def _stream_sse_completion(
                 "model": model,
                 "choices": [{"index": 0, "text": event.text, "finish_reason": event.finish_reason}],
             }
+            if include_usage:
+                payload["usage"] = None
+            if event.finish_reason is not None and event.prompt_tokens is not None and event.completion_tokens is not None:
+                final_usage = _usage_payload(event.prompt_tokens, event.completion_tokens)
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
     except AnnaEngineError as exc:
         yield _sse_error_frame(exc)
@@ -345,6 +383,17 @@ def _stream_sse_completion(
                 code="streaming_failed",
             )
         )
+
+    if include_usage and final_usage is not None:
+        usage_chunk = {
+            "id": response_id,
+            "object": "text_completion",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": final_usage,
+        }
+        yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
 
     yield "data: [DONE]\n\n"
 
@@ -393,6 +442,7 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
 
     try:
         if payload.stream:
+            include_usage = _stream_usage_requested(payload)
             stream_chat = _require_method(
                 engine,
                 "stream_chat",
@@ -414,6 +464,7 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
                     created=created,
                     model=model_id,
                     events=events,
+                    include_usage=include_usage,
                 ),
                 media_type="text/event-stream",
             )
@@ -474,6 +525,7 @@ def completions(request: Request, payload: CompletionRequest):
 
     try:
         if payload.stream:
+            include_usage = _stream_usage_requested(payload)
             stream_text = _require_method(
                 engine,
                 "stream_text",
@@ -487,6 +539,7 @@ def completions(request: Request, payload: CompletionRequest):
                     created=created,
                     model=model_id,
                     events=events,
+                    include_usage=include_usage,
                 ),
                 media_type="text/event-stream",
             )
