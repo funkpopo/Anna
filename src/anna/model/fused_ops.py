@@ -261,6 +261,7 @@ def run_gqa_decode_fused(
     scaling: float,
     gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # Optional gate may be flat [B, 1, H * D] or query-aligned [B, H, 1, D].
     op = _gqa_decode_op()
     if op is None:
         maybe_load_gated_delta_library()
@@ -285,6 +286,7 @@ def run_paged_gqa_decode_fused(
     scaling: float,
     gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # Optional gate may be flat [B, 1, H * D] or query-aligned [B, H, 1, D].
     op = _paged_gqa_decode_op()
     if op is None:
         maybe_load_gated_delta_library()

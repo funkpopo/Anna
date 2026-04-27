@@ -194,6 +194,13 @@ def _pack_paged_kv(
     return key_pages, value_pages, page_table
 
 
+def _decode_gate_query_layout(gate: torch.Tensor, *, num_heads: int, head_dim: int) -> torch.Tensor:
+    batch_size, seq_len, flat_dim = gate.shape
+    if flat_dim != num_heads * head_dim:
+        raise ValueError(f"gate last dim {flat_dim} must equal num_heads * head_dim ({num_heads * head_dim})")
+    return gate.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+
+
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
 def test_causal_conv1d_fused_xpu_matches_reference() -> None:
     if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "causal_conv1d_fused"):
@@ -292,6 +299,39 @@ def test_gqa_decode_fused_xpu_with_gate_matches_sigmoid_fusion() -> None:
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gqa_decode_fused_xpu_gate_accepts_equivalent_3d_and_4d_layouts() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gqa_decode_fused"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(11)
+    batch_size = 2
+    num_heads = 8
+    head_dim = 32
+    device = "xpu"
+    query = torch.randn(batch_size, num_heads, 1, head_dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(batch_size, 2, 23, head_dim, device=device, dtype=torch.bfloat16)
+    value = torch.randn(batch_size, 2, 23, head_dim, device=device, dtype=torch.bfloat16)
+    visible_lengths = torch.tensor([23, 17], device=device, dtype=torch.long)
+    gate_3d = torch.randn(batch_size, 1, num_heads * head_dim, device=device, dtype=torch.bfloat16)
+    gate_4d = _decode_gate_query_layout(gate_3d, num_heads=num_heads, head_dim=head_dim)
+
+    assert gate_4d.shape == (batch_size, num_heads, 1, head_dim)
+    assert gate_4d.stride(0) == num_heads * head_dim
+    assert gate_4d.stride(1) == head_dim
+    assert gate_4d.stride(3) == 1
+
+    base = torch.ops.anna.gqa_decode_fused(query, key, value, visible_lengths, head_dim**-0.5)
+    fused_3d = torch.ops.anna.gqa_decode_fused(query, key, value, visible_lengths, head_dim**-0.5, gate_3d)
+    fused_4d = torch.ops.anna.gqa_decode_fused(query, key, value, visible_lengths, head_dim**-0.5, gate_4d)
+    expected = base * torch.sigmoid(gate_4d)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(fused_3d.float().cpu(), expected.float().cpu(), atol=3e-2, rtol=3e-2)
+    assert torch.allclose(fused_4d.float().cpu(), expected.float().cpu(), atol=3e-2, rtol=3e-2)
+    assert torch.allclose(fused_3d.float().cpu(), fused_4d.float().cpu(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
 def test_paged_gqa_decode_fused_xpu_long_qwen35_shape_matches_reference() -> None:
     if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "paged_gqa_decode_fused"):
         pytest.skip("Anna fused-op library is not built")
@@ -354,6 +394,66 @@ def test_paged_gqa_decode_fused_xpu_with_gate_matches_sigmoid_fusion() -> None:
 
     torch.xpu.synchronize()
     assert torch.allclose(fused.float().cpu(), expected.float().cpu(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_paged_gqa_decode_fused_xpu_gate_accepts_equivalent_3d_and_4d_layouts() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "paged_gqa_decode_fused"):
+        pytest.skip("Anna fused-op library is not built")
+
+    torch.manual_seed(12)
+    batch_size = 2
+    num_heads = 8
+    head_dim = 64
+    key_len = 257
+    block_size = 32
+    device = "xpu"
+    query = torch.randn(batch_size, num_heads, 1, head_dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(batch_size, 2, key_len, head_dim, device=device, dtype=torch.bfloat16)
+    value = torch.randn(batch_size, 2, key_len, head_dim, device=device, dtype=torch.bfloat16)
+    key_pages, value_pages, page_table = _pack_paged_kv(key, value, block_size=block_size)
+    visible_lengths = torch.tensor([key_len, 211], device=device, dtype=torch.long)
+    gate_3d = torch.randn(batch_size, 1, num_heads * head_dim, device=device, dtype=torch.bfloat16)
+    gate_4d = _decode_gate_query_layout(gate_3d, num_heads=num_heads, head_dim=head_dim)
+    scale = head_dim**-0.5
+
+    assert gate_4d.shape == (batch_size, num_heads, 1, head_dim)
+    assert gate_4d.stride(0) == num_heads * head_dim
+    assert gate_4d.stride(1) == head_dim
+    assert gate_4d.stride(3) == 1
+
+    base = torch.ops.anna.paged_gqa_decode_fused(
+        query,
+        key_pages,
+        value_pages,
+        page_table,
+        visible_lengths,
+        scale,
+    )
+    fused_3d = torch.ops.anna.paged_gqa_decode_fused(
+        query,
+        key_pages,
+        value_pages,
+        page_table,
+        visible_lengths,
+        scale,
+        gate_3d,
+    )
+    fused_4d = torch.ops.anna.paged_gqa_decode_fused(
+        query,
+        key_pages,
+        value_pages,
+        page_table,
+        visible_lengths,
+        scale,
+        gate_4d,
+    )
+    expected = base * torch.sigmoid(gate_4d)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(fused_3d.float().cpu(), expected.float().cpu(), atol=3e-2, rtol=3e-2)
+    assert torch.allclose(fused_4d.float().cpu(), expected.float().cpu(), atol=3e-2, rtol=3e-2)
+    assert torch.allclose(fused_3d.float().cpu(), fused_4d.float().cpu(), atol=3e-2, rtol=3e-2)
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
@@ -660,6 +760,7 @@ def test_qwen3_attention_xpu_single_token_decode_uses_paged_kv_path(monkeypatch:
 
     torch.manual_seed(0)
     calls: list[tuple[torch.Size, torch.Size, torch.Size, tuple[int, ...]]] = []
+    gate_layouts: list[tuple[torch.Size, tuple[int, ...]]] = []
     paged_impl = model_ops.paged_kv_single_token_decode_attention
 
     def _stub_paged_decode(
@@ -680,6 +781,8 @@ def test_qwen3_attention_xpu_single_token_decode_uses_paged_kv_path(monkeypatch:
                 tuple(int(item) for item in visible_lengths.cpu().tolist()),
             )
         )
+        if gate is not None:
+            gate_layouts.append((gate.shape, tuple(int(stride) for stride in gate.stride())))
         return paged_impl(
             query,
             key_pages,
@@ -719,6 +822,12 @@ def test_qwen3_attention_xpu_single_token_decode_uses_paged_kv_path(monkeypatch:
             torch.Size([16, config.num_key_value_heads, config.cache_block_size, config.head_dim]),
             torch.Size([1, 1]),
             (7,),
+        )
+    ]
+    assert gate_layouts == [
+        (
+            torch.Size([1, config.num_attention_heads, 1, config.head_dim]),
+            (config.num_attention_heads * config.head_dim, config.head_dim, config.num_attention_heads * config.head_dim, 1),
         )
     ]
 

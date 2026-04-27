@@ -32,6 +32,40 @@ def _reference_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> tor
     return output.to(dtype=x.dtype)
 
 
+def _decode_gate_query_layout(gate: torch.Tensor, *, num_heads: int, head_dim: int) -> torch.Tensor:
+    batch_size, seq_len, flat_dim = gate.shape
+    if flat_dim != num_heads * head_dim:
+        raise ValueError(f"gate last dim {flat_dim} must equal num_heads * head_dim ({num_heads * head_dim})")
+    return gate.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+
+
+def _pack_paged_kv(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, num_kv_heads, key_len, head_dim = key.shape
+    pages_per_batch = (key_len + block_size - 1) // block_size
+    total_pages = batch_size * pages_per_batch
+    key_pages = key.new_zeros((total_pages, num_kv_heads, block_size, head_dim))
+    value_pages = value.new_zeros((total_pages, num_kv_heads, block_size, head_dim))
+    page_table = torch.full((batch_size, pages_per_batch), -1, device=key.device, dtype=torch.int32)
+
+    for batch_idx in range(batch_size):
+        for block_idx in range(pages_per_batch):
+            page_id = batch_idx * pages_per_batch + block_idx
+            start = block_idx * block_size
+            take = min(block_size, key_len - start)
+            if take <= 0:
+                continue
+            key_pages[page_id, :, :take, :].copy_(key[batch_idx, :, start : start + take, :])
+            value_pages[page_id, :, :take, :].copy_(value[batch_idx, :, start : start + take, :])
+            page_table[batch_idx, block_idx] = page_id
+
+    return key_pages, value_pages, page_table
+
+
 def _time_op(fn, *, warmup: int, iters: int) -> float:
     with torch.no_grad():
         for _ in range(warmup):
@@ -256,6 +290,98 @@ def _benchmark_gqa_decode_fused(
     max_abs_diff = float((gqa_output.float() - baseline_output.float()).abs().max().item())
     gqa_ms = _time_op(gqa, warmup=warmup, iters=iters)
     return baseline_ms, gqa_ms, max_abs_diff
+
+
+def _benchmark_gqa_decode_gate_layouts(
+    *,
+    batch_size: int,
+    key_len: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    warmup: int,
+    iters: int,
+) -> tuple[float, float, float]:
+    query_states = torch.randn(batch_size, num_heads, 1, head_dim, device="xpu", dtype=dtype)
+    key_states = torch.randn(batch_size, num_kv_heads, key_len, head_dim, device="xpu", dtype=dtype)
+    value_states = torch.randn(batch_size, num_kv_heads, key_len, head_dim, device="xpu", dtype=dtype)
+    visible_lengths = torch.randint(max(1, key_len // 2), key_len + 1, (batch_size,), device="xpu", dtype=torch.long)
+    gate_3d = torch.randn(batch_size, 1, num_heads * head_dim, device="xpu", dtype=dtype)
+    gate_4d = _decode_gate_query_layout(gate_3d, num_heads=num_heads, head_dim=head_dim)
+    scaling = head_dim**-0.5
+
+    gated_3d = lambda: torch.ops.anna.gqa_decode_fused(
+        query_states,
+        key_states,
+        value_states,
+        visible_lengths,
+        scaling,
+        gate_3d,
+    )
+    gated_4d = lambda: torch.ops.anna.gqa_decode_fused(
+        query_states,
+        key_states,
+        value_states,
+        visible_lengths,
+        scaling,
+        gate_4d,
+    )
+
+    gate_3d_output = gated_3d()
+    gate_4d_output = gated_4d()
+    max_abs_diff = float((gate_3d_output.float() - gate_4d_output.float()).abs().max().item())
+    gate_3d_ms = _time_op(gated_3d, warmup=warmup, iters=iters)
+    gate_4d_ms = _time_op(gated_4d, warmup=warmup, iters=iters)
+    return gate_3d_ms, gate_4d_ms, max_abs_diff
+
+
+def _benchmark_paged_gqa_decode_gate_layouts(
+    *,
+    batch_size: int,
+    key_len: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    block_size: int,
+    dtype: torch.dtype,
+    warmup: int,
+    iters: int,
+) -> tuple[float, float, float]:
+    query_states = torch.randn(batch_size, num_heads, 1, head_dim, device="xpu", dtype=dtype)
+    key_states = torch.randn(batch_size, num_kv_heads, key_len, head_dim, device="xpu", dtype=dtype)
+    value_states = torch.randn(batch_size, num_kv_heads, key_len, head_dim, device="xpu", dtype=dtype)
+    key_pages, value_pages, page_table = _pack_paged_kv(key_states, value_states, block_size=block_size)
+    visible_lengths = torch.randint(max(1, key_len // 2), key_len + 1, (batch_size,), device="xpu", dtype=torch.long)
+    gate_3d = torch.randn(batch_size, 1, num_heads * head_dim, device="xpu", dtype=dtype)
+    gate_4d = _decode_gate_query_layout(gate_3d, num_heads=num_heads, head_dim=head_dim)
+    scaling = head_dim**-0.5
+
+    gated_3d = lambda: torch.ops.anna.paged_gqa_decode_fused(
+        query_states,
+        key_pages,
+        value_pages,
+        page_table,
+        visible_lengths,
+        scaling,
+        gate_3d,
+    )
+    gated_4d = lambda: torch.ops.anna.paged_gqa_decode_fused(
+        query_states,
+        key_pages,
+        value_pages,
+        page_table,
+        visible_lengths,
+        scaling,
+        gate_4d,
+    )
+
+    gate_3d_output = gated_3d()
+    gate_4d_output = gated_4d()
+    max_abs_diff = float((gate_3d_output.float() - gate_4d_output.float()).abs().max().item())
+    gate_3d_ms = _time_op(gated_3d, warmup=warmup, iters=iters)
+    gate_4d_ms = _time_op(gated_4d, warmup=warmup, iters=iters)
+    return gate_3d_ms, gate_4d_ms, max_abs_diff
 
 
 def _benchmark_sdpa_gqa_decode_full_visible(
@@ -487,6 +613,27 @@ def main() -> None:
         warmup=args.warmup,
         iters=args.iters,
     )
+    decode_gate_3d_ms, decode_gate_4d_ms, decode_gate_diff = _benchmark_gqa_decode_gate_layouts(
+        batch_size=args.batch_size,
+        key_len=kv_len,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        head_dim=args.head_dim,
+        dtype=dtype,
+        warmup=args.warmup,
+        iters=args.iters,
+    )
+    paged_decode_gate_3d_ms, paged_decode_gate_4d_ms, paged_decode_gate_diff = _benchmark_paged_gqa_decode_gate_layouts(
+        batch_size=args.batch_size,
+        key_len=kv_len,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        head_dim=args.head_dim,
+        block_size=32,
+        dtype=dtype,
+        warmup=args.warmup,
+        iters=args.iters,
+    )
     decode_sdpa_baseline_ms, decode_sdpa_gqa_ms, decode_sdpa_gqa_diff = _benchmark_sdpa_gqa_decode_full_visible(
         batch_size=args.batch_size,
         key_len=kv_len,
@@ -550,6 +697,14 @@ def main() -> None:
     print(
         f"gqa_decode_fused_proto,{decode_baseline_ms:.4f},{decode_gqa_ms:.4f},"
         f"{_format_speedup(decode_baseline_ms, decode_gqa_ms)},{decode_gqa_diff:.6f}"
+    )
+    print(
+        f"gqa_decode_gate_3d_contiguous_vs_4d_query_layout,{decode_gate_3d_ms:.4f},{decode_gate_4d_ms:.4f},"
+        f"{_format_speedup(decode_gate_3d_ms, decode_gate_4d_ms)},{decode_gate_diff:.6f}"
+    )
+    print(
+        f"paged_gqa_decode_gate_3d_contiguous_vs_4d_query_layout,{paged_decode_gate_3d_ms:.4f},{paged_decode_gate_4d_ms:.4f},"
+        f"{_format_speedup(paged_decode_gate_3d_ms, paged_decode_gate_4d_ms)},{paged_decode_gate_diff:.6f}"
     )
     print(
         f"moe_router,{router_baseline_ms:.4f},{router_fused_ms:.4f},"
