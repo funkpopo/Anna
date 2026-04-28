@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 import logging
 import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -19,6 +22,8 @@ _AUTO_ROUND_PACKING_FORMATS = frozenset({"auto_round:auto_gptq"})
 _FLOAT_OVERRIDE_DATA_TYPES = frozenset({"fp", "float", "float16", "fp16", "bfloat16", "bf16"})
 _REGEX_META_CHARS = frozenset("\\[](){}?*+^$|")
 _XPU_INT4_MATMUL_STRATEGIES = frozenset({"auto", "torch", "dequant", "sycl"})
+_XPU_INT4_LAYOUT_CACHE_VERSION = 1
+_XPU_INT4_LAYOUT_NAME = "anna_xpu_int4_linear_v1"
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,127 @@ def _empty_parameter(
 
 def _int4_shifts(*, device: torch.device | str | None = None) -> torch.Tensor:
     return torch.arange(0, 32, 4, device=device, dtype=torch.int32)
+
+
+def _dtype_cache_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _safe_cache_key(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "module"
+
+
+def _hash_tensor(hasher: "hashlib._Hash", tensor: torch.Tensor | None) -> None:
+    if tensor is None:
+        hasher.update(b"<none>")
+        return
+    materialized = tensor.detach().to(device="cpu").contiguous()
+    hasher.update(str(materialized.dtype).encode("utf-8"))
+    hasher.update(json.dumps(tuple(materialized.shape)).encode("utf-8"))
+    hasher.update(materialized.numpy().tobytes())
+
+
+def _linear_cache_fingerprint(module: nn.Module, *, group_size: int, compute_dtype: torch.dtype) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(type(module).__qualname__.encode("utf-8"))
+    hasher.update(str(group_size).encode("utf-8"))
+    hasher.update(_dtype_cache_name(compute_dtype).encode("utf-8"))
+    hasher.update(_XPU_INT4_LAYOUT_NAME.encode("utf-8"))
+    hasher.update(str(getattr(module, "in_features", "")).encode("utf-8"))
+    hasher.update(str(getattr(module, "out_features", "")).encode("utf-8"))
+    if isinstance(module, AutoRoundGPTQLinear):
+        hasher.update(str(module.group_size).encode("utf-8"))
+        _hash_tensor(hasher, module.qweight)
+        _hash_tensor(hasher, module.qzeros)
+        _hash_tensor(hasher, module.scales)
+        _hash_tensor(hasher, module.bias)
+    elif isinstance(module, AWQLinear):
+        hasher.update(str(module.group_size).encode("utf-8"))
+        _hash_tensor(hasher, module.qweight)
+        _hash_tensor(hasher, module.qzeros)
+        _hash_tensor(hasher, module.scales)
+        _hash_tensor(hasher, module.bias)
+        _hash_tensor(hasher, module.weight)
+    else:
+        weight, bias = _extract_dense_weight_bias(module)
+        _hash_tensor(hasher, weight)
+        _hash_tensor(hasher, bias)
+    return hasher.hexdigest()
+
+
+def _cache_file_for_linear(cache_dir: Path, module_name: str, fingerprint: str) -> Path:
+    return cache_dir / f"{_safe_cache_key(module_name)}-{fingerprint[:16]}.pt"
+
+
+def _load_xpu_int4_linear_from_cache(
+    cache_path: Path,
+    *,
+    device: torch.device | str | None,
+    compute_dtype: torch.dtype,
+    fingerprint: str,
+) -> "XPUInt4Linear | None":
+    if not cache_path.exists():
+        return None
+    try:
+        payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+    except Exception:
+        logger.warning("Ignoring unreadable XPU int4 cache file: %s", cache_path, exc_info=True)
+        return None
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    if metadata.get("version") != _XPU_INT4_LAYOUT_CACHE_VERSION or metadata.get("fingerprint") != fingerprint:
+        return None
+    if metadata.get("layout") != _XPU_INT4_LAYOUT_NAME:
+        return None
+    try:
+        quantized = XPUInt4Linear(
+            int(metadata["in_features"]),
+            int(metadata["out_features"]),
+            group_size=int(metadata["group_size"]),
+            bias=bool(metadata["has_bias"]),
+            compute_dtype=compute_dtype,
+            device=device,
+            padded_in_features=int(metadata["padded_in_features"]),
+        )
+        with torch.no_grad():
+            quantized.qweight.copy_(payload["qweight"].to(device=quantized.qweight.device))
+            quantized.qscale.copy_(payload["qscale"].to(device=quantized.qscale.device))
+            quantized.qzeros.copy_(payload["qzeros"].to(device=quantized.qzeros.device))
+            if quantized.bias is not None:
+                quantized.bias.copy_(payload["bias"].to(device=quantized.bias.device, dtype=quantized.bias.dtype))
+    except Exception:
+        logger.warning("Ignoring incompatible XPU int4 cache file: %s", cache_path, exc_info=True)
+        return None
+    logger.info("Loaded XPU int4 layout cache: %s", cache_path)
+    return quantized
+
+
+def _save_xpu_int4_linear_to_cache(
+    cache_path: Path,
+    quantized: "XPUInt4Linear",
+    *,
+    fingerprint: str,
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "metadata": {
+            "version": _XPU_INT4_LAYOUT_CACHE_VERSION,
+            "layout": _XPU_INT4_LAYOUT_NAME,
+            "fingerprint": fingerprint,
+            "in_features": quantized.in_features,
+            "out_features": quantized.out_features,
+            "group_size": quantized.group_size,
+            "padded_in_features": quantized.padded_in_features,
+            "compute_dtype": _dtype_cache_name(quantized.compute_dtype),
+            "has_bias": quantized.bias is not None,
+        },
+        "qweight": quantized.qweight.detach().to(device="cpu").contiguous(),
+        "qscale": quantized.qscale.detach().to(device="cpu").contiguous(),
+        "qzeros": quantized.qzeros.detach().to(device="cpu").contiguous(),
+        "bias": None if quantized.bias is None else quantized.bias.detach().to(device="cpu").contiguous(),
+    }
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(cache_path)
 
 
 def _unpack_int4_last_dim(packed: torch.Tensor) -> torch.Tensor:
@@ -658,9 +784,14 @@ def convert_module_linears_to_xpu_int4(
     compute_dtype: torch.dtype | None = None,
     device: torch.device | str = torch.device("xpu"),
     include_predicate: Callable[[str, nn.Module], bool] | None = None,
+    cache_dir: str | Path | None = None,
 ) -> int:
     count = 0
     gc_every = 16
+    resolved_cache_dir = Path(cache_dir) if cache_dir is not None else None
+    env_cache_dir = os.getenv("ANNA_XPU_INT4_CACHE_DIR")
+    if resolved_cache_dir is None and env_cache_dir:
+        resolved_cache_dir = Path(env_cache_dir)
     for module_name, child in list(module.named_modules()):
         if not module_name:
             continue
@@ -671,12 +802,41 @@ def convert_module_linears_to_xpu_int4(
         if include_predicate is not None and not include_predicate(module_name, child):
             continue
         resolved_group_size = int(getattr(child, "group_size", group_size))
-        replacement = XPUInt4Linear.from_linear(
-            child,
-            group_size=resolved_group_size,
-            compute_dtype=compute_dtype or getattr(child, "compute_dtype", torch.bfloat16),
-            device=device,
-        )
+        resolved_compute_dtype = compute_dtype or getattr(child, "compute_dtype", torch.bfloat16)
+        replacement = None
+        cache_path = None
+        fingerprint = None
+        if resolved_cache_dir is not None:
+            try:
+                fingerprint = _linear_cache_fingerprint(
+                    child,
+                    group_size=resolved_group_size,
+                    compute_dtype=resolved_compute_dtype,
+                )
+                cache_path = _cache_file_for_linear(resolved_cache_dir, module_name, fingerprint)
+                replacement = _load_xpu_int4_linear_from_cache(
+                    cache_path,
+                    device=device,
+                    compute_dtype=resolved_compute_dtype,
+                    fingerprint=fingerprint,
+                )
+            except Exception:
+                logger.warning("Failed to probe XPU int4 cache for module %s", module_name, exc_info=True)
+                replacement = None
+
+        if replacement is None:
+            replacement = XPUInt4Linear.from_linear(
+                child,
+                group_size=resolved_group_size,
+                compute_dtype=resolved_compute_dtype,
+                device=device,
+            )
+            if cache_path is not None and fingerprint is not None:
+                try:
+                    _save_xpu_int4_linear_to_cache(cache_path, replacement, fingerprint=fingerprint)
+                    logger.info("Saved XPU int4 layout cache: %s", cache_path)
+                except Exception:
+                    logger.warning("Failed to save XPU int4 cache for module %s", module_name, exc_info=True)
         _set_submodule(module, module_name, replacement)
         count += 1
         if gc_every > 0 and count % gc_every == 0:

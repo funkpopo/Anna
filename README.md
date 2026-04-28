@@ -106,6 +106,14 @@ anna-generate --model-dir /path/to/text-model --prompt "Explain KV cache in one 
 anna-bench --model-dir /path/to/model --prompt "Hello" --warmup 1 --runs 3
 ```
 
+**Check runtime XPU int4 cache eligibility:**
+
+```bash
+anna-xpu-int4-cache --model-dir /path/to/model --weight-quant auto --xpu-total-memory-gib 16
+```
+
+For safetensors Qwen3.5 models without an existing quantization config, this reports whether `--weight-quant auto` resolves to `int4` and shows the sidecar cache directory, usually `<model-dir>/.anna/xpu_int4_cache`.
+
 **TTS (example: base voice clone):**
 
 ```bash

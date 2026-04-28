@@ -539,6 +539,7 @@ class AnnaQwen3_5TextEngine:
                     model=model,
                     device=device_context.device,
                     compute_dtype=device_context.dtype,
+                    cache_dir=model_path / ".anna" / "xpu_int4_cache",
                 )
                 release_conversion_artifacts(device_context.device)
             total_quantized_replacements = model_quantized_replacements + runtime_weight_quantized_replacements
@@ -843,6 +844,7 @@ class AnnaQwen3_5TextEngine:
         model: Qwen3_5TextForConditionalGeneration,
         device: torch.device,
         compute_dtype: torch.dtype,
+        cache_dir: Path | None = None,
     ) -> int:
         def _should_quantize(module_name: str, _module: torch.nn.Module) -> bool:
             normalized = module_name.replace("\\", "/")
@@ -858,12 +860,14 @@ class AnnaQwen3_5TextEngine:
             compute_dtype=compute_dtype,
             device=device,
             include_predicate=_should_quantize,
+            cache_dir=cache_dir,
         )
         logger.info(
-            "Runtime dense XPU int4 quantization: replacements=%s device=%s compute_dtype=%s",
+            "Runtime dense XPU int4 quantization: replacements=%s device=%s compute_dtype=%s cache_dir=%s",
             replacements,
             device,
             compute_dtype,
+            cache_dir,
         )
         return replacements
 
