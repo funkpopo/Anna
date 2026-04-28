@@ -64,3 +64,25 @@ def sample_next_token(
     next_logits = apply_top_p(next_logits, top_p)
     probs = torch.softmax(next_logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
+def sample_next_token_from_candidates(
+    candidate_logits: torch.Tensor,
+    candidate_token_ids: torch.Tensor,
+    *,
+    temperature: float = 0.7,
+    top_p: float = 0.95,
+) -> torch.Tensor:
+    if candidate_logits.shape != candidate_token_ids.shape:
+        raise ValueError("candidate_logits and candidate_token_ids must have the same shape")
+    if candidate_logits.numel() == 0:
+        raise ValueError("candidate logits must not be empty")
+
+    if temperature <= 0.0:
+        return candidate_token_ids.gather(dim=-1, index=torch.argmax(candidate_logits, dim=-1, keepdim=True)).squeeze(-1)
+
+    next_logits = candidate_logits / temperature
+    next_logits = apply_top_p(next_logits, top_p)
+    probs = torch.softmax(next_logits, dim=-1)
+    selected = torch.multinomial(probs, num_samples=1)
+    return candidate_token_ids.gather(dim=-1, index=selected).squeeze(-1)

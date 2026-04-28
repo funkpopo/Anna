@@ -107,6 +107,20 @@ def _moe_grouped_int4_mlp_op():
     return getattr(namespace, "moe_grouped_int4_mlp_fused", None)
 
 
+def _lm_head_topk_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "lm_head_topk_fused", None)
+
+
+def _lm_head_int4_topk_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "lm_head_int4_topk_fused", None)
+
+
 def _rmsnorm_op():
     namespace = getattr(torch.ops, "anna", None)
     if namespace is None:
@@ -185,6 +199,14 @@ def moe_scatter_fused_is_available() -> bool:
 
 def moe_grouped_int4_mlp_fused_is_available() -> bool:
     return _moe_grouped_int4_mlp_op() is not None
+
+
+def lm_head_topk_fused_is_available() -> bool:
+    return _lm_head_topk_op() is not None
+
+
+def lm_head_int4_topk_fused_is_available() -> bool:
+    return _lm_head_int4_topk_op() is not None
 
 
 def rmsnorm_fused_is_available() -> bool:
@@ -404,6 +426,46 @@ def run_moe_grouped_int4_mlp_fused(
         int(group_size),
         int(max_routes_per_expert),
     )
+
+
+def run_lm_head_topk_fused(
+    *,
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op = _lm_head_topk_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _lm_head_topk_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna lm_head_topk_fused op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(hidden_states, weight, int(top_k))
+
+
+def run_lm_head_int4_topk_fused(
+    *,
+    hidden_states: torch.Tensor,
+    qweight: torch.Tensor,
+    qscale: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int,
+    in_features: int,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op = _lm_head_int4_topk_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _lm_head_int4_topk_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna lm_head_int4_topk_fused op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    return op(hidden_states, qweight, qscale, qzeros, int(group_size), int(in_features), int(top_k))
 
 
 def run_rmsnorm_fused(

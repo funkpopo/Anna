@@ -16,6 +16,7 @@ from anna.model.ops import (
     torch_causal_conv1d_update,
     torch_recurrent_gated_delta_rule,
 )
+from anna.model.quantization import XPUInt4Linear
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 
 
@@ -165,6 +166,54 @@ def _reference_moe_router(
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
     usage = torch.bincount(selected_experts.reshape(-1), minlength=router_logits.shape[-1])
     return routing_weights, selected_experts, usage
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_lm_head_topk_fused_xpu_matches_reference() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "lm_head_topk_fused"):
+        pytest.skip("Anna fused-op library is not built with lm_head_topk_fused")
+
+    torch.manual_seed(0)
+    device = "xpu"
+    hidden_states = torch.randn(2, 3, 16, device=device, dtype=torch.float16)
+    weight = torch.randn(31, 16, device=device, dtype=torch.float16)
+
+    values, indices = torch.ops.anna.lm_head_topk_fused(hidden_states, weight, 5)
+    reference_values, reference_indices = torch.topk(hidden_states @ weight.t(), k=5, dim=-1)
+
+    assert values.shape == (2, 3, 5)
+    assert indices.shape == (2, 3, 5)
+    assert indices.dtype == torch.long
+    assert torch.equal(indices.cpu(), reference_indices.cpu())
+    assert torch.allclose(values.cpu(), reference_values.cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_lm_head_int4_topk_fused_xpu_matches_quantized_reference() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "lm_head_int4_topk_fused"):
+        pytest.skip("Anna fused-op library is not built with lm_head_int4_topk_fused")
+
+    torch.manual_seed(0)
+    dense = torch.nn.Linear(16, 31, bias=False, dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=32, compute_dtype=torch.float16, device="xpu")
+    hidden_states = torch.randn(2, 3, 16, device="xpu", dtype=torch.float16)
+
+    values, indices = torch.ops.anna.lm_head_int4_topk_fused(
+        hidden_states,
+        quantized.qweight,
+        quantized.qscale,
+        quantized.qzeros,
+        quantized.group_size,
+        quantized.in_features,
+        5,
+    )
+    reference_values, reference_indices = torch.topk(quantized(hidden_states), k=5, dim=-1)
+
+    assert values.shape == (2, 3, 5)
+    assert indices.shape == (2, 3, 5)
+    assert indices.dtype == torch.long
+    assert torch.equal(indices.cpu(), reference_indices.cpu())
+    assert torch.allclose(values.cpu(), reference_values.cpu(), atol=2e-2, rtol=2e-2)
 
 
 def _pack_paged_kv(

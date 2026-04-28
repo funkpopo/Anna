@@ -876,3 +876,26 @@ def test_runtime_weight_quantized_lm_head_preserves_forward_shapes() -> None:
     )
 
     assert outputs.logits.shape == (1, 1, model.config.vocab_size)
+
+
+def test_qwen3_5_lm_head_topk_matches_full_logits() -> None:
+    torch.manual_seed(0)
+    config = Qwen3_5TextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        layer_types=["full_attention"],
+    )
+    model = Qwen3_5TextForCausalLM(config)
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+
+    full = model(input_ids=input_ids, use_cache=False, logits_to_keep=1).logits
+    topk = model.forward_topk(input_ids=input_ids, use_cache=False, logits_to_keep=1, top_k=5)
+    reference_values, reference_indices = torch.topk(full, k=5, dim=-1)
+
+    assert torch.allclose(topk.candidate_logits, reference_values)
+    assert torch.equal(topk.candidate_token_ids, reference_indices)
