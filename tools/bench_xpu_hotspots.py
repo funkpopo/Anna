@@ -90,6 +90,7 @@ def _benchmark_xpu_int4_linear(
     dtype: torch.dtype,
     warmup: int,
     iters: int,
+    strategy: str = "auto",
 ) -> tuple[float, float, float]:
     dense = torch.nn.Linear(in_features, out_features, bias=False, device="xpu", dtype=torch.float32)
     quantized = XPUInt4Linear.from_linear(dense, group_size=group_size, compute_dtype=dtype, device="xpu")
@@ -98,7 +99,7 @@ def _benchmark_xpu_int4_linear(
 
     baseline = lambda: F.linear(hidden_states, dense_weight)
     previous_strategy = os.environ.get("ANNA_XPU_INT4_MATMUL")
-    os.environ["ANNA_XPU_INT4_MATMUL"] = "auto"
+    os.environ["ANNA_XPU_INT4_MATMUL"] = strategy
     candidate = lambda: quantized(hidden_states)
     baseline_ms = _time_op(baseline, warmup=warmup, iters=iters)
     candidate_output = candidate()
@@ -108,6 +109,160 @@ def _benchmark_xpu_int4_linear(
         os.environ.pop("ANNA_XPU_INT4_MATMUL", None)
     else:
         os.environ["ANNA_XPU_INT4_MATMUL"] = previous_strategy
+    max_abs_diff = float((candidate_output.float() - baseline_output.float()).abs().max().item())
+    return baseline_ms, candidate_ms, max_abs_diff
+
+
+def _benchmark_lm_head_int4_topk(
+    *,
+    tokens: int,
+    in_features: int,
+    vocab_size: int,
+    top_k: int,
+    group_size: int,
+    dtype: torch.dtype,
+    warmup: int,
+    iters: int,
+    local_size: int | None = None,
+) -> tuple[float, float, float]:
+    dense = torch.nn.Linear(in_features, vocab_size, bias=False, device="xpu", dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=group_size, compute_dtype=dtype, device="xpu")
+    hidden_states = torch.randn(tokens, in_features, device="xpu", dtype=dtype)
+    previous_local_size = os.environ.get("ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE")
+    if local_size is None:
+        os.environ.pop("ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE", None)
+    else:
+        os.environ["ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE"] = str(local_size)
+
+    baseline = lambda: torch.topk(quantized(hidden_states), k=top_k, dim=-1)
+    candidate = lambda: torch.ops.anna.lm_head_int4_topk_fused(
+        hidden_states,
+        quantized.qweight,
+        quantized.qscale,
+        quantized.qzeros,
+        quantized.group_size,
+        quantized.in_features,
+        top_k,
+    )
+    try:
+        baseline_ms = _time_op(baseline, warmup=warmup, iters=iters)
+        candidate_values, candidate_indices = candidate()
+        baseline_values, baseline_indices = baseline()
+        candidate_ms = _time_op(candidate, warmup=warmup, iters=iters)
+    finally:
+        if previous_local_size is None:
+            os.environ.pop("ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE", None)
+        else:
+            os.environ["ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE"] = previous_local_size
+
+    if not torch.equal(candidate_indices.cpu(), baseline_indices.cpu()):
+        max_abs_diff = float("inf")
+    else:
+        max_abs_diff = float((candidate_values.float() - baseline_values.float()).abs().max().item())
+    return baseline_ms, candidate_ms, max_abs_diff
+
+
+def _restore_env(name: str, previous: str | None) -> None:
+    if previous is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = previous
+
+
+def _benchmark_moe_grouped_int4_mlp(
+    *,
+    tokens_per_expert: int,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    group_size: int,
+    dtype: torch.dtype,
+    warmup: int,
+    iters: int,
+    gate_local_size: int | None = None,
+    down_local_size: int | None = None,
+) -> tuple[float, float, float]:
+    gate_layers: list[XPUInt4Linear] = []
+    up_layers: list[XPUInt4Linear] = []
+    down_layers: list[XPUInt4Linear] = []
+    for _ in range(num_experts):
+        gate_dense = torch.nn.Linear(hidden_size, intermediate_size, bias=False, device="xpu", dtype=torch.float32)
+        up_dense = torch.nn.Linear(hidden_size, intermediate_size, bias=False, device="xpu", dtype=torch.float32)
+        down_dense = torch.nn.Linear(intermediate_size, hidden_size, bias=False, device="xpu", dtype=torch.float32)
+        gate_layers.append(XPUInt4Linear.from_linear(gate_dense, group_size=group_size, compute_dtype=dtype, device="xpu"))
+        up_layers.append(XPUInt4Linear.from_linear(up_dense, group_size=group_size, compute_dtype=dtype, device="xpu"))
+        down_layers.append(XPUInt4Linear.from_linear(down_dense, group_size=group_size, compute_dtype=dtype, device="xpu"))
+
+    total_routes = max(1, tokens_per_expert) * max(1, num_experts)
+    compact_hidden_states = torch.randn(total_routes, hidden_size, device="xpu", dtype=dtype)
+    compact_routing_weights = torch.rand(total_routes, 1, device="xpu", dtype=dtype)
+    compact_outputs = torch.empty(total_routes, hidden_size, device="xpu", dtype=dtype)
+    offsets = torch.arange(0, total_routes + 1, max(1, tokens_per_expert), device="xpu", dtype=torch.long)
+    active_experts = torch.arange(num_experts, device="xpu", dtype=torch.long)
+    active_slots = torch.arange(num_experts, device="xpu", dtype=torch.long)
+
+    gate_qweight = torch.stack([layer.qweight for layer in gate_layers], dim=0)
+    gate_qscale = torch.stack([layer.qscale for layer in gate_layers], dim=0)
+    gate_qzeros = torch.stack([layer.qzeros for layer in gate_layers], dim=0)
+    up_qweight = torch.stack([layer.qweight for layer in up_layers], dim=0)
+    up_qscale = torch.stack([layer.qscale for layer in up_layers], dim=0)
+    up_qzeros = torch.stack([layer.qzeros for layer in up_layers], dim=0)
+    down_qweight = torch.stack([layer.qweight for layer in down_layers], dim=0)
+    down_qscale = torch.stack([layer.qscale for layer in down_layers], dim=0)
+    down_qzeros = torch.stack([layer.qzeros for layer in down_layers], dim=0)
+
+    def baseline() -> torch.Tensor:
+        output = torch.empty_like(compact_outputs)
+        for expert_idx in range(num_experts):
+            start = expert_idx * max(1, tokens_per_expert)
+            end = start + max(1, tokens_per_expert)
+            hidden = compact_hidden_states[start:end]
+            routed = down_layers[expert_idx](F.silu(gate_layers[expert_idx](hidden)) * up_layers[expert_idx](hidden))
+            output[start:end] = routed * compact_routing_weights[start:end]
+        return output
+
+    def candidate() -> torch.Tensor:
+        output = compact_outputs.zero_()
+        return torch.ops.anna.moe_grouped_int4_mlp_fused(
+            compact_hidden_states,
+            compact_routing_weights,
+            output,
+            offsets,
+            active_experts,
+            active_slots,
+            gate_qweight,
+            gate_qscale,
+            gate_qzeros,
+            up_qweight,
+            up_qscale,
+            up_qzeros,
+            down_qweight,
+            down_qscale,
+            down_qzeros,
+            group_size,
+            max(1, tokens_per_expert),
+        )
+
+    previous_gate = os.environ.get("ANNA_XPU_INT4_MOE_GATE_LOCAL_SIZE")
+    previous_down = os.environ.get("ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE")
+    if gate_local_size is None:
+        os.environ.pop("ANNA_XPU_INT4_MOE_GATE_LOCAL_SIZE", None)
+    else:
+        os.environ["ANNA_XPU_INT4_MOE_GATE_LOCAL_SIZE"] = str(gate_local_size)
+    if down_local_size is None:
+        os.environ.pop("ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE", None)
+    else:
+        os.environ["ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE"] = str(down_local_size)
+
+    try:
+        baseline_ms = _time_op(baseline, warmup=warmup, iters=iters)
+        candidate_output = candidate()
+        baseline_output = baseline()
+        candidate_ms = _time_op(candidate, warmup=warmup, iters=iters)
+    finally:
+        _restore_env("ANNA_XPU_INT4_MOE_GATE_LOCAL_SIZE", previous_gate)
+        _restore_env("ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE", previous_down)
+
     max_abs_diff = float((candidate_output.float() - baseline_output.float()).abs().max().item())
     return baseline_ms, candidate_ms, max_abs_diff
 
@@ -576,11 +731,22 @@ def main() -> None:
     parser.add_argument("--int4-m", type=int, default=1, help="Token rows for XPU int4 linear benchmark.")
     parser.add_argument("--int4-k", type=int, default=None, help="Input features for XPU int4 linear benchmark.")
     parser.add_argument("--int4-n", type=int, default=None, help="Output features for XPU int4 linear benchmark.")
+    parser.add_argument(
+        "--lm-head-vocab-size",
+        type=int,
+        default=None,
+        help="Vocabulary size for lm_head_int4_topk_fused arc-profile rows. Defaults to --int4-n.",
+    )
     parser.add_argument("--int4-group-size", type=int, default=128)
     parser.add_argument(
         "--arc-profile",
         action="store_true",
         help="Run additional Arc A770/A750-oriented int4 linear shapes for decode small batches.",
+    )
+    parser.add_argument(
+        "--arc-int4-only",
+        action="store_true",
+        help="Only run the Arc int4 profile rows. Requires --arc-profile and skips the general hotspot suite.",
     )
     args = parser.parse_args()
 
@@ -596,127 +762,11 @@ def main() -> None:
     kv_len = args.seq_len if args.kv_len is None else int(args.kv_len)
     num_key_value_groups = max(1, args.num_heads // max(1, args.num_kv_heads))
     xpu_info = inspect_xpu_device(torch.device("xpu"))
+    effective_top_k = max(1, min(args.top_k, args.experts))
 
-    rmsnorm_baseline_ms, rmsnorm_fused_ms, rmsnorm_diff = _benchmark_rmsnorm(
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        hidden_size=args.hidden_size,
-        dtype=dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-    )
-    qk_baseline_ms, qk_fused_ms, qk_diff = _benchmark_qk_norm_rotary(
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        head_dim=args.head_dim,
-        rotary_dim=rotary_dim,
-        dtype=dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-    )
-    repeat_kv_ms = _benchmark_repeat_kv(
-        batch_size=args.batch_size,
-        seq_len=kv_len,
-        num_kv_heads=args.num_kv_heads,
-        num_key_value_groups=num_key_value_groups,
-        head_dim=args.head_dim,
-        dtype=dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-    )
-    sdpa_baseline_ms, sdpa_gqa_ms, sdpa_diff = _benchmark_sdpa_gqa_prefill(
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        head_dim=args.head_dim,
-        dtype=dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-    )
-    gqa_baseline_ms, gqa_grouped_ms, gqa_diff = _benchmark_grouped_attention(
-        batch_size=args.batch_size,
-        query_len=args.seq_len,
-        key_len=kv_len,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        head_dim=args.head_dim,
-        dtype=dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-    )
-    decode_baseline_ms, decode_gqa_ms, decode_gqa_diff = _benchmark_gqa_decode_fused(
-        batch_size=args.batch_size,
-        key_len=kv_len,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        head_dim=args.head_dim,
-        dtype=dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-    )
-    decode_gate_3d_ms, decode_gate_4d_ms, decode_gate_diff = _benchmark_gqa_decode_gate_layouts(
-        batch_size=args.batch_size,
-        key_len=kv_len,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        head_dim=args.head_dim,
-        dtype=dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-    )
-    paged_decode_gate_3d_ms, paged_decode_gate_4d_ms, paged_decode_gate_diff = _benchmark_paged_gqa_decode_gate_layouts(
-        batch_size=args.batch_size,
-        key_len=kv_len,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        head_dim=args.head_dim,
-        block_size=32,
-        dtype=dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-    )
-    decode_sdpa_baseline_ms, decode_sdpa_gqa_ms, decode_sdpa_gqa_diff = _benchmark_sdpa_gqa_decode_full_visible(
-        batch_size=args.batch_size,
-        key_len=kv_len,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        head_dim=args.head_dim,
-        dtype=dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-    )
-    decode_variable_baseline_ms, decode_variable_gqa_ms, decode_variable_gqa_diff = _benchmark_sdpa_gqa_decode_variable_visible(
-        batch_size=args.batch_size,
-        key_len=kv_len,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        head_dim=args.head_dim,
-        dtype=dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-    )
-    router_baseline_ms, router_fused_ms, router_diff = _benchmark_router(
-        tokens=tokens,
-        num_experts=args.experts,
-        top_k=args.top_k,
-        dtype=dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-    )
     int4_k = args.hidden_size if args.int4_k is None else args.int4_k
     int4_n = args.hidden_size if args.int4_n is None else args.int4_n
-    int4_baseline_ms, int4_candidate_ms, int4_diff = _benchmark_xpu_int4_linear(
-        tokens=args.int4_m,
-        in_features=int4_k,
-        out_features=int4_n,
-        group_size=args.int4_group_size,
-        dtype=dtype,
-        warmup=args.warmup,
-        iters=args.iters,
-    )
+    lm_head_vocab_size = int4_n if args.lm_head_vocab_size is None else args.lm_head_vocab_size
 
     print(
         f"shape batch={args.batch_size} seq={args.seq_len} hidden={args.hidden_size} "
@@ -726,53 +776,175 @@ def main() -> None:
     if xpu_info is not None:
         print(f"device_name={xpu_info.name}")
         print(f"device_index={xpu_info.device_index}")
-    print("op,baseline_ms,fused_ms,speedup,max_abs_diff")
-    print(
-        f"rmsnorm,{rmsnorm_baseline_ms:.4f},{rmsnorm_fused_ms:.4f},"
-        f"{_format_speedup(rmsnorm_baseline_ms, rmsnorm_fused_ms)},{rmsnorm_diff:.6f}"
-    )
-    print(
-        f"qk_norm_rotary,{qk_baseline_ms:.4f},{qk_fused_ms:.4f},"
-        f"{_format_speedup(qk_baseline_ms, qk_fused_ms)},{qk_diff:.6f}"
-    )
-    print(f"repeat_kv_materialize,-,{repeat_kv_ms:.4f},-,-")
-    print(
-        f"sdpa_gqa_prefill,{sdpa_baseline_ms:.4f},{sdpa_gqa_ms:.4f},"
-        f"{_format_speedup(sdpa_baseline_ms, sdpa_gqa_ms)},{sdpa_diff:.6f}"
-    )
-    print(
-        f"grouped_query_attention_decode,{gqa_baseline_ms:.4f},{gqa_grouped_ms:.4f},"
-        f"{_format_speedup(gqa_baseline_ms, gqa_grouped_ms)},{gqa_diff:.6f}"
-    )
-    print(
-        f"sdpa_gqa_decode_full_visible,{decode_sdpa_baseline_ms:.4f},{decode_sdpa_gqa_ms:.4f},"
-        f"{_format_speedup(decode_sdpa_baseline_ms, decode_sdpa_gqa_ms)},{decode_sdpa_gqa_diff:.6f}"
-    )
-    print(
-        f"sdpa_gqa_decode_variable_visible,{decode_variable_baseline_ms:.4f},{decode_variable_gqa_ms:.4f},"
-        f"{_format_speedup(decode_variable_baseline_ms, decode_variable_gqa_ms)},{decode_variable_gqa_diff:.6f}"
-    )
-    print(
-        f"gqa_decode_fused_proto,{decode_baseline_ms:.4f},{decode_gqa_ms:.4f},"
-        f"{_format_speedup(decode_baseline_ms, decode_gqa_ms)},{decode_gqa_diff:.6f}"
-    )
-    print(
-        f"gqa_decode_gate_3d_contiguous_vs_4d_query_layout,{decode_gate_3d_ms:.4f},{decode_gate_4d_ms:.4f},"
-        f"{_format_speedup(decode_gate_3d_ms, decode_gate_4d_ms)},{decode_gate_diff:.6f}"
-    )
-    print(
-        f"paged_gqa_decode_gate_3d_contiguous_vs_4d_query_layout,{paged_decode_gate_3d_ms:.4f},{paged_decode_gate_4d_ms:.4f},"
-        f"{_format_speedup(paged_decode_gate_3d_ms, paged_decode_gate_4d_ms)},{paged_decode_gate_diff:.6f}"
-    )
-    print(
-        f"moe_router,{router_baseline_ms:.4f},{router_fused_ms:.4f},"
-        f"{_format_speedup(router_baseline_ms, router_fused_ms)},{router_diff:.6f}"
-    )
-    print(
-        f"xpu_int4_linear_m{args.int4_m}_k{int4_k}_n{int4_n}_g{args.int4_group_size},"
-        f"{int4_baseline_ms:.4f},{int4_candidate_ms:.4f},"
-        f"{_format_speedup(int4_baseline_ms, int4_candidate_ms)},{int4_diff:.6f}"
-    )
+    if args.arc_int4_only and not args.arc_profile:
+        raise ValueError("--arc-int4-only requires --arc-profile")
+    if not args.arc_int4_only:
+        rmsnorm_baseline_ms, rmsnorm_fused_ms, rmsnorm_diff = _benchmark_rmsnorm(
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            hidden_size=args.hidden_size,
+            dtype=dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        qk_baseline_ms, qk_fused_ms, qk_diff = _benchmark_qk_norm_rotary(
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_dim=args.head_dim,
+            rotary_dim=rotary_dim,
+            dtype=dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        repeat_kv_ms = _benchmark_repeat_kv(
+            batch_size=args.batch_size,
+            seq_len=kv_len,
+            num_kv_heads=args.num_kv_heads,
+            num_key_value_groups=num_key_value_groups,
+            head_dim=args.head_dim,
+            dtype=dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        sdpa_baseline_ms, sdpa_gqa_ms, sdpa_diff = _benchmark_sdpa_gqa_prefill(
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_dim=args.head_dim,
+            dtype=dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        gqa_baseline_ms, gqa_grouped_ms, gqa_diff = _benchmark_grouped_attention(
+            batch_size=args.batch_size,
+            query_len=args.seq_len,
+            key_len=kv_len,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_dim=args.head_dim,
+            dtype=dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        decode_baseline_ms, decode_gqa_ms, decode_gqa_diff = _benchmark_gqa_decode_fused(
+            batch_size=args.batch_size,
+            key_len=kv_len,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_dim=args.head_dim,
+            dtype=dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        decode_gate_3d_ms, decode_gate_4d_ms, decode_gate_diff = _benchmark_gqa_decode_gate_layouts(
+            batch_size=args.batch_size,
+            key_len=kv_len,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_dim=args.head_dim,
+            dtype=dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        paged_decode_gate_3d_ms, paged_decode_gate_4d_ms, paged_decode_gate_diff = _benchmark_paged_gqa_decode_gate_layouts(
+            batch_size=args.batch_size,
+            key_len=kv_len,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_dim=args.head_dim,
+            block_size=32,
+            dtype=dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        decode_sdpa_baseline_ms, decode_sdpa_gqa_ms, decode_sdpa_gqa_diff = _benchmark_sdpa_gqa_decode_full_visible(
+            batch_size=args.batch_size,
+            key_len=kv_len,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_dim=args.head_dim,
+            dtype=dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        decode_variable_baseline_ms, decode_variable_gqa_ms, decode_variable_gqa_diff = _benchmark_sdpa_gqa_decode_variable_visible(
+            batch_size=args.batch_size,
+            key_len=kv_len,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_dim=args.head_dim,
+            dtype=dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        router_baseline_ms, router_fused_ms, router_diff = _benchmark_router(
+            tokens=tokens,
+            num_experts=args.experts,
+            top_k=effective_top_k,
+            dtype=dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        int4_baseline_ms, int4_candidate_ms, int4_diff = _benchmark_xpu_int4_linear(
+            tokens=args.int4_m,
+            in_features=int4_k,
+            out_features=int4_n,
+            group_size=args.int4_group_size,
+            dtype=dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+
+        print("op,baseline_ms,fused_ms,speedup,max_abs_diff")
+        print(
+            f"rmsnorm,{rmsnorm_baseline_ms:.4f},{rmsnorm_fused_ms:.4f},"
+            f"{_format_speedup(rmsnorm_baseline_ms, rmsnorm_fused_ms)},{rmsnorm_diff:.6f}"
+        )
+        print(
+            f"qk_norm_rotary,{qk_baseline_ms:.4f},{qk_fused_ms:.4f},"
+            f"{_format_speedup(qk_baseline_ms, qk_fused_ms)},{qk_diff:.6f}"
+        )
+        print(f"repeat_kv_materialize,-,{repeat_kv_ms:.4f},-,-")
+        print(
+            f"sdpa_gqa_prefill,{sdpa_baseline_ms:.4f},{sdpa_gqa_ms:.4f},"
+            f"{_format_speedup(sdpa_baseline_ms, sdpa_gqa_ms)},{sdpa_diff:.6f}"
+        )
+        print(
+            f"grouped_query_attention_decode,{gqa_baseline_ms:.4f},{gqa_grouped_ms:.4f},"
+            f"{_format_speedup(gqa_baseline_ms, gqa_grouped_ms)},{gqa_diff:.6f}"
+        )
+        print(
+            f"sdpa_gqa_decode_full_visible,{decode_sdpa_baseline_ms:.4f},{decode_sdpa_gqa_ms:.4f},"
+            f"{_format_speedup(decode_sdpa_baseline_ms, decode_sdpa_gqa_ms)},{decode_sdpa_gqa_diff:.6f}"
+        )
+        print(
+            f"sdpa_gqa_decode_variable_visible,{decode_variable_baseline_ms:.4f},{decode_variable_gqa_ms:.4f},"
+            f"{_format_speedup(decode_variable_baseline_ms, decode_variable_gqa_ms)},{decode_variable_gqa_diff:.6f}"
+        )
+        print(
+            f"gqa_decode_fused_proto,{decode_baseline_ms:.4f},{decode_gqa_ms:.4f},"
+            f"{_format_speedup(decode_baseline_ms, decode_gqa_ms)},{decode_gqa_diff:.6f}"
+        )
+        print(
+            f"gqa_decode_gate_3d_contiguous_vs_4d_query_layout,{decode_gate_3d_ms:.4f},{decode_gate_4d_ms:.4f},"
+            f"{_format_speedup(decode_gate_3d_ms, decode_gate_4d_ms)},{decode_gate_diff:.6f}"
+        )
+        print(
+            f"paged_gqa_decode_gate_3d_contiguous_vs_4d_query_layout,{paged_decode_gate_3d_ms:.4f},{paged_decode_gate_4d_ms:.4f},"
+            f"{_format_speedup(paged_decode_gate_3d_ms, paged_decode_gate_4d_ms)},{paged_decode_gate_diff:.6f}"
+        )
+        print(
+            f"moe_router,{router_baseline_ms:.4f},{router_fused_ms:.4f},"
+            f"{_format_speedup(router_baseline_ms, router_fused_ms)},{router_diff:.6f}"
+        )
+        print(
+            f"xpu_int4_linear_m{args.int4_m}_k{int4_k}_n{int4_n}_g{args.int4_group_size},"
+            f"{int4_baseline_ms:.4f},{int4_candidate_ms:.4f},"
+            f"{_format_speedup(int4_baseline_ms, int4_candidate_ms)},{int4_diff:.6f}"
+        )
     if args.arc_profile:
         print("arc_int4_profile,device_name,strategy,M,K,N,group_size,dtype,baseline_ms,candidate_ms,speedup,max_abs_diff")
         arc_shapes = [
@@ -784,20 +956,70 @@ def main() -> None:
             (1, args.hidden_size * 4, args.hidden_size),
         ]
         for m, k, n in arc_shapes:
-            baseline_ms, candidate_ms, diff = _benchmark_xpu_int4_linear(
-                tokens=m,
-                in_features=k,
-                out_features=n,
+            strategies = ("auto", "sycl") if m <= 4 else ("auto",)
+            for strategy in strategies:
+                baseline_ms, candidate_ms, diff = _benchmark_xpu_int4_linear(
+                    tokens=m,
+                    in_features=k,
+                    out_features=n,
+                    group_size=args.int4_group_size,
+                    dtype=dtype,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    strategy=strategy,
+                )
+                device_name = "" if xpu_info is None else xpu_info.name
+                print(
+                    f"arc_int4_profile,{device_name},{strategy},{m},{k},{n},{args.int4_group_size},{dtype},"
+                    f"{baseline_ms:.4f},{candidate_ms:.4f},{_format_speedup(baseline_ms, candidate_ms)},{diff:.6f}"
+                )
+        print("arc_lm_head_int4_topk_profile,device_name,local_size,M,K,N,top_k,group_size,dtype,baseline_ms,candidate_ms,speedup,max_abs_diff")
+        for local_size in (8, 16, 32, 64):
+            baseline_ms, candidate_ms, diff = _benchmark_lm_head_int4_topk(
+                tokens=args.int4_m,
+                in_features=int4_k,
+                vocab_size=lm_head_vocab_size,
+                top_k=max(1, args.top_k),
                 group_size=args.int4_group_size,
                 dtype=dtype,
                 warmup=args.warmup,
                 iters=args.iters,
+                local_size=local_size,
             )
             device_name = "" if xpu_info is None else xpu_info.name
             print(
-                f"arc_int4_profile,{device_name},auto,{m},{k},{n},{args.int4_group_size},{dtype},"
+                f"arc_lm_head_int4_topk_profile,{device_name},{local_size},{args.int4_m},{int4_k},{lm_head_vocab_size},"
+                f"{max(1, args.top_k)},{args.int4_group_size},{dtype},"
                 f"{baseline_ms:.4f},{candidate_ms:.4f},{_format_speedup(baseline_ms, candidate_ms)},{diff:.6f}"
             )
+        print(
+            "arc_moe_grouped_int4_mlp_profile,device_name,gate_local_size,down_local_size,"
+            "tokens_per_expert,experts,hidden_size,intermediate_size,group_size,dtype,"
+            "baseline_ms,candidate_ms,speedup,max_abs_diff"
+        )
+        moe_hidden_size = int4_k
+        moe_intermediate_size = int4_n if int4_n != int4_k else int4_k * 2
+        for gate_local_size in (64, 128, 256):
+            for down_local_size in (64, 128, 256):
+                baseline_ms, candidate_ms, diff = _benchmark_moe_grouped_int4_mlp(
+                    tokens_per_expert=max(1, args.int4_m),
+                    num_experts=max(1, min(args.experts, 8)),
+                    hidden_size=moe_hidden_size,
+                    intermediate_size=moe_intermediate_size,
+                    group_size=args.int4_group_size,
+                    dtype=dtype,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    gate_local_size=gate_local_size,
+                    down_local_size=down_local_size,
+                )
+                device_name = "" if xpu_info is None else xpu_info.name
+                print(
+                    f"arc_moe_grouped_int4_mlp_profile,{device_name},{gate_local_size},{down_local_size},"
+                    f"{max(1, args.int4_m)},{max(1, min(args.experts, 8))},{moe_hidden_size},{moe_intermediate_size},"
+                    f"{args.int4_group_size},{dtype},{baseline_ms:.4f},{candidate_ms:.4f},"
+                    f"{_format_speedup(baseline_ms, candidate_ms)},{diff:.6f}"
+                )
 
     print("next_paths")
     print("single-token variable-visible decode now maps to native masked GQA; multi-token masked decode remains the main full-attention gap.")

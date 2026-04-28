@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -1215,6 +1216,45 @@ class AnnaQwen3_5TextEngine:
             release_unused_memory()
         logger.info("Trimmed idle KV cache pages: released_pages=%s", trimmed_pages)
 
+    def _clear_runtime_caches_after_recover(self, *, reason: str) -> None:
+        prompt_cache = getattr(self, "_prompt_cache", None)
+        prompt_entries = 0
+        if prompt_cache is not None:
+            for entry in list(prompt_cache.values()):
+                past_key_values = getattr(entry, "past_key_values", None)
+                release = getattr(past_key_values, "release", None)
+                if callable(release):
+                    try:
+                        release()
+                    except Exception:  # pragma: no cover - best-effort cleanup
+                        logger.debug("Failed to release prompt cache entry during XPU recovery.", exc_info=True)
+                prompt_entries += 1
+            prompt_cache.clear()
+
+        released_pages = 0
+        allocator = getattr(self, "cache_allocator", None)
+        clear = getattr(allocator, "clear", None)
+        if callable(clear):
+            try:
+                released_pages = int(clear())
+            except Exception:  # pragma: no cover - best-effort cleanup
+                logger.exception("Failed to clear KV cache allocator after XPU recovery.")
+        elif allocator is not None:
+            try:
+                released_pages = int(allocator.trim())
+            except Exception:  # pragma: no cover - best-effort cleanup
+                logger.exception("Failed to trim KV cache allocator after XPU recovery.")
+
+        release_unused_memory = getattr(self.device_context, "release_unused_memory", None)
+        if callable(release_unused_memory):
+            release_unused_memory()
+        logger.warning(
+            "Cleared runtime caches after XPU recovery: reason=%s prompt_entries=%s released_pages=%s",
+            reason,
+            prompt_entries,
+            released_pages,
+        )
+
     def set_scheduler(self, scheduler: object | None) -> None:
         self.scheduler = scheduler
 
@@ -1280,6 +1320,18 @@ class AnnaQwen3_5TextEngine:
                 "kv_cache_quantization": self.optimization_config.kv_cache_quantization,
                 "kv_cache_quant_bits": self.optimization_config.kv_cache_quant_bits,
                 "kv_cache_residual_len": self.optimization_config.kv_cache_residual_len,
+                "xpu_int4_kernels": {
+                    "matmul_strategy": os.getenv("ANNA_XPU_INT4_MATMUL", "auto"),
+                    "auto_gemv_enabled": os.getenv("ANNA_XPU_AUTO_INT4_GEMV"),
+                    "gemv_local_size": os.getenv("ANNA_XPU_INT4_GEMV_LOCAL_SIZE"),
+                    "lm_head_local_size": os.getenv("ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE"),
+                    "lm_head_block_topk_threshold": os.getenv("ANNA_XPU_INT4_LM_HEAD_BLOCK_TOPK_THRESHOLD", "65536"),
+                    "lm_head_block_size": os.getenv("ANNA_XPU_INT4_LM_HEAD_BLOCK_SIZE", "4096"),
+                    "moe_gate_local_size": os.getenv("ANNA_XPU_INT4_MOE_GATE_LOCAL_SIZE"),
+                    "moe_down_local_size": os.getenv("ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE"),
+                    "lm_head_int4_topk_disabled": os.getenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK"),
+                    "moe_grouped_int4_disabled": os.getenv("ANNA_XPU_DISABLE_MOE_GROUPED_INT4"),
+                },
             },
             "vision_enabled": self.config.vision_config is not None,
             "cache_device": str(self.device_context.migration_policy.execution_device),
@@ -2157,6 +2209,7 @@ class AnnaQwen3_5TextEngine:
         if self.device_context.should_recover(exc):
             try:
                 self.device_context.recover()
+                self._clear_runtime_caches_after_recover(reason=category)
             except Exception:  # pragma: no cover - best-effort recovery
                 logger.exception("Failed to recover device context after runtime failure.")
 

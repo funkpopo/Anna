@@ -72,6 +72,18 @@ python tools/build_gated_delta_fused_op.py
 
 产物在 `.build/anna_gated_delta_fused`。也可用环境变量 `ANNA_GATED_DELTA_OP_LIB` 指定库路径（见下文）。
 
+Arc int4 fused kernel 调参开关：
+
+- `ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE`：`lm_head_int4_topk_fused` 的 work-group local size（会向上取 2 的幂，最大 64；blocked top-k 路径为了保证正确性至少使用 64）。
+- `ANNA_XPU_INT4_LM_HEAD_BLOCK_TOPK_THRESHOLD`：两阶段 blocked `lm_head_int4_topk_fused` 路径的 vocab 阈值（默认 65536）。
+- `ANNA_XPU_INT4_LM_HEAD_BLOCK_SIZE`：blocked `lm_head_int4_topk_fused` 的 vocab block 大小（默认 4096）。
+- `ANNA_XPU_INT4_GEMV_LOCAL_SIZE`：实验性 standalone `XPUInt4Linear` GEMV 路径的 local size；仅在 `ANNA_XPU_INT4_MATMUL=sycl` 且 decode rows `<= 4` 时使用（会向上取 2 的幂，最大 256）。
+- `ANNA_XPU_AUTO_INT4_GEMV`：允许 `ANNA_XPU_INT4_MATMUL=auto` 在严格的 `M=1,K=N=4096,group=128` shape 上试探 standalone GEMV。默认关闭，直到 Arc sweep 数据稳定证明收益。
+- `ANNA_XPU_INT4_MOE_GATE_LOCAL_SIZE`：grouped int4 MoE gate/up projection 的 local size（会向上取 2 的幂，最大 256）。
+- `ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE`：grouped int4 MoE down projection 的 local size（会向上取 2 的幂，最大 256）。
+
+默认值保持当前保守策略。在 Arc A770/A750 上，建议先配合 `tools/bench_xpu_hotspots.py --arc-profile` 扫描这些值；需要专门扫 int4 时可加 `--arc-int4-only` 跳过 attention/router 等通用热点。报告会同时包含普通 `XPUInt4Linear`、`lm_head_int4_topk_fused` 和 `moe_grouped_int4_mlp_fused` 行，便于确认局部 kernel 优化是否真的覆盖 decode 关键路径。
+
 ## 快速开始
 
 **启动 API 服务：**
@@ -224,7 +236,7 @@ anna-speak --model-dir /path/to/tts --input "你好。" --output out.wav --ref-a
 
 | 变量 | 作用 |
 | --- | --- |
-| `ANNA_XPU_INT4_MATMUL` | `auto`（默认）、`torch`、`dequant`；`sycl` 目前会回退为 `auto`。用于选择 XPU 上 int4 矩阵乘的实现路径。 |
+| `ANNA_XPU_INT4_MATMUL` | `auto`（默认）、`torch`、`dequant` 或实验性 `sycl`。`sycl` 对 decode rows `<= 4` 使用 Anna standalone int4 GEMV；`auto` 只有在 `ANNA_XPU_AUTO_INT4_GEMV=1` 且严格 shape guard 命中时才会试探该路径。 |
 | `ANNA_GATED_DELTA_OP_LIB` | 指定已编译的 gated delta 融合算子动态库路径。 |
 | `ANNA_XPU_DISABLE_MOE_GROUPED_INT4`、`ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK` | 设为 `1` / `true` 等可关闭对应融合算子。 |
 | `ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED` | 设为 `1`、`true`、`yes`、`on` 等可在可用时启用 int4 LM-head top-k 融合路径。 |

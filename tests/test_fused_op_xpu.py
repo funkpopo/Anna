@@ -1,5 +1,6 @@
 import pytest
 import torch
+import os
 
 import anna.model.ops as model_ops
 import anna.model.fused_ops as fused_ops
@@ -225,6 +226,168 @@ def test_lm_head_int4_topk_fused_xpu_matches_quantized_reference() -> None:
     assert indices.dtype == torch.long
     assert torch.equal(indices.cpu(), reference_indices.cpu())
     assert torch.allclose(values.cpu(), reference_values.cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_lm_head_int4_topk_fused_xpu_respects_local_size_override() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "lm_head_int4_topk_fused"):
+        pytest.skip("Anna fused-op library is not built with lm_head_int4_topk_fused")
+
+    previous = os.environ.get("ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE")
+    os.environ["ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE"] = "16"
+    try:
+        torch.manual_seed(0)
+        dense = torch.nn.Linear(16, 31, bias=False, dtype=torch.float32)
+        quantized = XPUInt4Linear.from_linear(dense, group_size=32, compute_dtype=torch.float16, device="xpu")
+        hidden_states = torch.randn(2, 3, 16, device="xpu", dtype=torch.float16)
+
+        values, indices = torch.ops.anna.lm_head_int4_topk_fused(
+            hidden_states,
+            quantized.qweight,
+            quantized.qscale,
+            quantized.qzeros,
+            quantized.group_size,
+            quantized.in_features,
+            5,
+        )
+        reference_values, reference_indices = torch.topk(quantized(hidden_states), k=5, dim=-1)
+    finally:
+        if previous is None:
+            os.environ.pop("ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE", None)
+        else:
+            os.environ["ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE"] = previous
+
+    assert torch.equal(indices.cpu(), reference_indices.cpu())
+    assert torch.allclose(values.cpu(), reference_values.cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_lm_head_int4_topk_fused_xpu_blocked_path_matches_quantized_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "lm_head_int4_topk_fused"):
+        pytest.skip("Anna fused-op library is not built with lm_head_int4_topk_fused")
+
+    torch.manual_seed(5)
+    monkeypatch.setenv("ANNA_XPU_INT4_LM_HEAD_BLOCK_TOPK_THRESHOLD", "64")
+    monkeypatch.setenv("ANNA_XPU_INT4_LM_HEAD_BLOCK_SIZE", "64")
+    dense = torch.nn.Linear(96, 192, bias=False, device="xpu", dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=32, compute_dtype=torch.float16, device="xpu")
+    hidden_states = torch.randn(1, 96, device="xpu", dtype=torch.float16)
+
+    values, indices = torch.ops.anna.lm_head_int4_topk_fused(
+        hidden_states,
+        quantized.qweight,
+        quantized.qscale,
+        quantized.qzeros,
+        quantized.group_size,
+        quantized.in_features,
+        5,
+    )
+    reference_values, reference_indices = torch.topk(quantized(hidden_states), k=5, dim=-1)
+
+    torch.xpu.synchronize()
+    assert torch.equal(indices.cpu(), reference_indices.cpu())
+    assert torch.allclose(values.cpu(), reference_values.cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_xpu_int4_gemv_matches_quantized_reference() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "xpu_int4_gemv"):
+        pytest.skip("Anna fused-op library is not built with xpu_int4_gemv")
+
+    torch.manual_seed(3)
+    dense = torch.nn.Linear(64, 96, bias=False, device="xpu", dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=32, compute_dtype=torch.float16, device="xpu")
+    hidden_states = torch.randn(4, 64, device="xpu", dtype=torch.float16)
+
+    output = torch.ops.anna.xpu_int4_gemv(
+        hidden_states,
+        quantized.qweight,
+        quantized.qscale,
+        quantized.qzeros,
+        quantized.group_size,
+        quantized.in_features,
+    )
+    reference = quantized(hidden_states)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(output.cpu(), reference.cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_xpu_int4_linear_sycl_strategy_uses_gemv(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "xpu_int4_gemv"):
+        pytest.skip("Anna fused-op library is not built with xpu_int4_gemv")
+
+    torch.manual_seed(4)
+    dense = torch.nn.Linear(64, 96, bias=False, device="xpu", dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=32, compute_dtype=torch.float16, device="xpu")
+    hidden_states = torch.randn(2, 64, device="xpu", dtype=torch.float16)
+
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "auto")
+    reference = quantized(hidden_states)
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "sycl")
+    output = quantized(hidden_states)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(output.cpu(), reference.cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_xpu_int4_linear_auto_strategy_does_not_use_gemv_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "xpu_int4_gemv"):
+        pytest.skip("Anna fused-op library is not built with xpu_int4_gemv")
+
+    torch.manual_seed(6)
+    dense = torch.nn.Linear(4096, 4096, bias=False, device="xpu", dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=128, compute_dtype=torch.bfloat16, device="xpu")
+    hidden_states = torch.randn(1, 4096, device="xpu", dtype=torch.bfloat16)
+
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "torch")
+    reference = quantized(hidden_states)
+
+    def _fail_if_called(x_padded: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("auto GEMV should be gated off unless ANNA_XPU_AUTO_INT4_GEMV is enabled")
+
+    monkeypatch.setattr(quantized, "_forward_sycl_int4_gemv", _fail_if_called)
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "auto")
+    output = quantized(hidden_states)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(output.cpu(), reference.cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_xpu_int4_linear_auto_strategy_can_try_strict_gemv_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "xpu_int4_gemv"):
+        pytest.skip("Anna fused-op library is not built with xpu_int4_gemv")
+
+    torch.manual_seed(7)
+    dense = torch.nn.Linear(4096, 4096, bias=False, device="xpu", dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=128, compute_dtype=torch.bfloat16, device="xpu")
+    hidden_states = torch.randn(1, 4096, device="xpu", dtype=torch.bfloat16)
+    called = {"value": False}
+
+    def _tracked_gemv(x_padded: torch.Tensor) -> torch.Tensor:
+        called["value"] = True
+        return torch.ops.anna.xpu_int4_gemv(
+            x_padded,
+            quantized.qweight,
+            quantized.qscale,
+            quantized.qzeros,
+            quantized.group_size,
+            quantized.padded_in_features,
+        )
+
+    monkeypatch.setattr(quantized, "_forward_sycl_int4_gemv", _tracked_gemv)
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "auto")
+    monkeypatch.setenv("ANNA_XPU_AUTO_INT4_GEMV", "1")
+    output = quantized(hidden_states)
+
+    torch.xpu.synchronize()
+    assert called["value"] is True
+    assert output.shape == (1, 4096)
 
 
 def _pack_paged_kv(

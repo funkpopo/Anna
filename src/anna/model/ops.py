@@ -311,6 +311,17 @@ class Qwen3PageAllocator:
     def trim(self) -> int:
         return sum(layer.trim() for layer in self.layers)
 
+    def clear(self) -> int:
+        released_pages = 0
+        for layer in self.layers:
+            released_pages += layer.capacity()
+            layer._refcount.clear()
+            layer.key_pages = None
+            layer.value_pages = None
+            layer.free_pages.clear()
+        self.prefix_block_pool.clear()
+        return released_pages
+
     def to(
         self,
         *,

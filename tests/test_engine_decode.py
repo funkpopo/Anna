@@ -8,6 +8,8 @@ import torch
 
 from anna.core.function_calling import ParsedToolCall
 from anna.mm.qwen3_5_text_processor import PreparedInputs
+from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
+from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, GenerationConfig, GenerationPerfStats, ThinkingStreamParser
 from anna.runtime.qwen3_5_text_engine import EngineOptimizationConfig, StreamEvent, TextGenerationResult
 from anna.runtime.streaming import IncrementalTextAssembler
@@ -59,6 +61,20 @@ class _ToolCallingTokenizer(_EngineChatTokenizer):
             text.replace(marker, "").strip(),
             [ParsedToolCall(name="get_weather", arguments="{\"location\":\"Shanghai\"}", id="call_123")],
         )
+
+
+def _tiny_text_config() -> Qwen3_5TextConfig:
+    return Qwen3_5TextConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        vocab_size=128,
+        layer_types=("linear_attention", "full_attention", "linear_attention", "linear_attention"),
+        cache_block_size=4,
+    )
 
 
 def test_stable_decode_delta_avoids_repeated_prefix_output() -> None:
@@ -285,6 +301,73 @@ def test_trim_runtime_cache_if_idle_skips_when_requests_are_active() -> None:
 
     assert engine.cache_allocator.trim_calls == 0
     assert engine.device_context.release_calls == 0
+
+
+def test_page_allocator_clear_releases_pages_even_when_in_use() -> None:
+    config = _tiny_text_config()
+    allocator = Qwen3PageAllocator(config)
+    cache = Qwen3DynamicCache(config, allocator=allocator)
+    key = torch.randn(1, 2, config.cache_block_size, 16)
+    value = torch.randn(1, 2, config.cache_block_size, 16)
+
+    cache.update(key, value, layer_idx=1)
+    assert allocator.layers[1].used_pages() > 0
+
+    released_pages = allocator.clear()
+
+    assert released_pages > 0
+    assert allocator.layers[1].key_pages is None
+    assert allocator.layers[1].value_pages is None
+    assert allocator.layers[1].free_pages == []
+
+
+def test_handle_runtime_failure_clears_runtime_caches_after_recover() -> None:
+    class DummyKV:
+        def __init__(self) -> None:
+            self.release_calls = 0
+
+        def release(self) -> None:
+            self.release_calls += 1
+
+    class DummyAllocator:
+        def __init__(self) -> None:
+            self.clear_calls = 0
+
+        def clear(self) -> int:
+            self.clear_calls += 1
+            return 7
+
+    class DummyDeviceContext:
+        def __init__(self) -> None:
+            self.recover_calls = 0
+            self.release_calls = 0
+
+        def classify_runtime_error(self, exc: BaseException) -> str:
+            return "device_lost"
+
+        def should_recover(self, exc: BaseException) -> bool:
+            return True
+
+        def recover(self) -> None:
+            self.recover_calls += 1
+
+        def release_unused_memory(self) -> None:
+            self.release_calls += 1
+
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    kv = DummyKV()
+    engine._prompt_cache = OrderedDict({(1, 2): SimpleNamespace(past_key_values=kv)})
+    engine.cache_allocator = DummyAllocator()
+    engine.device_context = DummyDeviceContext()
+
+    error = engine._handle_runtime_failure(RuntimeError("UR_RESULT_ERROR_DEVICE_LOST"))
+
+    assert error.code == "device_lost"
+    assert kv.release_calls == 1
+    assert len(engine._prompt_cache) == 0
+    assert engine.cache_allocator.clear_calls == 1
+    assert engine.device_context.recover_calls == 1
+    assert engine.device_context.release_calls == 1
 
 
 def test_qwen_runtime_accepts_turboquant_kv_cache_quantization_when_available(monkeypatch: pytest.MonkeyPatch) -> None:

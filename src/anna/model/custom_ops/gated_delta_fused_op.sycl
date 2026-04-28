@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <limits>
 #include <tuple>
@@ -125,6 +126,35 @@ inline float load_as_float(const scalar_t* ptr, int64_t idx) {
   return static_cast<float>(ptr[idx]);
 }
 
+inline int32_t unpack_int4_lane(uint32_t packed, int64_t in_idx) {
+  const int64_t shift = (in_idx & 7) << 2;
+  return static_cast<int32_t>((packed >> shift) & 0xFu);
+}
+
+inline int64_t int4_group_index(int64_t in_idx, int64_t group_count, int64_t group_size) {
+  int64_t group_idx = in_idx / group_size;
+  return sycl::min<int64_t>(group_idx, group_count - 1);
+}
+
+int64_t resolve_power_of_two_env_local_size(const char* env_name, int64_t fallback, int64_t max_value) {
+  const char* raw = std::getenv(env_name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return fallback;
+  }
+  char* end = nullptr;
+  const long parsed = std::strtol(raw, &end, 10);
+  if (end == raw || parsed <= 0) {
+    return fallback;
+  }
+  int64_t local_size = next_power_of_two(static_cast<int64_t>(parsed));
+  local_size = std::min<int64_t>(local_size, max_value);
+  return std::max<int64_t>(local_size, 1);
+}
+
+int64_t default_bounded_local_size(int64_t dimension, int64_t max_value) {
+  return std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(dimension, max_value))), max_value);
+}
+
 inline float load_grouped_int4_weight(
     const int32_t* qweight_ptr,
     const float* qscale_ptr,
@@ -137,12 +167,10 @@ inline float load_grouped_int4_weight(
     int64_t group_count,
     int64_t group_size) {
   const int64_t packed_idx = in_idx >> 3;
-  const int64_t shift = (in_idx & 7) << 2;
   const int64_t qweight_offset = (bank_slot * out_features + out_idx) * packed_cols + packed_idx;
   const uint32_t packed = static_cast<uint32_t>(qweight_ptr[qweight_offset]);
-  const int32_t qvalue = static_cast<int32_t>((packed >> shift) & 0xFu);
-  int64_t group_idx = in_idx / group_size;
-  group_idx = sycl::min<int64_t>(group_idx, group_count - 1);
+  const int32_t qvalue = unpack_int4_lane(packed, in_idx);
+  const int64_t group_idx = int4_group_index(in_idx, group_count, group_size);
   const int64_t scale_offset = (bank_slot * group_count + group_idx) * out_features + out_idx;
   const int32_t zero_point = static_cast<int32_t>(qzeros_ptr[scale_offset]);
   return (static_cast<float>(qvalue - zero_point)) * qscale_ptr[scale_offset];
@@ -159,11 +187,9 @@ inline float load_xpu_int4_linear_weight(
     int64_t group_count,
     int64_t group_size) {
   const int64_t packed_idx = in_idx >> 3;
-  const int64_t shift = (in_idx & 7) << 2;
   const uint32_t packed = static_cast<uint32_t>(qweight_ptr[out_idx * packed_cols + packed_idx]);
-  const int32_t qvalue = static_cast<int32_t>((packed >> shift) & 0xFu);
-  int64_t group_idx = in_idx / group_size;
-  group_idx = sycl::min<int64_t>(group_idx, group_count - 1);
+  const int32_t qvalue = unpack_int4_lane(packed, in_idx);
+  const int64_t group_idx = int4_group_index(in_idx, group_count, group_size);
   const int64_t scale_offset = group_idx * out_features + out_idx;
   const int32_t zero_point = static_cast<int32_t>(qzeros_ptr[scale_offset]);
   return (static_cast<float>(qvalue - zero_point)) * qscale_ptr[scale_offset];
@@ -468,6 +494,51 @@ void validate_lm_head_int4_topk_inputs(
 }
 
 void validate_lm_head_int4_topk_xpu_inputs(
+    const at::Tensor& hidden_states,
+    const at::Tensor& qweight,
+    const at::Tensor& qscale,
+    const at::Tensor& qzeros) {
+  auto device = hidden_states.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "hidden_states must be an XPU tensor");
+  TORCH_CHECK(qweight.device() == device, "qweight must be on the same device as hidden_states");
+  TORCH_CHECK(qscale.device() == device, "qscale must be on the same device as hidden_states");
+  TORCH_CHECK(qzeros.device() == device, "qzeros must be on the same device as hidden_states");
+}
+
+void validate_xpu_int4_gemv_inputs(
+    const at::Tensor& hidden_states,
+    const at::Tensor& qweight,
+    const at::Tensor& qscale,
+    const at::Tensor& qzeros,
+    int64_t group_size,
+    int64_t in_features) {
+  TORCH_CHECK(hidden_states.dim() == 2, "xpu_int4_gemv expects hidden_states shaped [rows, in_features]");
+  TORCH_CHECK(qweight.dim() == 2, "qweight must be [out_features, packed_cols]");
+  TORCH_CHECK(qscale.dim() == 2, "qscale must be [group_count, out_features]");
+  TORCH_CHECK(qzeros.dim() == 2, "qzeros must be [group_count, out_features]");
+  TORCH_CHECK(group_size > 0, "group_size must be positive");
+  TORCH_CHECK(in_features > 0, "in_features must be positive");
+  TORCH_CHECK(hidden_states.size(0) > 0, "hidden_states rows must be positive");
+  TORCH_CHECK(hidden_states.size(0) <= 4, "xpu_int4_gemv is intended for decode rows <= 4");
+  TORCH_CHECK(hidden_states.size(1) == in_features, "hidden_states last dimension must match in_features");
+  TORCH_CHECK(qweight.scalar_type() == at::kInt, "qweight must be int32");
+  TORCH_CHECK(qscale.scalar_type() == at::kFloat, "qscale must be float32");
+  TORCH_CHECK(qzeros.scalar_type() == at::kChar, "qzeros must be int8");
+  TORCH_CHECK(qweight.is_contiguous(), "qweight must be contiguous");
+  TORCH_CHECK(qscale.is_contiguous(), "qscale must be contiguous");
+  TORCH_CHECK(qzeros.is_contiguous(), "qzeros must be contiguous");
+  TORCH_CHECK(qweight.size(0) > 0, "qweight out_features must be positive");
+  TORCH_CHECK(qweight.size(1) * 8 >= in_features, "qweight packed columns are smaller than in_features");
+  TORCH_CHECK(qscale.size(1) == qweight.size(0), "qscale output dimension must match qweight");
+  TORCH_CHECK(qzeros.sizes() == qscale.sizes(), "qzeros shape must match qscale");
+  TORCH_CHECK(qscale.size(0) * group_size >= in_features, "qscale group count is smaller than in_features");
+  TORCH_CHECK(
+      hidden_states.scalar_type() == at::kHalf || hidden_states.scalar_type() == at::kBFloat16 ||
+          hidden_states.scalar_type() == at::kFloat,
+      "xpu_int4_gemv XPU kernel supports float16, bfloat16, and float32 hidden states");
+}
+
+void validate_xpu_int4_gemv_xpu_inputs(
     const at::Tensor& hidden_states,
     const at::Tensor& qweight,
     const at::Tensor& qscale,
@@ -1353,6 +1424,198 @@ void launch_lm_head_int4_topk_kernel(
   });
 }
 
+template <typename scalar_t>
+void launch_lm_head_int4_topk_blocks_kernel(
+    sycl::queue& queue,
+    const scalar_t* hidden_ptr,
+    const int32_t* qweight_ptr,
+    const float* qscale_ptr,
+    const int8_t* qzeros_ptr,
+    scalar_t* block_values_ptr,
+    int64_t* block_indices_ptr,
+    int64_t row_count,
+    int64_t in_features,
+    int64_t vocab_size,
+    int64_t packed_cols,
+    int64_t group_count,
+    int64_t group_size,
+    int64_t top_k,
+    int64_t local_size,
+    int64_t block_size,
+    int64_t num_blocks) {
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> local_values(
+        sycl::range<1>(static_cast<size_t>(local_size * top_k)), cgh);
+    sycl::local_accessor<int64_t, 1> local_indices(
+        sycl::range<1>(static_cast<size_t>(local_size * top_k)), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<2>(
+            sycl::range<2>(
+                static_cast<size_t>(row_count),
+                static_cast<size_t>(num_blocks * local_size)),
+            sycl::range<2>(1, static_cast<size_t>(local_size))),
+        [=](sycl::nd_item<2> item) {
+          const int64_t row = static_cast<int64_t>(item.get_group(0));
+          const int64_t block_idx = static_cast<int64_t>(item.get_group(1));
+          const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+          const int64_t local_base = lane * top_k;
+          const int64_t hidden_base = row * in_features;
+          const int64_t vocab_begin = block_idx * block_size;
+          const int64_t vocab_end = sycl::min<int64_t>(vocab_begin + block_size, vocab_size);
+
+          for (int64_t k = 0; k < top_k; ++k) {
+            local_values[local_base + k] = -std::numeric_limits<float>::infinity();
+            local_indices[local_base + k] = 0;
+          }
+
+          for (int64_t vocab_idx = vocab_begin + lane; vocab_idx < vocab_end; vocab_idx += local_size) {
+            float acc = 0.0f;
+            for (int64_t hidden_idx = 0; hidden_idx < in_features; ++hidden_idx) {
+              const float weight_value = load_xpu_int4_linear_weight(
+                  qweight_ptr,
+                  qscale_ptr,
+                  qzeros_ptr,
+                  vocab_idx,
+                  hidden_idx,
+                  vocab_size,
+                  packed_cols,
+                  group_count,
+                  group_size);
+              acc += load_as_float(hidden_ptr, hidden_base + hidden_idx) * weight_value;
+            }
+
+            if (acc <= local_values[local_base + top_k - 1]) {
+              continue;
+            }
+            int64_t insert_idx = top_k - 1;
+            while (insert_idx > 0 && acc > local_values[local_base + insert_idx - 1]) {
+              local_values[local_base + insert_idx] = local_values[local_base + insert_idx - 1];
+              local_indices[local_base + insert_idx] = local_indices[local_base + insert_idx - 1];
+              --insert_idx;
+            }
+            local_values[local_base + insert_idx] = acc;
+            local_indices[local_base + insert_idx] = vocab_idx;
+          }
+
+          item.barrier(sycl::access::fence_space::local_space);
+
+          if (lane != 0) {
+            return;
+          }
+
+          for (int64_t lane_idx = 1; lane_idx < local_size; ++lane_idx) {
+            const int64_t candidate_base = lane_idx * top_k;
+            for (int64_t candidate_idx = 0; candidate_idx < top_k; ++candidate_idx) {
+              const float candidate_value = local_values[candidate_base + candidate_idx];
+              const int64_t candidate_token = local_indices[candidate_base + candidate_idx];
+              if (candidate_value <= local_values[top_k - 1]) {
+                continue;
+              }
+              int64_t insert_idx = top_k - 1;
+              while (insert_idx > 0 && candidate_value > local_values[insert_idx - 1]) {
+                local_values[insert_idx] = local_values[insert_idx - 1];
+                local_indices[insert_idx] = local_indices[insert_idx - 1];
+                --insert_idx;
+              }
+              local_values[insert_idx] = candidate_value;
+              local_indices[insert_idx] = candidate_token;
+            }
+          }
+
+          const int64_t output_base = (row * num_blocks + block_idx) * top_k;
+          for (int64_t k = 0; k < top_k; ++k) {
+            block_values_ptr[output_base + k] = static_cast<scalar_t>(local_values[k]);
+            block_indices_ptr[output_base + k] = local_indices[k];
+          }
+        });
+  });
+}
+
+template <typename scalar_t>
+void launch_lm_head_int4_topk_merge_kernel(
+    sycl::queue& queue,
+    const scalar_t* block_values_ptr,
+    const int64_t* block_indices_ptr,
+    scalar_t* values_ptr,
+    int64_t* indices_ptr,
+    int64_t row_count,
+    int64_t num_blocks,
+    int64_t top_k,
+    int64_t local_size) {
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> local_values(
+        sycl::range<1>(static_cast<size_t>(local_size * top_k)), cgh);
+    sycl::local_accessor<int64_t, 1> local_indices(
+        sycl::range<1>(static_cast<size_t>(local_size * top_k)), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<2>(
+            sycl::range<2>(static_cast<size_t>(row_count), static_cast<size_t>(local_size)),
+            sycl::range<2>(1, static_cast<size_t>(local_size))),
+        [=](sycl::nd_item<2> item) {
+          const int64_t row = static_cast<int64_t>(item.get_group(0));
+          const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+          const int64_t local_base = lane * top_k;
+
+          for (int64_t k = 0; k < top_k; ++k) {
+            local_values[local_base + k] = -std::numeric_limits<float>::infinity();
+            local_indices[local_base + k] = 0;
+          }
+
+          for (int64_t block_idx = lane; block_idx < num_blocks; block_idx += local_size) {
+            const int64_t block_base = (row * num_blocks + block_idx) * top_k;
+            for (int64_t candidate_idx = 0; candidate_idx < top_k; ++candidate_idx) {
+              const float candidate_value = load_as_float(block_values_ptr, block_base + candidate_idx);
+              const int64_t candidate_token = block_indices_ptr[block_base + candidate_idx];
+              if (candidate_value <= local_values[local_base + top_k - 1]) {
+                continue;
+              }
+              int64_t insert_idx = top_k - 1;
+              while (insert_idx > 0 && candidate_value > local_values[local_base + insert_idx - 1]) {
+                local_values[local_base + insert_idx] = local_values[local_base + insert_idx - 1];
+                local_indices[local_base + insert_idx] = local_indices[local_base + insert_idx - 1];
+                --insert_idx;
+              }
+              local_values[local_base + insert_idx] = candidate_value;
+              local_indices[local_base + insert_idx] = candidate_token;
+            }
+          }
+
+          item.barrier(sycl::access::fence_space::local_space);
+
+          if (lane != 0) {
+            return;
+          }
+
+          const int64_t output_base = row * top_k;
+          for (int64_t lane_idx = 1; lane_idx < local_size; ++lane_idx) {
+            const int64_t candidate_base = lane_idx * top_k;
+            for (int64_t candidate_idx = 0; candidate_idx < top_k; ++candidate_idx) {
+              const float candidate_value = local_values[candidate_base + candidate_idx];
+              const int64_t candidate_token = local_indices[candidate_base + candidate_idx];
+              if (candidate_value <= local_values[top_k - 1]) {
+                continue;
+              }
+              int64_t insert_idx = top_k - 1;
+              while (insert_idx > 0 && candidate_value > local_values[insert_idx - 1]) {
+                local_values[insert_idx] = local_values[insert_idx - 1];
+                local_indices[insert_idx] = local_indices[insert_idx - 1];
+                --insert_idx;
+              }
+              local_values[insert_idx] = candidate_value;
+              local_indices[insert_idx] = candidate_token;
+            }
+          }
+
+          for (int64_t k = 0; k < top_k; ++k) {
+            values_ptr[output_base + k] = static_cast<scalar_t>(local_values[k]);
+            indices_ptr[output_base + k] = local_indices[k];
+          }
+        });
+  });
+}
+
 std::tuple<at::Tensor, at::Tensor> lm_head_int4_topk_fused_meta(
     const at::Tensor& hidden_states,
     const at::Tensor& qweight,
@@ -1391,8 +1654,10 @@ std::tuple<at::Tensor, at::Tensor> lm_head_int4_topk_fused_xpu(
   const auto packed_cols = qweight.size(1);
   const auto group_count = qscale.size(0);
   const auto row_count = hidden_states.numel() / in_features;
-  const int64_t local_size =
-      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(vocab_size, 64))), 64);
+  const int64_t local_size = resolve_power_of_two_env_local_size(
+      "ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE",
+      default_bounded_local_size(vocab_size, 64),
+      64);
 
   auto stream = c10::xpu::getCurrentXPUStream(hidden_states.device().index());
   validate_lm_head_topk_local_memory_requirements(stream.queue().get_device(), local_size, top_k);
@@ -1401,6 +1666,17 @@ std::tuple<at::Tensor, at::Tensor> lm_head_int4_topk_fused_xpu(
   output_sizes.back() = top_k;
   auto values = at::empty(output_sizes, hidden_states.options());
   auto indices = at::empty(output_sizes, hidden_states.options().dtype(at::kLong));
+  const int64_t block_threshold = resolve_power_of_two_env_local_size(
+      "ANNA_XPU_INT4_LM_HEAD_BLOCK_TOPK_THRESHOLD",
+      65536,
+      1048576);
+  const int64_t block_size = resolve_power_of_two_env_local_size(
+      "ANNA_XPU_INT4_LM_HEAD_BLOCK_SIZE",
+      4096,
+      65536);
+  const bool use_block_topk = vocab_size >= block_threshold && block_size > 0;
+  const int64_t kernel_local_size = use_block_topk ? std::max<int64_t>(local_size, 64) : local_size;
+  validate_lm_head_topk_local_memory_requirements(stream.queue().get_device(), kernel_local_size, top_k);
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::kHalf,
@@ -1408,25 +1684,194 @@ std::tuple<at::Tensor, at::Tensor> lm_head_int4_topk_fused_xpu(
       hidden_states.scalar_type(),
       "lm_head_int4_topk_fused_xpu",
       [&] {
-        launch_lm_head_int4_topk_kernel(
+        if (use_block_topk) {
+          const int64_t num_blocks = (vocab_size + block_size - 1) / block_size;
+          auto block_values = at::empty({row_count, num_blocks, top_k}, hidden_states.options());
+          auto block_indices = at::empty({row_count, num_blocks, top_k}, hidden_states.options().dtype(at::kLong));
+          launch_lm_head_int4_topk_blocks_kernel(
+              stream.queue(),
+              hidden_states.const_data_ptr<scalar_t>(),
+              qweight.const_data_ptr<int32_t>(),
+              qscale.const_data_ptr<float>(),
+              qzeros.const_data_ptr<int8_t>(),
+              block_values.mutable_data_ptr<scalar_t>(),
+              block_indices.mutable_data_ptr<int64_t>(),
+              row_count,
+              in_features,
+              vocab_size,
+              packed_cols,
+              group_count,
+              group_size,
+              top_k,
+              kernel_local_size,
+              block_size,
+              num_blocks);
+          launch_lm_head_int4_topk_merge_kernel(
+              stream.queue(),
+              block_values.const_data_ptr<scalar_t>(),
+              block_indices.const_data_ptr<int64_t>(),
+              values.mutable_data_ptr<scalar_t>(),
+              indices.mutable_data_ptr<int64_t>(),
+              row_count,
+              num_blocks,
+              top_k,
+              kernel_local_size);
+        } else {
+          launch_lm_head_int4_topk_kernel(
+              stream.queue(),
+              hidden_states.const_data_ptr<scalar_t>(),
+              qweight.const_data_ptr<int32_t>(),
+              qscale.const_data_ptr<float>(),
+              qzeros.const_data_ptr<int8_t>(),
+              values.mutable_data_ptr<scalar_t>(),
+              indices.mutable_data_ptr<int64_t>(),
+              row_count,
+              in_features,
+              vocab_size,
+              packed_cols,
+              group_count,
+              group_size,
+              top_k,
+              kernel_local_size);
+        }
+      });
+
+  return {values, indices};
+}
+
+template <typename scalar_t>
+void launch_xpu_int4_gemv_kernel(
+    sycl::queue& queue,
+    const scalar_t* hidden_ptr,
+    const int32_t* qweight_ptr,
+    const float* qscale_ptr,
+    const int8_t* qzeros_ptr,
+    scalar_t* output_ptr,
+    int64_t row_count,
+    int64_t in_features,
+    int64_t out_features,
+    int64_t packed_cols,
+    int64_t group_count,
+    int64_t group_size,
+    int64_t local_size) {
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> partial_sums(sycl::range<1>(static_cast<size_t>(local_size)), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<2>(
+            sycl::range<2>(
+                static_cast<size_t>(row_count),
+                static_cast<size_t>(out_features * local_size)),
+            sycl::range<2>(1, static_cast<size_t>(local_size))),
+        [=](sycl::nd_item<2> item) {
+          const int64_t row = static_cast<int64_t>(item.get_group(0));
+          const int64_t out_idx = static_cast<int64_t>(item.get_group(1));
+          const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+          const int64_t hidden_base = row * in_features;
+
+          float acc = 0.0f;
+          int64_t current_group = -1;
+          float current_scale = 0.0f;
+          int32_t current_zero = 0;
+          for (int64_t packed_idx = lane; packed_idx < packed_cols; packed_idx += local_size) {
+            const uint32_t packed = static_cast<uint32_t>(qweight_ptr[out_idx * packed_cols + packed_idx]);
+            const int64_t hidden_pack_base = packed_idx << 3;
+            for (int64_t nibble = 0; nibble < 8; ++nibble) {
+              const int64_t hidden_idx = hidden_pack_base + nibble;
+              if (hidden_idx >= in_features) {
+                break;
+              }
+              const int64_t group_idx = int4_group_index(hidden_idx, group_count, group_size);
+              if (group_idx != current_group) {
+                const int64_t scale_offset = group_idx * out_features + out_idx;
+                current_scale = qscale_ptr[scale_offset];
+                current_zero = static_cast<int32_t>(qzeros_ptr[scale_offset]);
+                current_group = group_idx;
+              }
+              const int32_t qvalue = static_cast<int32_t>((packed >> (nibble * 4)) & 0xFu);
+              const float weight_value = static_cast<float>(qvalue - current_zero) * current_scale;
+              acc += load_as_float(hidden_ptr, hidden_base + hidden_idx) * weight_value;
+            }
+          }
+
+          partial_sums[lane] = acc;
+          item.barrier(sycl::access::fence_space::local_space);
+
+          for (int64_t stride = local_size >> 1; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+              partial_sums[lane] += partial_sums[lane + stride];
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+          }
+
+          if (lane == 0) {
+            output_ptr[row * out_features + out_idx] = static_cast<scalar_t>(partial_sums[0]);
+          }
+        });
+  });
+}
+
+at::Tensor xpu_int4_gemv_meta(
+    const at::Tensor& hidden_states,
+    const at::Tensor& qweight,
+    const at::Tensor& qscale,
+    const at::Tensor& qzeros,
+    int64_t group_size,
+    int64_t in_features) {
+  validate_xpu_int4_gemv_inputs(hidden_states, qweight, qscale, qzeros, group_size, in_features);
+  auto output_options = hidden_states.options().device(c10::Device(c10::DeviceType::Meta));
+  return at::empty({hidden_states.size(0), qweight.size(0)}, output_options);
+}
+
+at::Tensor xpu_int4_gemv_xpu(
+    const at::Tensor& hidden_states_in,
+    const at::Tensor& qweight_in,
+    const at::Tensor& qscale_in,
+    const at::Tensor& qzeros_in,
+    int64_t group_size,
+    int64_t in_features) {
+  validate_xpu_int4_gemv_inputs(hidden_states_in, qweight_in, qscale_in, qzeros_in, group_size, in_features);
+  validate_xpu_int4_gemv_xpu_inputs(hidden_states_in, qweight_in, qscale_in, qzeros_in);
+
+  auto hidden_states = hidden_states_in.contiguous();
+  auto qweight = qweight_in.contiguous();
+  auto qscale = qscale_in.contiguous();
+  auto qzeros = qzeros_in.contiguous();
+  const auto row_count = hidden_states.size(0);
+  const auto out_features = qweight.size(0);
+  const auto packed_cols = qweight.size(1);
+  const auto group_count = qscale.size(0);
+  const int64_t local_size = resolve_power_of_two_env_local_size(
+      "ANNA_XPU_INT4_GEMV_LOCAL_SIZE",
+      default_bounded_local_size(in_features, 128),
+      256);
+
+  auto output = at::empty({row_count, out_features}, hidden_states.options());
+  auto stream = c10::xpu::getCurrentXPUStream(hidden_states.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      hidden_states.scalar_type(),
+      "xpu_int4_gemv_xpu",
+      [&] {
+        launch_xpu_int4_gemv_kernel(
             stream.queue(),
             hidden_states.const_data_ptr<scalar_t>(),
             qweight.const_data_ptr<int32_t>(),
             qscale.const_data_ptr<float>(),
             qzeros.const_data_ptr<int8_t>(),
-            values.mutable_data_ptr<scalar_t>(),
-            indices.mutable_data_ptr<int64_t>(),
+            output.mutable_data_ptr<scalar_t>(),
             row_count,
             in_features,
-            vocab_size,
+            out_features,
             packed_cols,
             group_count,
             group_size,
-            top_k,
             local_size);
       });
 
-  return {values, indices};
+  return output;
 }
 
 at::Tensor rmsnorm_fused_meta(
@@ -2246,10 +2691,14 @@ at::Tensor moe_grouped_int4_mlp_fused_xpu(
 
   auto activation = at::empty({routes, intermediate_dim}, compact_hidden_states.options().dtype(at::kFloat));
   auto stream = c10::xpu::getCurrentXPUStream(compact_hidden_states.device().index());
-  const int64_t gate_local_size =
-      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(hidden_dim, 256))), 256);
-  const int64_t down_local_size =
-      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(intermediate_dim, 256))), 256);
+  const int64_t gate_local_size = resolve_power_of_two_env_local_size(
+      "ANNA_XPU_INT4_MOE_GATE_LOCAL_SIZE",
+      default_bounded_local_size(hidden_dim, 256),
+      256);
+  const int64_t down_local_size = resolve_power_of_two_env_local_size(
+      "ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE",
+      default_bounded_local_size(intermediate_dim, 256),
+      256);
   const size_t active_range = static_cast<size_t>(active_count);
   const size_t gate_group_range = static_cast<size_t>(max_routes_per_expert * intermediate_dim);
   const size_t down_group_range = static_cast<size_t>(max_routes_per_expert * hidden_dim);
@@ -3145,6 +3594,15 @@ TORCH_LIBRARY(anna, m) {
       "int top_k"
       ") -> (Tensor, Tensor)");
   m.def(
+      "xpu_int4_gemv("
+      "Tensor hidden_states, "
+      "Tensor qweight, "
+      "Tensor qscale, "
+      "Tensor qzeros, "
+      "int group_size, "
+      "int in_features"
+      ") -> Tensor");
+  m.def(
       "rmsnorm_fused("
       "Tensor input, "
       "Tensor weight, "
@@ -3230,6 +3688,7 @@ TORCH_LIBRARY_IMPL(anna, Meta, m) {
   m.impl("moe_grouped_int4_mlp_fused", anna::moe_grouped_int4_mlp_fused_meta);
   m.impl("lm_head_topk_fused", anna::lm_head_topk_fused_meta);
   m.impl("lm_head_int4_topk_fused", anna::lm_head_int4_topk_fused_meta);
+  m.impl("xpu_int4_gemv", anna::xpu_int4_gemv_meta);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_meta);
   m.impl("rmsnorm_fused_ex", anna::rmsnorm_fused_ex_meta);
   m.impl("rmsnorm_gated_fused", anna::rmsnorm_gated_fused_meta);
@@ -3250,6 +3709,7 @@ TORCH_LIBRARY_IMPL(anna, XPU, m) {
   m.impl("moe_grouped_int4_mlp_fused", anna::moe_grouped_int4_mlp_fused_xpu);
   m.impl("lm_head_topk_fused", anna::lm_head_topk_fused_xpu);
   m.impl("lm_head_int4_topk_fused", anna::lm_head_int4_topk_fused_xpu);
+  m.impl("xpu_int4_gemv", anna::xpu_int4_gemv_xpu);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_xpu);
   m.impl("rmsnorm_fused_ex", anna::rmsnorm_fused_ex_xpu);
   m.impl("rmsnorm_gated_fused", anna::rmsnorm_gated_fused_xpu);
