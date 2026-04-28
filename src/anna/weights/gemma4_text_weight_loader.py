@@ -9,6 +9,7 @@ from safetensors import safe_open
 
 from anna.model.gemma4_config import Gemma4Config
 from anna.model.gemma4_text_model import Gemma4ForConditionalGeneration
+from anna.model.quantization import _release_cpu_memory_caches
 from anna.weights.safetensors_device import safetensors_pt_device_str
 
 
@@ -106,7 +107,11 @@ def load_gemma4_text_model_weights(
 
                 with torch.no_grad():
                     target.copy_(source.to(device=target.device, dtype=target.dtype))
+                del source
                 loaded += 1
+        _release_cpu_memory_caches()
 
     model.tie_weights()
+    del tensor_targets
+    _release_cpu_memory_caches()
     return WeightLoadReport(loaded=loaded, skipped=skipped)

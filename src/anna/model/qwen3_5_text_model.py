@@ -841,7 +841,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
         self.lm_head.to(torch.device("cpu") if offload_token_io else execution_device)
 
     def tie_weights(self) -> None:
-        if self.config.tie_word_embeddings:
+        if self.config.tie_word_embeddings and isinstance(self.lm_head, nn.Linear):
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
@@ -935,7 +935,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         self.lm_head.to(torch.device("cpu") if offload_token_io else execution_device)
 
     def tie_weights(self) -> None:
-        if self.config.tie_word_embeddings:
+        if self.config.tie_word_embeddings and isinstance(self.lm_head, nn.Linear):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
     def get_input_embeddings(self) -> nn.Embedding:
