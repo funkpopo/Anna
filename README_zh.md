@@ -84,6 +84,8 @@ Arc int4 fused kernel 调参开关：
 
 默认值保持当前保守策略。在 Arc A770/A750 上，建议先配合 `tools/bench_xpu_hotspots.py --arc-profile` 扫描这些值；需要专门扫 int4 时可加 `--arc-int4-only` 跳过 attention/router 等通用热点。报告会同时包含普通 `XPUInt4Linear`、`lm_head_int4_topk_fused` 和 `moe_grouped_int4_mlp_fused` 行，便于确认局部 kernel 优化是否真的覆盖 decode 关键路径。
 
+运行时 int4 转换 `lm_head` 时，Anna 还会额外准备面向 top-k 的 scale/zero 布局（`[vocab, group_count]`）供 `lm_head_int4_topk_fused` 使用；普通 linear 仍保持标准 matmul 布局。
+
 ## 快速开始
 
 **启动 API 服务：**

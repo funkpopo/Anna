@@ -415,6 +415,28 @@ class XPUInt4Linear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+    def prepare_lm_head_topk_layout(self) -> "XPUInt4Linear":
+        qscale = self.qscale.transpose(0, 1).contiguous()
+        qzeros = self.qzeros.transpose(0, 1).contiguous()
+        if "lm_head_qscale" in self._buffers:
+            self._buffers["lm_head_qscale"] = qscale
+        else:
+            self.register_buffer("lm_head_qscale", qscale, persistent=True)
+        if "lm_head_qzeros" in self._buffers:
+            self._buffers["lm_head_qzeros"] = qzeros
+        else:
+            self.register_buffer("lm_head_qzeros", qzeros, persistent=True)
+        return self
+
+    def lm_head_topk_tensors(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qscale = getattr(self, "lm_head_qscale", None)
+        qzeros = getattr(self, "lm_head_qzeros", None)
+        if qscale is None or qzeros is None or qscale.device != self.qscale.device or qzeros.device != self.qzeros.device:
+            self.prepare_lm_head_topk_layout()
+            qscale = self.lm_head_qscale
+            qzeros = self.lm_head_qzeros
+        return self.qweight, qscale, qzeros
+
     @staticmethod
     def _padded_in_features(in_features: int, group_size: int) -> int:
         padded = ((in_features + group_size - 1) // group_size) * group_size
@@ -821,6 +843,12 @@ def estimate_module_xpu_int4_bytes(
                 + child.qscale.nelement() * child.qscale.element_size()
                 + child.qzeros.nelement() * child.qzeros.element_size()
             )
+            lm_head_qscale = getattr(child, "lm_head_qscale", None)
+            lm_head_qzeros = getattr(child, "lm_head_qzeros", None)
+            if lm_head_qscale is not None:
+                total += lm_head_qscale.nelement() * lm_head_qscale.element_size()
+            if lm_head_qzeros is not None:
+                total += lm_head_qzeros.nelement() * lm_head_qzeros.element_size()
             if child.bias is not None:
                 total += child.bias.nelement() * child.bias.element_size()
         elif isinstance(child, (AutoRoundGPTQLinear, AWQLinear, DenseLinear, nn.Linear)):
@@ -894,6 +922,8 @@ def convert_module_linears_to_xpu_int4(
                     logger.info("Saved XPU int4 layout cache: %s", cache_path)
                 except Exception:
                     logger.warning("Failed to save XPU int4 cache for module %s", module_name, exc_info=True)
+        if module_name == "lm_head" or module_name.endswith(".lm_head"):
+            replacement.prepare_lm_head_topk_layout()
         _set_submodule(module, module_name, replacement)
         count += 1
         if gc_every > 0 and count % gc_every == 0:
@@ -934,6 +964,8 @@ def replace_linear_modules_with_xpu_int4_placeholders(
         )
 
     for module_name, replacement in replacements:
+        if module_name == "lm_head" or module_name.endswith(".lm_head"):
+            replacement.prepare_lm_head_topk_layout()
         _set_submodule(model, module_name, replacement)
     return len(replacements)
 

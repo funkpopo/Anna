@@ -84,6 +84,8 @@ Arc int4 fused-kernel tuning knobs:
 
 These default to the existing conservative choices. On Arc A770/A750, sweep these values with `tools/bench_xpu_hotspots.py --arc-profile`; add `--arc-int4-only` for focused int4 sweeps that skip the general attention/router hotspot suite. The report includes ordinary `XPUInt4Linear`, `lm_head_int4_topk_fused`, and `moe_grouped_int4_mlp_fused` rows so kernel-local wins can be checked against decode-critical paths.
 
+When runtime int4 converts `lm_head`, Anna also prepares a top-k-specific scale/zero layout (`[vocab, group_count]`) for `lm_head_int4_topk_fused`; ordinary linear layers keep the standard matmul layout.
+
 ## Quick start
 
 **API server:**

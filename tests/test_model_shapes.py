@@ -83,7 +83,7 @@ def _stub_run_gated_delta_fused(
 
 @pytest.fixture(autouse=True)
 def _stub_gated_delta_fused(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(model_ops, "run_gated_delta_fused", _stub_run_gated_delta_fused)
+    monkeypatch.setattr(model_ops, "run_gated_delta_fused", _stub_run_gated_delta_fused, raising=False)
 
 
 def _tiny_config() -> Qwen3_5TextConfig:
@@ -843,6 +843,8 @@ def test_engine_runtime_weight_quantization_converts_dense_text_linears() -> Non
     assert after_bytes < before_bytes
     assert isinstance(model.model.layers[0].linear_attn.in_proj_qkv, XPUInt4Linear)
     assert isinstance(model.lm_head, XPUInt4Linear)
+    assert model.lm_head.lm_head_qscale.shape == (model.lm_head.out_features, model.lm_head.qscale.shape[0])
+    assert model.lm_head.lm_head_qzeros.shape == (model.lm_head.out_features, model.lm_head.qzeros.shape[0])
 
 
 def test_engine_runtime_weight_quantization_skips_sparse_expert_modules() -> None:

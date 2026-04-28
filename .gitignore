@@ -10,6 +10,7 @@ __pycache__/
 .coverage
 .coverage.*
 .zig-cache/
+.anna/
 zig-out/
 htmlcov/
 
