@@ -1241,6 +1241,29 @@ class AnnaQwen3_5TextEngine:
             release_unused_memory()
         logger.info("Trimmed idle KV cache pages: released_pages=%s", trimmed_pages)
 
+    def _reclaim_runtime_memory_for_admission(self) -> bool:
+        released = False
+        prompt_cache = getattr(self, "_prompt_cache", None)
+        if prompt_cache:
+            for key, entry in list(prompt_cache.items()):
+                self._evict_prompt_cache_entry(key, entry)
+                released = True
+
+        allocator = getattr(self, "cache_allocator", None)
+        trim = getattr(allocator, "trim", None)
+        if callable(trim):
+            try:
+                released = int(trim()) > 0 or released
+            except Exception:  # pragma: no cover - best-effort cleanup
+                logger.debug("Failed to trim KV cache allocator during memory admission.", exc_info=True)
+
+        if released:
+            release_unused_memory = getattr(self.device_context, "release_unused_memory", None)
+            if callable(release_unused_memory):
+                release_unused_memory()
+            logger.info("Reclaimed runtime caches before memory admission.")
+        return released
+
     def _clear_runtime_caches_after_recover(self, *, reason: str) -> None:
         prompt_cache = getattr(self, "_prompt_cache", None)
         prompt_entries = 0
@@ -2090,8 +2113,12 @@ class AnnaQwen3_5TextEngine:
         memory_info = self.device_context.get_memory_info()
         if memory_info is None:
             return context_remaining
-
         policy = self.device_context.safety_policy
+        if memory_info.free_bytes < policy.min_free_bytes and self._reclaim_runtime_memory_for_admission():
+            memory_info = self.device_context.get_memory_info()
+            if memory_info is None:
+                return context_remaining
+
         if memory_info.free_bytes < policy.min_free_bytes:
             raise AnnaEngineError(
                 f"Insufficient free XPU memory before generation: free={_format_bytes(memory_info.free_bytes)}, "
@@ -2129,6 +2156,27 @@ class AnnaQwen3_5TextEngine:
         if best > 0:
             return best
 
+        if self._reclaim_runtime_memory_for_admission():
+            memory_info = self.device_context.get_memory_info()
+            if memory_info is None:
+                return context_remaining
+            available_budget = max(0, memory_info.free_bytes - policy.reserve_margin_bytes)
+            max_allowed = int(memory_info.total_bytes * policy.max_estimated_usage_ratio)
+            memory_budget = min(available_budget, max_allowed)
+            low = 1
+            high = context_remaining
+            while low <= high:
+                mid = (low + high) // 2
+                probe.max_new_tokens = mid
+                estimated_bytes = self._estimate_generation_memory_bytes(prepared, config=probe)
+                if estimated_bytes <= memory_budget:
+                    best = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+            if best > 0:
+                return best
+
         one_token_config = GenerationConfig(max_new_tokens=1)
         estimated_bytes = self._estimate_generation_memory_bytes(prepared, config=one_token_config)
         raise AnnaEngineError(
@@ -2163,15 +2211,25 @@ class AnnaQwen3_5TextEngine:
         total_tokens = int(prepared.input_ids.shape[1]) + config.max_new_tokens
         full_layers = sum(1 for layer_type in text_config.layer_types if layer_type == "full_attention")
         linear_layers = max(0, text_config.num_hidden_layers - full_layers)
-
-        kv_cache_bytes = (
-            full_layers
-            * 2
-            * total_tokens
-            * text_config.num_key_value_heads
-            * text_config.head_dim
-            * bytes_per_elem
-        )
+        kv_elements_per_token = text_config.num_key_value_heads * text_config.head_dim
+        if self.optimization_config.kv_cache_quantization == "turboquant":
+            residual_tokens = min(total_tokens, max(1, int(self.optimization_config.kv_cache_residual_len)))
+            quantized_tokens = max(0, total_tokens - residual_tokens)
+            quant_bits = int(self.optimization_config.kv_cache_quant_bits)
+            quantized_bytes = (2 * quantized_tokens * kv_elements_per_token * quant_bits + 7) // 8
+            residual_bytes = 2 * residual_tokens * kv_elements_per_token * bytes_per_elem
+            # TurboQuant keeps per-group scale/min metadata in floating point. The
+            # exact group count is implementation-specific, so budget a modest
+            # metadata margin while still reflecting the compressed KV footprint.
+            kv_cache_bytes = full_layers * int((quantized_bytes + residual_bytes) * 1.20)
+        else:
+            kv_cache_bytes = (
+                full_layers
+                * 2
+                * total_tokens
+                * kv_elements_per_token
+                * bytes_per_elem
+            )
         linear_key_dim = text_config.linear_num_key_heads * text_config.linear_key_head_dim
         linear_value_dim = text_config.linear_num_value_heads * text_config.linear_value_head_dim
         conv_cache_bytes = linear_layers * (linear_key_dim * 2 + linear_value_dim) * text_config.linear_conv_kernel_dim * bytes_per_elem
@@ -2211,6 +2269,17 @@ class AnnaQwen3_5TextEngine:
         policy = self.device_context.safety_policy
         available_budget = max(0, memory_info.free_bytes - policy.reserve_margin_bytes)
         max_allowed = int(memory_info.total_bytes * policy.max_estimated_usage_ratio)
+
+        if (
+            memory_info.free_bytes < policy.min_free_bytes
+            or estimated_bytes > available_budget
+            or estimated_bytes > max_allowed
+        ) and self._reclaim_runtime_memory_for_admission():
+            memory_info = self.device_context.get_memory_info()
+            if memory_info is None:
+                return
+            available_budget = max(0, memory_info.free_bytes - policy.reserve_margin_bytes)
+            max_allowed = int(memory_info.total_bytes * policy.max_estimated_usage_ratio)
 
         if memory_info.free_bytes < policy.min_free_bytes:
             raise AnnaEngineError(
