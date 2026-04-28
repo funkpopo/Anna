@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,28 @@ _XPU_INT4_GEMV_CACHE_TILE = 4
 _XPU_INT4_LM_HEAD_CACHE_TILE = 4
 
 logger = logging.getLogger(__name__)
+
+
+def _release_cpu_memory_caches() -> None:
+    gc.collect()
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            logger.debug("Failed to trim libc malloc arena after XPU int4 cache work.", exc_info=True)
+    elif sys.platform == "win32":
+        try:
+            import ctypes
+
+            try:
+                ctypes.CDLL("msvcrt")._heapmin()
+            except Exception:
+                logger.debug("Failed to minimize CRT heap after XPU int4 cache work.", exc_info=True)
+            ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+        except Exception:
+            logger.debug("Failed to trim Windows working set after XPU int4 cache work.", exc_info=True)
 
 
 def _empty_parameter(
@@ -57,9 +80,12 @@ def _hash_tensor(hasher: "hashlib._Hash", tensor: torch.Tensor | None) -> None:
         hasher.update(b"<none>")
         return
     materialized = tensor.detach().to(device="cpu").contiguous()
-    hasher.update(str(materialized.dtype).encode("utf-8"))
-    hasher.update(json.dumps(tuple(materialized.shape)).encode("utf-8"))
-    hasher.update(materialized.numpy().tobytes())
+    try:
+        hasher.update(str(materialized.dtype).encode("utf-8"))
+        hasher.update(json.dumps(tuple(materialized.shape)).encode("utf-8"))
+        hasher.update(materialized.numpy().tobytes())
+    finally:
+        del materialized
 
 
 def _linear_cache_fingerprint(module: nn.Module, *, group_size: int, compute_dtype: torch.dtype) -> str:
@@ -110,62 +136,71 @@ def _load_xpu_int4_linear_from_cache(
         return None
     metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
     if metadata.get("version") != _XPU_INT4_LAYOUT_CACHE_VERSION or metadata.get("fingerprint") != fingerprint:
+        del payload
+        _release_cpu_memory_caches()
         return None
     if metadata.get("layout") != _XPU_INT4_LAYOUT_NAME:
+        del payload
+        _release_cpu_memory_caches()
         return None
     try:
-        quantized = XPUInt4Linear(
-            int(metadata["in_features"]),
-            int(metadata["out_features"]),
-            group_size=int(metadata["group_size"]),
-            bias=bool(metadata["has_bias"]),
-            compute_dtype=compute_dtype,
-            device=device,
-            padded_in_features=int(metadata["padded_in_features"]),
-        )
-        with torch.no_grad():
-            quantized.qweight.copy_(payload["qweight"].to(device=quantized.qweight.device))
-            quantized.qscale.copy_(payload["qscale"].to(device=quantized.qscale.device))
-            quantized.qzeros.copy_(payload["qzeros"].to(device=quantized.qzeros.device))
-            if quantized.bias is not None:
-                quantized.bias.copy_(payload["bias"].to(device=quantized.bias.device, dtype=quantized.bias.dtype))
-        if "gemv_qweight" in payload and "gemv_qscale" in payload and "gemv_qzeros" in payload:
-            quantized.register_buffer(
-                "gemv_qweight",
-                payload["gemv_qweight"].to(device=quantized.qweight.device).contiguous(),
-                persistent=True,
+        try:
+            quantized = XPUInt4Linear(
+                int(metadata["in_features"]),
+                int(metadata["out_features"]),
+                group_size=int(metadata["group_size"]),
+                bias=bool(metadata["has_bias"]),
+                compute_dtype=compute_dtype,
+                device=device,
+                padded_in_features=int(metadata["padded_in_features"]),
             )
-            quantized.register_buffer(
-                "gemv_qscale",
-                payload["gemv_qscale"].to(device=quantized.qscale.device).contiguous(),
-                persistent=True,
-            )
-            quantized.register_buffer(
-                "gemv_qzeros",
-                payload["gemv_qzeros"].to(device=quantized.qzeros.device).contiguous(),
-                persistent=True,
-            )
-            quantized.gemv_output_tile = int(metadata.get("gemv_output_tile", _XPU_INT4_GEMV_CACHE_TILE))
-        if "lm_head_qweight" in payload and "lm_head_qscale" in payload and "lm_head_qzeros" in payload:
-            quantized.register_buffer(
-                "lm_head_qweight",
-                payload["lm_head_qweight"].to(device=quantized.qweight.device).contiguous(),
-                persistent=True,
-            )
-            quantized.register_buffer(
-                "lm_head_qscale",
-                payload["lm_head_qscale"].to(device=quantized.qscale.device).contiguous(),
-                persistent=True,
-            )
-            quantized.register_buffer(
-                "lm_head_qzeros",
-                payload["lm_head_qzeros"].to(device=quantized.qzeros.device).contiguous(),
-                persistent=True,
-            )
-            quantized.lm_head_output_tile = int(metadata.get("lm_head_output_tile", _XPU_INT4_LM_HEAD_CACHE_TILE))
+            with torch.no_grad():
+                quantized.qweight.copy_(payload["qweight"].to(device=quantized.qweight.device))
+                quantized.qscale.copy_(payload["qscale"].to(device=quantized.qscale.device))
+                quantized.qzeros.copy_(payload["qzeros"].to(device=quantized.qzeros.device))
+                if quantized.bias is not None:
+                    quantized.bias.copy_(payload["bias"].to(device=quantized.bias.device, dtype=quantized.bias.dtype))
+            if "gemv_qweight" in payload and "gemv_qscale" in payload and "gemv_qzeros" in payload:
+                quantized.register_buffer(
+                    "gemv_qweight",
+                    payload["gemv_qweight"].to(device=quantized.qweight.device).contiguous(),
+                    persistent=True,
+                )
+                quantized.register_buffer(
+                    "gemv_qscale",
+                    payload["gemv_qscale"].to(device=quantized.qscale.device).contiguous(),
+                    persistent=True,
+                )
+                quantized.register_buffer(
+                    "gemv_qzeros",
+                    payload["gemv_qzeros"].to(device=quantized.qzeros.device).contiguous(),
+                    persistent=True,
+                )
+                quantized.gemv_output_tile = int(metadata.get("gemv_output_tile", _XPU_INT4_GEMV_CACHE_TILE))
+            if "lm_head_qweight" in payload and "lm_head_qscale" in payload and "lm_head_qzeros" in payload:
+                quantized.register_buffer(
+                    "lm_head_qweight",
+                    payload["lm_head_qweight"].to(device=quantized.qweight.device).contiguous(),
+                    persistent=True,
+                )
+                quantized.register_buffer(
+                    "lm_head_qscale",
+                    payload["lm_head_qscale"].to(device=quantized.qscale.device).contiguous(),
+                    persistent=True,
+                )
+                quantized.register_buffer(
+                    "lm_head_qzeros",
+                    payload["lm_head_qzeros"].to(device=quantized.qzeros.device).contiguous(),
+                    persistent=True,
+                )
+                quantized.lm_head_output_tile = int(metadata.get("lm_head_output_tile", _XPU_INT4_LM_HEAD_CACHE_TILE))
+        finally:
+            del payload
     except Exception:
         logger.warning("Ignoring incompatible XPU int4 cache file: %s", cache_path, exc_info=True)
+        _release_cpu_memory_caches()
         return None
+    _release_cpu_memory_caches()
     logger.info("Loaded XPU int4 layout cache: %s", cache_path)
     return quantized
 
@@ -208,8 +243,12 @@ def _save_xpu_int4_linear_to_cache(
         if tensor is not None:
             payload[name] = tensor.detach().to(device="cpu").contiguous()
     tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    torch.save(payload, tmp_path)
-    tmp_path.replace(cache_path)
+    try:
+        torch.save(payload, tmp_path)
+        tmp_path.replace(cache_path)
+    finally:
+        del payload
+        _release_cpu_memory_caches()
 
 
 def _unpack_int4_last_dim(packed: torch.Tensor) -> torch.Tensor:
@@ -1047,7 +1086,14 @@ def convert_module_linears_to_xpu_int4(
     env_cache_dir = os.getenv("ANNA_XPU_INT4_CACHE_DIR")
     if resolved_cache_dir is None and env_cache_dir:
         resolved_cache_dir = Path(env_cache_dir)
-    for module_name, child in list(module.named_modules()):
+    module_names = [module_name for module_name, _child in module.named_modules() if module_name]
+    for module_name in module_names:
+        try:
+            child = module.get_submodule(module_name)
+        except AttributeError:
+            child = module
+            for part in module_name.split("."):
+                child = getattr(child, part)
         if not module_name:
             continue
         if isinstance(child, XPUInt4Linear):
@@ -1098,11 +1144,15 @@ def convert_module_linears_to_xpu_int4(
         if module_name == "lm_head" or module_name.endswith(".lm_head"):
             replacement.prepare_lm_head_topk_layout()
         _set_submodule(module, module_name, replacement)
+        del child
         count += 1
-        if gc_every > 0 and count % gc_every == 0:
-            gc.collect()
+        if device is not None and torch.device(device).type == "xpu":
+            _release_cpu_memory_caches()
+        elif gc_every > 0 and count % gc_every == 0:
+            _release_cpu_memory_caches()
 
-    gc.collect()
+    del module_names
+    _release_cpu_memory_caches()
     return count
 
 

@@ -19,6 +19,7 @@ from anna.api.schemas import ChatCompletionRequest, CompletionRequest, SpeechReq
 from anna.runtime.qwen3_5_text_engine import (
     AnnaEngineError,
     GenerationConfig,
+    GenerationPerfStats,
     ReasoningFormat,
     StreamEvent,
     TextGenerationResult,
@@ -112,23 +113,12 @@ async def _stream_until_done_or_disconnected(
     request: Request,
     config: GenerationConfig,
     chunks: Iterator[str],
-    *,
-    close_events: Callable[[], None] | None = None,
 ) -> AsyncIterator[str]:
     output: queue.Queue[object] = queue.Queue()
 
-    def _close() -> None:
+    def _cancel() -> None:
         if config.cancellation_event is not None:
             config.cancellation_event.set()
-        if close_events is not None:
-            close_events()
-        close = getattr(chunks, "close", None)
-        if callable(close):
-            try:
-                close()
-            except ValueError:
-                # The sync generator is currently executing in the worker thread.
-                pass
 
     def _worker() -> None:
         try:
@@ -150,7 +140,7 @@ async def _stream_until_done_or_disconnected(
                 if await request.is_disconnected():
                     disconnected = True
                     logger.info("Client disconnected; cancelling streaming generation.")
-                    _close()
+                    _cancel()
                     break
                 await asyncio.sleep(0.05)
                 continue
@@ -165,7 +155,7 @@ async def _stream_until_done_or_disconnected(
                 raise RuntimeError(str(item))
             yield item
     finally:
-        _close()
+        _cancel()
 
 
 def _normalize_stop(stop: str | list[str] | None) -> list[str]:
@@ -281,7 +271,7 @@ def _chat_response_payload(
         message["reasoning_content"] = result.reasoning_text
     if result.tool_calls:
         message["tool_calls"] = result.tool_calls
-    return {
+    payload: dict[str, object] = {
         "id": response_id,
         "object": "chat.completion",
         "created": created,
@@ -299,6 +289,9 @@ def _chat_response_payload(
             "total_tokens": result.prompt_tokens + result.completion_tokens,
         },
     }
+    if result.perf is not None:
+        payload["anna"] = {"generation_perf": _generation_perf_public(result.perf)}
+    return payload
 
 
 def _usage_payload(prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
@@ -306,6 +299,21 @@ def _usage_payload(prompt_tokens: int, completion_tokens: int) -> dict[str, int]
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+def _generation_perf_public(perf: GenerationPerfStats) -> dict[str, float | int]:
+    return {
+        "prefill_seconds": perf.prefill_seconds,
+        "ttft_seconds": perf.ttft_seconds,
+        "decode_seconds": perf.decode_seconds,
+        "prefill_tokens_per_second": perf.prefill_tokens_per_second,
+        "decode_tokens_per_second": perf.decode_tokens_per_second,
+        "total_seconds": perf.total_seconds,
+        "total_tokens_per_second": perf.total_tokens_per_second,
+        "prompt_tokens": perf.prompt_tokens,
+        "completion_tokens": perf.completion_tokens,
+        "decode_tokens": perf.decode_tokens,
     }
 
 
@@ -448,6 +456,7 @@ def _stream_sse_chat(
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
     except AnnaEngineError as exc:
         yield _sse_error_frame(exc)
+        yield "data: [DONE]\n\n"
     except Exception:  # pragma: no cover - defensive fallback
         logger.exception("Unhandled chat streaming failure.")
         yield _sse_error_frame(
@@ -458,9 +467,10 @@ def _stream_sse_chat(
                 code="streaming_failed",
             )
         )
+        yield "data: [DONE]\n\n"
     else:
         if include_usage and final_usage is not None:
-            usage_chunk = {
+            usage_chunk: dict[str, object] = {
                 "id": response_id,
                 "object": "chat.completion.chunk",
                 "created": created,
@@ -468,6 +478,8 @@ def _stream_sse_chat(
                 "choices": [],
                 "usage": final_usage,
             }
+            if final_perf is not None:
+                usage_chunk["anna"] = {"generation_perf": _generation_perf_public(final_perf)}
             yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
 
         if route_name is not None and final_usage is not None:
@@ -526,6 +538,7 @@ def _stream_sse_completion(
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
     except AnnaEngineError as exc:
         yield _sse_error_frame(exc)
+        yield "data: [DONE]\n\n"
     except Exception:  # pragma: no cover - defensive fallback
         logger.exception("Unhandled text streaming failure.")
         yield _sse_error_frame(
@@ -536,6 +549,7 @@ def _stream_sse_completion(
                 code="streaming_failed",
             )
         )
+        yield "data: [DONE]\n\n"
     finally:
         close = getattr(events, "close", None)
         if callable(close):
@@ -648,7 +662,6 @@ async def chat_completions(request: Request, payload: ChatCompletionRequest):
                     request,
                     config,
                     chunks,
-                    close_events=getattr(events, "close", None),
                 ),
                 media_type="text/event-stream",
             )
@@ -738,7 +751,6 @@ async def completions(request: Request, payload: CompletionRequest):
                     request,
                     config,
                     chunks,
-                    close_events=getattr(events, "close", None),
                 ),
                 media_type="text/event-stream",
             )

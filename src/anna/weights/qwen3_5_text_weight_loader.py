@@ -12,7 +12,12 @@ from safetensors import safe_open
 from anna.core.gguf_model import has_gguf_model
 from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
-from anna.model.quantization import replace_linear_modules, replace_linear_modules_with_xpu_int4_placeholders
+from anna.model.quantization import (
+    XPUInt4Linear,
+    _release_cpu_memory_caches,
+    replace_linear_modules,
+    replace_linear_modules_with_xpu_int4_placeholders,
+)
 from anna.weights.safetensors_device import safetensors_pt_device_str
 
 logger = logging.getLogger(__name__)
@@ -118,6 +123,7 @@ def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, 
         return load_qwen3_5_text_model_weights_from_gguf(model, model_path)
     tensor_targets = {name: tensor for name, tensor in model.named_parameters()}
     tensor_targets.update({name: tensor for name, tensor in model.named_buffers()})
+    module_targets = dict(model.named_modules())
     loaded = 0
     skipped = 0
     weight_files = _iter_weight_files(model_path)
@@ -146,6 +152,27 @@ def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, 
         with safe_open(str(weight_file), framework="pt", device=st_device) as handle:
             for key in handle.keys():
                 if key not in tensor_targets:
+                    if key.endswith(".weight"):
+                        module_name = key[: -len(".weight")]
+                        module = module_targets.get(module_name)
+                        if isinstance(module, XPUInt4Linear):
+                            source = handle.get_tensor(key)
+                            if tuple(source.shape) != (module.out_features, module.in_features):
+                                raise ValueError(
+                                    f"Shape mismatch for {key}: expected {(module.out_features, module.in_features)}, got {tuple(source.shape)}"
+                                )
+                            qweight, qscale, qzeros = XPUInt4Linear._quantize_weight(
+                                source,
+                                group_size=module.group_size,
+                                padded_in_features=module.padded_in_features,
+                            )
+                            with torch.no_grad():
+                                module.qweight.copy_(qweight.to(device=module.qweight.device))
+                                module.qscale.copy_(qscale.to(device=module.qscale.device))
+                                module.qzeros.copy_(qzeros.to(device=module.qzeros.device))
+                            del source, qweight, qscale, qzeros
+                            loaded += 1
+                            continue
                     skipped += 1
                     continue
 
@@ -161,8 +188,10 @@ def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, 
                         target.copy_(source)
                     else:
                         target.copy_(source.to(device=target.device, dtype=target.dtype))
+                del source
                 loaded += 1
         loaded_bytes += shard_size
+        _release_cpu_memory_caches()
         logger.info(
             "Loaded Qwen3.5 weight shard %s/%s: %s (cumulative_bytes=%s/%s, tensors_loaded=%s, tensors_skipped=%s)",
             shard_idx,
@@ -175,4 +204,7 @@ def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, 
         )
 
     model.tie_weights()
+    del tensor_targets
+    del module_targets
+    _release_cpu_memory_caches()
     return WeightLoadReport(loaded=loaded, skipped=skipped)

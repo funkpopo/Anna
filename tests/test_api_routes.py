@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
+import time
 
 from fastapi.testclient import TestClient
 
@@ -155,6 +158,68 @@ def test_streaming_chat_closes_engine_iterator_when_response_generator_closes() 
     generator.close()
 
     assert events.closed is True
+
+
+def test_streaming_disconnect_does_not_close_iterator_while_worker_is_iterating() -> None:
+    from anna.api.routes import _stream_until_done_or_disconnected
+    from anna.runtime.qwen3_5_text_engine import GenerationConfig
+
+    class _DisconnectingRequest:
+        async def is_disconnected(self) -> bool:
+            return True
+
+    class _SlowClosableChunks:
+        def __init__(self, cancellation_event: threading.Event) -> None:
+            self.cancellation_event = cancellation_event
+            self.started_second_next = threading.Event()
+            self.in_next = False
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> str:
+            if not self.started_second_next.is_set():
+                self.started_second_next.set()
+                return "data: first\n\n"
+
+            self.in_next = True
+            try:
+                while not self.cancellation_event.is_set():
+                    time.sleep(0.01)
+                raise StopIteration
+            finally:
+                self.in_next = False
+
+        def close(self) -> None:
+            if self.in_next:
+                raise ValueError("generator already executing")
+            self.closed = True
+
+    async def _run() -> _SlowClosableChunks:
+        cancellation_event = threading.Event()
+        chunks = _SlowClosableChunks(cancellation_event)
+        stream = _stream_until_done_or_disconnected(
+            _DisconnectingRequest(),
+            GenerationConfig(cancellation_event=cancellation_event),
+            chunks,
+        )
+
+        assert await anext(stream) == "data: first\n\n"
+        chunks.started_second_next.wait(timeout=1.0)
+        try:
+            await anext(stream)
+        except StopAsyncIteration:
+            pass
+        else:  # pragma: no cover - defensive assertion
+            raise AssertionError("stream should stop after disconnect")
+
+        return chunks
+
+    chunks = asyncio.run(_run())
+
+    assert chunks.cancellation_event.is_set()
+    assert chunks.closed is False
 
 
 def test_chat_completion_uses_engine_default_max_completion_tokens_when_request_omits_it() -> None:

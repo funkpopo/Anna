@@ -56,6 +56,25 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{num_bytes} B"
 
 
+def _module_cpu_tensor_bytes(module: torch.nn.Module) -> int:
+    total = 0
+    seen: set[tuple[int, int, int]] = set()
+    tensors = itertools.chain(module.named_parameters(), module.named_buffers())
+    for _name, tensor in tensors:
+        if tensor.device.type != "cpu":
+            continue
+        try:
+            storage = tensor.untyped_storage()
+            key = (int(storage.data_ptr()), int(tensor.storage_offset()), int(tensor.nbytes))
+        except Exception:
+            key = (id(tensor), 0, int(tensor.nelement() * tensor.element_size()))
+        if key in seen:
+            continue
+        seen.add(key)
+        total += int(tensor.nelement() * tensor.element_size())
+    return total
+
+
 def _strip_unstable_replacement_suffix(text: str) -> str:
     return strip_unstable_replacement_suffix(text)
 
@@ -496,10 +515,8 @@ class AnnaQwen3_5TextEngine:
         )
         uses_gguf_weights = has_gguf_model(model_path)
 
-        def _gguf_int4_placeholder_predicate(module_name: str, _module: torch.nn.Module) -> bool:
+        def _direct_int4_placeholder_predicate(module_name: str, _module: torch.nn.Module) -> bool:
             normalized = module_name.replace("\\", "/")
-            if normalized == "lm_head":
-                return False
             if ".visual." in normalized or normalized.startswith("model.visual."):
                 return False
             if ".mlp._expert_cache." in normalized:
@@ -525,7 +542,11 @@ class AnnaQwen3_5TextEngine:
                 config,
                 device=model_device,
                 dtype=device_context.dtype,
-                int4_placeholder_predicate=(_gguf_int4_placeholder_predicate if uses_gguf_weights else None),
+                int4_placeholder_predicate=(
+                    _direct_int4_placeholder_predicate
+                    if uses_gguf_weights or resolved_weight_quant == "int4"
+                    else None
+                ),
             )
             report = load_qwen3_5_text_model_weights(model, model_path)
             logger.info(
@@ -659,6 +680,10 @@ class AnnaQwen3_5TextEngine:
             resolved_cached_experts_per_layer = cls._effective_cached_experts_per_layer(model)
             model.eval()
             release_conversion_artifacts(device_context.device)
+            logger.info(
+                "Post-load Qwen3.5 CPU tensor residency: %s",
+                _format_bytes(_module_cpu_tensor_bytes(model)),
+            )
         except RuntimeError as exc:
             if device_context.should_recover(exc):
                 try:

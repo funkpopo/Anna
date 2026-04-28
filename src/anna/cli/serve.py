@@ -276,8 +276,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--xpu-int4-matmul",
         choices=("auto", "torch", "dequant", "sycl"),
-        default=None,
-        help="Override ANNA_XPU_INT4_MATMUL for XPU int4 dense linear execution. Experimental; omit to keep the environment/default.",
+        default="torch",
+        help="XPU int4 dense linear execution strategy. Defaults to torch; use sycl to enable the experimental standalone GEMV path.",
     )
     parser.add_argument(
         "--xpu-int4-gemv-kernel",
