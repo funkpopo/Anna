@@ -25,6 +25,13 @@ class _TinyQuantNet(nn.Module):
         )
 
 
+class _TinyLmHeadNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lm_head = nn.Linear(32, 64, bias=False)
+        self.proj = nn.Linear(32, 32, bias=False)
+
+
 def _pack_int4_first_dim(values: torch.Tensor) -> torch.Tensor:
     reshaped = values.reshape(values.shape[0] // 8, 8, values.shape[1]).permute(0, 2, 1).contiguous()
     shifts = (torch.arange(8, dtype=torch.int32).view(1, 1, 8) * 4)
@@ -117,6 +124,20 @@ def test_convert_module_linears_to_xpu_int4_respects_include_predicate() -> None
     assert isinstance(model.proj, nn.Linear)
     assert isinstance(model.block[0], XPUInt4Linear)
     assert isinstance(model.block[2], XPUInt4Linear)
+
+
+def test_convert_module_linears_to_xpu_int4_prepares_lm_head_topk_layout() -> None:
+    model = _TinyLmHeadNet()
+    converted = convert_module_linears_to_xpu_int4(model, group_size=32, device=torch.device("cpu"))
+
+    assert converted == 2
+    assert isinstance(model.lm_head, XPUInt4Linear)
+    assert model.lm_head.lm_head_qscale.shape == (64, 1)
+    assert model.lm_head.lm_head_qzeros.shape == (64, 1)
+    assert torch.equal(model.lm_head.lm_head_qscale, model.lm_head.qscale.transpose(0, 1).contiguous())
+    assert torch.equal(model.lm_head.lm_head_qzeros, model.lm_head.qzeros.transpose(0, 1).contiguous())
+    assert isinstance(model.proj, XPUInt4Linear)
+    assert not hasattr(model.proj, "lm_head_qscale")
 
 
 def test_convert_module_linears_to_xpu_int4_supports_autoround_payloads() -> None:

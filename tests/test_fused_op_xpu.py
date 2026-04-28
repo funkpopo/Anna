@@ -229,6 +229,33 @@ def test_lm_head_int4_topk_fused_xpu_matches_quantized_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_lm_head_int4_topk_fused_xpu_accepts_lm_head_topk_layout() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "lm_head_int4_topk_fused"):
+        pytest.skip("Anna fused-op library is not built with lm_head_int4_topk_fused")
+
+    torch.manual_seed(8)
+    dense = torch.nn.Linear(64, 96, bias=False, device="xpu", dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=32, compute_dtype=torch.float16, device="xpu")
+    quantized.prepare_lm_head_topk_layout()
+    hidden_states = torch.randn(2, 64, device="xpu", dtype=torch.float16)
+
+    values, indices = torch.ops.anna.lm_head_int4_topk_fused(
+        hidden_states,
+        quantized.qweight,
+        quantized.lm_head_qscale,
+        quantized.lm_head_qzeros,
+        quantized.group_size,
+        quantized.in_features,
+        5,
+    )
+    reference_values, reference_indices = torch.topk(quantized(hidden_states), k=5, dim=-1)
+
+    torch.xpu.synchronize()
+    assert torch.equal(indices.cpu(), reference_indices.cpu())
+    assert torch.allclose(values.cpu(), reference_values.cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
 def test_lm_head_int4_topk_fused_xpu_respects_local_size_override() -> None:
     if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "lm_head_int4_topk_fused"):
         pytest.skip("Anna fused-op library is not built with lm_head_int4_topk_fused")

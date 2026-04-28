@@ -195,6 +195,26 @@ inline float load_xpu_int4_linear_weight(
   return (static_cast<float>(qvalue - zero_point)) * qscale_ptr[scale_offset];
 }
 
+inline float load_xpu_int4_linear_weight_for_topk(
+    const int32_t* qweight_ptr,
+    const float* qscale_ptr,
+    const int8_t* qzeros_ptr,
+    int64_t out_idx,
+    int64_t in_idx,
+    int64_t out_features,
+    int64_t packed_cols,
+    int64_t group_count,
+    int64_t group_size,
+    bool scale_by_output) {
+  const int64_t packed_idx = in_idx >> 3;
+  const uint32_t packed = static_cast<uint32_t>(qweight_ptr[out_idx * packed_cols + packed_idx]);
+  const int32_t qvalue = unpack_int4_lane(packed, in_idx);
+  const int64_t group_idx = int4_group_index(in_idx, group_count, group_size);
+  const int64_t scale_offset = scale_by_output ? out_idx * group_count + group_idx : group_idx * out_features + out_idx;
+  const int32_t zero_point = static_cast<int32_t>(qzeros_ptr[scale_offset]);
+  return (static_cast<float>(qvalue - zero_point)) * qscale_ptr[scale_offset];
+}
+
 template <typename scalar_t, typename VectorAccessor>
 inline void normalize_gated_delta_qk(
     const scalar_t* query_ptr,
@@ -481,9 +501,12 @@ void validate_lm_head_int4_topk_inputs(
   TORCH_CHECK(qweight.size(0) > 0, "vocab_size must be positive");
   TORCH_CHECK(qweight.size(1) > 0, "qweight packed columns must be positive");
   TORCH_CHECK(qweight.size(1) * 8 >= in_features, "qweight packed width is smaller than in_features");
-  TORCH_CHECK(qscale.size(1) == qweight.size(0), "qscale vocab dimension must match qweight");
   TORCH_CHECK(qzeros.sizes() == qscale.sizes(), "qzeros shape must match qscale");
-  TORCH_CHECK(qscale.size(0) * group_size >= in_features, "qscale group count is smaller than in_features");
+  const bool scale_by_group = qscale.size(1) == qweight.size(0) && qscale.size(0) * group_size >= in_features;
+  const bool scale_by_output = qscale.size(0) == qweight.size(0) && qscale.size(1) * group_size >= in_features;
+  TORCH_CHECK(
+      scale_by_group || scale_by_output,
+      "qscale must be [group_count, vocab_size] or lm_head top-k layout [vocab_size, group_count]");
   TORCH_CHECK(top_k >= 1, "top_k must be positive");
   TORCH_CHECK(top_k <= qweight.size(0), "top_k must be <= vocab_size");
   TORCH_CHECK(at::isFloatingType(hidden_states.scalar_type()), "hidden_states must be floating-point");
@@ -1339,7 +1362,8 @@ void launch_lm_head_int4_topk_kernel(
     int64_t group_count,
     int64_t group_size,
     int64_t top_k,
-    int64_t local_size) {
+    int64_t local_size,
+    bool scale_by_output) {
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_values(
         sycl::range<1>(static_cast<size_t>(local_size * top_k)), cgh);
@@ -1364,7 +1388,7 @@ void launch_lm_head_int4_topk_kernel(
           for (int64_t vocab_idx = lane; vocab_idx < vocab_size; vocab_idx += local_size) {
             float acc = 0.0f;
             for (int64_t hidden_idx = 0; hidden_idx < in_features; ++hidden_idx) {
-              const float weight_value = load_xpu_int4_linear_weight(
+              const float weight_value = load_xpu_int4_linear_weight_for_topk(
                   qweight_ptr,
                   qscale_ptr,
                   qzeros_ptr,
@@ -1373,7 +1397,8 @@ void launch_lm_head_int4_topk_kernel(
                   vocab_size,
                   packed_cols,
                   group_count,
-                  group_size);
+                  group_size,
+                  scale_by_output);
               acc += load_as_float(hidden_ptr, hidden_base + hidden_idx) * weight_value;
             }
 
@@ -1442,7 +1467,8 @@ void launch_lm_head_int4_topk_blocks_kernel(
     int64_t top_k,
     int64_t local_size,
     int64_t block_size,
-    int64_t num_blocks) {
+    int64_t num_blocks,
+    bool scale_by_output) {
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_values(
         sycl::range<1>(static_cast<size_t>(local_size * top_k)), cgh);
@@ -1472,7 +1498,7 @@ void launch_lm_head_int4_topk_blocks_kernel(
           for (int64_t vocab_idx = vocab_begin + lane; vocab_idx < vocab_end; vocab_idx += local_size) {
             float acc = 0.0f;
             for (int64_t hidden_idx = 0; hidden_idx < in_features; ++hidden_idx) {
-              const float weight_value = load_xpu_int4_linear_weight(
+              const float weight_value = load_xpu_int4_linear_weight_for_topk(
                   qweight_ptr,
                   qscale_ptr,
                   qzeros_ptr,
@@ -1481,7 +1507,8 @@ void launch_lm_head_int4_topk_blocks_kernel(
                   vocab_size,
                   packed_cols,
                   group_count,
-                  group_size);
+                  group_size,
+                  scale_by_output);
               acc += load_as_float(hidden_ptr, hidden_base + hidden_idx) * weight_value;
             }
 
@@ -1652,7 +1679,8 @@ std::tuple<at::Tensor, at::Tensor> lm_head_int4_topk_fused_xpu(
   auto qzeros = qzeros_in.contiguous();
   const auto vocab_size = qweight.size(0);
   const auto packed_cols = qweight.size(1);
-  const auto group_count = qscale.size(0);
+  const bool scale_by_output = qscale.size(0) == vocab_size;
+  const auto group_count = scale_by_output ? qscale.size(1) : qscale.size(0);
   const auto row_count = hidden_states.numel() / in_features;
   const int64_t local_size = resolve_power_of_two_env_local_size(
       "ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE",
@@ -1705,7 +1733,8 @@ std::tuple<at::Tensor, at::Tensor> lm_head_int4_topk_fused_xpu(
               top_k,
               kernel_local_size,
               block_size,
-              num_blocks);
+              num_blocks,
+              scale_by_output);
           launch_lm_head_int4_topk_merge_kernel(
               stream.queue(),
               block_values.const_data_ptr<scalar_t>(),
@@ -1732,7 +1761,8 @@ std::tuple<at::Tensor, at::Tensor> lm_head_int4_topk_fused_xpu(
               group_count,
               group_size,
               top_k,
-              kernel_local_size);
+              kernel_local_size,
+              scale_by_output);
         }
       });
 

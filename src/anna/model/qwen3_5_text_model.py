@@ -94,11 +94,12 @@ def _lm_head_topk(
         and lm_head.qweight.device.type == "xpu"
         and lm_head_int4_topk_fused_is_available()
     ):
+        qweight, qscale, qzeros = lm_head.lm_head_topk_tensors()
         return run_lm_head_int4_topk_fused(
             hidden_states=hidden_states,
-            qweight=lm_head.qweight,
-            qscale=lm_head.qscale,
-            qzeros=lm_head.qzeros,
+            qweight=qweight,
+            qscale=qscale,
+            qzeros=qzeros,
             group_size=lm_head.group_size,
             in_features=lm_head.in_features,
             top_k=top_k,
