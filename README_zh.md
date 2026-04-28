@@ -78,13 +78,17 @@ Arc int4 fused kernel 调参开关：
 - `ANNA_XPU_INT4_LM_HEAD_BLOCK_TOPK_THRESHOLD`：两阶段 blocked `lm_head_int4_topk_fused` 路径的 vocab 阈值（默认 65536）。
 - `ANNA_XPU_INT4_LM_HEAD_BLOCK_SIZE`：blocked `lm_head_int4_topk_fused` 的 vocab block 大小（默认 4096）。
 - `ANNA_XPU_INT4_GEMV_LOCAL_SIZE`：实验性 standalone `XPUInt4Linear` GEMV 路径的 local size；仅在 `ANNA_XPU_INT4_MATMUL=sycl` 且 decode rows `<= 4` 时使用（会向上取 2 的幂，最大 256）。
+- `ANNA_XPU_INT4_GEMV_KERNEL`：实验性 standalone GEMV kernel 模式。默认 `wg` 使用原 work-group 归约路径；`subgroup` 在 M=1 时用一个 subgroup 计算一个输出 tile，并用 subgroup reduction，避免 local-memory partial sums。
+- `ANNA_XPU_INT4_GEMV_OUTPUT_TILE`：实验性 M=1 输出通道 tile；默认 `1`。大于 `1` 的值只用于严格 `4096x4096` decode 实验，可能触发 Level Zero 资源限制。`subgroup` 模式会准备 GEMV 专用 `[output_tiles, packed_k, tile]` qweight 布局和 `[group, output_tiles, tile]` scale/zero 布局，让 subgroup 读取相邻输出时连续访问，而不是复用普通 linear layout。
 - `ANNA_XPU_AUTO_INT4_GEMV`：允许 `ANNA_XPU_INT4_MATMUL=auto` 在严格的 `M=1,K=N=4096,group=128` shape 上试探 standalone GEMV。默认关闭，直到 Arc sweep 数据稳定证明收益。
 - `ANNA_XPU_INT4_MOE_GATE_LOCAL_SIZE`：grouped int4 MoE gate/up projection 的 local size（会向上取 2 的幂，最大 256）。
 - `ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE`：grouped int4 MoE down projection 的 local size（会向上取 2 的幂，最大 256）。
 
-默认值保持当前保守策略。在 Arc A770/A750 上，建议先配合 `tools/bench_xpu_hotspots.py --arc-profile` 扫描这些值；需要专门扫 int4 时可加 `--arc-int4-only` 跳过 attention/router 等通用热点。报告会同时包含普通 `XPUInt4Linear`、`lm_head_int4_topk_fused` 和 `moe_grouped_int4_mlp_fused` 行，便于确认局部 kernel 优化是否真的覆盖 decode 关键路径。
+默认值保持当前保守策略。在 Arc A770/A750 上，建议先配合 `tools/bench_xpu_hotspots.py --arc-profile` 扫描这些值；需要专门扫 int4 时可加 `--arc-int4-only` 跳过 attention/router 等通用热点。可用 `--arc-int4-gemv-kernels wg,subgroup`、`--arc-int4-gemv-local-sizes 32,64,128` 和 `--arc-int4-gemv-output-tiles 1,2,4` 做可复现 standalone GEMV sweep。报告会同时包含普通 `XPUInt4Linear`、`lm_head_int4_topk_fused` 和 `moe_grouped_int4_mlp_fused` 行，便于确认局部 kernel 优化是否真的覆盖 decode 关键路径。
+`anna-serve` 可直接用 CLI 参数替代 SYCL int4 环境变量：`--xpu-int4-matmul sycl --xpu-int4-gemv-kernel subgroup --xpu-int4-gemv-output-tile 4 --xpu-int4-gemv-local-size 128`。当同时设置 `--xpu-int4-matmul sycl --xpu-int4-gemv-kernel subgroup` 时，Anna 会把 tiled subgroup SYCL 路径应用到所有 `XPUInt4Linear` row count，而不是只用于 decode rows。
 
 运行时 int4 转换 `lm_head` 时，Anna 还会额外准备面向 top-k 的 scale/zero 布局（`[vocab, group_count]`）供 `lm_head_int4_topk_fused` 使用；普通 linear 仍保持标准 matmul 布局。
+XPU int4 sidecar cache 也会保存实验性 decode layout：GEMV subgroup 的 tile-major qweight/scale/zero，以及 `lm_head` fused top-k 使用的 tile-major qweight。旧 v1 cache 会自动 miss 并按新 payload 重建。
 
 ## 快速开始
 

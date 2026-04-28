@@ -134,10 +134,29 @@ def test_convert_module_linears_to_xpu_int4_prepares_lm_head_topk_layout() -> No
     assert isinstance(model.lm_head, XPUInt4Linear)
     assert model.lm_head.lm_head_qscale.shape == (64, 1)
     assert model.lm_head.lm_head_qzeros.shape == (64, 1)
+    assert model.lm_head.lm_head_qweight.shape == (16, 4, 4)
+    assert torch.equal(model.lm_head.lm_head_qweight[0, :, 0], model.lm_head.qweight[0])
     assert torch.equal(model.lm_head.lm_head_qscale, model.lm_head.qscale.transpose(0, 1).contiguous())
     assert torch.equal(model.lm_head.lm_head_qzeros, model.lm_head.qzeros.transpose(0, 1).contiguous())
     assert isinstance(model.proj, XPUInt4Linear)
     assert not hasattr(model.proj, "lm_head_qscale")
+
+
+def test_xpu_int4_linear_prepares_gemv_subgroup_layout() -> None:
+    dense = torch.nn.Linear(96, 65, bias=False)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=32, compute_dtype=torch.float16, device="cpu")
+
+    qweight, qscale, qzeros = quantized.gemv_subgroup_tensors(output_tile=4)
+
+    assert qweight.shape == (17, 12, 4)
+    assert qscale.shape == (3, 17, 4)
+    assert qzeros.shape == (3, 17, 4)
+    assert torch.equal(qweight[0, :, 0], quantized.qweight[0])
+    assert torch.equal(qweight[0, :, 1], quantized.qweight[1])
+    assert torch.equal(qscale[:, 0, 0], quantized.qscale[:, 0])
+    assert torch.equal(qzeros[:, 0, 0], quantized.qzeros[:, 0])
+    assert torch.equal(qscale[:, 16, 1:], torch.zeros_like(qscale[:, 16, 1:]))
+    assert torch.equal(qzeros[:, 16, 1:], torch.zeros_like(qzeros[:, 16, 1:]))
 
 
 def test_convert_module_linears_to_xpu_int4_supports_autoround_payloads() -> None:
@@ -240,6 +259,12 @@ def test_convert_module_linears_to_xpu_int4_uses_layout_cache(
     assert torch.equal(second.proj.qweight, first.proj.qweight)
     assert torch.equal(second.proj.qscale, first.proj.qscale)
     assert torch.equal(second.proj.qzeros, first.proj.qzeros)
+    assert torch.equal(second.proj.gemv_qweight, first.proj.gemv_qweight)
+    assert torch.equal(second.proj.gemv_qscale, first.proj.gemv_qscale)
+    assert torch.equal(second.proj.gemv_qzeros, first.proj.gemv_qzeros)
     payload = torch.load(next(cache_dir.glob("proj-*.pt")), map_location="cpu", weights_only=False)
     assert payload["metadata"]["layout"] == "anna_xpu_int4_linear_v1"
-    assert payload["metadata"]["version"] == 1
+    assert payload["metadata"]["version"] == 2
+    assert "gemv_qweight" in payload
+    assert "gemv_qscale" in payload
+    assert "gemv_qzeros" in payload

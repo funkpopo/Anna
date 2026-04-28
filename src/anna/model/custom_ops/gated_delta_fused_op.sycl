@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <tuple>
 
 namespace anna {
@@ -151,6 +152,11 @@ int64_t resolve_power_of_two_env_local_size(const char* env_name, int64_t fallba
   return std::max<int64_t>(local_size, 1);
 }
 
+bool env_equals(const char* env_name, const char* expected) {
+  const char* raw = std::getenv(env_name);
+  return raw != nullptr && std::string(raw) == expected;
+}
+
 int64_t default_bounded_local_size(int64_t dimension, int64_t max_value) {
   return std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(dimension, max_value))), max_value);
 }
@@ -205,9 +211,14 @@ inline float load_xpu_int4_linear_weight_for_topk(
     int64_t packed_cols,
     int64_t group_count,
     int64_t group_size,
-    bool scale_by_output) {
+    bool scale_by_output,
+    bool qweight_tiled,
+    int64_t output_tile) {
   const int64_t packed_idx = in_idx >> 3;
-  const uint32_t packed = static_cast<uint32_t>(qweight_ptr[out_idx * packed_cols + packed_idx]);
+  const int64_t qweight_offset = qweight_tiled
+      ? ((out_idx / output_tile) * packed_cols + packed_idx) * output_tile + (out_idx % output_tile)
+      : out_idx * packed_cols + packed_idx;
+  const uint32_t packed = static_cast<uint32_t>(qweight_ptr[qweight_offset]);
   const int32_t qvalue = unpack_int4_lane(packed, in_idx);
   const int64_t group_idx = int4_group_index(in_idx, group_count, group_size);
   const int64_t scale_offset = scale_by_output ? out_idx * group_count + group_idx : group_idx * out_features + out_idx;
@@ -486,7 +497,7 @@ void validate_lm_head_int4_topk_inputs(
     int64_t in_features,
     int64_t top_k) {
   TORCH_CHECK(hidden_states.dim() >= 2, "hidden_states must be [..., hidden_dim]");
-  TORCH_CHECK(qweight.dim() == 2, "qweight must be [vocab_size, packed_cols]");
+  TORCH_CHECK(qweight.dim() == 2 || qweight.dim() == 3, "qweight must be [vocab_size, packed_cols] or [output_tiles, packed_cols, output_tile]");
   TORCH_CHECK(qscale.dim() == 2, "qscale must be [group_count, vocab_size]");
   TORCH_CHECK(qzeros.dim() == 2, "qzeros must be [group_count, vocab_size]");
   TORCH_CHECK(qweight.scalar_type() == at::kInt, "qweight must be int32");
@@ -498,17 +509,21 @@ void validate_lm_head_int4_topk_inputs(
   TORCH_CHECK(group_size > 0 && group_size % 32 == 0, "group_size must be a positive multiple of 32");
   TORCH_CHECK(in_features > 0, "in_features must be positive");
   TORCH_CHECK(hidden_states.size(-1) == in_features, "hidden_states hidden_dim must match in_features");
-  TORCH_CHECK(qweight.size(0) > 0, "vocab_size must be positive");
-  TORCH_CHECK(qweight.size(1) > 0, "qweight packed columns must be positive");
-  TORCH_CHECK(qweight.size(1) * 8 >= in_features, "qweight packed width is smaller than in_features");
+  const bool qweight_tiled = qweight.dim() == 3;
+  const int64_t vocab_size = qweight_tiled ? qweight.size(0) * qweight.size(2) : qweight.size(0);
+  const int64_t packed_cols = qweight_tiled ? qweight.size(1) : qweight.size(1);
+  TORCH_CHECK(vocab_size > 0, "vocab_size must be positive");
+  TORCH_CHECK(packed_cols > 0, "qweight packed columns must be positive");
+  TORCH_CHECK(!qweight_tiled || (qweight.size(2) == 1 || qweight.size(2) == 2 || qweight.size(2) == 4), "qweight output_tile must be 1, 2, or 4");
+  TORCH_CHECK(packed_cols * 8 >= in_features, "qweight packed width is smaller than in_features");
   TORCH_CHECK(qzeros.sizes() == qscale.sizes(), "qzeros shape must match qscale");
-  const bool scale_by_group = qscale.size(1) == qweight.size(0) && qscale.size(0) * group_size >= in_features;
-  const bool scale_by_output = qscale.size(0) == qweight.size(0) && qscale.size(1) * group_size >= in_features;
+  const bool scale_by_group = qscale.size(1) == vocab_size && qscale.size(0) * group_size >= in_features;
+  const bool scale_by_output = qscale.size(0) == vocab_size && qscale.size(1) * group_size >= in_features;
   TORCH_CHECK(
       scale_by_group || scale_by_output,
       "qscale must be [group_count, vocab_size] or lm_head top-k layout [vocab_size, group_count]");
   TORCH_CHECK(top_k >= 1, "top_k must be positive");
-  TORCH_CHECK(top_k <= qweight.size(0), "top_k must be <= vocab_size");
+  TORCH_CHECK(top_k <= vocab_size, "top_k must be <= vocab_size");
   TORCH_CHECK(at::isFloatingType(hidden_states.scalar_type()), "hidden_states must be floating-point");
   TORCH_CHECK(
       hidden_states.scalar_type() == at::kHalf || hidden_states.scalar_type() == at::kBFloat16 ||
@@ -542,7 +557,6 @@ void validate_xpu_int4_gemv_inputs(
   TORCH_CHECK(group_size > 0, "group_size must be positive");
   TORCH_CHECK(in_features > 0, "in_features must be positive");
   TORCH_CHECK(hidden_states.size(0) > 0, "hidden_states rows must be positive");
-  TORCH_CHECK(hidden_states.size(0) <= 4, "xpu_int4_gemv is intended for decode rows <= 4");
   TORCH_CHECK(hidden_states.size(1) == in_features, "hidden_states last dimension must match in_features");
   TORCH_CHECK(qweight.scalar_type() == at::kInt, "qweight must be int32");
   TORCH_CHECK(qscale.scalar_type() == at::kFloat, "qscale must be float32");
@@ -571,6 +585,43 @@ void validate_xpu_int4_gemv_xpu_inputs(
   TORCH_CHECK(qweight.device() == device, "qweight must be on the same device as hidden_states");
   TORCH_CHECK(qscale.device() == device, "qscale must be on the same device as hidden_states");
   TORCH_CHECK(qzeros.device() == device, "qzeros must be on the same device as hidden_states");
+}
+
+void validate_xpu_int4_gemv_tiled_inputs(
+    const at::Tensor& hidden_states,
+    const at::Tensor& qweight,
+    const at::Tensor& qscale,
+    const at::Tensor& qzeros,
+    int64_t group_size,
+    int64_t in_features,
+    int64_t out_features) {
+  TORCH_CHECK(hidden_states.dim() == 2, "xpu_int4_gemv_tiled expects hidden_states shaped [rows, in_features]");
+  TORCH_CHECK(hidden_states.size(0) > 0, "hidden_states rows must be positive");
+  TORCH_CHECK(qweight.dim() == 3, "qweight must be [output_tiles, packed_cols, output_tile]");
+  TORCH_CHECK(qscale.dim() == 3, "qscale must be [group_count, output_tiles, output_tile]");
+  TORCH_CHECK(qzeros.dim() == 3, "qzeros must be [group_count, output_tiles, output_tile]");
+  TORCH_CHECK(group_size > 0, "group_size must be positive");
+  TORCH_CHECK(in_features > 0, "in_features must be positive");
+  TORCH_CHECK(out_features > 0, "out_features must be positive");
+  TORCH_CHECK(hidden_states.size(1) == in_features, "hidden_states last dimension must match in_features");
+  TORCH_CHECK(qweight.scalar_type() == at::kInt, "qweight must be int32");
+  TORCH_CHECK(qscale.scalar_type() == at::kFloat, "qscale must be float32");
+  TORCH_CHECK(qzeros.scalar_type() == at::kChar, "qzeros must be int8");
+  TORCH_CHECK(qweight.is_contiguous(), "qweight must be contiguous");
+  TORCH_CHECK(qscale.is_contiguous(), "qscale must be contiguous");
+  TORCH_CHECK(qzeros.is_contiguous(), "qzeros must be contiguous");
+  TORCH_CHECK(qweight.size(0) > 0, "qweight output tile count must be positive");
+  TORCH_CHECK(qweight.size(1) * 8 >= in_features, "qweight packed columns are smaller than in_features");
+  TORCH_CHECK(qweight.size(2) == 1 || qweight.size(2) == 2 || qweight.size(2) == 4, "output_tile must be 1, 2, or 4");
+  TORCH_CHECK(qscale.size(1) == qweight.size(0), "qscale output tile count must match qweight");
+  TORCH_CHECK(qscale.size(2) == qweight.size(2), "qscale output tile width must match qweight");
+  TORCH_CHECK(qzeros.sizes() == qscale.sizes(), "qzeros shape must match qscale");
+  TORCH_CHECK(qscale.size(0) * group_size >= in_features, "qscale group count is smaller than in_features");
+  TORCH_CHECK(qweight.size(0) * qweight.size(2) >= out_features, "qweight output tiles are smaller than out_features");
+  TORCH_CHECK(
+      hidden_states.scalar_type() == at::kHalf || hidden_states.scalar_type() == at::kBFloat16 ||
+          hidden_states.scalar_type() == at::kFloat,
+      "xpu_int4_gemv_tiled XPU kernel supports float16, bfloat16, and float32 hidden states");
 }
 
 void validate_moe_dispatch_inputs(
@@ -1363,7 +1414,9 @@ void launch_lm_head_int4_topk_kernel(
     int64_t group_size,
     int64_t top_k,
     int64_t local_size,
-    bool scale_by_output) {
+    bool scale_by_output,
+    bool qweight_tiled,
+    int64_t output_tile) {
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_values(
         sycl::range<1>(static_cast<size_t>(local_size * top_k)), cgh);
@@ -1398,7 +1451,9 @@ void launch_lm_head_int4_topk_kernel(
                   packed_cols,
                   group_count,
                   group_size,
-                  scale_by_output);
+                  scale_by_output,
+                  qweight_tiled,
+                  output_tile);
               acc += load_as_float(hidden_ptr, hidden_base + hidden_idx) * weight_value;
             }
 
@@ -1468,7 +1523,9 @@ void launch_lm_head_int4_topk_blocks_kernel(
     int64_t local_size,
     int64_t block_size,
     int64_t num_blocks,
-    bool scale_by_output) {
+    bool scale_by_output,
+    bool qweight_tiled,
+    int64_t output_tile) {
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_values(
         sycl::range<1>(static_cast<size_t>(local_size * top_k)), cgh);
@@ -1508,7 +1565,9 @@ void launch_lm_head_int4_topk_blocks_kernel(
                   packed_cols,
                   group_count,
                   group_size,
-                  scale_by_output);
+                  scale_by_output,
+                  qweight_tiled,
+                  output_tile);
               acc += load_as_float(hidden_ptr, hidden_base + hidden_idx) * weight_value;
             }
 
@@ -1677,7 +1736,9 @@ std::tuple<at::Tensor, at::Tensor> lm_head_int4_topk_fused_xpu(
   auto qweight = qweight_in.contiguous();
   auto qscale = qscale_in.contiguous();
   auto qzeros = qzeros_in.contiguous();
-  const auto vocab_size = qweight.size(0);
+  const bool qweight_tiled = qweight.dim() == 3;
+  const auto output_tile = qweight_tiled ? qweight.size(2) : 1;
+  const auto vocab_size = qweight_tiled ? qweight.size(0) * qweight.size(2) : qweight.size(0);
   const auto packed_cols = qweight.size(1);
   const bool scale_by_output = qscale.size(0) == vocab_size;
   const auto group_count = scale_by_output ? qscale.size(1) : qscale.size(0);
@@ -1734,7 +1795,9 @@ std::tuple<at::Tensor, at::Tensor> lm_head_int4_topk_fused_xpu(
               kernel_local_size,
               block_size,
               num_blocks,
-              scale_by_output);
+              scale_by_output,
+              qweight_tiled,
+              output_tile);
           launch_lm_head_int4_topk_merge_kernel(
               stream.queue(),
               block_values.const_data_ptr<scalar_t>(),
@@ -1762,7 +1825,9 @@ std::tuple<at::Tensor, at::Tensor> lm_head_int4_topk_fused_xpu(
               group_size,
               top_k,
               kernel_local_size,
-              scale_by_output);
+              scale_by_output,
+              qweight_tiled,
+              output_tile);
         }
       });
 
@@ -1841,6 +1906,348 @@ void launch_xpu_int4_gemv_kernel(
   });
 }
 
+template <typename scalar_t>
+void launch_xpu_int4_gemv_tiled_m1_kernel(
+    sycl::queue& queue,
+    const scalar_t* hidden_ptr,
+    const int32_t* qweight_ptr,
+    const float* qscale_ptr,
+    const int8_t* qzeros_ptr,
+    scalar_t* output_ptr,
+    int64_t in_features,
+    int64_t out_features,
+    int64_t packed_cols,
+    int64_t group_count,
+    int64_t group_size,
+    int64_t local_size,
+    int64_t output_tile) {
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> local_hidden(sycl::range<1>(static_cast<size_t>(in_features)), cgh);
+    sycl::local_accessor<float, 1> partial_sums(
+        sycl::range<1>(static_cast<size_t>(output_tile * local_size)), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<2>(
+            sycl::range<2>(
+                static_cast<size_t>((out_features + output_tile - 1) / output_tile),
+                static_cast<size_t>(output_tile * local_size)),
+            sycl::range<2>(1, static_cast<size_t>(output_tile * local_size))),
+        [=](sycl::nd_item<2> item) {
+          const int64_t tile_idx = static_cast<int64_t>(item.get_group(0));
+          const int64_t local_id = static_cast<int64_t>(item.get_local_id(1));
+          const int64_t out_lane = local_id / local_size;
+          const int64_t lane = local_id - out_lane * local_size;
+          const int64_t out_idx = tile_idx * output_tile + out_lane;
+
+          for (int64_t hidden_idx = local_id; hidden_idx < in_features; hidden_idx += output_tile * local_size) {
+            local_hidden[hidden_idx] = load_as_float(hidden_ptr, hidden_idx);
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float acc = 0.0f;
+          if (out_idx < out_features) {
+            int64_t current_group = -1;
+            float current_scale = 0.0f;
+            int32_t current_zero = 0;
+            for (int64_t packed_idx = lane; packed_idx < packed_cols; packed_idx += local_size) {
+              const uint32_t packed = static_cast<uint32_t>(qweight_ptr[out_idx * packed_cols + packed_idx]);
+              const int64_t hidden_pack_base = packed_idx << 3;
+              for (int64_t nibble = 0; nibble < 8; ++nibble) {
+                const int64_t hidden_idx = hidden_pack_base + nibble;
+                if (hidden_idx >= in_features) {
+                  break;
+                }
+                const int64_t group_idx = int4_group_index(hidden_idx, group_count, group_size);
+                if (group_idx != current_group) {
+                  const int64_t scale_offset = group_idx * out_features + out_idx;
+                  current_scale = qscale_ptr[scale_offset];
+                  current_zero = static_cast<int32_t>(qzeros_ptr[scale_offset]);
+                  current_group = group_idx;
+                }
+                const int32_t qvalue = static_cast<int32_t>((packed >> (nibble * 4)) & 0xFu);
+                acc += local_hidden[hidden_idx] * static_cast<float>(qvalue - current_zero) * current_scale;
+              }
+            }
+          }
+
+          const int64_t partial_base = out_lane * local_size;
+          partial_sums[partial_base + lane] = acc;
+          item.barrier(sycl::access::fence_space::local_space);
+
+          for (int64_t stride = local_size >> 1; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+              partial_sums[partial_base + lane] += partial_sums[partial_base + lane + stride];
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+          }
+
+          if (lane == 0 && out_idx < out_features) {
+            output_ptr[out_idx] = static_cast<scalar_t>(partial_sums[partial_base]);
+          }
+        });
+  });
+}
+
+template <typename scalar_t>
+void launch_xpu_int4_gemv_subgroup_m1_kernel(
+    sycl::queue& queue,
+    const scalar_t* hidden_ptr,
+    const int32_t* qweight_ptr,
+    const float* qscale_ptr,
+    const int8_t* qzeros_ptr,
+    scalar_t* output_ptr,
+    int64_t in_features,
+    int64_t out_features,
+    int64_t packed_cols,
+    int64_t group_count,
+    int64_t group_size,
+    int64_t local_size,
+    int64_t output_tile) {
+  const int64_t required_subgroup_size = 16;
+  const int64_t subgroups_per_work_group = std::max<int64_t>(1, local_size / required_subgroup_size);
+  const int64_t output_tiles = (out_features + output_tile - 1) / output_tile;
+  const int64_t work_groups = (output_tiles + subgroups_per_work_group - 1) / subgroups_per_work_group;
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+        sycl::nd_range<1>(
+            sycl::range<1>(static_cast<size_t>(work_groups * local_size)),
+            sycl::range<1>(static_cast<size_t>(local_size))),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+          auto subgroup = item.get_sub_group();
+          const int64_t subgroup_size = static_cast<int64_t>(subgroup.get_local_range()[0]);
+          const int64_t subgroups_per_work_group = static_cast<int64_t>(item.get_local_range(0)) / subgroup_size;
+          const int64_t subgroup_global =
+              static_cast<int64_t>(item.get_group(0)) * subgroups_per_work_group +
+              static_cast<int64_t>(subgroup.get_group_linear_id());
+          const int64_t out_base = subgroup_global * output_tile;
+          const int64_t lane = static_cast<int64_t>(subgroup.get_local_id()[0]);
+
+          float acc0 = 0.0f;
+          float acc1 = 0.0f;
+          float acc2 = 0.0f;
+          float acc3 = 0.0f;
+          int64_t current_group = -1;
+          float scale0 = 0.0f;
+          float scale1 = 0.0f;
+          float scale2 = 0.0f;
+          float scale3 = 0.0f;
+          int32_t zero0 = 0;
+          int32_t zero1 = 0;
+          int32_t zero2 = 0;
+          int32_t zero3 = 0;
+
+          for (int64_t packed_idx = lane; packed_idx < packed_cols; packed_idx += subgroup_size) {
+            const int64_t hidden_pack_base = packed_idx << 3;
+            uint32_t packed0 = 0;
+            uint32_t packed1 = 0;
+            uint32_t packed2 = 0;
+            uint32_t packed3 = 0;
+            if (out_base < out_features) {
+              packed0 = static_cast<uint32_t>(qweight_ptr[out_base * packed_cols + packed_idx]);
+            }
+            if (output_tile >= 2 && out_base + 1 < out_features) {
+              packed1 = static_cast<uint32_t>(qweight_ptr[(out_base + 1) * packed_cols + packed_idx]);
+            }
+            if (output_tile >= 4 && out_base + 2 < out_features) {
+              packed2 = static_cast<uint32_t>(qweight_ptr[(out_base + 2) * packed_cols + packed_idx]);
+            }
+            if (output_tile >= 4 && out_base + 3 < out_features) {
+              packed3 = static_cast<uint32_t>(qweight_ptr[(out_base + 3) * packed_cols + packed_idx]);
+            }
+            for (int64_t nibble = 0; nibble < 8; ++nibble) {
+              const int64_t hidden_idx = hidden_pack_base + nibble;
+              if (hidden_idx >= in_features) {
+                break;
+              }
+              const int64_t group_idx = int4_group_index(hidden_idx, group_count, group_size);
+              if (group_idx != current_group) {
+                const int64_t scale_base = group_idx * out_features + out_base;
+                if (out_base < out_features) {
+                  scale0 = qscale_ptr[scale_base];
+                  zero0 = static_cast<int32_t>(qzeros_ptr[scale_base]);
+                }
+                if (output_tile >= 2 && out_base + 1 < out_features) {
+                  scale1 = qscale_ptr[scale_base + 1];
+                  zero1 = static_cast<int32_t>(qzeros_ptr[scale_base + 1]);
+                }
+                if (output_tile >= 4 && out_base + 2 < out_features) {
+                  scale2 = qscale_ptr[scale_base + 2];
+                  zero2 = static_cast<int32_t>(qzeros_ptr[scale_base + 2]);
+                }
+                if (output_tile >= 4 && out_base + 3 < out_features) {
+                  scale3 = qscale_ptr[scale_base + 3];
+                  zero3 = static_cast<int32_t>(qzeros_ptr[scale_base + 3]);
+                }
+                current_group = group_idx;
+              }
+              const float hidden = load_as_float(hidden_ptr, hidden_idx);
+              const int64_t shift = nibble * 4;
+              if (out_base < out_features) {
+                const int32_t qvalue0 = static_cast<int32_t>((packed0 >> shift) & 0xFu);
+                acc0 += hidden * static_cast<float>(qvalue0 - zero0) * scale0;
+              }
+              if (output_tile >= 2 && out_base + 1 < out_features) {
+                const int32_t qvalue1 = static_cast<int32_t>((packed1 >> shift) & 0xFu);
+                acc1 += hidden * static_cast<float>(qvalue1 - zero1) * scale1;
+              }
+              if (output_tile >= 4 && out_base + 2 < out_features) {
+                const int32_t qvalue2 = static_cast<int32_t>((packed2 >> shift) & 0xFu);
+                acc2 += hidden * static_cast<float>(qvalue2 - zero2) * scale2;
+              }
+              if (output_tile >= 4 && out_base + 3 < out_features) {
+                const int32_t qvalue3 = static_cast<int32_t>((packed3 >> shift) & 0xFu);
+                acc3 += hidden * static_cast<float>(qvalue3 - zero3) * scale3;
+              }
+            }
+          }
+
+          acc0 = sycl::reduce_over_group(subgroup, acc0, sycl::plus<float>());
+          acc1 = sycl::reduce_over_group(subgroup, acc1, sycl::plus<float>());
+          acc2 = sycl::reduce_over_group(subgroup, acc2, sycl::plus<float>());
+          acc3 = sycl::reduce_over_group(subgroup, acc3, sycl::plus<float>());
+
+          if (lane == 0) {
+            if (out_base < out_features) {
+              output_ptr[out_base] = static_cast<scalar_t>(acc0);
+            }
+            if (output_tile >= 2 && out_base + 1 < out_features) {
+              output_ptr[out_base + 1] = static_cast<scalar_t>(acc1);
+            }
+            if (output_tile >= 4 && out_base + 2 < out_features) {
+              output_ptr[out_base + 2] = static_cast<scalar_t>(acc2);
+            }
+            if (output_tile >= 4 && out_base + 3 < out_features) {
+              output_ptr[out_base + 3] = static_cast<scalar_t>(acc3);
+            }
+          }
+        });
+  });
+}
+
+template <typename scalar_t>
+void launch_xpu_int4_gemv_tiled_layout_subgroup_m1_kernel(
+    sycl::queue& queue,
+    const scalar_t* hidden_ptr,
+    const int32_t* qweight_ptr,
+    const float* qscale_ptr,
+    const int8_t* qzeros_ptr,
+    scalar_t* output_ptr,
+    int64_t row_count,
+    int64_t in_features,
+    int64_t out_features,
+    int64_t packed_cols,
+    int64_t output_tiles,
+    int64_t group_count,
+    int64_t group_size,
+    int64_t local_size,
+    int64_t output_tile) {
+  const int64_t required_subgroup_size = 16;
+  const int64_t subgroups_per_work_group = std::max<int64_t>(1, local_size / required_subgroup_size);
+  const int64_t work_groups = (output_tiles + subgroups_per_work_group - 1) / subgroups_per_work_group;
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+        sycl::nd_range<2>(
+            sycl::range<2>(static_cast<size_t>(row_count), static_cast<size_t>(work_groups * local_size)),
+            sycl::range<2>(1, static_cast<size_t>(local_size))),
+        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+          auto subgroup = item.get_sub_group();
+          const int64_t subgroup_size = static_cast<int64_t>(subgroup.get_local_range()[0]);
+          const int64_t row = static_cast<int64_t>(item.get_group(0));
+          const int64_t subgroups_per_wg = static_cast<int64_t>(item.get_local_range(1)) / subgroup_size;
+          const int64_t tile_idx =
+              static_cast<int64_t>(item.get_group(1)) * subgroups_per_wg +
+              static_cast<int64_t>(subgroup.get_group_linear_id());
+          const int64_t out_base = tile_idx * output_tile;
+          const int64_t lane = static_cast<int64_t>(subgroup.get_local_id()[0]);
+          const int64_t hidden_base = row * in_features;
+          const int64_t output_base = row * out_features;
+
+          float acc0 = 0.0f;
+          float acc1 = 0.0f;
+          float acc2 = 0.0f;
+          float acc3 = 0.0f;
+          int64_t current_group = -1;
+          float scale0 = 0.0f;
+          float scale1 = 0.0f;
+          float scale2 = 0.0f;
+          float scale3 = 0.0f;
+          int32_t zero0 = 0;
+          int32_t zero1 = 0;
+          int32_t zero2 = 0;
+          int32_t zero3 = 0;
+
+          if (tile_idx < output_tiles) {
+            for (int64_t packed_idx = lane; packed_idx < packed_cols; packed_idx += subgroup_size) {
+              const int64_t weight_base = (tile_idx * packed_cols + packed_idx) * output_tile;
+              const uint32_t packed0 = static_cast<uint32_t>(qweight_ptr[weight_base]);
+              const uint32_t packed1 =
+                  output_tile >= 2 ? static_cast<uint32_t>(qweight_ptr[weight_base + 1]) : 0;
+              const uint32_t packed2 =
+                  output_tile >= 4 ? static_cast<uint32_t>(qweight_ptr[weight_base + 2]) : 0;
+              const uint32_t packed3 =
+                  output_tile >= 4 ? static_cast<uint32_t>(qweight_ptr[weight_base + 3]) : 0;
+              const int64_t hidden_pack_base = packed_idx << 3;
+              for (int64_t nibble = 0; nibble < 8; ++nibble) {
+                const int64_t hidden_idx = hidden_pack_base + nibble;
+                if (hidden_idx >= in_features) {
+                  break;
+                }
+                const int64_t group_idx = int4_group_index(hidden_idx, group_count, group_size);
+                if (group_idx != current_group) {
+                  const int64_t scale_base = (group_idx * output_tiles + tile_idx) * output_tile;
+                  scale0 = qscale_ptr[scale_base];
+                  zero0 = static_cast<int32_t>(qzeros_ptr[scale_base]);
+                  if (output_tile >= 2) {
+                    scale1 = qscale_ptr[scale_base + 1];
+                    zero1 = static_cast<int32_t>(qzeros_ptr[scale_base + 1]);
+                  }
+                  if (output_tile >= 4) {
+                    scale2 = qscale_ptr[scale_base + 2];
+                    scale3 = qscale_ptr[scale_base + 3];
+                    zero2 = static_cast<int32_t>(qzeros_ptr[scale_base + 2]);
+                    zero3 = static_cast<int32_t>(qzeros_ptr[scale_base + 3]);
+                  }
+                  current_group = group_idx;
+                }
+                const float hidden = load_as_float(hidden_ptr, hidden_base + hidden_idx);
+                const int64_t shift = nibble * 4;
+                acc0 += hidden * static_cast<float>(static_cast<int32_t>((packed0 >> shift) & 0xFu) - zero0) * scale0;
+                if (output_tile >= 2) {
+                  acc1 += hidden * static_cast<float>(static_cast<int32_t>((packed1 >> shift) & 0xFu) - zero1) * scale1;
+                }
+                if (output_tile >= 4) {
+                  acc2 += hidden * static_cast<float>(static_cast<int32_t>((packed2 >> shift) & 0xFu) - zero2) * scale2;
+                  acc3 += hidden * static_cast<float>(static_cast<int32_t>((packed3 >> shift) & 0xFu) - zero3) * scale3;
+                }
+              }
+            }
+          }
+
+          acc0 = sycl::reduce_over_group(subgroup, acc0, sycl::plus<float>());
+          acc1 = sycl::reduce_over_group(subgroup, acc1, sycl::plus<float>());
+          acc2 = sycl::reduce_over_group(subgroup, acc2, sycl::plus<float>());
+          acc3 = sycl::reduce_over_group(subgroup, acc3, sycl::plus<float>());
+
+          if (lane == 0 && tile_idx < output_tiles) {
+            if (out_base < out_features) {
+              output_ptr[output_base + out_base] = static_cast<scalar_t>(acc0);
+            }
+            if (output_tile >= 2 && out_base + 1 < out_features) {
+              output_ptr[output_base + out_base + 1] = static_cast<scalar_t>(acc1);
+            }
+            if (output_tile >= 4 && out_base + 2 < out_features) {
+              output_ptr[output_base + out_base + 2] = static_cast<scalar_t>(acc2);
+            }
+            if (output_tile >= 4 && out_base + 3 < out_features) {
+              output_ptr[output_base + out_base + 3] = static_cast<scalar_t>(acc3);
+            }
+          }
+        });
+  });
+}
+
 at::Tensor xpu_int4_gemv_meta(
     const at::Tensor& hidden_states,
     const at::Tensor& qweight,
@@ -1851,6 +2258,19 @@ at::Tensor xpu_int4_gemv_meta(
   validate_xpu_int4_gemv_inputs(hidden_states, qweight, qscale, qzeros, group_size, in_features);
   auto output_options = hidden_states.options().device(c10::Device(c10::DeviceType::Meta));
   return at::empty({hidden_states.size(0), qweight.size(0)}, output_options);
+}
+
+at::Tensor xpu_int4_gemv_tiled_meta(
+    const at::Tensor& hidden_states,
+    const at::Tensor& qweight,
+    const at::Tensor& qscale,
+    const at::Tensor& qzeros,
+    int64_t group_size,
+    int64_t in_features,
+    int64_t out_features) {
+  validate_xpu_int4_gemv_tiled_inputs(hidden_states, qweight, qscale, qzeros, group_size, in_features, out_features);
+  auto output_options = hidden_states.options().device(c10::Device(c10::DeviceType::Meta));
+  return at::empty({hidden_states.size(0), out_features}, output_options);
 }
 
 at::Tensor xpu_int4_gemv_xpu(
@@ -1875,6 +2295,20 @@ at::Tensor xpu_int4_gemv_xpu(
       "ANNA_XPU_INT4_GEMV_LOCAL_SIZE",
       default_bounded_local_size(in_features, 128),
       256);
+  const int64_t output_tile = resolve_power_of_two_env_local_size(
+      "ANNA_XPU_INT4_GEMV_OUTPUT_TILE",
+      1,
+      16);
+  const bool use_subgroup_m1 = row_count == 1 && env_equals("ANNA_XPU_INT4_GEMV_KERNEL", "subgroup");
+  const bool use_tiled_m1 =
+      row_count == 1 && !use_subgroup_m1 && in_features == 4096 && out_features == 4096 && output_tile > 1 &&
+      local_size * output_tile <= 256;
+  TORCH_CHECK(
+      !use_subgroup_m1 || (local_size >= 16 && local_size % 16 == 0),
+      "ANNA_XPU_INT4_GEMV_KERNEL=subgroup requires ANNA_XPU_INT4_GEMV_LOCAL_SIZE to be at least 16 and a multiple of 16");
+  TORCH_CHECK(
+      !use_subgroup_m1 || output_tile <= 4,
+      "ANNA_XPU_INT4_GEMV_KERNEL=subgroup supports ANNA_XPU_INT4_GEMV_OUTPUT_TILE <= 4");
 
   auto output = at::empty({row_count, out_features}, hidden_states.options());
   auto stream = c10::xpu::getCurrentXPUStream(hidden_states.device().index());
@@ -1885,7 +2319,96 @@ at::Tensor xpu_int4_gemv_xpu(
       hidden_states.scalar_type(),
       "xpu_int4_gemv_xpu",
       [&] {
-        launch_xpu_int4_gemv_kernel(
+        if (use_subgroup_m1) {
+          launch_xpu_int4_gemv_subgroup_m1_kernel(
+              stream.queue(),
+              hidden_states.const_data_ptr<scalar_t>(),
+              qweight.const_data_ptr<int32_t>(),
+              qscale.const_data_ptr<float>(),
+              qzeros.const_data_ptr<int8_t>(),
+              output.mutable_data_ptr<scalar_t>(),
+              in_features,
+              out_features,
+              packed_cols,
+              group_count,
+              group_size,
+              local_size,
+              output_tile);
+        } else if (use_tiled_m1) {
+          launch_xpu_int4_gemv_tiled_m1_kernel(
+              stream.queue(),
+              hidden_states.const_data_ptr<scalar_t>(),
+              qweight.const_data_ptr<int32_t>(),
+              qscale.const_data_ptr<float>(),
+              qzeros.const_data_ptr<int8_t>(),
+              output.mutable_data_ptr<scalar_t>(),
+              in_features,
+              out_features,
+              packed_cols,
+              group_count,
+              group_size,
+              local_size,
+              output_tile);
+        } else {
+          launch_xpu_int4_gemv_kernel(
+              stream.queue(),
+              hidden_states.const_data_ptr<scalar_t>(),
+              qweight.const_data_ptr<int32_t>(),
+              qscale.const_data_ptr<float>(),
+              qzeros.const_data_ptr<int8_t>(),
+              output.mutable_data_ptr<scalar_t>(),
+              row_count,
+              in_features,
+              out_features,
+              packed_cols,
+              group_count,
+              group_size,
+              local_size);
+        }
+      });
+
+  return output;
+}
+
+at::Tensor xpu_int4_gemv_tiled_xpu(
+    const at::Tensor& hidden_states_in,
+    const at::Tensor& qweight_in,
+    const at::Tensor& qscale_in,
+    const at::Tensor& qzeros_in,
+    int64_t group_size,
+    int64_t in_features,
+    int64_t out_features) {
+  validate_xpu_int4_gemv_tiled_inputs(
+      hidden_states_in, qweight_in, qscale_in, qzeros_in, group_size, in_features, out_features);
+  validate_xpu_int4_gemv_xpu_inputs(hidden_states_in, qweight_in, qscale_in, qzeros_in);
+
+  auto hidden_states = hidden_states_in.contiguous();
+  auto qweight = qweight_in.contiguous();
+  auto qscale = qscale_in.contiguous();
+  auto qzeros = qzeros_in.contiguous();
+  const auto row_count = hidden_states.size(0);
+  const auto output_tiles = qweight.size(0);
+  const auto packed_cols = qweight.size(1);
+  const auto output_tile = qweight.size(2);
+  const auto group_count = qscale.size(0);
+  const int64_t local_size = resolve_power_of_two_env_local_size(
+      "ANNA_XPU_INT4_GEMV_LOCAL_SIZE",
+      256,
+      256);
+  TORCH_CHECK(
+      local_size >= 16 && local_size % 16 == 0,
+      "xpu_int4_gemv_tiled requires ANNA_XPU_INT4_GEMV_LOCAL_SIZE to be at least 16 and a multiple of 16");
+
+  auto output = at::empty({row_count, out_features}, hidden_states.options());
+  auto stream = c10::xpu::getCurrentXPUStream(hidden_states.device().index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      hidden_states.scalar_type(),
+      "xpu_int4_gemv_tiled_xpu",
+      [&] {
+        launch_xpu_int4_gemv_tiled_layout_subgroup_m1_kernel(
             stream.queue(),
             hidden_states.const_data_ptr<scalar_t>(),
             qweight.const_data_ptr<int32_t>(),
@@ -1896,9 +2419,11 @@ at::Tensor xpu_int4_gemv_xpu(
             in_features,
             out_features,
             packed_cols,
+            output_tiles,
             group_count,
             group_size,
-            local_size);
+            local_size,
+            output_tile);
       });
 
   return output;
@@ -3633,6 +4158,16 @@ TORCH_LIBRARY(anna, m) {
       "int in_features"
       ") -> Tensor");
   m.def(
+      "xpu_int4_gemv_tiled("
+      "Tensor hidden_states, "
+      "Tensor qweight, "
+      "Tensor qscale, "
+      "Tensor qzeros, "
+      "int group_size, "
+      "int in_features, "
+      "int out_features"
+      ") -> Tensor");
+  m.def(
       "rmsnorm_fused("
       "Tensor input, "
       "Tensor weight, "
@@ -3719,6 +4254,7 @@ TORCH_LIBRARY_IMPL(anna, Meta, m) {
   m.impl("lm_head_topk_fused", anna::lm_head_topk_fused_meta);
   m.impl("lm_head_int4_topk_fused", anna::lm_head_int4_topk_fused_meta);
   m.impl("xpu_int4_gemv", anna::xpu_int4_gemv_meta);
+  m.impl("xpu_int4_gemv_tiled", anna::xpu_int4_gemv_tiled_meta);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_meta);
   m.impl("rmsnorm_fused_ex", anna::rmsnorm_fused_ex_meta);
   m.impl("rmsnorm_gated_fused", anna::rmsnorm_gated_fused_meta);
@@ -3740,6 +4276,7 @@ TORCH_LIBRARY_IMPL(anna, XPU, m) {
   m.impl("lm_head_topk_fused", anna::lm_head_topk_fused_xpu);
   m.impl("lm_head_int4_topk_fused", anna::lm_head_int4_topk_fused_xpu);
   m.impl("xpu_int4_gemv", anna::xpu_int4_gemv_xpu);
+  m.impl("xpu_int4_gemv_tiled", anna::xpu_int4_gemv_tiled_xpu);
   m.impl("rmsnorm_fused", anna::rmsnorm_fused_xpu);
   m.impl("rmsnorm_fused_ex", anna::rmsnorm_fused_ex_xpu);
   m.impl("rmsnorm_gated_fused", anna::rmsnorm_gated_fused_xpu);

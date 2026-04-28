@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 
 import uvicorn
 
@@ -51,6 +52,41 @@ def _safety_factor(value: str) -> float:
     if parsed < 1.0:
         raise argparse.ArgumentTypeError("value must be >= 1.0")
     return parsed
+
+
+def _int4_gemv_output_tile(value: str) -> int:
+    parsed = int(value)
+    if parsed not in {1, 2, 4}:
+        raise argparse.ArgumentTypeError("value must be one of: 1, 2, 4")
+    return parsed
+
+
+def _int4_gemv_local_size(value: str) -> int:
+    parsed = int(value)
+    if parsed < 16 or parsed > 256 or parsed & (parsed - 1):
+        raise argparse.ArgumentTypeError("value must be a power of two in [16, 256]")
+    return parsed
+
+
+def configure_int4_kernel_environment(args: argparse.Namespace) -> None:
+    updates = {
+        "ANNA_XPU_INT4_MATMUL": args.xpu_int4_matmul,
+        "ANNA_XPU_INT4_GEMV_KERNEL": args.xpu_int4_gemv_kernel,
+        "ANNA_XPU_INT4_GEMV_OUTPUT_TILE": None
+        if args.xpu_int4_gemv_output_tile is None
+        else str(args.xpu_int4_gemv_output_tile),
+        "ANNA_XPU_INT4_GEMV_LOCAL_SIZE": None
+        if args.xpu_int4_gemv_local_size is None
+        else str(args.xpu_int4_gemv_local_size),
+    }
+    applied: dict[str, str] = {}
+    for name, value in updates.items():
+        if value is None:
+            continue
+        os.environ[name] = value
+        applied[name] = value
+    if applied:
+        logger.info("Applied XPU int4 kernel CLI overrides: %s", applied)
 
 
 def _build_safety_policy(settings: ServeSettings) -> RuntimeSafetyPolicy | None:
@@ -238,6 +274,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Quantization used for dense language-model linear weights executed on XPU. 'auto' enables int4 when the model is oversized for available XPU memory.",
     )
     parser.add_argument(
+        "--xpu-int4-matmul",
+        choices=("auto", "torch", "dequant", "sycl"),
+        default=None,
+        help="Override ANNA_XPU_INT4_MATMUL for XPU int4 dense linear execution. Experimental; omit to keep the environment/default.",
+    )
+    parser.add_argument(
+        "--xpu-int4-gemv-kernel",
+        choices=("wg", "subgroup"),
+        default=None,
+        help="Override ANNA_XPU_INT4_GEMV_KERNEL for the experimental standalone SYCL GEMV path.",
+    )
+    parser.add_argument(
+        "--xpu-int4-gemv-output-tile",
+        type=_int4_gemv_output_tile,
+        default=None,
+        help="Override ANNA_XPU_INT4_GEMV_OUTPUT_TILE for experimental M=1 GEMV. Valid values: 1, 2, 4.",
+    )
+    parser.add_argument(
+        "--xpu-int4-gemv-local-size",
+        type=_int4_gemv_local_size,
+        default=None,
+        help="Override ANNA_XPU_INT4_GEMV_LOCAL_SIZE. Must be a power of two in [16, 256].",
+    )
+    parser.add_argument(
         "--resident-expert-layers",
         type=int,
         default=None,
@@ -312,6 +372,7 @@ def main() -> None:
         xpu_device_index=args.xpu_device_index,
         no_xpu_env_defaults=args.no_xpu_env_defaults,
     )
+    configure_int4_kernel_environment(args)
     model_dir = resolve_model_dir(args.model_dir)
     model_name = resolve_model_name(model_name=args.model_name, model_dir=model_dir)
     settings = ServeSettings(

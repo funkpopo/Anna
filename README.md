@@ -78,13 +78,17 @@ Arc int4 fused-kernel tuning knobs:
 - `ANNA_XPU_INT4_LM_HEAD_BLOCK_TOPK_THRESHOLD`: vocabulary threshold for the two-stage blocked `lm_head_int4_topk_fused` path (default 65536).
 - `ANNA_XPU_INT4_LM_HEAD_BLOCK_SIZE`: vocabulary block size for blocked `lm_head_int4_topk_fused` (default 4096).
 - `ANNA_XPU_INT4_GEMV_LOCAL_SIZE`: work-group local size for the experimental standalone `XPUInt4Linear` GEMV path used when `ANNA_XPU_INT4_MATMUL=sycl` and decode rows are `<= 4` (rounded up to a power of two, max 256).
+- `ANNA_XPU_INT4_GEMV_KERNEL`: experimental standalone GEMV kernel mode. The default `wg` uses the original work-group reduction path; `subgroup` uses one subgroup per M=1 output tile with subgroup reduction and no local-memory partial sums.
+- `ANNA_XPU_INT4_GEMV_OUTPUT_TILE`: experimental M=1 output-channel tile for the standalone GEMV path. The default is `1`; values above `1` are only tried for strict `4096x4096` decode experiments and may hit Level Zero resource limits. In `subgroup` mode Anna prepares a GEMV-specific `[output_tiles, packed_k, tile]` qweight layout plus `[group, output_tiles, tile]` scale/zero layout so subgroup lanes read adjacent outputs contiguously instead of reusing the ordinary linear layout.
 - `ANNA_XPU_AUTO_INT4_GEMV`: allow `ANNA_XPU_INT4_MATMUL=auto` to try the standalone GEMV path for the narrow `M=1,K=N=4096,group=128` shape. Default is off until Arc sweep data is consistently positive.
 - `ANNA_XPU_INT4_MOE_GATE_LOCAL_SIZE`: local size for grouped int4 MoE gate/up projection (rounded up to a power of two, max 256).
 - `ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE`: local size for grouped int4 MoE down projection (rounded up to a power of two, max 256).
 
-These default to the existing conservative choices. On Arc A770/A750, sweep these values with `tools/bench_xpu_hotspots.py --arc-profile`; add `--arc-int4-only` for focused int4 sweeps that skip the general attention/router hotspot suite. The report includes ordinary `XPUInt4Linear`, `lm_head_int4_topk_fused`, and `moe_grouped_int4_mlp_fused` rows so kernel-local wins can be checked against decode-critical paths.
+These default to the existing conservative choices. On Arc A770/A750, sweep these values with `tools/bench_xpu_hotspots.py --arc-profile`; add `--arc-int4-only` for focused int4 sweeps that skip the general attention/router hotspot suite. Use `--arc-int4-gemv-kernels wg,subgroup`, `--arc-int4-gemv-local-sizes 32,64,128`, and `--arc-int4-gemv-output-tiles 1,2,4` for repeatable standalone GEMV sweeps. The report includes ordinary `XPUInt4Linear`, `lm_head_int4_topk_fused`, and `moe_grouped_int4_mlp_fused` rows so kernel-local wins can be checked against decode-critical paths.
+For `anna-serve`, the SYCL int4 knobs can be supplied as CLI overrides: `--xpu-int4-matmul sycl --xpu-int4-gemv-kernel subgroup --xpu-int4-gemv-output-tile 4 --xpu-int4-gemv-local-size 128`. With `--xpu-int4-matmul sycl --xpu-int4-gemv-kernel subgroup`, Anna applies the tiled subgroup SYCL path to all `XPUInt4Linear` row counts, not just decode rows.
 
 When runtime int4 converts `lm_head`, Anna also prepares a top-k-specific scale/zero layout (`[vocab, group_count]`) for `lm_head_int4_topk_fused`; ordinary linear layers keep the standard matmul layout.
+The XPU int4 sidecar cache also stores experimental decode layouts: GEMV subgroup tensors (`[output_tiles, packed_k, tile]` qweight plus tiled scale/zero) and, for `lm_head`, a tile-major qweight used by fused top-k. Older v1 cache files are ignored and rebuilt with the expanded payload.
 
 ## Quick start
 
