@@ -56,3 +56,7 @@ class PrefixBlockPool:
                 bucket.discard(key)
                 if not bucket:
                     del self._page_to_keys[(layer_idx, pid)]
+
+    def clear(self) -> None:
+        self._key_to_page.clear()
+        self._page_to_keys.clear()

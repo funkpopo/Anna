@@ -518,9 +518,6 @@ class XPUInt4Linear(nn.Module):
         if strategy not in _XPU_INT4_MATMUL_STRATEGIES:
             logger.warning("Ignoring unsupported ANNA_XPU_INT4_MATMUL=%r; using auto.", strategy)
             return "auto"
-        if strategy == "sycl":
-            logger.warning("ANNA_XPU_INT4_MATMUL=sycl was requested, but no standalone int4 GEMV kernel is registered yet; using auto.")
-            return "auto"
         return strategy
 
     def _forward_dequant(self, x_padded: torch.Tensor) -> torch.Tensor:
@@ -543,6 +540,50 @@ class XPUInt4Linear(nn.Module):
             output = output + self.bias.to(device=output.device, dtype=output.dtype)
         return output
 
+    def _forward_sycl_int4_gemv(self, x_padded: torch.Tensor) -> torch.Tensor:
+        if x_padded.shape[0] > 4:
+            raise RuntimeError("Anna xpu_int4_gemv is only enabled for decode rows <= 4.")
+        namespace = getattr(torch.ops, "anna", None)
+        op = None if namespace is None else getattr(namespace, "xpu_int4_gemv", None)
+        if op is None:
+            from anna.model.fused_ops import maybe_load_gated_delta_library
+
+            maybe_load_gated_delta_library()
+            namespace = getattr(torch.ops, "anna", None)
+            op = None if namespace is None else getattr(namespace, "xpu_int4_gemv", None)
+        if op is None:
+            raise RuntimeError(
+                "Anna xpu_int4_gemv op is not registered. Build/load the custom op first, "
+                "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+            )
+        output = op(
+            x_padded,
+            self.qweight,
+            self.qscale,
+            self.qzeros,
+            self.group_size,
+            self.padded_in_features,
+        )
+        if self.bias is not None:
+            output = output + self.bias.to(device=output.device, dtype=output.dtype)
+        return output
+
+    def _should_auto_use_sycl_int4_gemv(self, x_padded: torch.Tensor) -> bool:
+        if os.getenv("ANNA_XPU_AUTO_INT4_GEMV", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            return False
+        if os.getenv("ANNA_XPU_DISABLE_AUTO_INT4_GEMV", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return False
+        return (
+            x_padded.device.type == "xpu"
+            and x_padded.shape[0] == 1
+            and self.in_features == 4096
+            and self.out_features == 4096
+            and self.padded_in_features == 4096
+            and self.group_size == 128
+            and self.bias is None
+            and self.compute_dtype in {torch.float16, torch.bfloat16}
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
@@ -561,9 +602,25 @@ class XPUInt4Linear(nn.Module):
             strategy = self._matmul_strategy()
             if strategy == "dequant":
                 output = self._forward_dequant(x_padded)
+            elif strategy == "sycl":
+                output = self._forward_sycl_int4_gemv(x_padded)
             else:
                 try:
-                    output = self._forward_torch_xpu_int4(x_padded)
+                    if strategy == "auto" and self._should_auto_use_sycl_int4_gemv(x_padded):
+                        try:
+                            output = self._forward_sycl_int4_gemv(x_padded)
+                        except Exception:
+                            logger.warning(
+                                "Falling back to PyTorch XPU int4 linear after auto sycl GEMV failure: "
+                                "in_features=%s out_features=%s group_size=%s",
+                                self.in_features,
+                                self.out_features,
+                                self.group_size,
+                                exc_info=True,
+                            )
+                            output = self._forward_torch_xpu_int4(x_padded)
+                    else:
+                        output = self._forward_torch_xpu_int4(x_padded)
                 except Exception:
                     if strategy == "torch":
                         raise

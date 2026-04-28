@@ -72,6 +72,18 @@ python tools/build_gated_delta_fused_op.py
 
 Output goes under `.build/anna_gated_delta_fused`. You can point to the built library with `ANNA_GATED_DELTA_OP_LIB` (see below).
 
+Arc int4 fused-kernel tuning knobs:
+
+- `ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE`: work-group local size for `lm_head_int4_topk_fused` (rounded up to a power of two, max 64; the blocked top-k path uses at least 64 for correctness).
+- `ANNA_XPU_INT4_LM_HEAD_BLOCK_TOPK_THRESHOLD`: vocabulary threshold for the two-stage blocked `lm_head_int4_topk_fused` path (default 65536).
+- `ANNA_XPU_INT4_LM_HEAD_BLOCK_SIZE`: vocabulary block size for blocked `lm_head_int4_topk_fused` (default 4096).
+- `ANNA_XPU_INT4_GEMV_LOCAL_SIZE`: work-group local size for the experimental standalone `XPUInt4Linear` GEMV path used when `ANNA_XPU_INT4_MATMUL=sycl` and decode rows are `<= 4` (rounded up to a power of two, max 256).
+- `ANNA_XPU_AUTO_INT4_GEMV`: allow `ANNA_XPU_INT4_MATMUL=auto` to try the standalone GEMV path for the narrow `M=1,K=N=4096,group=128` shape. Default is off until Arc sweep data is consistently positive.
+- `ANNA_XPU_INT4_MOE_GATE_LOCAL_SIZE`: local size for grouped int4 MoE gate/up projection (rounded up to a power of two, max 256).
+- `ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE`: local size for grouped int4 MoE down projection (rounded up to a power of two, max 256).
+
+These default to the existing conservative choices. On Arc A770/A750, sweep these values with `tools/bench_xpu_hotspots.py --arc-profile`; add `--arc-int4-only` for focused int4 sweeps that skip the general attention/router hotspot suite. The report includes ordinary `XPUInt4Linear`, `lm_head_int4_topk_fused`, and `moe_grouped_int4_mlp_fused` rows so kernel-local wins can be checked against decode-critical paths.
+
 ## Quick start
 
 **API server:**
@@ -222,7 +234,7 @@ Use `--no-xpu-env-defaults` if you manage these globally.
 
 | Variable | Purpose |
 | --- | --- |
-| `ANNA_XPU_INT4_MATMUL` | `auto` (default), `torch`, `dequant`; `sycl` is accepted but currently falls back to `auto`. Selects XPU int4 matmul path for compatible layers. |
+| `ANNA_XPU_INT4_MATMUL` | `auto` (default), `torch`, `dequant`, or experimental `sycl`. `sycl` uses Anna's standalone int4 GEMV for decode rows `<= 4`; `auto` only tries it when `ANNA_XPU_AUTO_INT4_GEMV=1` and the strict shape guard matches. |
 | `ANNA_GATED_DELTA_OP_LIB` | Path to the compiled **gated delta** fused op library if not auto-discovered. |
 | `ANNA_XPU_DISABLE_MOE_GROUPED_INT4`, `ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK` | Set to disable specific fused ops (e.g. `1` / `true`). |
 | `ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED` | `1` / `true` / `yes` / `on` to opt into int4 LM-head top-k fused path when available. |
