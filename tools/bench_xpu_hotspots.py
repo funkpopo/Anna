@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import sys
 import time
@@ -26,6 +27,29 @@ def _resolve_dtype(name: str) -> torch.dtype:
     if normalized in {"fp32", "float32", "float"}:
         return torch.float32
     raise ValueError(f"Unsupported dtype: {name}")
+
+
+def _parse_int_list(value: str) -> tuple[int, ...]:
+    parsed = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    if not parsed:
+        raise argparse.ArgumentTypeError("expected at least one integer")
+    if any(item <= 0 for item in parsed):
+        raise argparse.ArgumentTypeError("all values must be positive")
+    return parsed
+
+
+@contextlib.contextmanager
+def _temporary_env(updates: dict[str, str]):
+    previous = {key: os.environ.get(key) for key in updates}
+    try:
+        os.environ.update(updates)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _reference_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -99,18 +123,33 @@ def _benchmark_xpu_int4_linear(
 
     baseline = lambda: F.linear(hidden_states, dense_weight)
     previous_strategy = os.environ.get("ANNA_XPU_INT4_MATMUL")
-    os.environ["ANNA_XPU_INT4_MATMUL"] = strategy
-    candidate = lambda: quantized(hidden_states)
-    baseline_ms = _time_op(baseline, warmup=warmup, iters=iters)
-    candidate_output = candidate()
-    baseline_output = baseline()
-    candidate_ms = _time_op(candidate, warmup=warmup, iters=iters)
-    if previous_strategy is None:
-        os.environ.pop("ANNA_XPU_INT4_MATMUL", None)
-    else:
-        os.environ["ANNA_XPU_INT4_MATMUL"] = previous_strategy
-    max_abs_diff = float((candidate_output.float() - baseline_output.float()).abs().max().item())
-    return baseline_ms, candidate_ms, max_abs_diff
+    try:
+        os.environ["ANNA_XPU_INT4_MATMUL"] = strategy
+        candidate = lambda: quantized(hidden_states)
+        baseline_ms = _time_op(baseline, warmup=warmup, iters=iters)
+        baseline_output = baseline()
+        try:
+            candidate_output = candidate()
+            candidate_ms = _time_op(candidate, warmup=warmup, iters=iters)
+            max_abs_diff = float((candidate_output.float() - baseline_output.float()).abs().max().item())
+        except Exception as exc:
+            try:
+                torch.xpu.synchronize()
+            except Exception:
+                pass
+            print(
+                "arc_int4_profile_error,"
+                f"strategy={strategy},M={tokens},K={in_features},N={out_features},"
+                f"group_size={group_size},error={type(exc).__name__}:{exc}"
+            )
+            candidate_ms = float("inf")
+            max_abs_diff = float("inf")
+        return baseline_ms, candidate_ms, max_abs_diff
+    finally:
+        if previous_strategy is None:
+            os.environ.pop("ANNA_XPU_INT4_MATMUL", None)
+        else:
+            os.environ["ANNA_XPU_INT4_MATMUL"] = previous_strategy
 
 
 def _benchmark_lm_head_int4_topk(
@@ -748,6 +787,24 @@ def main() -> None:
         action="store_true",
         help="Only run the Arc int4 profile rows. Requires --arc-profile and skips the general hotspot suite.",
     )
+    parser.add_argument(
+        "--arc-int4-gemv-local-sizes",
+        type=_parse_int_list,
+        default=(32, 64, 128),
+        help="Comma-separated ANNA_XPU_INT4_GEMV_LOCAL_SIZE values for Arc int4 sycl profile rows.",
+    )
+    parser.add_argument(
+        "--arc-int4-gemv-output-tiles",
+        type=_parse_int_list,
+        default=(1,),
+        help="Comma-separated ANNA_XPU_INT4_GEMV_OUTPUT_TILE values for M=1,K=N=4096 sycl profile rows.",
+    )
+    parser.add_argument(
+        "--arc-int4-gemv-kernels",
+        type=str,
+        default="wg",
+        help="Comma-separated experimental GEMV kernel modes for sycl rows: wg or subgroup.",
+    )
     args = parser.parse_args()
 
     if not hasattr(torch, "xpu") or not torch.xpu.is_available():
@@ -778,6 +835,12 @@ def main() -> None:
         print(f"device_index={xpu_info.device_index}")
     if args.arc_int4_only and not args.arc_profile:
         raise ValueError("--arc-int4-only requires --arc-profile")
+    arc_int4_gemv_kernels = tuple(item.strip() for item in args.arc_int4_gemv_kernels.split(",") if item.strip())
+    if not arc_int4_gemv_kernels:
+        raise ValueError("--arc-int4-gemv-kernels must contain at least one mode")
+    unsupported_kernels = sorted(set(arc_int4_gemv_kernels) - {"wg", "subgroup"})
+    if unsupported_kernels:
+        raise ValueError(f"Unsupported --arc-int4-gemv-kernels values: {unsupported_kernels}")
     if not args.arc_int4_only:
         rmsnorm_baseline_ms, rmsnorm_fused_ms, rmsnorm_diff = _benchmark_rmsnorm(
             batch_size=args.batch_size,
@@ -946,7 +1009,10 @@ def main() -> None:
             f"{_format_speedup(int4_baseline_ms, int4_candidate_ms)},{int4_diff:.6f}"
         )
     if args.arc_profile:
-        print("arc_int4_profile,device_name,strategy,M,K,N,group_size,dtype,baseline_ms,candidate_ms,speedup,max_abs_diff")
+        print(
+            "arc_int4_profile,device_name,strategy,M,K,N,group_size,dtype,gemv_kernel,gemv_local_size,gemv_output_tile,"
+            "baseline_ms,candidate_ms,speedup,max_abs_diff"
+        )
         arc_shapes = [
             (1, args.hidden_size, args.hidden_size),
             (2, args.hidden_size, args.hidden_size),
@@ -958,21 +1024,42 @@ def main() -> None:
         for m, k, n in arc_shapes:
             strategies = ("auto", "sycl") if m <= 4 else ("auto",)
             for strategy in strategies:
-                baseline_ms, candidate_ms, diff = _benchmark_xpu_int4_linear(
-                    tokens=m,
-                    in_features=k,
-                    out_features=n,
-                    group_size=args.int4_group_size,
-                    dtype=dtype,
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    strategy=strategy,
-                )
-                device_name = "" if xpu_info is None else xpu_info.name
-                print(
-                    f"arc_int4_profile,{device_name},{strategy},{m},{k},{n},{args.int4_group_size},{dtype},"
-                    f"{baseline_ms:.4f},{candidate_ms:.4f},{_format_speedup(baseline_ms, candidate_ms)},{diff:.6f}"
-                )
+                gemv_kernels = arc_int4_gemv_kernels if strategy == "sycl" and m == 1 else ("wg",)
+                gemv_local_sizes = args.arc_int4_gemv_local_sizes if strategy == "sycl" else (0,)
+                for gemv_kernel in gemv_kernels:
+                    gemv_output_tiles = (
+                        args.arc_int4_gemv_output_tiles
+                        if strategy == "sycl" and m == 1 and k == 4096 and n == 4096
+                        else (1,)
+                    )
+                    for gemv_local_size in gemv_local_sizes:
+                        for gemv_output_tile in gemv_output_tiles:
+                            if gemv_kernel == "subgroup" and gemv_output_tile > 4:
+                                continue
+                            env_updates = {}
+                            if strategy == "sycl":
+                                env_updates = {
+                                    "ANNA_XPU_INT4_GEMV_KERNEL": gemv_kernel,
+                                    "ANNA_XPU_INT4_GEMV_LOCAL_SIZE": str(gemv_local_size),
+                                    "ANNA_XPU_INT4_GEMV_OUTPUT_TILE": str(gemv_output_tile),
+                                }
+                            with _temporary_env(env_updates):
+                                baseline_ms, candidate_ms, diff = _benchmark_xpu_int4_linear(
+                                    tokens=m,
+                                    in_features=k,
+                                    out_features=n,
+                                    group_size=args.int4_group_size,
+                                    dtype=dtype,
+                                    warmup=args.warmup,
+                                    iters=args.iters,
+                                    strategy=strategy,
+                                )
+                            device_name = "" if xpu_info is None else xpu_info.name
+                            print(
+                                f"arc_int4_profile,{device_name},{strategy},{m},{k},{n},{args.int4_group_size},{dtype},"
+                                f"{gemv_kernel},{gemv_local_size},{gemv_output_tile},"
+                                f"{baseline_ms:.4f},{candidate_ms:.4f},{_format_speedup(baseline_ms, candidate_ms)},{diff:.6f}"
+                            )
         print("arc_lm_head_int4_topk_profile,device_name,local_size,M,K,N,top_k,group_size,dtype,baseline_ms,candidate_ms,speedup,max_abs_diff")
         for local_size in (8, 16, 32, 64):
             baseline_ms, candidate_ms, diff = _benchmark_lm_head_int4_topk(
