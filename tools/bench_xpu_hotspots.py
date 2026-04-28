@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -12,6 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from anna.model.fused_ops import maybe_load_gated_delta_library
 from anna.model.ops import apply_rotary_pos_emb, grouped_query_attention, repeat_kv
+from anna.model.quantization import XPUInt4Linear
+from anna.runtime.device import inspect_xpu_device
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -76,6 +79,37 @@ def _time_op(fn, *, warmup: int, iters: int) -> float:
             fn()
         torch.xpu.synchronize()
     return (time.perf_counter() - started_at) * 1000.0 / max(1, iters)
+
+
+def _benchmark_xpu_int4_linear(
+    *,
+    tokens: int,
+    in_features: int,
+    out_features: int,
+    group_size: int,
+    dtype: torch.dtype,
+    warmup: int,
+    iters: int,
+) -> tuple[float, float, float]:
+    dense = torch.nn.Linear(in_features, out_features, bias=False, device="xpu", dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=group_size, compute_dtype=dtype, device="xpu")
+    hidden_states = torch.randn(tokens, in_features, device="xpu", dtype=dtype)
+    dense_weight = dense.weight.detach().to(device="xpu", dtype=dtype)
+
+    baseline = lambda: F.linear(hidden_states, dense_weight)
+    previous_strategy = os.environ.get("ANNA_XPU_INT4_MATMUL")
+    os.environ["ANNA_XPU_INT4_MATMUL"] = "auto"
+    candidate = lambda: quantized(hidden_states)
+    baseline_ms = _time_op(baseline, warmup=warmup, iters=iters)
+    candidate_output = candidate()
+    baseline_output = baseline()
+    candidate_ms = _time_op(candidate, warmup=warmup, iters=iters)
+    if previous_strategy is None:
+        os.environ.pop("ANNA_XPU_INT4_MATMUL", None)
+    else:
+        os.environ["ANNA_XPU_INT4_MATMUL"] = previous_strategy
+    max_abs_diff = float((candidate_output.float() - baseline_output.float()).abs().max().item())
+    return baseline_ms, candidate_ms, max_abs_diff
 
 
 def _benchmark_rmsnorm(
@@ -539,6 +573,15 @@ def main() -> None:
     parser.add_argument("--dtype", type=str, default="bf16")
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
+    parser.add_argument("--int4-m", type=int, default=1, help="Token rows for XPU int4 linear benchmark.")
+    parser.add_argument("--int4-k", type=int, default=None, help="Input features for XPU int4 linear benchmark.")
+    parser.add_argument("--int4-n", type=int, default=None, help="Output features for XPU int4 linear benchmark.")
+    parser.add_argument("--int4-group-size", type=int, default=128)
+    parser.add_argument(
+        "--arc-profile",
+        action="store_true",
+        help="Run additional Arc A770/A750-oriented int4 linear shapes for decode small batches.",
+    )
     args = parser.parse_args()
 
     if not hasattr(torch, "xpu") or not torch.xpu.is_available():
@@ -552,6 +595,7 @@ def main() -> None:
     tokens = args.batch_size * args.seq_len
     kv_len = args.seq_len if args.kv_len is None else int(args.kv_len)
     num_key_value_groups = max(1, args.num_heads // max(1, args.num_kv_heads))
+    xpu_info = inspect_xpu_device(torch.device("xpu"))
 
     rmsnorm_baseline_ms, rmsnorm_fused_ms, rmsnorm_diff = _benchmark_rmsnorm(
         batch_size=args.batch_size,
@@ -662,12 +706,26 @@ def main() -> None:
         warmup=args.warmup,
         iters=args.iters,
     )
+    int4_k = args.hidden_size if args.int4_k is None else args.int4_k
+    int4_n = args.hidden_size if args.int4_n is None else args.int4_n
+    int4_baseline_ms, int4_candidate_ms, int4_diff = _benchmark_xpu_int4_linear(
+        tokens=args.int4_m,
+        in_features=int4_k,
+        out_features=int4_n,
+        group_size=args.int4_group_size,
+        dtype=dtype,
+        warmup=args.warmup,
+        iters=args.iters,
+    )
 
     print(
         f"shape batch={args.batch_size} seq={args.seq_len} hidden={args.hidden_size} "
         f"heads={args.num_heads}/{args.num_kv_heads} head_dim={args.head_dim} rotary_dim={rotary_dim} kv_len={kv_len} "
         f"dtype={dtype}"
     )
+    if xpu_info is not None:
+        print(f"device_name={xpu_info.name}")
+        print(f"device_index={xpu_info.device_index}")
     print("op,baseline_ms,fused_ms,speedup,max_abs_diff")
     print(
         f"rmsnorm,{rmsnorm_baseline_ms:.4f},{rmsnorm_fused_ms:.4f},"
@@ -710,6 +768,36 @@ def main() -> None:
         f"moe_router,{router_baseline_ms:.4f},{router_fused_ms:.4f},"
         f"{_format_speedup(router_baseline_ms, router_fused_ms)},{router_diff:.6f}"
     )
+    print(
+        f"xpu_int4_linear_m{args.int4_m}_k{int4_k}_n{int4_n}_g{args.int4_group_size},"
+        f"{int4_baseline_ms:.4f},{int4_candidate_ms:.4f},"
+        f"{_format_speedup(int4_baseline_ms, int4_candidate_ms)},{int4_diff:.6f}"
+    )
+    if args.arc_profile:
+        print("arc_int4_profile,device_name,strategy,M,K,N,group_size,dtype,baseline_ms,candidate_ms,speedup,max_abs_diff")
+        arc_shapes = [
+            (1, args.hidden_size, args.hidden_size),
+            (2, args.hidden_size, args.hidden_size),
+            (4, args.hidden_size, args.hidden_size),
+            (8, args.hidden_size, args.hidden_size),
+            (1, args.hidden_size, args.hidden_size * 4),
+            (1, args.hidden_size * 4, args.hidden_size),
+        ]
+        for m, k, n in arc_shapes:
+            baseline_ms, candidate_ms, diff = _benchmark_xpu_int4_linear(
+                tokens=m,
+                in_features=k,
+                out_features=n,
+                group_size=args.int4_group_size,
+                dtype=dtype,
+                warmup=args.warmup,
+                iters=args.iters,
+            )
+            device_name = "" if xpu_info is None else xpu_info.name
+            print(
+                f"arc_int4_profile,{device_name},auto,{m},{k},{n},{args.int4_group_size},{dtype},"
+                f"{baseline_ms:.4f},{candidate_ms:.4f},{_format_speedup(baseline_ms, candidate_ms)},{diff:.6f}"
+            )
 
     print("next_paths")
     print("single-token variable-visible decode now maps to native masked GQA; multi-token masked decode remains the main full-attention gap.")

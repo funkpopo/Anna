@@ -8,6 +8,7 @@ from anna.core.config import BenchmarkSettings, parse_resident_expert_layer_indi
 from anna.core.logging import setup_logging
 from anna.core.model_family import inspect_model_family
 from anna.core.model_path import resolve_model_dir, resolve_model_name
+from anna.cli.xpu_env import add_xpu_environment_args, configure_cli_xpu_environment
 from anna.runtime.qwen3_5_text_engine import GenerationConfig
 from anna.runtime.model_runtime_loader import load_model_runtime_from_model_dir
 
@@ -34,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image", default=None, help="Optional local image path.")
     parser.add_argument("--video", default=None, help="Optional local video path.")
     parser.add_argument("--device", default="auto")
+    add_xpu_environment_args(parser)
     parser.add_argument("--dtype", default="auto")
     parser.add_argument(
         "--compile-mode",
@@ -153,6 +155,12 @@ def _build_messages(settings: BenchmarkSettings) -> list[dict]:
 
 def main() -> None:
     args = build_parser().parse_args()
+    setup_logging(args.log_level)
+    configure_cli_xpu_environment(
+        device=args.device,
+        xpu_device_index=args.xpu_device_index,
+        no_xpu_env_defaults=args.no_xpu_env_defaults,
+    )
     model_dir = resolve_model_dir(args.model_dir)
     model_family_info = inspect_model_family(model_dir)
     if model_family_info.model_family == "qwen3_tts":
@@ -193,7 +201,6 @@ def main() -> None:
         runs=args.runs,
     )
 
-    setup_logging(args.log_level)
     engine = load_model_runtime_from_model_dir(
         settings.model_dir,
         model_id=settings.model_id,
@@ -267,6 +274,9 @@ def main() -> None:
     print(f"mode={mode}")
     print(f"device={engine.device_context.device}")
     print(f"compute_dtype={engine.device_context.dtype}")
+    if engine.device_context.xpu_info is not None:
+        print(f"xpu_device_name={engine.device_context.xpu_info.name}")
+        print(f"xpu_device_index={engine.device_context.xpu_info.device_index}")
     print(f"offload_mode={engine.offload_mode}")
     print(f"offload_vision={engine.offload_vision}")
     print(f"compile_mode={engine.optimization_config.compile_mode}")

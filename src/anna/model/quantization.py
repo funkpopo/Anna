@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import gc
+import logging
+import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,6 +18,9 @@ _AUTO_ROUND_QUANT_METHODS = frozenset({"auto-round", "auto_round"})
 _AUTO_ROUND_PACKING_FORMATS = frozenset({"auto_round:auto_gptq"})
 _FLOAT_OVERRIDE_DATA_TYPES = frozenset({"fp", "float", "float16", "fp16", "bfloat16", "bf16"})
 _REGEX_META_CHARS = frozenset("\\[](){}?*+^$|")
+_XPU_INT4_MATMUL_STRATEGIES = frozenset({"auto", "torch", "dequant", "sycl"})
+
+logger = logging.getLogger(__name__)
 
 
 def _empty_parameter(
@@ -381,6 +386,37 @@ class XPUInt4Linear(nn.Module):
         dequantized = (groups - qzeros.unsqueeze(-1)) * qscale.unsqueeze(-1)
         return dequantized.reshape(self.out_features, self.padded_in_features)[:, : self.in_features]
 
+    @staticmethod
+    def _matmul_strategy() -> str:
+        strategy = os.getenv("ANNA_XPU_INT4_MATMUL", "auto").strip().lower()
+        if strategy not in _XPU_INT4_MATMUL_STRATEGIES:
+            logger.warning("Ignoring unsupported ANNA_XPU_INT4_MATMUL=%r; using auto.", strategy)
+            return "auto"
+        if strategy == "sycl":
+            logger.warning("ANNA_XPU_INT4_MATMUL=sycl was requested, but no standalone int4 GEMV kernel is registered yet; using auto.")
+            return "auto"
+        return strategy
+
+    def _forward_dequant(self, x_padded: torch.Tensor) -> torch.Tensor:
+        weight = self._dequantize_weight().to(device=x_padded.device, dtype=self.compute_dtype)
+        bias = None if self.bias is None else self.bias.to(device=x_padded.device, dtype=self.compute_dtype)
+        return F.linear(x_padded, weight, bias)
+
+    def _forward_torch_xpu_int4(self, x_padded: torch.Tensor) -> torch.Tensor:
+        op = getattr(torch.ops.aten, "_weight_int4pack_mm_with_scales_and_zeros", None)
+        if op is None:
+            raise RuntimeError("aten._weight_int4pack_mm_with_scales_and_zeros is unavailable")
+        output = op(
+            x_padded,
+            self.qweight,
+            self.group_size,
+            self.qscale,
+            self.qzeros,
+        )
+        if self.bias is not None:
+            output = output + self.bias.to(device=output.device, dtype=output.dtype)
+        return output
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
@@ -396,19 +432,25 @@ class XPUInt4Linear(nn.Module):
             x_padded = x_2d.to(dtype=self.compute_dtype)
 
         if uses_xpu_kernel:
-            output = torch.ops.aten._weight_int4pack_mm_with_scales_and_zeros(
-                x_padded,
-                self.qweight,
-                self.group_size,
-                self.qscale,
-                self.qzeros,
-            )
-            if self.bias is not None:
-                output = output + self.bias.to(device=output.device, dtype=output.dtype)
+            strategy = self._matmul_strategy()
+            if strategy == "dequant":
+                output = self._forward_dequant(x_padded)
+            else:
+                try:
+                    output = self._forward_torch_xpu_int4(x_padded)
+                except Exception:
+                    if strategy == "torch":
+                        raise
+                    logger.warning(
+                        "Falling back to dequantized XPU int4 linear: in_features=%s out_features=%s group_size=%s",
+                        self.in_features,
+                        self.out_features,
+                        self.group_size,
+                        exc_info=True,
+                    )
+                    output = self._forward_dequant(x_padded)
         else:
-            weight = self._dequantize_weight().to(device=x_padded.device, dtype=self.compute_dtype)
-            bias = None if self.bias is None else self.bias.to(device=x_padded.device, dtype=self.compute_dtype)
-            output = F.linear(x_padded, weight, bias)
+            output = self._forward_dequant(x_padded)
         return output.reshape(*original_shape, self.out_features).to(dtype=x.dtype)
 
 

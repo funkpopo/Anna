@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 from torch import nn
 
 from anna.model.qwen3_5_text_config import QuantizationConfig
@@ -173,3 +174,11 @@ def test_xpu_int4_linear_cpu_fallback_matches_dense_linear_closely() -> None:
 
     assert max_error < 0.15
     assert mean_error < 0.05
+
+
+def test_xpu_int4_linear_strategy_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "dequant")
+    assert XPUInt4Linear._matmul_strategy() == "dequant"
+
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "invalid")
+    assert XPUInt4Linear._matmul_strategy() == "auto"

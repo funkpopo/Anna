@@ -16,6 +16,20 @@ _DLL_DIRECTORY_HANDLES: list[object] = []
 _CONFIGURED_DLL_PATHS: set[str] = set()
 
 
+def _env_flag_enabled(name: str) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _op_disabled(env_name: str) -> bool:
+    if _env_flag_enabled(env_name):
+        logger.info("Anna fused op disabled by %s", env_name)
+        return True
+    return False
+
+
 def _default_library_candidates() -> list[str]:
     repo_root = Path(__file__).resolve().parents[3]
     build_dir = repo_root / ".build" / "anna_gated_delta_fused"
@@ -198,7 +212,7 @@ def moe_scatter_fused_is_available() -> bool:
 
 
 def moe_grouped_int4_mlp_fused_is_available() -> bool:
-    return _moe_grouped_int4_mlp_op() is not None
+    return not _op_disabled("ANNA_XPU_DISABLE_MOE_GROUPED_INT4") and _moe_grouped_int4_mlp_op() is not None
 
 
 def lm_head_topk_fused_is_available() -> bool:
@@ -206,7 +220,7 @@ def lm_head_topk_fused_is_available() -> bool:
 
 
 def lm_head_int4_topk_fused_is_available() -> bool:
-    return _lm_head_int4_topk_op() is not None
+    return not _op_disabled("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK") and _lm_head_int4_topk_op() is not None
 
 
 def rmsnorm_fused_is_available() -> bool:
@@ -399,9 +413,13 @@ def run_moe_grouped_int4_mlp_fused(
     max_routes_per_expert: int,
 ) -> torch.Tensor:
     op = _moe_grouped_int4_mlp_op()
+    if _op_disabled("ANNA_XPU_DISABLE_MOE_GROUPED_INT4"):
+        op = None
     if op is None:
         maybe_load_gated_delta_library()
         op = _moe_grouped_int4_mlp_op()
+    if _op_disabled("ANNA_XPU_DISABLE_MOE_GROUPED_INT4"):
+        op = None
     if op is None:
         raise RuntimeError(
             "Anna moe_grouped_int4_mlp_fused op is not registered. Build/load the custom op first, "
@@ -457,9 +475,13 @@ def run_lm_head_int4_topk_fused(
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     op = _lm_head_int4_topk_op()
+    if _op_disabled("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK"):
+        op = None
     if op is None:
         maybe_load_gated_delta_library()
         op = _lm_head_int4_topk_op()
+    if _op_disabled("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK"):
+        op = None
     if op is None:
         raise RuntimeError(
             "Anna lm_head_int4_topk_fused op is not registered. Build/load the custom op first, "
