@@ -106,6 +106,14 @@ anna-generate --model-dir /path/to/text-model --prompt "用一段话解释 KV ca
 anna-bench --model-dir /path/to/model --prompt "你好" --warmup 1 --runs 3
 ```
 
+**检查运行时 XPU int4 缓存是否会启用：**
+
+```bash
+anna-xpu-int4-cache --model-dir /path/to/model --weight-quant auto --xpu-total-memory-gib 16
+```
+
+对于没有现成量化配置的 safetensors Qwen3.5 模型，这个命令会报告 `--weight-quant auto` 是否解析为 `int4`，并显示 sidecar 缓存目录，通常是 `<model-dir>/.anna/xpu_int4_cache`。
+
 **语音合成（示例：基础克隆音色）：**
 
 ```bash

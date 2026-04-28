@@ -226,6 +226,7 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
                 device=device_context.device,
                 compute_dtype=device_context.dtype,
                 offload_vision=resolved_offload_vision,
+                cache_dir=model_path / ".anna" / "xpu_int4_cache",
             )
         model.configure_runtime(
             device_context.device,
@@ -361,6 +362,7 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         device: torch.device,
         compute_dtype: torch.dtype,
         offload_vision: bool,
+        cache_dir: Path | None = None,
     ) -> int:
         def _should_quantize(module_name: str, _module: torch.nn.Module) -> bool:
             normalized = module_name.replace("\\", "/")
@@ -375,13 +377,15 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             compute_dtype=compute_dtype,
             device=device,
             include_predicate=_should_quantize,
+            cache_dir=cache_dir,
         )
         logger.info(
-            "Runtime dense XPU int4 quantization for Gemma4: replacements=%s device=%s compute_dtype=%s offload_vision=%s",
+            "Runtime dense XPU int4 quantization for Gemma4: replacements=%s device=%s compute_dtype=%s offload_vision=%s cache_dir=%s",
             replacements,
             device,
             compute_dtype,
             offload_vision,
+            cache_dir,
         )
         return replacements
 

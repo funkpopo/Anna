@@ -36,6 +36,7 @@ anna-serve = "anna.cli.serve:main"
 anna-generate = "anna.cli.generate:main"
 anna-bench = "anna.cli.bench:main"
 anna-speak = "anna.cli.qwen3_tts_speak:main"
+anna-xpu-int4-cache = "anna.cli.xpu_int4_cache:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
