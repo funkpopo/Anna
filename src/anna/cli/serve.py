@@ -9,6 +9,7 @@ from anna.api.app import create_app, list_app_routes
 from anna.core.config import ServeSettings, parse_resident_expert_layer_indices
 from anna.core.logging import setup_logging
 from anna.core.model_path import resolve_model_dir, resolve_model_name
+from anna.cli.xpu_env import add_xpu_environment_args, configure_cli_xpu_environment
 from anna.runtime.device import RuntimeSafetyPolicy
 from anna.runtime.model_runtime_loader import load_model_runtime_from_model_dir
 from anna.runtime.service_metrics import AnnaServiceMetricsLogger
@@ -130,6 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--model-name", default=None, help="Model name exposed through the API.")
     parser.add_argument("--device", default="auto")
+    add_xpu_environment_args(parser)
     parser.add_argument("--dtype", default="auto")
     parser.add_argument(
         "--compile-mode",
@@ -304,6 +306,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    setup_logging(args.log_level)
+    configure_cli_xpu_environment(
+        device=args.device,
+        xpu_device_index=args.xpu_device_index,
+        no_xpu_env_defaults=args.no_xpu_env_defaults,
+    )
     model_dir = resolve_model_dir(args.model_dir)
     model_name = resolve_model_name(model_name=args.model_name, model_dir=model_dir)
     settings = ServeSettings(
@@ -342,7 +350,6 @@ def main() -> None:
         log_level=args.log_level,
     )
 
-    setup_logging(settings.log_level)
     engine = load_model_runtime_from_model_dir(
         settings.model_dir,
         model_id=settings.model_id,

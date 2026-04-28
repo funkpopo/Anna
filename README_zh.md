@@ -2,158 +2,91 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-Anna 是一个面向 Intel Arc Alchemist / PyTorch XPU 的本地推理运行时和 OpenAI 兼容 API 服务。当前项目已经可以直接从本地模型目录加载并运行 Qwen3.5 文本生成模型、Gemma 4 多模态模型，以及 Qwen3-TTS 语音合成模型。Qwen3.5 模型目录现在既支持 Hugging Face 风格的 `config.json` / tokenizer / safetensors，也支持 GGUF 主模型文件，并可选配套 `mmproj-*.gguf` 视觉塔文件。
+Anna 是一个在**本地**跑大语言模型和语音模型的**推理运行时**，对外提供 **OpenAI 格式 HTTP API**。底层基于 **PyTorch**，针对 **Intel Arc（XPU）** 做了较多优化，**CPU** 也可用于开发与测试。
 
-## 项目能力
+你把磁盘上的一个**模型目录**指给 Anna（常见是带 `config.json` 的 Hugging Face 式目录，或 Qwen 的 **GGUF** 加可选的 `mmproj` 视觉塔），Anna 会按模型类型提供聊天、文本补全、多模态聊天或语音合成。
 
-- OpenAI 兼容接口：
-  - `GET /healthz`
-  - `GET /v1/models`
-  - `POST /v1/chat/completions`
-  - `POST /v1/completions`
-  - `POST /v1/audio/speech`
-- 聊天补全与文本补全，支持非流式和流式返回
-- 支持将推理过程拆分到 `reasoning_content`
-- 聊天模型支持工具 / 函数调用，以及流式 tool-call 增量输出
-- 本地多模态输入支持
-  - Qwen3.5：文本、图片、视频
-  - Gemma4：文本、图片、视频、音频
-- `qwen3_tts` 可通过 API 和 `anna-speak` 完成本地语音合成
-- 提供 CLI：`anna-serve`、`anna-generate`、`anna-bench`、`anna-speak`
-- 面向 XPU 的运行时优化：
-  - `torch.compile`
-  - 预填充分块
-  - 精确提示词 KV 缓存复用
-  - TurboQuant KV 缓存压缩
-  - 运行时 int4 权重量化
-  - Qwen MoE expert offload / expert cache
-  - 连续批处理
-  - 可选 SYCL fused 自定义算子
-- `/healthz` 与终端日志可查看内存、缓存和请求指标
+## 能做什么
+
+- **HTTP 接口**：`/healthz`、`/v1/models`、`/v1/chat/completions`、`/v1/completions`、`/v1/audio/speech`
+- **流式 / 非流式**；可把推理过程拆到 `reasoning_content`；支持**工具 / 函数调用**
+- **多模态聊天**（图片、视频；Gemma 4 还支持音频），取决于模型能力
+- **命令行**：`anna-serve`、`anna-generate`、`anna-bench`、`anna-speak`
+- **运行时能力**（偏 XPU）：`torch.compile`、预填充分块、相同提示词 KV 复用、TurboQuant KV、运行时 int4 权重、MoE 专家卸载与缓存、可选连续批处理、可选 SYCL 融合算子
 
 ## 支持的模型类型
 
-Anna 根据 `config.json` 顶层的 `model_type` 自动选择运行时：
+Anna 根据 `config.json` **顶层**的 `model_type` 选择后端：
 
-- `qwen3_tts` -> Qwen3-TTS 运行时
-- `gemma4` -> Gemma4 运行时
-- 其他值 -> Qwen3.5 文本运行时
+| `model_type` 大致情况 | 运行时 | 典型用途 |
+| --- | --- | --- |
+| 非 `qwen3_tts`、非 `gemma4`（如 `qwen3_5`、`qwen3_5_moe`、`qwen3_5_vl`） | Qwen3.5 文本 / 多模态 | 聊天、补全、图文/视频、工具调用 |
+| `gemma4` | Gemma 4 | 同上，聊天里可带音频 |
+| `qwen3_tts` | Qwen3-TTS | 仅语音合成 |
 
-| 模型族 | `config.json` 顶层 `model_type` | 其他已识别类型 / 配置 | 能力 | 主要命令 |
-| --- | --- | --- | --- | --- |
-| Qwen3.5 文本运行时 | 除 `qwen3_tts`、`gemma4` 之外的值；已知 / 预期值包括 `qwen3_5`、`qwen3_5_text`、`qwen3_5_moe`、`qwen3_5_vl` | 可带 `vision_config`；支持解析 AWQ、AutoRound 等量化配置 | 文本补全、聊天补全、流式输出、推理拆分、工具调用、图片 / 视频多模态聊天 | `anna-serve`、`anna-generate`、`anna-bench` |
-| Gemma4 运行时 | `gemma4` | `text_config.model_type=gemma4_text`；可选 `vision_config.model_type=gemma4_vision`；可选 `audio_config.model_type=gemma4_audio` | 文本补全、聊天补全、流式输出、推理拆分、工具调用、图片 / 视频 / 音频多模态聊天 | `anna-serve`、`anna-generate`、`anna-bench` |
-| Qwen3-TTS 运行时 | `qwen3_tts` | 运行时的 `tts_model_type` 可为 `base`、`custom_voice`、`voice_design` | 本地语音合成 | `anna-serve`、`anna-speak` |
+**与各 CLI 的对应关系：**
 
-补充说明：
-
-- `anna-generate` 和 `anna-bench` 仅适用于文本生成模型族（`qwen3_5_text`、`gemma4`）。
-- `anna-speak` 仅适用于 `qwen3_tts`。
-- `/v1/audio/speech` 只有在当前加载模型支持语音合成时才会成功。
-- `anna-bench` 目前支持 `--image` 和 `--video`，还没有音频基准参数。
-- 多模态输入走聊天消息内容数组或 benchmark CLI；`/v1/completions` 仍然是纯文本接口。
+- `anna-generate`、`anna-bench`：只适用于**文本生成类**模型（不能是 `qwen3_tts`）。
+- `anna-speak`：只适用于 `qwen3_tts`。
+- `anna-serve`：三类都可以；具体哪个 HTTP 接口能用，取决于当前加载的模型。
 
 ## 环境要求
 
-- Python `3.11+`
-- 一个本地模型目录，满足以下任一形式：
-  - 包含 `config.json`、tokenizer 文件和权重
-  - 或包含一个 Qwen GGUF 主模型文件，并可选携带 `mmproj-*.gguf`
-- 单独安装与你环境匹配的 PyTorch
-  - CPU 可用于调试和测试
-  - Intel Arc + 带 `xpu` 的 PyTorch 是当前项目的目标运行路径
-- 视频输入依赖 `imageio` 和 `imageio-ffmpeg`
-- `qwen3_tts` 依赖 `qwen-tts`
-- 若需要构建可选的 fused XPU 算子：
-  - Intel oneAPI DPC++/C++ Compiler
-  - Windows 下还需要 Visual Studio Build Tools
+- **Python 3.11+**
+- 本机上的**模型目录**（HF 式目录，或 Qwen GGUF + 可选 `mmproj-*.gguf`）
+- 按你的机器单独安装 **PyTorch**（项目要求 `torch>=2.7`）。用 Arc 时请装带 **XPU** 的版本。
+- **视频**：依赖 `imageio`、`imageio-ffmpeg`（随包安装）
+- **Qwen3-TTS**：依赖 `qwen-tts`（已在项目依赖里）
+- **可选**：融合 XPU 算子需要 Intel **oneAPI** DPC++；Windows 上通常还需要 **Visual Studio** 生成工具
 
-上面的 Python 依赖会由 `pip install -e .` 安装；PyTorch 和 oneAPI 需要根据你的系统单独准备。
+`pip install -e .` 会装 Python 依赖；**PyTorch 和 oneAPI 要按你的硬件自行准备**。
 
-## 安装方式
-
-### 1. 克隆仓库
+## 安装
 
 ```bash
-git clone <your-repo-url> Anna
+git clone https://github.com/YOUR_USERNAME/Anna.git
 cd Anna
-```
-
-### 2. 创建并激活虚拟环境
-
-Windows PowerShell：
-
-```powershell
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -U pip
 ```
 
-Linux：
+**Windows（PowerShell）：** `.\.venv\Scripts\Activate.ps1`  
+**Linux / macOS：** `source .venv/bin/activate`
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
 python -m pip install -U pip
-```
-
-### 3. 安装 Anna
-
-```bash
 python -m pip install -e .
+# 可选：python -m pip install -e ".[dev]"
 ```
 
-可选开发依赖：
+**检查 PyTorch / XPU：**
 
 ```bash
-python -m pip install -e ".[dev]"
+python -c "import torch; print(torch.__version__); print(getattr(torch, 'xpu', None) and torch.xpu.is_available())"
 ```
 
-### 4. 安装并验证 PyTorch
-
-请安装与你目标设备匹配的 PyTorch。如果要跑 Intel Arc，请使用带 `xpu` 支持的版本，并先验证：
-
-```bash
-python -c "import torch; print(torch.__version__); print(hasattr(torch, 'xpu')); print(torch.xpu.is_available() if hasattr(torch, 'xpu') else False)"
-```
-
-### 5. 构建 fused XPU 自定义算子
-
-这个步骤主要用于提升 XPU 性能；基础 CPU 调试不依赖它。
+**可选：编译融合算子**（在支持的 XPU 环境上有利于性能）：
 
 ```bash
 python tools/build_gated_delta_fused_op.py
 ```
 
-编译产物会输出到 `.build/anna_gated_delta_fused`。
-
-## 当前工作区内可直接使用的模型目录示例
-
-如果你已经把模型下载到了仓库内的 `models/` 目录，当前工作区里已有的示例包括：
-
-- `models/Intel/Qwen3___5-2B-int4-AutoRound`
-- `models/Intel/Qwen3___5-35B-A3B-int4-AutoRound`
-- `models/google/gemma-4-E4B-it`
-- `models/Qwen/Qwen3-TTS-12Hz-1___7B-Base`
-
-下面所有命令里的 `--model-dir` 都可以替换成类似上面的目录。
+产物在 `.build/anna_gated_delta_fused`。也可用环境变量 `ANNA_GATED_DELTA_OP_LIB` 指定库路径（见下文）。
 
 ## 快速开始
 
-### 启动 OpenAI 兼容 API 服务
-
-最简用法：
+**启动 API 服务：**
 
 ```bash
-anna-serve --model-dir <path-to-model> --host 127.0.0.1 --port 8000
+anna-serve --model-dir /path/to/model --host 127.0.0.1 --port 8000
 ```
 
-一个更接近 XPU 实战的例子：
+**偏 XPU 的一例：**
 
 ```bash
 anna-serve \
-  --model-dir <path-to-model> \
+  --model-dir /path/to/model \
   --device xpu \
+  --xpu-device-index 0 \
   --dtype bfloat16 \
   --kv-cache-quantization turboquant \
   --kv-cache-quant-bits 4 \
@@ -161,162 +94,180 @@ anna-serve \
   --prompt-cache-size 4
 ```
 
-如果是大尺寸 Qwen MoE 模型，还可以继续调这些参数：
-
-- `--offload-mode experts`
-- `--expert-quant int4`
-- `--cached-experts-per-layer <N>` (推荐64)
-- `--resident-expert-layers <N>`
-
-### 本地文本生成
-
-`anna-generate` 是一个从 prompt 直接生成文本的 CLI，只适用于文本生成模型族：
+**命令行直接生成文本：**
 
 ```bash
-anna-generate --model-dir <path-to-text-model> --prompt "Write a short summary of KV cache."
+anna-generate --model-dir /path/to/text-model --prompt "用一段话解释 KV cache。"
 ```
 
-### 做模型基准
-
-纯文本基准：
+**性能基准（纯文本或多模态）：**
 
 ```bash
-anna-bench --model-dir <path-to-text-model> --prompt "Explain grouped-query attention." --warmup 1 --runs 3
+anna-bench --model-dir /path/to/model --prompt "你好" --warmup 1 --runs 3
 ```
 
-图片基准：
+**语音合成（示例：基础克隆音色）：**
 
 ```bash
-anna-bench --model-dir <path-to-multimodal-model> --prompt "Describe the image." --image ./demo.png
+anna-speak --model-dir /path/to/tts --input "你好。" --output out.wav --ref-audio ref.wav --ref-text "参考句子的文字。"
 ```
 
-视频基准：
+---
 
-```bash
-anna-bench --model-dir <path-to-multimodal-model> --prompt "Summarize the clip." --video ./demo.mp4
-```
+## 命令行参数说明（逐项含义）
 
-### 使用 Qwen3-TTS 合成语音
+下面按「谁用得到」分组，方便你对照 `anna-serve -h` 等帮助信息。
 
-Base 克隆音色模型：
+### 多条命令共有（文本类：`serve` / `generate` / `bench`）
 
-```bash
-anna-speak \
-  --model-dir <path-to-qwen3-tts-base> \
-  --input "Hello from Anna." \
-  --output out.wav \
-  --ref-audio ref.wav \
-  --ref-text "Reference transcript."
-```
+| 参数 | 作用说明 |
+| --- | --- |
+| `--model-dir` | **必填**。模型所在目录（或 Anna 能识别的 GGUF 布局）。 |
+| `--model-name` | 在日志或对外展示里用的模型名；不设则从路径推断。 |
+| `--device` | 执行设备：`auto`（有 XPU 则优先 XPU）、`cpu`、`xpu`。 |
+| `--xpu-device-index N` | 通过 `ONEAPI_DEVICE_SELECTOR=level_zero:N` 绑定第 **N** 块 XPU。机器上同时有核显和 Arc 时，用这个指定 Arc。 |
+| `--no-xpu-env-defaults` | **不要**自动设置 Anna 推荐的 Level Zero 环境变量（见下文「XPU 环境」）。 |
+| `--dtype` | 计算精度：`auto`、`float32`、`float16`、`bfloat16`。 |
+| `--compile-mode` | `torch.compile` 模式：`none`、`auto`、`default`、`reduce-overhead`、`max-autotune`。**默认**：`serve` 为 `auto`，`generate` / `bench` 为 `none`（首次编译可能增加延迟）。 |
+| `--compile-fullgraph` | 在启用 compile 时请求整图捕获。 |
+| `--prefill-chunk-size` | 把较长的**纯文本**预填充分成多段（按 token 数）。`0` 表示在 XPU 上由 Anna 自动决定块大小。 |
+| `--prompt-cache-size` | 最多缓存 **N** 条**完全相同**的文本提示的 KV，便于重复请求。`0` 表示关闭。 |
+| `--prompt-cache-max-tokens` | 只缓存不超过 **N** 个 token 的提示，减轻长提示的内存压力。`0` 表示不设上限。 |
+| `--profile-runtime` | 打开预填 / 解码阶段的 XPU 同步计时与内存等剖析日志。 |
+| `--kv-cache-quantization` | KV 量化：`none` 或 `turboquant`（Qwen3.5 与 Gemma4 支持）。 |
+| `--kv-cache-quant-bits` | TurboQuant 位宽：`2`、`3` 或 `4`。 |
+| `--kv-cache-residual-len` | 最近的 **N** 个 KV 位置保持高精度，更早的位置再压缩。 |
+| `--offload-mode` | `auto`、`none`、`experts`；`experts` 在适用时会做 MoE 专家卸载。 |
+| `--offload-vision` | 主模型在 XPU 上时，仍把**视觉塔留在 CPU**，省显存（适合纯文本或显存紧张）。 |
+| `--expert-quant` | XPU 上**专家权重**的量化：`auto`、`none`、`int4`；`auto` 在卸载场景下可能启用 int4。 |
+| `--weight-quant` | XPU 上**稠密线性层**权重量化：`auto`、`none`、`int4`；`auto` 在显存吃紧时可能启用 int4。 |
+| `--resident-expert-layers` | 前 **N** 个稀疏 MoE 层整层留在加速器上；不设则在专家卸载模式下自动估算。 |
+| `--resident-expert-layer-indices` | 逗号分隔的 **从 0 开始**的层号，指定哪些层常驻；**覆盖** `--resident-expert-layers`。 |
+| `--cached-experts-per-layer` | 每层最多在 XPU 上缓存多少个已卸载专家；`0` 关闭；不设则自动。 |
+| `--log-level` | 日志级别，例如 `info`。 |
 
-CustomVoice 模型：
+### 仅 `anna-serve`
 
-```bash
-anna-speak \
-  --model-dir <path-to-qwen3-tts-custom> \
-  --input "Hello from Anna." \
-  --output out.wav \
-  --speaker Vivian \
-  --instruct "Speak with energy."
-```
+| 参数 | 作用说明 |
+| --- | --- |
+| `--no-inference-warmup` | 加载后**不做**一小轮预热推理；融合核可能在**第一次真实请求**时才加载。 |
+| `--enable-thinking` / `--disable-thinking` | 客户端未指定思考相关字段时，聊天是否默认开启思考。 |
+| `--max-completion-tokens` | 请求里未写 `max_tokens` / `max_completion_tokens` 时的默认输出长度上限。 |
+| `--reasoning-format` | 推理内容格式：`none` 或与 `deepseek` 类似地把推理放进 `reasoning_content`。 |
+| `--min-free-memory-mib` | 开始生成前要求至少剩余这么多 XPU 显存（MiB），用于准入控制。 |
+| `--reserve-memory-mib` | 准入时额外预留的显存余量（MiB）。 |
+| `--max-estimated-usage-ratio` | 若估算用量超过总显存的该比例（0–1]，则拒绝请求。 |
+| `--generation-memory-safety-factor` | 对估算的生成显存再乘的系数（≥ 1），偏保守则调大。 |
+| `--scheduler-max-batch-size` | 大于 **1** 时开启**连续批处理**（解码步合并）。为 **1** 时逐请求解码（延迟更低、核启动更多）。 |
+| `--scheduler-batch-wait-ms` | 批处理时，为凑批最多等待的毫秒数；越大吞吐越好、尾延迟可能变差。 |
+| `--metrics-log-interval-seconds` | 每隔 **N** 秒在终端打汇总指标；`0` 关闭。 |
+| `--host`、`--port` | HTTP 服务监听地址与端口。 |
 
-VoiceDesign 模型：
+### 仅 `anna-generate`
 
-```bash
-anna-speak \
-  --model-dir <path-to-qwen3-tts-voice-design> \
-  --input "Hello from Anna." \
-  --output out.wav \
-  --instruct "A calm, warm female voice."
-```
+| 参数 | 作用说明 |
+| --- | --- |
+| `--prompt` | **必填**。输入文本。 |
+| `--max-new-tokens` | 最多新生成多少个 token；不设则跟模型配置或内部安全估算。 |
+| `--temperature`、`--top-p`、`--top-k`、`--repetition-penalty` | 采样与重复惩罚。 |
 
-CLI 的 `--response-format` 支持 `wav` 和 `flac`。
+### 仅 `anna-bench`
 
-## OpenAI 兼容 API
+| 参数 | 作用说明 |
+| --- | --- |
+| `--image` / `--video` | 本地图片 / 视频路径；会走多模态聊天式推理（暂无单独音频 benchmark）。 |
+| `--warmup` | 正式计时的 `runs` 之前先跑几轮，用于预热。 |
+| `--runs` | 计时轮数；输出平均延迟、吞吐等。 |
+| `--max-new-tokens`、采样相关参数 | 与 `generate` 含义相同；bench 默认更偏确定性与测速（如 `temperature=0`）。 |
 
-服务启动后，路由始终存在，但是否能成功响应，取决于当前加载的模型族是否支持对应能力。
+### 仅 `anna-speak`（Qwen3-TTS）
 
-### 路由列表
+**注意：** 该命令**没有** `--xpu-device-index` / `--no-xpu-env-defaults`；若在 Arc 上要固定设备，可自行设置 `ONEAPI_DEVICE_SELECTOR` 等。
 
-- `GET /healthz`
+| 参数 | 作用说明 |
+| --- | --- |
+| `--input` | 要合成的文字。 |
+| `--output` | 输出音频路径。 |
+| `--language` | 可选语言。 |
+| `--speaker` | CustomVoice 模型的说话人名称。 |
+| `--instruct` | VoiceDesign / CustomVoice 的风格或指令描述。 |
+| `--ref-audio`、`--ref-text` | 基础克隆模型：参考音频与对应文本。 |
+| `--x-vector-only-mode` | 基础克隆：只用说话人嵌入，不用参考文本条件。 |
+| `--response-format` | 输出容器：`wav` 或 `flac`。 |
+| `--max-new-tokens` | 生成长度上限（语音 token 侧）。 |
+| `--do-sample` / `--no-do-sample` | 主路径是否随机采样。 |
+| `--temperature`、`--top-p`、`--top-k`、`--repetition-penalty` | 主采样参数。 |
+| `--subtalker-do-sample` 等 | 子模块的采样参数。 |
+| `--non-streaming-mode`（默认）与 `--streaming-style-input` | 文本是整块送入还是模拟流式送入。 |
+
+### XPU / Level Zero 自动环境
+
+在 `--device` 为 `auto` 或 `xpu` 且**未**加 `--no-xpu-env-defaults` 时，Anna 会在加载模型前设置推荐变量，例如：
+
+- `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1`
+- `ZES_ENABLE_SYSMAN=1`
+- 若指定了 `--xpu-device-index`，则设置 `ONEAPI_DEVICE_SELECTOR=level_zero:<index>`
+
+若你在系统里已统一配置 Level Zero，可加 `--no-xpu-env-defaults` 避免覆盖。
+
+---
+
+## 可选环境变量（进阶）
+
+| 变量 | 作用 |
+| --- | --- |
+| `ANNA_XPU_INT4_MATMUL` | `auto`（默认）、`torch`、`dequant`；`sycl` 目前会回退为 `auto`。用于选择 XPU 上 int4 矩阵乘的实现路径。 |
+| `ANNA_GATED_DELTA_OP_LIB` | 指定已编译的 gated delta 融合算子动态库路径。 |
+| `ANNA_XPU_DISABLE_MOE_GROUPED_INT4`、`ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK` | 设为 `1` / `true` 等可关闭对应融合算子。 |
+| `ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED` | 设为 `1`、`true`、`yes`、`on` 等可在可用时启用 int4 LM-head top-k 融合路径。 |
+| `ANNA_PREFIX_KV_SHARE` | 设为 `0` 可关闭 ops 中的前缀 KV 共享（默认开启）。 |
+| `ANNA_DPCPP`、`ANNA_VCVARS64`、`ANNA_ONEAPI_RUNTIME_PATHS` | Windows / oneAPI 下编译 `tools/build_gated_delta_fused_op.py` 时的路径提示。 |
+
+---
+
+## API 简要说明
+
+路由始终注册；能否成功取决于当前模型是否支持该能力。
+
+- `GET /healthz`：健康检查与运行时指标（若实现支持）
 - `GET /v1/models`
-- `POST /v1/chat/completions`
-- `POST /v1/completions`
-- `POST /v1/audio/speech`
+- `POST /v1/chat/completions`：支持多模态 `content`、工具、思考 / 推理相关字段
+- `POST /v1/completions`：**仅文本** prompt
+- `POST /v1/audio/speech`：仅当加载 `qwen3_tts` 时可用
 
-### 请求示例
-
-列出模型：
+**列出模型：**
 
 ```bash
 curl http://127.0.0.1:8000/v1/models
 ```
 
-聊天补全：
+**聊天：**
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "local-model",
-    "messages": [{"role": "user", "content": "Write a haiku about Intel Arc."}],
-    "reasoning_format": "deepseek"
-  }'
+  -d '{"model":"local-model","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-文本补全：
-
-```bash
-curl -X POST http://127.0.0.1:8000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "local-model",
-    "prompt": "Anna is",
-    "max_tokens": 64
-  }'
-```
-
-Base 克隆音色 TTS 模型语音合成：
+**语音（基础克隆示例）：**
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "local-model",
-    "input": "Hello from Anna.",
-    "ref_audio": "ref.wav",
-    "ref_text": "Reference transcript.",
-    "response_format": "wav"
-  }' \
+  -d '{"model":"local-model","input":"你好","ref_audio":"ref.wav","ref_text":"……","response_format":"wav"}' \
   --output speech.wav
 ```
 
-`custom_voice` 模型请传 `speaker` 或 `voice`；`voice_design` 模型请传 `instruct`。
-
-聊天请求还支持：
-
-- 含 `text`、`image_url`、`video_url`、`audio_url` 的多模态 `content` 数组
-- `tools`、`tool_choice`、`parallel_tool_calls`
-- `enable_thinking` 或 `chat_template_kwargs.enable_thinking`
-
-## 常用运行参数
-
-| 分类 | 参数 | 说明 |
-| --- | --- | --- |
-| 通用 | `--device`、`--dtype`、`--compile-mode`、`--compile-fullgraph` | `device` 支持 `auto`、`cpu`、`xpu`；`dtype` 支持 `auto`、`float32`、`float16`、`bfloat16` |
-| 预填充与 prompt cache | `--prefill-chunk-size`、`--prompt-cache-size`、`--prompt-cache-max-tokens`、`--profile-runtime` | 文本生成 CLI 和服务均可用 |
-| KV cache | `--kv-cache-quantization`、`--kv-cache-quant-bits`、`--kv-cache-residual-len` | Qwen3.5 和 Gemma4 运行时支持 TurboQuant |
-| Qwen 大模型控制 | `--offload-mode`、`--offload-vision`、`--expert-quant`、`--weight-quant`、`--resident-expert-layers`、`--resident-expert-layer-indices`、`--cached-experts-per-layer` | 主要用于大尺寸 Qwen3.5 MoE / VL 模型 |
-| 服务默认行为与安全阈值 | `--enable-thinking`、`--disable-thinking`、`--reasoning-format`、`--max-completion-tokens`、`--min-free-memory-mib`、`--reserve-memory-mib`、`--max-estimated-usage-ratio`、`--generation-memory-safety-factor` | 控制默认聊天行为与请求准入 |
-| 服务批处理与指标 | `--scheduler-max-batch-size`、`--scheduler-batch-wait-ms`、`--metrics-log-interval-seconds` | 连续批处理只有在 batch size 大于 `1` 时才会启用 |
-| 语音合成 | `--language`、`--speaker`、`--instruct`、`--ref-audio`、`--ref-text`、`--x-vector-only-mode`、`--response-format` | `anna-speak` 支持 `wav`、`flac`；API 还支持 `pcm` |
+---
 
 ## 开发
-
-运行测试：
 
 ```bash
 python -m pytest
 ```
 
-如果你在做 XPU fused kernel 相关开发，先构建自定义算子，再使用 `.build/anna_gated_delta_fused` 下的编译结果跑 CLI 或测试会更稳妥。
+若修改融合核，请先执行 `tools/build_gated_delta_fused_op.py`，再针对 `.build/anna_gated_delta_fused` 跑测试或 CLI。
+
+## 许可证
+
+见 [LICENSE](LICENSE)。

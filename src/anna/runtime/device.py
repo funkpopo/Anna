@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 
 import torch
@@ -23,6 +25,8 @@ _COMPUTE_DTYPES: dict[str, torch.dtype] = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
 }
+
+logger = logging.getLogger(__name__)
 
 
 def _xpu_module():
@@ -78,6 +82,124 @@ class DeviceMemoryInfo:
 
 
 @dataclass(slots=True)
+class XPUDeviceInfo:
+    device_index: int
+    name: str
+    total_memory: int | None = None
+    free_memory: int | None = None
+    allocated_memory: int | None = None
+    reserved_memory: int | None = None
+    runtime: str = "torch.xpu"
+    device_type: str | None = None
+    is_arc_alchemist: bool = False
+    is_acm_g10: bool = False
+    is_arc_a770_or_a750: bool = False
+
+    def as_log_fields(self) -> dict[str, object]:
+        return {
+            "device_index": self.device_index,
+            "name": self.name,
+            "total_memory": self.total_memory,
+            "free_memory": self.free_memory,
+            "allocated_memory": self.allocated_memory,
+            "reserved_memory": self.reserved_memory,
+            "runtime": self.runtime,
+            "device_type": self.device_type,
+            "is_arc_alchemist": self.is_arc_alchemist,
+            "is_acm_g10": self.is_acm_g10,
+            "is_arc_a770_or_a750": self.is_arc_a770_or_a750,
+        }
+
+
+def _call_xpu_getter(name: str, *args):
+    xpu = _xpu_module()
+    if xpu is None:
+        return None
+    getter = getattr(xpu, name, None)
+    if not callable(getter):
+        return None
+    try:
+        return getter(*args)
+    except Exception:
+        logger.debug("torch.xpu.%s failed", name, exc_info=True)
+        return None
+
+
+def _current_xpu_index(device: torch.device | None = None) -> int:
+    if device is not None and device.index is not None:
+        return int(device.index)
+    current = _call_xpu_getter("current_device")
+    if current is None:
+        return 0
+    return int(current)
+
+
+def inspect_xpu_device(device: torch.device | None = None) -> XPUDeviceInfo | None:
+    if not has_xpu():
+        return None
+
+    index = _current_xpu_index(device)
+    name = _call_xpu_getter("get_device_name", index)
+    if name is None:
+        properties = _call_xpu_getter("get_device_properties", index)
+        name = getattr(properties, "name", None) if properties is not None else None
+    name = str(name or f"xpu:{index}")
+    lowered_name = name.lower()
+
+    probe_device = torch.device("xpu", index)
+    free_memory = total_memory = allocated_memory = reserved_memory = None
+    xpu = _xpu_module()
+    if xpu is not None and hasattr(xpu, "mem_get_info"):
+        try:
+            free_memory, total_memory = xpu.mem_get_info()
+        except Exception:
+            logger.debug("torch.xpu.mem_get_info failed", exc_info=True)
+    if xpu is not None and hasattr(xpu, "memory_allocated"):
+        try:
+            allocated_memory = int(xpu.memory_allocated(probe_device))
+        except Exception:
+            logger.debug("torch.xpu.memory_allocated failed", exc_info=True)
+    if xpu is not None and hasattr(xpu, "memory_reserved"):
+        try:
+            reserved_memory = int(xpu.memory_reserved(probe_device))
+        except Exception:
+            logger.debug("torch.xpu.memory_reserved failed", exc_info=True)
+
+    is_arc = "arc" in lowered_name
+    is_a770_or_a750 = "a770" in lowered_name or "a750" in lowered_name
+    is_acm_g10 = is_a770_or_a750 or "acm-g10" in lowered_name or "acm_g10" in lowered_name
+    return XPUDeviceInfo(
+        device_index=index,
+        name=name,
+        total_memory=None if total_memory is None else int(total_memory),
+        free_memory=None if free_memory is None else int(free_memory),
+        allocated_memory=allocated_memory,
+        reserved_memory=reserved_memory,
+        device_type="arc" if is_arc else None,
+        is_arc_alchemist=is_arc,
+        is_acm_g10=is_acm_g10,
+        is_arc_a770_or_a750=is_a770_or_a750,
+    )
+
+
+def configure_xpu_environment(*, device_index: int | None = None, set_selector: bool = False) -> dict[str, str]:
+    configured: dict[str, str] = {}
+    defaults = {
+        "UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS": "1",
+        "ZES_ENABLE_SYSMAN": "1",
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
+        configured[key] = os.environ[key]
+    if set_selector and device_index is not None:
+        os.environ["ONEAPI_DEVICE_SELECTOR"] = f"level_zero:{int(device_index)}"
+        configured["ONEAPI_DEVICE_SELECTOR"] = os.environ["ONEAPI_DEVICE_SELECTOR"]
+    elif "ONEAPI_DEVICE_SELECTOR" in os.environ:
+        configured["ONEAPI_DEVICE_SELECTOR"] = os.environ["ONEAPI_DEVICE_SELECTOR"]
+    return configured
+
+
+@dataclass(slots=True)
 class DeviceContext:
     device: torch.device
     dtype: torch.dtype
@@ -86,6 +208,7 @@ class DeviceContext:
     reported_dtype: str
     migration_policy: TensorMigrationPolicy
     safety_policy: RuntimeSafetyPolicy
+    xpu_info: XPUDeviceInfo | None = None
 
     @classmethod
     def resolve(
@@ -131,6 +254,10 @@ class DeviceContext:
             cache_dtype=resolved_dtype,
         )
 
+        xpu_info = inspect_xpu_device(resolved_device) if resolved_device.type == "xpu" else None
+        if xpu_info is not None:
+            logger.info("Resolved XPU device info: %s", xpu_info.as_log_fields())
+
         return cls(
             device=resolved_device,
             dtype=resolved_dtype,
@@ -139,6 +266,7 @@ class DeviceContext:
             reported_dtype=reported_dtype,
             migration_policy=migration_policy,
             safety_policy=RuntimeSafetyPolicy(),
+            xpu_info=xpu_info,
         )
 
     def _move_tensor(

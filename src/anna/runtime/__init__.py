@@ -1,4 +1,12 @@
-from anna.runtime.device import DeviceContext, DeviceMemoryInfo, RuntimeSafetyPolicy, TensorMigrationPolicy
+from anna.runtime.device import (
+    DeviceContext,
+    DeviceMemoryInfo,
+    RuntimeSafetyPolicy,
+    TensorMigrationPolicy,
+    XPUDeviceInfo,
+    configure_xpu_environment,
+    inspect_xpu_device,
+)
 from anna.runtime.gemma4_text_engine import AnnaGemma4TextEngine
 from anna.runtime.qwen3_5_text_engine import (
     AnnaEngineError,
@@ -19,4 +27,7 @@ __all__ = [
     "StreamEvent",
     "TensorMigrationPolicy",
     "TextGenerationResult",
+    "XPUDeviceInfo",
+    "configure_xpu_environment",
+    "inspect_xpu_device",
 ]

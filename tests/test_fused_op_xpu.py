@@ -2,6 +2,7 @@ import pytest
 import torch
 
 import anna.model.ops as model_ops
+import anna.model.fused_ops as fused_ops
 from anna.model.fused_ops import maybe_load_gated_delta_library
 from anna.model.gemma4_config import Gemma4RopeParameters, Gemma4TextConfig
 from anna.model.gemma4_text_model import Gemma4TextRotaryEmbedding
@@ -25,6 +26,16 @@ def _reference_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> tor
     output = output * torch.rsqrt(output.pow(2).mean(dim=-1, keepdim=True) + eps)
     output = output * (1.0 + weight.float())
     return output.to(dtype=x.dtype)
+
+
+def test_int4_fused_op_availability_respects_disable_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK", "1")
+    monkeypatch.setattr(fused_ops, "_lm_head_int4_topk_op", lambda: object())
+    assert fused_ops.lm_head_int4_topk_fused_is_available() is False
+
+    monkeypatch.setenv("ANNA_XPU_DISABLE_MOE_GROUPED_INT4", "true")
+    monkeypatch.setattr(fused_ops, "_moe_grouped_int4_mlp_op", lambda: object())
+    assert fused_ops.moe_grouped_int4_mlp_fused_is_available() is False
 
 
 def _reference_rmsnorm_ex(
