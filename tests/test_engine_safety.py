@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import torch
@@ -58,6 +59,71 @@ def test_guard_generation_memory_rejects_oversized_request() -> None:
         assert exc.code == "estimated_device_oom"
     else:  # pragma: no cover - defensive
         raise AssertionError("Expected memory guard to reject the oversized request.")
+
+
+def test_guard_generation_memory_reclaims_runtime_caches_before_rejecting() -> None:
+    class DummyKV:
+        def __init__(self) -> None:
+            self.release_calls = 0
+
+        def release(self) -> None:
+            self.release_calls += 1
+
+    class DummyAllocator:
+        def __init__(self) -> None:
+            self.trim_calls = 0
+
+        def trim(self) -> int:
+            self.trim_calls += 1
+            return 4
+
+    class DummyDeviceContext:
+        dtype = torch.bfloat16
+        safety_policy = RuntimeSafetyPolicy(
+            min_free_bytes=0,
+            reserve_margin_bytes=128 << 20,
+            max_estimated_usage_ratio=1.0,
+            generation_memory_safety_factor=1.0,
+        )
+
+        def __init__(self) -> None:
+            self.release_calls = 0
+            self.memory_reads = 0
+
+        def get_memory_info(self) -> DeviceMemoryInfo:
+            self.memory_reads += 1
+            free_bytes = 512 << 20 if self.memory_reads == 1 else 1536 << 20
+            return DeviceMemoryInfo(
+                free_bytes=free_bytes,
+                total_bytes=2048 << 20,
+                allocated_bytes=0,
+                reserved_bytes=0,
+            )
+
+        def release_unused_memory(self) -> None:
+            self.release_calls += 1
+
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    kv = DummyKV()
+    engine._prompt_cache = OrderedDict({(1, 2): SimpleNamespace(past_key_values=kv)})
+    engine.cache_allocator = DummyAllocator()
+    engine.device_context = DummyDeviceContext()
+    engine._estimate_generation_memory_bytes = lambda prepared, *, config: 1024 << 20
+
+    prepared = PreparedInputs(
+        prompt="test",
+        input_ids=torch.ones((1, 8), dtype=torch.long),
+        attention_mask=torch.ones((1, 8), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 8), dtype=torch.int32),
+    )
+
+    engine._guard_generation_memory(prepared, config=GenerationConfig(max_new_tokens=8))
+
+    assert kv.release_calls == 1
+    assert len(engine._prompt_cache) == 0
+    assert engine.cache_allocator.trim_calls == 1
+    assert engine.device_context.release_calls == 1
+    assert engine.device_context.memory_reads == 2
 
 
 def test_validate_generation_request_uses_remaining_context_when_no_memory_info_is_available() -> None:

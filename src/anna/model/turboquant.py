@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -8,6 +9,12 @@ import torch
 
 _mse_quantizers: dict[tuple[int, int, str], Any] = {}
 _ip_quantizers: dict[tuple[int, int, str], Any] = {}
+_KEEP_DECODE_CACHE = os.getenv("ANNA_TURBOQUANT_KEEP_DECODE_CACHE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 if not hasattr(np, "trapz"):
     np.trapz = np.trapezoid
@@ -547,6 +554,8 @@ class TurboQuantKVRow:
             return None, None
 
         if (
+            _KEEP_DECODE_CACHE
+            and
             self._decode_quantized_keys is not None
             and self._decode_quantized_values is not None
             and self._decode_quantized_length == quantized_len
@@ -566,9 +575,12 @@ class TurboQuantKVRow:
             device=self.device,
             dtype=self.dtype,
         ).contiguous()
-        self._decode_quantized_keys = quantized_keys
-        self._decode_quantized_values = quantized_values
-        self._decode_quantized_length = quantized_len
+        if _KEEP_DECODE_CACHE:
+            self._decode_quantized_keys = quantized_keys
+            self._decode_quantized_values = quantized_values
+            self._decode_quantized_length = quantized_len
+        else:
+            self._invalidate_decode_cache()
         return quantized_keys, quantized_values
 
     def append(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
@@ -644,12 +656,12 @@ class TurboQuantKVRow:
             bits=self.bits,
             device=self.device,
             dtype=self.dtype,
-        ).contiguous()
+        ).contiguous() if _KEEP_DECODE_CACHE else None
         new_decode_values = dequantize_turboquant_values(
             quantized_values,
             device=self.device,
             dtype=self.dtype,
-        ).contiguous()
+        ).contiguous() if _KEEP_DECODE_CACHE else None
         self._quantized_keys = _concat_key_states(self._quantized_keys, quantized_keys)
         self._quantized_values = _concat_value_states(self._quantized_values, quantized_values)
         self._residual_keys = residual_keys[:, overflow:, :].contiguous()
@@ -657,7 +669,9 @@ class TurboQuantKVRow:
 
         # Incrementally extend decode tensors instead of invalidating the full prefix. A full
         # re-dequant on every append was O(total_quantized_tokens) per layer per decode step.
-        if self._decode_quantized_keys is None:
+        if not _KEEP_DECODE_CACHE:
+            self._invalidate_decode_cache()
+        elif self._decode_quantized_keys is None:
             if prior_quant_len == 0:
                 self._decode_quantized_keys = new_decode_keys
                 self._decode_quantized_values = new_decode_values

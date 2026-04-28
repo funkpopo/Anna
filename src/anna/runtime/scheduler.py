@@ -442,6 +442,19 @@ class AnnaScheduler:
         available_budget = max(0, memory_info.free_bytes - policy.reserve_margin_bytes)
         max_allowed = int(memory_info.total_bytes * policy.max_estimated_usage_ratio)
 
+        if (
+            memory_info.free_bytes < policy.min_free_bytes
+            or estimated_bytes > available_budget
+            or estimated_bytes > max_allowed
+        ):
+            reclaim = getattr(self.engine, "_reclaim_runtime_memory_for_admission", None)
+            if callable(reclaim) and reclaim():
+                memory_info = self.engine.device_context.get_memory_info()
+                if memory_info is None:
+                    return
+                available_budget = max(0, memory_info.free_bytes - policy.reserve_margin_bytes)
+                max_allowed = int(memory_info.total_bytes * policy.max_estimated_usage_ratio)
+
         if memory_info.free_bytes < policy.min_free_bytes:
             raise self.engine._handle_runtime_failure(RuntimeError("out of memory"))
         if estimated_bytes > available_budget or estimated_bytes > max_allowed:
