@@ -24,7 +24,7 @@ from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.memory_release import release_conversion_artifacts
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
-from anna.sampling.sampler import sample_next_token
+from anna.sampling.sampler import sample_next_token, sample_next_token_from_candidates
 from anna.weights.qwen3_5_text_weight_loader import build_qwen3_5_text_model, estimate_qwen3_5_text_model_weight_bytes, load_qwen3_5_text_model_config, load_qwen3_5_text_model_weights
 from anna.weights.qwen3_5_text_tokenizer import Qwen3_5TextTokenizer
 
@@ -156,6 +156,7 @@ class GenerationConfig:
     top_k: int = 50
     repetition_penalty: float = 1.0
     stop_strings: list[str] = field(default_factory=list)
+    cancellation_event: threading.Event | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -1828,6 +1829,57 @@ class AnnaQwen3_5TextEngine:
             **model_kwargs,
         )
 
+    def _fused_lm_head_candidate_count(self, config: GenerationConfig) -> int | None:
+        if config.repetition_penalty != 1.0:
+            return None
+        if config.temperature <= 0.0:
+            return 1
+        if config.top_k <= 0:
+            return None
+        return int(config.top_k)
+
+    def _forward_generation_model_topk(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: object | None = None,
+        model_kwargs: dict[str, object] | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | None = None,
+        top_k: int,
+    ):
+        attention_mask = self._prune_trivial_attention_mask(attention_mask)
+        model_kwargs = {} if model_kwargs is None else dict(model_kwargs)
+        has_multimodal_inputs = any(
+            model_kwargs.get(key) is not None
+            for key in self._forward_multimodal_input_keys()
+        )
+        if not has_multimodal_inputs:
+            forward_fn = getattr(self.model, "forward_text_only_topk", None)
+            if forward_fn is None:
+                return None
+            return forward_fn(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                logits_to_keep=logits_to_keep,
+                top_k=top_k,
+            )
+        forward_fn = getattr(self.model, "forward_topk", None)
+        if forward_fn is None:
+            return None
+        return forward_fn(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            logits_to_keep=logits_to_keep,
+            top_k=top_k,
+            **model_kwargs,
+        )
+
     def warmup_inference_kernels(self) -> None:
         from anna.model.fused_ops import maybe_load_gated_delta_library
 
@@ -2241,18 +2293,21 @@ class AnnaQwen3_5TextEngine:
             self._trim_runtime_cache_if_idle()
 
     def _stream_direct(self, prepared: PreparedInputs, *, config: GenerationConfig) -> Iterator[StreamEvent]:
-        for delta, finished, reason, prompt_tokens, completion_tokens, perf in self._iter_generation(prepared, config):
-            if delta:
-                yield StreamEvent(text=delta, finish_reason=None)
-            if finished:
-                yield StreamEvent(
-                    text="",
-                    finish_reason=reason or "stop",
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    perf=perf,
-                )
-                return
+        try:
+            for delta, finished, reason, prompt_tokens, completion_tokens, perf in self._iter_generation(prepared, config):
+                if delta:
+                    yield StreamEvent(text=delta, finish_reason=None)
+                if finished:
+                    yield StreamEvent(
+                        text="",
+                        finish_reason=reason or "stop",
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        perf=perf,
+                    )
+                    return
+        except RuntimeError as exc:
+            raise self._handle_runtime_failure(exc) from exc
 
     def _trim_stop_strings(self, text: str, stop_strings: list[str]) -> tuple[str, bool]:
         if not stop_strings:
@@ -2315,6 +2370,15 @@ class AnnaQwen3_5TextEngine:
             return appended, history_ids
         return torch.cat([history_tensor, appended]), history_ids
 
+    def _raise_if_generation_cancelled(self, config: GenerationConfig) -> None:
+        if config.cancellation_event is not None and config.cancellation_event.is_set():
+            raise AnnaEngineError(
+                "Generation cancelled because the client disconnected.",
+                status_code=499,
+                error_type="server_error",
+                code="client_disconnected",
+            )
+
     @torch.inference_mode()
     def _generate_token_ids(
         self,
@@ -2345,30 +2409,59 @@ class AnnaQwen3_5TextEngine:
                 current_logits = prefill.logits
 
                 for step_idx in range(config.max_new_tokens):
+                    self._raise_if_generation_cancelled(config)
+                    candidate_logits = None
+                    candidate_token_ids = None
                     if step_idx > 0:
                         try:
                             with self.execution_lock:
-                                outputs = self._profiled_forward_generation_model(
-                                    stage=f"decode[{step_idx}]",
-                                    input_ids=input_ids,
-                                    attention_mask=None,
-                                    past_key_values=past_key_values,
-                                    use_cache=True,
-                                    logits_to_keep=1,
+                                candidate_count = self._fused_lm_head_candidate_count(config)
+                                outputs = (
+                                    self._forward_generation_model_topk(
+                                        input_ids=input_ids,
+                                        attention_mask=None,
+                                        past_key_values=past_key_values,
+                                        use_cache=True,
+                                        logits_to_keep=1,
+                                        top_k=candidate_count,
+                                    )
+                                    if candidate_count is not None
+                                    else None
                                 )
-                            current_logits = outputs.logits[0, -1]
+                                if outputs is None:
+                                    outputs = self._profiled_forward_generation_model(
+                                        stage=f"decode[{step_idx}]",
+                                        input_ids=input_ids,
+                                        attention_mask=None,
+                                        past_key_values=past_key_values,
+                                        use_cache=True,
+                                        logits_to_keep=1,
+                                    )
+                            if hasattr(outputs, "candidate_logits"):
+                                candidate_logits = outputs.candidate_logits[0, -1]
+                                candidate_token_ids = outputs.candidate_token_ids[0, -1]
+                            else:
+                                current_logits = outputs.logits[0, -1]
                             past_key_values = outputs.past_key_values
                         except RuntimeError as exc:
                             raise self._handle_runtime_failure(exc) from exc
 
-                    next_token = sample_next_token(
-                        current_logits,
-                        generated_ids=repetition_history,
-                        temperature=config.temperature,
-                        top_p=config.top_p,
-                        top_k=config.top_k,
-                        repetition_penalty=config.repetition_penalty,
-                    )
+                    if candidate_logits is not None and candidate_token_ids is not None:
+                        next_token = sample_next_token_from_candidates(
+                            candidate_logits,
+                            candidate_token_ids,
+                            temperature=config.temperature,
+                            top_p=config.top_p,
+                        )
+                    else:
+                        next_token = sample_next_token(
+                            current_logits,
+                            generated_ids=repetition_history,
+                            temperature=config.temperature,
+                            top_p=config.top_p,
+                            top_k=config.top_k,
+                            repetition_penalty=config.repetition_penalty,
+                        )
                     token_id = int(next_token.item())
                     if first_token_at is None:
                         first_token_at = time.perf_counter()
@@ -2458,30 +2551,59 @@ class AnnaQwen3_5TextEngine:
                 current_logits = prefill.logits
 
                 for step_idx in range(config.max_new_tokens):
+                    self._raise_if_generation_cancelled(config)
+                    candidate_logits = None
+                    candidate_token_ids = None
                     if step_idx > 0:
                         try:
                             with self.execution_lock:
-                                outputs = self._profiled_forward_generation_model(
-                                    stage=f"decode[{step_idx}]",
-                                    input_ids=input_ids,
-                                    attention_mask=None,
-                                    past_key_values=past_key_values,
-                                    use_cache=True,
-                                    logits_to_keep=1,
+                                candidate_count = self._fused_lm_head_candidate_count(config)
+                                outputs = (
+                                    self._forward_generation_model_topk(
+                                        input_ids=input_ids,
+                                        attention_mask=None,
+                                        past_key_values=past_key_values,
+                                        use_cache=True,
+                                        logits_to_keep=1,
+                                        top_k=candidate_count,
+                                    )
+                                    if candidate_count is not None
+                                    else None
                                 )
-                            current_logits = outputs.logits[0, -1]
+                                if outputs is None:
+                                    outputs = self._profiled_forward_generation_model(
+                                        stage=f"decode[{step_idx}]",
+                                        input_ids=input_ids,
+                                        attention_mask=None,
+                                        past_key_values=past_key_values,
+                                        use_cache=True,
+                                        logits_to_keep=1,
+                                    )
+                            if hasattr(outputs, "candidate_logits"):
+                                candidate_logits = outputs.candidate_logits[0, -1]
+                                candidate_token_ids = outputs.candidate_token_ids[0, -1]
+                            else:
+                                current_logits = outputs.logits[0, -1]
                             past_key_values = outputs.past_key_values
                         except RuntimeError as exc:
                             raise self._handle_runtime_failure(exc) from exc
 
-                    next_token = sample_next_token(
-                        current_logits,
-                        generated_ids=repetition_history,
-                        temperature=config.temperature,
-                        top_p=config.top_p,
-                        top_k=config.top_k,
-                        repetition_penalty=config.repetition_penalty,
-                    )
+                    if candidate_logits is not None and candidate_token_ids is not None:
+                        next_token = sample_next_token_from_candidates(
+                            candidate_logits,
+                            candidate_token_ids,
+                            temperature=config.temperature,
+                            top_p=config.top_p,
+                        )
+                    else:
+                        next_token = sample_next_token(
+                            current_logits,
+                            generated_ids=repetition_history,
+                            temperature=config.temperature,
+                            top_p=config.top_p,
+                            top_k=config.top_k,
+                            repetition_penalty=config.repetition_penalty,
+                        )
                     token_id = int(next_token.item())
                     if first_token_at is None:
                         first_token_at = time.perf_counter()

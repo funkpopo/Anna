@@ -46,6 +46,7 @@ class SchedulerRequest:
     events: queue.Queue[object] = field(default_factory=queue.Queue)
     generation_started_at: float | None = None
     first_token_at: float | None = None
+    cancelled: bool = False
 
 
 class AnnaScheduler:
@@ -83,13 +84,34 @@ class AnnaScheduler:
 
     def stream(self, prepared: PreparedInputsLike, *, config: "GenerationConfig") -> Iterator["StreamEvent"]:
         request = self._submit(prepared, config=config, stream=True)
-        while True:
-            item = request.events.get()
-            if item is _DONE:
+        try:
+            while True:
+                item = request.events.get()
+                if item is _DONE:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            if not request.done.is_set():
+                self.cancel(request)
+
+    def cancel(self, request: SchedulerRequest) -> None:
+        metrics = getattr(self.engine, "metrics", None)
+        with self._condition:
+            if request.done.is_set() or request.cancelled:
                 return
-            if isinstance(item, BaseException):
-                raise item
-            yield item
+            request.cancelled = True
+            if self._pending:
+                self._pending = deque(candidate for candidate in self._pending if candidate is not request)
+            self._condition.notify_all()
+        request.error = self._cancelled_error()
+        self._release_request_cache(request)
+        request.events.put(_DONE)
+        request.done.set()
+        if metrics is not None:
+            metrics.record_request_finished(success=False)
+        self.engine._trim_runtime_cache_if_idle()
 
     def _submit(self, prepared: PreparedInputsLike, *, config: "GenerationConfig", stream: bool) -> SchedulerRequest:
         if self._fatal_error is not None:
@@ -117,7 +139,11 @@ class AnnaScheduler:
 
                     pending_batch: list[SchedulerRequest] = []
                     while self._pending and len(pending_batch) < self.max_batch_size:
-                        pending_batch.append(self._pending.popleft())
+                        request = self._pending.popleft()
+                        if self._is_request_cancelled(request):
+                            self._drop_cancelled_request(request)
+                        else:
+                            pending_batch.append(request)
 
                 if pending_batch:
                     try:
@@ -129,6 +155,7 @@ class AnnaScheduler:
                     continue
 
                 next_active: list[SchedulerRequest] = []
+                active = [request for request in active if not self._drop_cancelled_request(request)]
                 ready = [request for request in active if request.past_key_values is not None]
                 for request in active:
                     if request.past_key_values is None:
@@ -152,6 +179,12 @@ class AnnaScheduler:
             self._fail_requests(active + pending, fatal)
 
     def _prefill_batch(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest]:
+        for request in requests:
+            if self._is_request_cancelled(request):
+                self._drop_cancelled_request(request)
+        requests = [request for request in requests if not self._is_request_cancelled(request)]
+        if not requests:
+            return []
         metrics = getattr(self.engine, "metrics", None)
         if metrics is not None:
             metrics.record_requests_started_from_queue(len(requests))
@@ -180,6 +213,12 @@ class AnnaScheduler:
         return active
 
     def _prefill_same_length_group(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest]:
+        for request in requests:
+            if self._is_request_cancelled(request):
+                self._drop_cancelled_request(request)
+        requests = [request for request in requests if not self._is_request_cancelled(request)]
+        if not requests:
+            return []
         batched = self._batch_text_inputs(requests)
         self._guard_batch_memory(requests)
         prompt_length = int(batched.input_ids.shape[1])
@@ -245,6 +284,11 @@ class AnnaScheduler:
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
         active: list[SchedulerRequest] = []
         for row_idx, request in enumerate(requests):
+            if self._is_request_cancelled(request):
+                if split_caches[row_idx] is not None:
+                    split_caches[row_idx].release()
+                self._drop_cancelled_request(request)
+                continue
             request.past_key_values = split_caches[row_idx]
             next_token = sample_next_token(
                 outputs.logits[row_idx, -1],
@@ -285,6 +329,12 @@ class AnnaScheduler:
         return active
 
     def _decode_batch(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest]:
+        for request in requests:
+            if self._is_request_cancelled(request):
+                self._drop_cancelled_request(request)
+        requests = [request for request in requests if not self._is_request_cancelled(request)]
+        if not requests:
+            return []
         input_ids = torch.cat([request.input_ids for request in requests if request.input_ids is not None], dim=0)
         caches = [request.past_key_values for request in requests if request.past_key_values is not None]
         if not caches:
@@ -312,6 +362,11 @@ class AnnaScheduler:
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
         metrics = getattr(self.engine, "metrics", None)
         for row_idx, request in enumerate(requests):
+            if self._is_request_cancelled(request):
+                if split_caches[row_idx] is not None:
+                    split_caches[row_idx].release()
+                self._drop_cancelled_request(request)
+                continue
             request.past_key_values = split_caches[row_idx]
             next_token = sample_next_token(
                 outputs.logits[row_idx, -1],
@@ -400,6 +455,8 @@ class AnnaScheduler:
             )
 
     def _emit_text(self, request: SchedulerRequest, text: str) -> None:
+        if self._is_request_cancelled(request):
+            return
         request.text_parts.append(text)
         if request.stream:
             from anna.runtime.qwen3_5_text_engine import StreamEvent
@@ -407,6 +464,9 @@ class AnnaScheduler:
             request.events.put(StreamEvent(text=text, finish_reason=None))
 
     def _finish_request(self, request: SchedulerRequest, *, finish_reason: str) -> None:
+        if self._is_request_cancelled(request):
+            self._release_request_cache(request)
+            return
         metrics = getattr(self.engine, "metrics", None)
         if request.assembler is not None:
             tail, _ = request.assembler.flush()
@@ -449,6 +509,40 @@ class AnnaScheduler:
         if metrics is not None:
             metrics.record_request_finished(success=True)
         self.engine._trim_runtime_cache_if_idle()
+
+    def _release_request_cache(self, request: SchedulerRequest) -> None:
+        if request.past_key_values is not None:
+            request.past_key_values.release()
+            request.past_key_values = None
+
+    def _drop_cancelled_request(self, request: SchedulerRequest) -> bool:
+        if not self._is_request_cancelled(request):
+            return False
+        request.cancelled = True
+        self._release_request_cache(request)
+        if not request.done.is_set():
+            request.error = self._cancelled_error()
+            request.events.put(_DONE)
+            request.done.set()
+            metrics = getattr(self.engine, "metrics", None)
+            if metrics is not None:
+                metrics.record_request_finished(success=False)
+        return True
+
+    def _is_request_cancelled(self, request: SchedulerRequest) -> bool:
+        return request.cancelled or (
+            request.config.cancellation_event is not None and request.config.cancellation_event.is_set()
+        )
+
+    def _cancelled_error(self) -> "AnnaEngineError":
+        from anna.runtime.qwen3_5_text_engine import AnnaEngineError
+
+        return AnnaEngineError(
+            "Generation cancelled because the client disconnected.",
+            status_code=499,
+            error_type="server_error",
+            code="client_disconnected",
+        )
 
     def _build_perf_stats(self, request: SchedulerRequest):
         started_at = request.generation_started_at
@@ -498,9 +592,7 @@ class AnnaScheduler:
         normalized = exc if isinstance(exc, AnnaEngineError) else self._normalize_error(exc)
         metrics = getattr(self.engine, "metrics", None)
         request.error = normalized
-        if request.past_key_values is not None:
-            request.past_key_values.release()
-            request.past_key_values = None
+        self._release_request_cache(request)
         if request.stream:
             request.events.put(normalized)
             request.events.put(_DONE)

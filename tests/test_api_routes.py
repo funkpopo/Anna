@@ -6,7 +6,7 @@ import logging
 from fastapi.testclient import TestClient
 
 from anna.api.app import create_app, list_app_routes
-from anna.runtime.qwen3_5_text_engine import AnnaEngineError, GenerationPerfStats, TextGenerationResult
+from anna.runtime.qwen3_5_text_engine import AnnaEngineError, GenerationPerfStats, StreamEvent, TextGenerationResult
 
 
 class _FailingStreamEngine:
@@ -124,6 +124,37 @@ def test_streaming_chat_returns_sse_error_frame_for_engine_failures() -> None:
     assert "event: error" in response.text
     assert '"code": "insufficient_device_memory"' in response.text
     assert "data: [DONE]" in response.text
+
+
+def test_streaming_chat_closes_engine_iterator_when_response_generator_closes() -> None:
+    from anna.api.routes import _stream_sse_chat
+
+    class _ClosableEvents:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise AssertionError("events should not be consumed before the response generator closes")
+
+        def close(self) -> None:
+            self.closed = True
+
+    events = _ClosableEvents()
+    generator = _stream_sse_chat(
+        response_id="chatcmpl-test",
+        created=1,
+        model="fake-model",
+        events=events,
+        include_usage=False,
+    )
+
+    assert '"role": "assistant"' in next(generator)
+    generator.close()
+
+    assert events.closed is True
 
 
 def test_chat_completion_uses_engine_default_max_completion_tokens_when_request_omits_it() -> None:
@@ -701,6 +732,48 @@ def test_chat_completion_logs_prefill_and_decode_metrics(caplog) -> None:
         )
 
     assert response.status_code == 200
+    log_lines = [record.message for record in caplog.records if record.name == "anna.api.routes"]
+    assert any("prefill_seconds=0.250" in line for line in log_lines)
+    assert any("decode_tokens_per_second=16.00" in line for line in log_lines)
+
+
+def test_streaming_chat_logs_prefill_and_decode_metrics(caplog) -> None:
+    class _ProfilingStreamEngine(_CapturingEngine):
+        def stream_chat(self, *_args, **_kwargs):
+            yield StreamEvent(text="ok", finish_reason=None)
+            yield StreamEvent(
+                text="",
+                finish_reason="stop",
+                prompt_tokens=50,
+                completion_tokens=5,
+                perf=GenerationPerfStats(
+                    total_seconds=0.5,
+                    prefill_seconds=0.25,
+                    ttft_seconds=0.25,
+                    decode_seconds=0.25,
+                    prompt_tokens=50,
+                    completion_tokens=5,
+                    prefill_tokens_per_second=200.0,
+                    decode_tokens=4,
+                    decode_tokens_per_second=16.0,
+                    total_tokens_per_second=10.0,
+                ),
+            )
+
+    client = TestClient(create_app(_ProfilingStreamEngine()))
+
+    with caplog.at_level(logging.INFO, logger="anna.api.routes"):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "fake-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert "data: [DONE]" in response.text
     log_lines = [record.message for record in caplog.records if record.name == "anna.api.routes"]
     assert any("prefill_seconds=0.250" in line for line in log_lines)
     assert any("decode_tokens_per_second=16.00" in line for line in log_lines)

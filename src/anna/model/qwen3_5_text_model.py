@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 from dataclasses import dataclass
 
 import torch
@@ -17,6 +18,20 @@ from anna.model.ops import (
     Qwen3TextRotaryEmbedding,
     rotate_half,
 )
+from anna.model.fused_ops import (
+    lm_head_int4_topk_fused_is_available,
+    lm_head_topk_fused_is_available,
+    run_lm_head_int4_topk_fused,
+    run_lm_head_topk_fused,
+)
+from anna.model.quantization import XPUInt4Linear
+
+_ENABLE_INT4_LM_HEAD_TOPK_FUSED = os.getenv("ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 @dataclass(slots=True)
@@ -28,6 +43,14 @@ class TextModelOutput:
 @dataclass(slots=True)
 class CausalLMOutput:
     logits: torch.Tensor
+    past_key_values: Qwen3DynamicCache | None = None
+    rope_deltas: torch.Tensor | None = None
+
+
+@dataclass(slots=True)
+class CausalLMTopKOutput:
+    candidate_logits: torch.Tensor
+    candidate_token_ids: torch.Tensor
     past_key_values: Qwen3DynamicCache | None = None
     rope_deltas: torch.Tensor | None = None
 
@@ -51,6 +74,45 @@ def _module_device(module: nn.Module) -> torch.device:
     for buffer in module.buffers():
         return buffer.device
     return torch.device("cpu")
+
+
+def _lm_head_topk(
+    lm_head: nn.Module,
+    hidden_states: torch.Tensor,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if top_k <= 0:
+        raise ValueError("top_k must be positive for lm_head top-k")
+    lm_head_device = _module_device(lm_head)
+    if hidden_states.device != lm_head_device:
+        hidden_states = hidden_states.to(device=lm_head_device)
+    if (
+        _ENABLE_INT4_LM_HEAD_TOPK_FUSED
+        and top_k <= 16
+        and hidden_states.device.type == "xpu"
+        and isinstance(lm_head, XPUInt4Linear)
+        and lm_head.qweight.device.type == "xpu"
+        and lm_head_int4_topk_fused_is_available()
+    ):
+        return run_lm_head_int4_topk_fused(
+            hidden_states=hidden_states,
+            qweight=lm_head.qweight,
+            qscale=lm_head.qscale,
+            qzeros=lm_head.qzeros,
+            group_size=lm_head.group_size,
+            in_features=lm_head.in_features,
+            top_k=top_k,
+        )
+    if (
+        hidden_states.device.type == "xpu"
+        and isinstance(lm_head, nn.Linear)
+        and lm_head.bias is None
+        and lm_head_topk_fused_is_available()
+    ):
+        return run_lm_head_topk_fused(hidden_states=hidden_states, weight=lm_head.weight, top_k=top_k)
+    logits = lm_head(hidden_states)
+    k = min(int(top_k), int(logits.shape[-1]))
+    return torch.topk(logits, k=k, dim=-1)
 
 
 def _align_tensor_device(tensor: torch.Tensor | None, device: torch.device) -> torch.Tensor | None:
@@ -808,6 +870,31 @@ class Qwen3_5TextForCausalLM(nn.Module):
         logits = self.lm_head(hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)
 
+    def forward_topk(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Qwen3DynamicCache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | None = None,
+        top_k: int = 1,
+    ) -> CausalLMTopKOutput:
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+        )
+        hidden_states = outputs.last_hidden_state
+        if logits_to_keep is not None and logits_to_keep > 0:
+            hidden_states = hidden_states[:, -logits_to_keep:, :]
+        values, indices = _lm_head_topk(self.lm_head, hidden_states, top_k)
+        return CausalLMTopKOutput(candidate_logits=values, candidate_token_ids=indices, past_key_values=outputs.past_key_values)
+
 
 class Qwen3_5TextForConditionalGeneration(nn.Module):
     def __init__(self, config: Qwen3_5TextModelConfig):
@@ -881,6 +968,32 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         logits = self.lm_head(hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)
 
+    def forward_text_only_topk(
+        self,
+        *,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Qwen3DynamicCache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | None = None,
+        top_k: int = 1,
+    ) -> CausalLMTopKOutput:
+        outputs = self.model.language_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+        )
+        hidden_states = outputs.last_hidden_state
+        if logits_to_keep is not None and logits_to_keep > 0:
+            hidden_states = hidden_states[:, -logits_to_keep:, :]
+        values, indices = _lm_head_topk(self.lm_head, hidden_states, top_k)
+        return CausalLMTopKOutput(candidate_logits=values, candidate_token_ids=indices, past_key_values=outputs.past_key_values)
+
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -917,6 +1030,46 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             hidden_states = hidden_states.to(device=lm_head_device)
         logits = self.lm_head(hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values, rope_deltas=outputs.rope_deltas)
+
+    def forward_topk(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Qwen3DynamicCache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.IntTensor | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | None = None,
+        top_k: int = 1,
+    ) -> CausalLMTopKOutput:
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
+            use_cache=use_cache,
+        )
+        hidden_states = outputs.last_hidden_state
+        if logits_to_keep is not None and logits_to_keep > 0:
+            hidden_states = hidden_states[:, -logits_to_keep:, :]
+        values, indices = _lm_head_topk(self.lm_head, hidden_states, top_k)
+        return CausalLMTopKOutput(
+            candidate_logits=values,
+            candidate_token_ids=indices,
+            past_key_values=outputs.past_key_values,
+            rope_deltas=outputs.rope_deltas,
+        )
 
     def kv_cache_runtime_info(self) -> dict[str, object]:
         return self.model.kv_cache_runtime_info()

@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import io
+import asyncio
+import queue
+import threading
 import time
 import uuid
-from typing import Iterator
+from typing import AsyncIterator, Callable, Iterator, TypeVar
 
 import numpy as np
 import soundfile as sf
@@ -26,6 +29,8 @@ from anna.runtime.qwen3_tts_engine import Qwen3TTSSynthesisConfig
 router = APIRouter()
 logger = logging.getLogger(__name__)
 _MISSING = object()
+_T = TypeVar("_T")
+_STREAM_DONE = object()
 
 
 def _engine(request: Request):
@@ -48,7 +53,119 @@ def _memory_snapshot(engine: object):
     device_context = getattr(engine, "device_context", None)
     if device_context is None or not hasattr(device_context, "get_memory_info"):
         return None
-    return device_context.get_memory_info()
+    try:
+        return device_context.get_memory_info()
+    except RuntimeError as exc:
+        classify = getattr(device_context, "classify_runtime_error", None)
+        category = classify(exc) if callable(classify) else "runtime_error"
+        if category == "device_lost":
+            logger.warning("Skipping XPU memory snapshot because the device is lost: %s", exc)
+            return None
+        raise
+
+
+async def _run_generation_until_done_or_disconnected(
+    request: Request,
+    config: GenerationConfig,
+    func: Callable[[], _T],
+) -> _T:
+    result: dict[str, _T] = {}
+    errors: list[BaseException] = []
+
+    def _target() -> None:
+        try:
+            result["value"] = func()
+        except BaseException as exc:  # pragma: no cover - re-raised in request task
+            errors.append(exc)
+
+    worker = threading.Thread(target=_target, name="anna-request-generation", daemon=True)
+    worker.start()
+    disconnected = False
+    while worker.is_alive():
+        if await request.is_disconnected():
+            disconnected = True
+            if config.cancellation_event is not None:
+                config.cancellation_event.set()
+            logger.info("Client disconnected; cancelling in-flight generation.")
+            break
+        await asyncio.sleep(0.05)
+
+    while worker.is_alive():
+        await asyncio.sleep(0.05)
+
+    if errors:
+        exc = errors[0]
+        if isinstance(exc, Exception):
+            raise exc
+        raise RuntimeError(str(exc))
+    if disconnected:
+        raise AnnaEngineError(
+            "Generation cancelled because the client disconnected.",
+            status_code=499,
+            error_type="server_error",
+            code="client_disconnected",
+        )
+    return result["value"]
+
+
+async def _stream_until_done_or_disconnected(
+    request: Request,
+    config: GenerationConfig,
+    chunks: Iterator[str],
+    *,
+    close_events: Callable[[], None] | None = None,
+) -> AsyncIterator[str]:
+    output: queue.Queue[object] = queue.Queue()
+
+    def _close() -> None:
+        if config.cancellation_event is not None:
+            config.cancellation_event.set()
+        if close_events is not None:
+            close_events()
+        close = getattr(chunks, "close", None)
+        if callable(close):
+            try:
+                close()
+            except ValueError:
+                # The sync generator is currently executing in the worker thread.
+                pass
+
+    def _worker() -> None:
+        try:
+            for chunk in chunks:
+                output.put(chunk)
+        except BaseException as exc:  # pragma: no cover - surfaced to async generator
+            output.put(exc)
+        finally:
+            output.put(_STREAM_DONE)
+
+    worker = threading.Thread(target=_worker, name="anna-stream-response", daemon=True)
+    worker.start()
+    disconnected = False
+    try:
+        while True:
+            try:
+                item = output.get_nowait()
+            except queue.Empty:
+                if await request.is_disconnected():
+                    disconnected = True
+                    logger.info("Client disconnected; cancelling streaming generation.")
+                    _close()
+                    break
+                await asyncio.sleep(0.05)
+                continue
+
+            if item is _STREAM_DONE:
+                return
+            if isinstance(item, BaseException):
+                if disconnected:
+                    return
+                if isinstance(item, Exception):
+                    raise item
+                raise RuntimeError(str(item))
+            yield item
+    finally:
+        _close()
 
 
 def _normalize_stop(stop: str | list[str] | None) -> list[str]:
@@ -291,25 +408,33 @@ def _stream_sse_chat(
     model: str,
     events: Iterator[StreamEvent],
     include_usage: bool,
+    route_name: str | None = None,
+    started_at: float | None = None,
+    memory_before=None,
+    memory_after_provider: Callable[[], object | None] | None = None,
 ) -> Iterator[str]:
-    role_chunk = {
-        "id": response_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-    }
-    if include_usage:
-        role_chunk["usage"] = None
-    yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
-
     final_usage = None
+    final_perf = None
+    final_finish_reason = "stop"
     try:
+        role_chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+        if include_usage:
+            role_chunk["usage"] = None
+        yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
+
         for event in events:
             if not event.text and not event.reasoning_text and not event.tool_calls and event.finish_reason is None:
                 continue
             if event.finish_reason is not None and event.prompt_tokens is not None and event.completion_tokens is not None:
                 final_usage = _usage_payload(event.prompt_tokens, event.completion_tokens)
+                final_perf = event.perf
+                final_finish_reason = event.finish_reason or final_finish_reason
             payload = _chat_chunk_payload(
                 response_id=response_id,
                 created=created,
@@ -333,19 +458,39 @@ def _stream_sse_chat(
                 code="streaming_failed",
             )
         )
+    else:
+        if include_usage and final_usage is not None:
+            usage_chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": final_usage,
+            }
+            yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
 
-    if include_usage and final_usage is not None:
-        usage_chunk = {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [],
-            "usage": final_usage,
-        }
-        yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
+        if route_name is not None and final_usage is not None:
+            _log_generation_result(
+                route_name=route_name,
+                model=model,
+                result=TextGenerationResult(
+                    text="",
+                    finish_reason=final_finish_reason,
+                    prompt_tokens=final_usage["prompt_tokens"],
+                    completion_tokens=final_usage["completion_tokens"],
+                    perf=final_perf,
+                ),
+                elapsed_seconds=0.0 if started_at is None else time.perf_counter() - started_at,
+                memory_before=memory_before,
+                memory_after=None if memory_after_provider is None else memory_after_provider(),
+            )
 
-    yield "data: [DONE]\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        close = getattr(events, "close", None)
+        if callable(close):
+            close()
 
 
 def _stream_sse_completion(
@@ -355,8 +500,14 @@ def _stream_sse_completion(
     model: str,
     events: Iterator[StreamEvent],
     include_usage: bool,
+    route_name: str | None = None,
+    started_at: float | None = None,
+    memory_before=None,
+    memory_after_provider: Callable[[], object | None] | None = None,
 ) -> Iterator[str]:
     final_usage = None
+    final_perf = None
+    final_finish_reason = "stop"
     try:
         for event in events:
             payload = {
@@ -370,6 +521,8 @@ def _stream_sse_completion(
                 payload["usage"] = None
             if event.finish_reason is not None and event.prompt_tokens is not None and event.completion_tokens is not None:
                 final_usage = _usage_payload(event.prompt_tokens, event.completion_tokens)
+                final_perf = event.perf
+                final_finish_reason = event.finish_reason or final_finish_reason
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
     except AnnaEngineError as exc:
         yield _sse_error_frame(exc)
@@ -383,6 +536,10 @@ def _stream_sse_completion(
                 code="streaming_failed",
             )
         )
+    finally:
+        close = getattr(events, "close", None)
+        if callable(close):
+            close()
 
     if include_usage and final_usage is not None:
         usage_chunk = {
@@ -394,6 +551,22 @@ def _stream_sse_completion(
             "usage": final_usage,
         }
         yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
+
+    if route_name is not None and final_usage is not None:
+        _log_generation_result(
+            route_name=route_name,
+            model=model,
+            result=TextGenerationResult(
+                text="",
+                finish_reason=final_finish_reason,
+                prompt_tokens=final_usage["prompt_tokens"],
+                completion_tokens=final_usage["completion_tokens"],
+                perf=final_perf,
+            ),
+            elapsed_seconds=0.0 if started_at is None else time.perf_counter() - started_at,
+            memory_before=memory_before,
+            memory_after=None if memory_after_provider is None else memory_after_provider(),
+        )
 
     yield "data: [DONE]\n\n"
 
@@ -422,7 +595,7 @@ def list_models(request: Request) -> dict:
 
 
 @router.post("/v1/chat/completions")
-def chat_completions(request: Request, payload: ChatCompletionRequest):
+async def chat_completions(request: Request, payload: ChatCompletionRequest):
     engine = _engine(request)
     config = GenerationConfig(
         max_new_tokens=payload.max_completion_tokens or payload.max_tokens or _default_max_completion_tokens(engine),
@@ -431,6 +604,7 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
         top_k=payload.top_k,
         repetition_penalty=payload.repetition_penalty,
         stop_strings=_normalize_stop(payload.stop),
+        cancellation_event=threading.Event(),
     )
     response_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -458,13 +632,23 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
                 tool_choice=payload.tool_choice,
                 parallel_tool_calls=payload.parallel_tool_calls,
             )
+            chunks = _stream_sse_chat(
+                response_id=response_id,
+                created=created,
+                model=model_id,
+                events=events,
+                include_usage=include_usage,
+                route_name="chat_completion",
+                started_at=started_at,
+                memory_before=memory_before,
+                memory_after_provider=lambda: _memory_snapshot(engine),
+            )
             return StreamingResponse(
-                _stream_sse_chat(
-                    response_id=response_id,
-                    created=created,
-                    model=model_id,
-                    events=events,
-                    include_usage=include_usage,
+                _stream_until_done_or_disconnected(
+                    request,
+                    config,
+                    chunks,
+                    close_events=getattr(events, "close", None),
                 ),
                 media_type="text/event-stream",
             )
@@ -475,14 +659,18 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
             message=f"The loaded {_model_family_name(engine)} model family does not support chat completions.",
             code="unsupported_chat_completions",
         )
-        result = generate_chat(
-            payload.messages,
-            config=config,
-            enable_thinking=enable_thinking,
-            reasoning_format=reasoning_format,
-            tools=payload.tools,
-            tool_choice=payload.tool_choice,
-            parallel_tool_calls=payload.parallel_tool_calls,
+        result = await _run_generation_until_done_or_disconnected(
+            request,
+            config,
+            lambda: generate_chat(
+                payload.messages,
+                config=config,
+                enable_thinking=enable_thinking,
+                reasoning_format=reasoning_format,
+                tools=payload.tools,
+                tool_choice=payload.tool_choice,
+                parallel_tool_calls=payload.parallel_tool_calls,
+            ),
         )
     except AnnaEngineError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -507,7 +695,7 @@ def chat_completions(request: Request, payload: ChatCompletionRequest):
 
 
 @router.post("/v1/completions")
-def completions(request: Request, payload: CompletionRequest):
+async def completions(request: Request, payload: CompletionRequest):
     engine = _engine(request)
     config = GenerationConfig(
         max_new_tokens=payload.max_tokens or _default_max_completion_tokens(engine),
@@ -516,6 +704,7 @@ def completions(request: Request, payload: CompletionRequest):
         top_k=payload.top_k,
         repetition_penalty=payload.repetition_penalty,
         stop_strings=_normalize_stop(payload.stop),
+        cancellation_event=threading.Event(),
     )
     response_id = f"cmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -533,13 +722,23 @@ def completions(request: Request, payload: CompletionRequest):
                 code="unsupported_text_completions",
             )
             events = stream_text(payload.prompt, config=config)
+            chunks = _stream_sse_completion(
+                response_id=response_id,
+                created=created,
+                model=model_id,
+                events=events,
+                include_usage=include_usage,
+                route_name="completion",
+                started_at=started_at,
+                memory_before=memory_before,
+                memory_after_provider=lambda: _memory_snapshot(engine),
+            )
             return StreamingResponse(
-                _stream_sse_completion(
-                    response_id=response_id,
-                    created=created,
-                    model=model_id,
-                    events=events,
-                    include_usage=include_usage,
+                _stream_until_done_or_disconnected(
+                    request,
+                    config,
+                    chunks,
+                    close_events=getattr(events, "close", None),
                 ),
                 media_type="text/event-stream",
             )
@@ -550,7 +749,11 @@ def completions(request: Request, payload: CompletionRequest):
             message=f"The loaded {_model_family_name(engine)} model family does not support text completions.",
             code="unsupported_text_completions",
         )
-        result = generate_text(payload.prompt, config=config)
+        result = await _run_generation_until_done_or_disconnected(
+            request,
+            config,
+            lambda: generate_text(payload.prompt, config=config),
+        )
     except AnnaEngineError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
