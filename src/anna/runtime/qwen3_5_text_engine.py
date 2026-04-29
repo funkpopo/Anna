@@ -2114,10 +2114,35 @@ class AnnaQwen3_5TextEngine:
         if memory_info is None:
             return context_remaining
         policy = self.device_context.safety_policy
-        if memory_info.free_bytes < policy.min_free_bytes and self._reclaim_runtime_memory_for_admission():
-            memory_info = self.device_context.get_memory_info()
-            if memory_info is None:
-                return context_remaining
+        probe = GenerationConfig(max_new_tokens=1)
+
+        for attempt in range(2):
+            if memory_info.free_bytes >= policy.min_free_bytes:
+                available_budget = max(0, memory_info.free_bytes - policy.reserve_margin_bytes)
+                max_allowed = int(memory_info.total_bytes * policy.max_estimated_usage_ratio)
+                memory_budget = min(available_budget, max_allowed)
+                if memory_budget > 0:
+                    low = 1
+                    high = context_remaining
+                    best = 0
+                    while low <= high:
+                        mid = (low + high) // 2
+                        probe.max_new_tokens = mid
+                        estimated_bytes = self._estimate_generation_memory_bytes(prepared, config=probe)
+                        if estimated_bytes <= memory_budget:
+                            best = mid
+                            low = mid + 1
+                        else:
+                            high = mid - 1
+                    if best > 0:
+                        return best
+
+            if attempt == 0 and self._reclaim_runtime_memory_for_admission():
+                memory_info = self.device_context.get_memory_info()
+                if memory_info is None:
+                    return context_remaining
+                continue
+            break
 
         if memory_info.free_bytes < policy.min_free_bytes:
             raise AnnaEngineError(
@@ -2138,44 +2163,6 @@ class AnnaQwen3_5TextEngine:
                 error_type="server_error",
                 code="insufficient_device_memory",
             )
-
-        probe = GenerationConfig(max_new_tokens=1)
-        low = 1
-        high = context_remaining
-        best = 0
-        while low <= high:
-            mid = (low + high) // 2
-            probe.max_new_tokens = mid
-            estimated_bytes = self._estimate_generation_memory_bytes(prepared, config=probe)
-            if estimated_bytes <= memory_budget:
-                best = mid
-                low = mid + 1
-            else:
-                high = mid - 1
-
-        if best > 0:
-            return best
-
-        if self._reclaim_runtime_memory_for_admission():
-            memory_info = self.device_context.get_memory_info()
-            if memory_info is None:
-                return context_remaining
-            available_budget = max(0, memory_info.free_bytes - policy.reserve_margin_bytes)
-            max_allowed = int(memory_info.total_bytes * policy.max_estimated_usage_ratio)
-            memory_budget = min(available_budget, max_allowed)
-            low = 1
-            high = context_remaining
-            while low <= high:
-                mid = (low + high) // 2
-                probe.max_new_tokens = mid
-                estimated_bytes = self._estimate_generation_memory_bytes(prepared, config=probe)
-                if estimated_bytes <= memory_budget:
-                    best = mid
-                    low = mid + 1
-                else:
-                    high = mid - 1
-            if best > 0:
-                return best
 
         one_token_config = GenerationConfig(max_new_tokens=1)
         estimated_bytes = self._estimate_generation_memory_bytes(prepared, config=one_token_config)
