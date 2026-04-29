@@ -13,8 +13,10 @@ from typing import Any, Iterator, Literal, cast
 import torch
 
 from anna.core.function_calling import ThinkingStreamParser, ToolCallDelta
+from anna.core.format_utils import format_bytes
 from anna.core.gguf_model import has_gguf_model
-from anna.mm.qwen3_5_text_processor import PreparedInputs, Qwen3_5TextMultimodalProcessor
+from anna.mm.prepared_inputs import PreparedInputs
+from anna.mm.qwen3_5_text_processor import Qwen3_5TextMultimodalProcessor
 from anna.model.fused_ops import maybe_load_gated_delta_library, paged_gqa_decode_fused_is_available
 from anna.model.quantization import AutoRoundGPTQLinear, convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
@@ -46,16 +48,6 @@ def _common_prefix_length(left: str, right: str) -> int:
     return index
 
 
-def _format_bytes(num_bytes: int) -> str:
-    units = ["B", "KiB", "MiB", "GiB", "TiB"]
-    value = float(num_bytes)
-    for unit in units:
-        if value < 1024.0 or unit == units[-1]:
-            return f"{value:.2f} {unit}"
-        value /= 1024.0
-    return f"{num_bytes} B"
-
-
 def _module_cpu_tensor_bytes(module: torch.nn.Module) -> int:
     total = 0
     seen: set[tuple[int, int, int]] = set()
@@ -73,10 +65,6 @@ def _module_cpu_tensor_bytes(module: torch.nn.Module) -> int:
         seen.add(key)
         total += int(tensor.nelement() * tensor.element_size())
     return total
-
-
-def _strip_unstable_replacement_suffix(text: str) -> str:
-    return strip_unstable_replacement_suffix(text)
 
 
 def normalize_reasoning_format(value: str | None) -> ReasoningFormat:
@@ -365,8 +353,8 @@ class AnnaQwen3_5TextEngine:
             self.device_context.device,
             resolved,
             block,
-            _format_bytes(estimated_bytes_per_token),
-            _format_bytes(target_chunk_budget),
+            format_bytes(estimated_bytes_per_token),
+            format_bytes(target_chunk_budget),
         )
         return resolved
 
@@ -682,7 +670,7 @@ class AnnaQwen3_5TextEngine:
             release_conversion_artifacts(device_context.device)
             logger.info(
                 "Post-load Qwen3.5 CPU tensor residency: %s",
-                _format_bytes(_module_cpu_tensor_bytes(model)),
+                format_bytes(_module_cpu_tensor_bytes(model)),
             )
         except RuntimeError as exc:
             if device_context.should_recover(exc):
@@ -1091,10 +1079,10 @@ class AnnaQwen3_5TextEngine:
             logger.info(
                 "Auto resident expert placement skipped: expert_quant=%s free=%s reserve=%s budget_factor=%.2f budget=%s",
                 expert_quant,
-                _format_bytes(memory_info.free_bytes),
-                _format_bytes(reserve_bytes),
+                format_bytes(memory_info.free_bytes),
+                format_bytes(reserve_bytes),
                 budget_factor,
-                _format_bytes(budget_bytes),
+                format_bytes(budget_bytes),
             )
             return ()
 
@@ -1118,13 +1106,13 @@ class AnnaQwen3_5TextEngine:
         logger.info(
             "Auto resident expert placement: expert_quant=%s free=%s reserve=%s budget_factor=%.2f budget=%s selected_layers=%s selected_bytes=%s candidate_layer_bytes=%s",
             expert_quant,
-            _format_bytes(memory_info.free_bytes),
-            _format_bytes(reserve_bytes),
+            format_bytes(memory_info.free_bytes),
+            format_bytes(reserve_bytes),
             budget_factor,
-            _format_bytes(budget_bytes),
+            format_bytes(budget_bytes),
             selected_indices,
-            _format_bytes(consumed_bytes),
-            {layer_idx: _format_bytes(layer_bytes) for layer_idx, layer_bytes in layer_sizes[:8]},
+            format_bytes(consumed_bytes),
+            {layer_idx: format_bytes(layer_bytes) for layer_idx, layer_bytes in layer_sizes[:8]},
         )
         return tuple(selected_indices)
 
@@ -1186,13 +1174,13 @@ class AnnaQwen3_5TextEngine:
         logger.info(
             "Auto expert cache sizing: expert_quant=%s free=%s target_free=%s cache_budget_fraction=%.2f budget_factor=%.2f cache_budget=%s offloaded_layers=%s per_expert=%s minimum_cache=%s cached_experts_per_layer=%s",
             expert_quant,
-            _format_bytes(memory_info.free_bytes),
-            _format_bytes(cache_target_free_bytes),
+            format_bytes(memory_info.free_bytes),
+            format_bytes(cache_target_free_bytes),
             cache_budget_fraction,
             budget_factor,
-            _format_bytes(cache_budget_bytes),
+            format_bytes(cache_budget_bytes),
             len(offloaded_blocks),
-            _format_bytes(per_expert_bytes),
+            format_bytes(per_expert_bytes),
             minimum_cache,
             resolved,
         )
@@ -1677,8 +1665,8 @@ class AnnaQwen3_5TextEngine:
             int(input_ids.shape[-1]),
             seen_tokens,
             elapsed_seconds,
-            _format_bytes(memory_before.free_bytes) if memory_before is not None else "n/a",
-            _format_bytes(memory_after.free_bytes) if memory_after is not None else "n/a",
+            format_bytes(memory_before.free_bytes if memory_before is not None else None),
+            format_bytes(memory_after.free_bytes if memory_after is not None else None),
             stats_before,
             stats_after,
         )
@@ -2146,8 +2134,8 @@ class AnnaQwen3_5TextEngine:
 
         if memory_info.free_bytes < policy.min_free_bytes:
             raise AnnaEngineError(
-                f"Insufficient free XPU memory before generation: free={_format_bytes(memory_info.free_bytes)}, "
-                f"required reserve={_format_bytes(policy.min_free_bytes)}. Reduce workload or restart the service.",
+                f"Insufficient free XPU memory before generation: free={format_bytes(memory_info.free_bytes)}, "
+                f"required reserve={format_bytes(policy.min_free_bytes)}. Reduce workload or restart the service.",
                 status_code=503,
                 error_type="server_error",
                 code="insufficient_device_memory",
@@ -2167,8 +2155,8 @@ class AnnaQwen3_5TextEngine:
         one_token_config = GenerationConfig(max_new_tokens=1)
         estimated_bytes = self._estimate_generation_memory_bytes(prepared, config=one_token_config)
         raise AnnaEngineError(
-            f"Request rejected by memory guard: estimated={_format_bytes(estimated_bytes)}, "
-            f"free={_format_bytes(memory_info.free_bytes)}, reserve={_format_bytes(policy.reserve_margin_bytes)}. "
+            f"Request rejected by memory guard: estimated={format_bytes(estimated_bytes)}, "
+            f"free={format_bytes(memory_info.free_bytes)}, reserve={format_bytes(policy.reserve_margin_bytes)}. "
             "Reduce prompt length, image/video size, or max_completion_tokens.",
             status_code=400,
             error_type="invalid_request_error",
@@ -2199,10 +2187,11 @@ class AnnaQwen3_5TextEngine:
         full_layers = sum(1 for layer_type in text_config.layer_types if layer_type == "full_attention")
         linear_layers = max(0, text_config.num_hidden_layers - full_layers)
         kv_elements_per_token = text_config.num_key_value_heads * text_config.head_dim
-        if self.optimization_config.kv_cache_quantization == "turboquant":
-            residual_tokens = min(total_tokens, max(1, int(self.optimization_config.kv_cache_residual_len)))
+        optimization_config = getattr(self, "optimization_config", None)
+        if optimization_config is not None and optimization_config.kv_cache_quantization == "turboquant":
+            residual_tokens = min(total_tokens, max(1, int(optimization_config.kv_cache_residual_len)))
             quantized_tokens = max(0, total_tokens - residual_tokens)
-            quant_bits = int(self.optimization_config.kv_cache_quant_bits)
+            quant_bits = int(optimization_config.kv_cache_quant_bits)
             quantized_bytes = (2 * quantized_tokens * kv_elements_per_token * quant_bits + 7) // 8
             residual_bytes = 2 * residual_tokens * kv_elements_per_token * bytes_per_elem
             # TurboQuant keeps per-group scale/min metadata in floating point. The
@@ -2270,8 +2259,8 @@ class AnnaQwen3_5TextEngine:
 
         if memory_info.free_bytes < policy.min_free_bytes:
             raise AnnaEngineError(
-                f"Insufficient free XPU memory before generation: free={_format_bytes(memory_info.free_bytes)}, "
-                f"required reserve={_format_bytes(policy.min_free_bytes)}. Reduce workload or restart the service.",
+                f"Insufficient free XPU memory before generation: free={format_bytes(memory_info.free_bytes)}, "
+                f"required reserve={format_bytes(policy.min_free_bytes)}. Reduce workload or restart the service.",
                 status_code=503,
                 error_type="server_error",
                 code="insufficient_device_memory",
@@ -2279,8 +2268,8 @@ class AnnaQwen3_5TextEngine:
 
         if estimated_bytes > available_budget or estimated_bytes > max_allowed:
             raise AnnaEngineError(
-                f"Request rejected by memory guard: estimated={_format_bytes(estimated_bytes)}, "
-                f"free={_format_bytes(memory_info.free_bytes)}, reserve={_format_bytes(policy.reserve_margin_bytes)}. "
+                f"Request rejected by memory guard: estimated={format_bytes(estimated_bytes)}, "
+                f"free={format_bytes(memory_info.free_bytes)}, reserve={format_bytes(policy.reserve_margin_bytes)}. "
                 "Reduce prompt length, image/video size, or max_completion_tokens.",
                 status_code=400,
                 error_type="invalid_request_error",
@@ -2466,13 +2455,13 @@ class AnnaQwen3_5TextEngine:
         emitted_text: str,
     ) -> tuple[str, str]:
         stable_length = _common_prefix_length(previous_text, current_text)
-        stable_text = _strip_unstable_replacement_suffix(current_text[:stable_length])
+        stable_text = strip_unstable_replacement_suffix(current_text[:stable_length])
         if not stable_text.startswith(emitted_text):
             return "", emitted_text
         return stable_text[len(emitted_text) :], stable_text
 
     def _flush_decode_tail(self, *, current_text: str, emitted_text: str) -> tuple[str, str]:
-        current_text = _strip_unstable_replacement_suffix(current_text)
+        current_text = strip_unstable_replacement_suffix(current_text)
         if not current_text.startswith(emitted_text):
             return "", emitted_text
         return current_text[len(emitted_text) :], current_text

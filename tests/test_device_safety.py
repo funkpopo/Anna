@@ -4,9 +4,8 @@ import pytest
 import torch
 
 import anna.runtime.device as runtime_device
-from anna.mm.gemma4_text_processor import PreparedInputs as GemmaPreparedInputs
+from anna.mm.prepared_inputs import PreparedInputs
 from anna.runtime.device import DeviceContext
-from anna.mm.qwen3_5_text_processor import PreparedInputs
 
 
 def test_classify_runtime_error_out_of_memory() -> None:
@@ -95,9 +94,9 @@ def test_move_prepared_inputs_returns_same_object_when_tensors_already_match_tar
     assert moved is prepared
 
 
-def test_move_prepared_inputs_preserves_gemma_prepared_input_type() -> None:
+def test_move_prepared_inputs_preserves_prepared_input_type() -> None:
     context = DeviceContext.resolve(device="cpu", dtype="fp32", model_dtype="float32")
-    prepared = GemmaPreparedInputs(
+    prepared = PreparedInputs(
         prompt="gemma",
         input_ids=torch.ones((1, 3), dtype=torch.long),
         attention_mask=torch.ones((1, 3), dtype=torch.long),
@@ -108,8 +107,8 @@ def test_move_prepared_inputs_preserves_gemma_prepared_input_type() -> None:
 
     moved = context.move_prepared_inputs(prepared)
 
-    assert isinstance(moved, GemmaPreparedInputs)
-    assert moved.__class__.__module__ == "anna.mm.gemma4_text_processor"
+    assert isinstance(moved, PreparedInputs)
+    assert moved.__class__.__module__ == "anna.mm.prepared_inputs"
 
 
 def test_device_context_rejects_fp8_dtype_alias() -> None:

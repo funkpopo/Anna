@@ -11,6 +11,7 @@ from anna.model.gemma4_config import Gemma4Config, Gemma4RopeParameters, Gemma4T
 from anna.model.gemma4_multimodal import Gemma4AudioModel, Gemma4MultimodalEmbedder, Gemma4VisionModel
 from anna.model.fused_ops import run_gqa_decode_fused, run_qk_norm_rotary_fused_ex, run_rmsnorm_fused_ex
 from anna.model.ops import (
+    _module_device,
     apply_mask_to_padding_states,
     apply_rotary_pos_emb,
     grouped_query_attention,
@@ -29,14 +30,6 @@ class Gemma4TextModelOutput:
 class Gemma4CausalLMOutput:
     logits: torch.Tensor
     past_key_values: "Gemma4DynamicCache | None" = None
-
-
-def _module_device(module: nn.Module) -> torch.device:
-    for parameter in module.parameters():
-        return parameter.device
-    for buffer in module.buffers():
-        return buffer.device
-    return torch.device("cpu")
 
 
 def _normalize_add_lengths(batch_size: int, append_lengths: torch.Tensor | int) -> list[int]:
