@@ -1,11 +1,65 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from anna.core.model_family import inspect_model_family
 from anna.runtime.gemma4_text_engine import AnnaGemma4TextEngine
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine
 from anna.runtime.qwen3_tts_engine import AnnaQwen3TTSEngine
+
+
+def _shared_from_model_dir_kwargs(
+    *,
+    model_id: str | None = None,
+    device: str = "auto",
+    dtype: str = "auto",
+    compile_mode: str = "none",
+    compile_fullgraph: bool = False,
+    prefill_chunk_size: int = 0,
+    prompt_cache_size: int = 0,
+    prompt_cache_max_tokens: int = 0,
+    profile_runtime: bool = False,
+    kv_cache_quantization: str = "none",
+    kv_cache_quant_bits: int = 4,
+    kv_cache_residual_len: int = 128,
+    safety_policy=None,
+    default_max_completion_tokens: int | None = None,
+    default_enable_thinking: bool = True,
+    reasoning_format: str = "deepseek",
+    offload_mode: str = "auto",
+    offload_vision: bool = False,
+    expert_quant: str = "auto",
+    weight_quant: str = "auto",
+    resident_expert_layers: int | None = None,
+    resident_expert_layer_indices: tuple[int, ...] | None = None,
+    cached_experts_per_layer: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "model_id": model_id,
+        "device": device,
+        "dtype": dtype,
+        "compile_mode": compile_mode,
+        "compile_fullgraph": compile_fullgraph,
+        "prefill_chunk_size": prefill_chunk_size,
+        "prompt_cache_size": prompt_cache_size,
+        "prompt_cache_max_tokens": prompt_cache_max_tokens,
+        "profile_runtime": profile_runtime,
+        "kv_cache_quantization": kv_cache_quantization,
+        "kv_cache_quant_bits": kv_cache_quant_bits,
+        "kv_cache_residual_len": kv_cache_residual_len,
+        "safety_policy": safety_policy,
+        "default_max_completion_tokens": default_max_completion_tokens,
+        "default_enable_thinking": default_enable_thinking,
+        "reasoning_format": reasoning_format,
+        "offload_mode": offload_mode,
+        "offload_vision": offload_vision,
+        "expert_quant": expert_quant,
+        "weight_quant": weight_quant,
+        "resident_expert_layers": resident_expert_layers,
+        "resident_expert_layer_indices": resident_expert_layer_indices,
+        "cached_experts_per_layer": cached_experts_per_layer,
+    }
 
 
 def load_model_runtime_from_model_dir(
@@ -35,64 +89,7 @@ def load_model_runtime_from_model_dir(
     resident_expert_layer_indices: tuple[int, ...] | None = None,
     cached_experts_per_layer: int | None = None,
 ):
-    model_family_info = inspect_model_family(model_dir)
-    if model_family_info.model_family == "qwen3_tts":
-        return AnnaQwen3TTSEngine.from_model_dir(
-            model_dir,
-            model_id=model_id,
-            device=device,
-            dtype=dtype,
-            compile_mode=compile_mode,
-            compile_fullgraph=compile_fullgraph,
-            prefill_chunk_size=prefill_chunk_size,
-            prompt_cache_size=prompt_cache_size,
-            prompt_cache_max_tokens=prompt_cache_max_tokens,
-            profile_runtime=profile_runtime,
-            kv_cache_quantization=kv_cache_quantization,
-            kv_cache_quant_bits=kv_cache_quant_bits,
-            kv_cache_residual_len=kv_cache_residual_len,
-            safety_policy=safety_policy,
-            default_max_completion_tokens=default_max_completion_tokens,
-            default_enable_thinking=default_enable_thinking,
-            reasoning_format=reasoning_format,
-            offload_mode=offload_mode,
-            offload_vision=offload_vision,
-            expert_quant=expert_quant,
-            weight_quant=weight_quant,
-            resident_expert_layers=resident_expert_layers,
-            resident_expert_layer_indices=resident_expert_layer_indices,
-            cached_experts_per_layer=cached_experts_per_layer,
-        )
-    if model_family_info.model_family == "gemma4":
-        return AnnaGemma4TextEngine.from_model_dir(
-            model_dir,
-            model_id=model_id,
-            device=device,
-            dtype=dtype,
-            compile_mode=compile_mode,
-            compile_fullgraph=compile_fullgraph,
-            prefill_chunk_size=prefill_chunk_size,
-            prompt_cache_size=prompt_cache_size,
-            prompt_cache_max_tokens=prompt_cache_max_tokens,
-            profile_runtime=profile_runtime,
-            kv_cache_quantization=kv_cache_quantization,
-            kv_cache_quant_bits=kv_cache_quant_bits,
-            kv_cache_residual_len=kv_cache_residual_len,
-            safety_policy=safety_policy,
-            default_max_completion_tokens=default_max_completion_tokens,
-            default_enable_thinking=default_enable_thinking,
-            reasoning_format=reasoning_format,
-            offload_mode=offload_mode,
-            offload_vision=offload_vision,
-            expert_quant=expert_quant,
-            weight_quant=weight_quant,
-            resident_expert_layers=resident_expert_layers,
-            resident_expert_layer_indices=resident_expert_layer_indices,
-            cached_experts_per_layer=cached_experts_per_layer,
-        )
-
-    return AnnaQwen3_5TextEngine.from_model_dir(
-        model_dir,
+    shared = _shared_from_model_dir_kwargs(
         model_id=model_id,
         device=device,
         dtype=dtype,
@@ -117,3 +114,9 @@ def load_model_runtime_from_model_dir(
         resident_expert_layer_indices=resident_expert_layer_indices,
         cached_experts_per_layer=cached_experts_per_layer,
     )
+    model_family_info = inspect_model_family(model_dir)
+    if model_family_info.model_family == "qwen3_tts":
+        return AnnaQwen3TTSEngine.from_model_dir(model_dir, **shared)
+    if model_family_info.model_family == "gemma4":
+        return AnnaGemma4TextEngine.from_model_dir(model_dir, **shared)
+    return AnnaQwen3_5TextEngine.from_model_dir(model_dir, **shared)

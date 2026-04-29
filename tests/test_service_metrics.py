@@ -53,8 +53,8 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
 
     line = AnnaServiceMetricsLogger.format_interval(previous, current)
 
-    assert "Avg prompt throughput: 8.0 tokens/s" in line
-    assert "Avg generation throughput: 5.0 tokens/s" in line
+    assert "Interval prompt: 8.0 tok/s" in line
+    assert "Interval generation: 5.0 tok/s" in line
     assert "Running: 2 reqs" in line
     assert "Waiting: 1 reqs" in line
     assert "GPU KV cache usage: 50.0% (6/12 pages)" in line
