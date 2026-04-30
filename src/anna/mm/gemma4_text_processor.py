@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-import base64
 import io
 import json
 import math
-import os
-import tempfile
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,26 +12,12 @@ import soundfile as sf
 import torch
 from PIL import Image
 
+from anna.mm.media_io import collect_message_media_refs, load_image_pil, load_video_frames, read_media_bytes
+from anna.mm.prepared_inputs import PreparedInputs
 from anna.weights.gemma4_tokenizer import Gemma4Tokenizer
 
 
 _SUPPORTED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
-
-
-@dataclass(slots=True)
-class PreparedInputs:
-    prompt: str
-    input_ids: torch.Tensor
-    attention_mask: torch.Tensor
-    mm_token_type_ids: torch.Tensor
-    pixel_values: torch.Tensor | None = None
-    image_position_ids: torch.Tensor | None = None
-    image_grid_thw: torch.Tensor | None = None
-    pixel_values_videos: torch.Tensor | None = None
-    video_position_ids: torch.Tensor | None = None
-    video_grid_thw: torch.Tensor | None = None
-    input_features: torch.Tensor | None = None
-    input_features_mask: torch.Tensor | None = None
 
 
 def _unfold_audio(array: np.ndarray, size: int, step: int) -> np.ndarray:
@@ -425,6 +406,9 @@ class _Gemma4AudioFeatureExtractor:
 
 
 class Gemma4TextProcessor:
+    _load_image = staticmethod(load_image_pil)
+    _load_video = staticmethod(load_video_frames)
+
     def __init__(
         self,
         tokenizer: Gemma4Tokenizer,
@@ -548,21 +532,21 @@ class Gemma4TextProcessor:
             )
         prompt = self.tokenizer.render_messages(messages, **render_kwargs)
 
-        images = self._collect_media(messages, "image_url")
-        videos = self._collect_media(messages, "video_url")
-        audios = self._collect_media(messages, "audio_url")
+        images = collect_message_media_refs(messages, "image_url")
+        videos = collect_message_media_refs(messages, "video_url")
+        audios = collect_message_media_refs(messages, "audio_url")
 
         pixel_values = image_position_ids = None
         pixel_values_videos = video_position_ids = None
         input_features = input_features_mask = None
 
         if images:
-            loaded_images = [self._load_image(reference) for reference in images]
+            loaded_images = [load_image_pil(reference) for reference in images]
             pixel_values, image_position_ids, num_soft_tokens = self.preprocess_images(loaded_images)
             prompt = self._expand_image_placeholders(prompt, num_soft_tokens)
 
         if videos:
-            loaded_videos = [self._load_video(reference) for reference in videos]
+            loaded_videos = [load_video_frames(reference) for reference in videos]
             sampled_frames: list[list[Image.Image]] = []
             sampled_timestamps: list[list[float]] = []
             for frames, fps in loaded_videos:
@@ -598,82 +582,8 @@ class Gemma4TextProcessor:
             tensor_dtype=tensor_dtype,
         )
 
-    def _collect_media(self, messages: list[Any], part_type: str) -> list[Any]:
-        refs: list[Any] = []
-        for message in messages:
-            content = getattr(message, "content", None)
-            if content is None and isinstance(message, dict):
-                content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for item in content:
-                if hasattr(item, "type"):
-                    item_type = getattr(item, "type")
-                    value = getattr(item, part_type, None)
-                else:
-                    item_type = item.get("type")
-                    value = item.get(part_type)
-                if item_type == part_type:
-                    refs.append(value)
-        return refs
-
-    def _resolve_media_url(self, ref: Any) -> str:
-        if isinstance(ref, str):
-            return ref
-        if isinstance(ref, dict):
-            url = ref.get("url")
-            if not url:
-                raise ValueError("Media URL object is missing the 'url' field.")
-            return url
-        raise ValueError("Unsupported media reference format.")
-
-    def _read_bytes(self, media_ref: Any) -> bytes:
-        url = self._resolve_media_url(media_ref)
-        if url.startswith("data:"):
-            _, payload = url.split(",", 1)
-            return base64.b64decode(payload)
-        if url.startswith(("http://", "https://")):
-            with urllib.request.urlopen(url) as response:
-                return response.read()
-        return Path(url).read_bytes()
-
-    def _load_image(self, media_ref: Any) -> Image.Image:
-        return Image.open(io.BytesIO(self._read_bytes(media_ref))).convert("RGB")
-
-    def _load_video(self, media_ref: Any) -> tuple[list[Image.Image], float]:
-        try:
-            import imageio
-        except Exception as exc:  # pragma: no cover - dependency availability is environment-specific
-            raise RuntimeError("Video input requires imageio with ffmpeg support installed.") from exc
-
-        url = self._resolve_media_url(media_ref)
-        temp_path: str | None = None
-        if url.startswith(("http://", "https://", "data:")):
-            suffix = Path(urllib.parse.urlparse(url).path).suffix or ".mp4"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
-                handle.write(self._read_bytes(media_ref))
-                temp_path = handle.name
-            video_path = temp_path
-        else:
-            video_path = url
-
-        reader = None
-        try:
-            reader = imageio.get_reader(video_path, format="FFMPEG")
-            metadata = reader.get_meta_data()
-            fps = float(metadata.get("fps") or 24.0)
-            frames = [Image.fromarray(frame).convert("RGB") for frame in reader]
-        finally:
-            if reader is not None:
-                reader.close()
-            if temp_path is not None:
-                os.unlink(temp_path)
-        if not frames:
-            raise ValueError("Decoded video contained zero frames.")
-        return frames, fps
-
     def _load_audio(self, media_ref: Any) -> tuple[np.ndarray, int]:
-        audio_bytes = self._read_bytes(media_ref)
+        audio_bytes = read_media_bytes(media_ref)
         waveform, sampling_rate = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
         waveform = np.asarray(waveform, dtype=np.float32)
         if waveform.ndim == 2:

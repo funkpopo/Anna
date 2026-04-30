@@ -17,8 +17,10 @@ from anna.model.prefix_block_cache import PrefixBlockPool
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.model.turboquant import VALID_KV_CACHE_QUANT_BITS, TurboQuantKVRow
 from anna.model.fused_ops import (
+    loaded_fused_library_paths,
     run_causal_conv1d_decode_fused,
     run_causal_conv1d_prefill_fused,
+    run_flashqla_gated_delta_prefill,
     run_gated_delta_decode_fused,
     run_gated_delta_prefill_fused,
     run_gqa_decode_fused,
@@ -35,6 +37,7 @@ from anna.model.quantization import AWQLinear, AutoRoundGPTQLinear, XPUInt4Linea
 from anna.model.xpu_decode_profile import xpu_profile_region
 
 logger = logging.getLogger(__name__)
+_LOGGED_FLASHQLA_GDN_PREFILL = False
 
 
 def _compiler_disable(fn: Callable[..., object]) -> Callable[..., object]:
@@ -2249,6 +2252,22 @@ class Qwen3GatedDeltaNet(nn.Module):
         initial_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         seq_len = int(query.shape[1])
+        use_flashqla_prefill = os.environ.get("ANNA_XPU_FLASHQLA_GDN_PREFILL", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if use_flashqla_prefill and query.device.type != "xpu":
+            raise RuntimeError(
+                "ANNA_XPU_FLASHQLA_GDN_PREFILL=1 requires XPU tensors; "
+                f"got query.device={query.device}. This path does not fall back."
+            )
+        if use_flashqla_prefill and seq_len <= 1:
+            raise RuntimeError(
+                "ANNA_XPU_FLASHQLA_GDN_PREFILL=1 requires prefill seq_len > 1; "
+                f"got seq_len={seq_len}. This path does not fall back."
+            )
         if query.device.type == "xpu" and seq_len > 1:
             state = initial_state
             if state is None:
@@ -2256,6 +2275,26 @@ class Qwen3GatedDeltaNet(nn.Module):
                     (query.shape[0], self.recurrent_num_heads, self.head_k_dim, self.head_v_dim),
                     device=query.device,
                     dtype=torch.float32,
+                )
+            if use_flashqla_prefill:
+                global _LOGGED_FLASHQLA_GDN_PREFILL
+                if not _LOGGED_FLASHQLA_GDN_PREFILL:
+                    logger.info(
+                        "Enabled Intel FlashQLA-compatible GDN prefill: chunk_size=64 supported_dtypes=(float16,bfloat16) "
+                        "head_k_dim=%s head_v_dim=%s num_heads=%s fused_libraries=%s",
+                        self.head_k_dim,
+                        self.head_v_dim,
+                        self.recurrent_num_heads,
+                        loaded_fused_library_paths(),
+                    )
+                    _LOGGED_FLASHQLA_GDN_PREFILL = True
+                return run_flashqla_gated_delta_prefill(
+                    query=query,
+                    key=key,
+                    value=value,
+                    g=g,
+                    beta=beta,
+                    state=state,
                 )
             return run_gated_delta_prefill_fused(
                 query=query,

@@ -85,7 +85,7 @@ Arc int4 fused-kernel tuning knobs:
 - `ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE`: local size for grouped int4 MoE down projection (rounded up to a power of two, max 256).
 
 These default to the existing conservative choices. On Arc A770/A750, sweep these values with `tools/bench_xpu_hotspots.py --arc-profile`; add `--arc-int4-only` for focused int4 sweeps that skip the general attention/router hotspot suite. Use `--arc-int4-gemv-kernels wg,subgroup`, `--arc-int4-gemv-local-sizes 32,64,128`, and `--arc-int4-gemv-output-tiles 1,2,4` for repeatable standalone GEMV sweeps. The report includes ordinary `XPUInt4Linear`, `lm_head_int4_topk_fused`, and `moe_grouped_int4_mlp_fused` rows so kernel-local wins can be checked against decode-critical paths.
-For `anna-serve`, the SYCL int4 knobs can be supplied as CLI overrides: `--xpu-int4-matmul sycl --xpu-int4-gemv-kernel subgroup --xpu-int4-gemv-output-tile 4 --xpu-int4-gemv-local-size 128`. With `--xpu-int4-matmul sycl --xpu-int4-gemv-kernel subgroup`, Anna applies the tiled subgroup SYCL path to all `XPUInt4Linear` row counts, not just decode rows.
+For `anna-serve`, the SYCL int4 knobs can be supplied as CLI overrides: `--xpu-int4-matmul sycl --xpu-int4-gemv-kernel subgroup --xpu-int4-gemv-output-tile 4 --xpu-int4-gemv-local-size 128`. With `--xpu-int4-matmul sycl --xpu-int4-gemv-kernel subgroup`, Anna applies the tiled subgroup SYCL path to all `XPUInt4Linear` row counts, not just decode rows. The Intel FlashQLA-compatible GDN prefill path can also be enabled from the CLI with `--enable-flashqla-gdn-prefill`; this maps to `ANNA_XPU_FLASHQLA_GDN_PREFILL=1` and deliberately does not fall back if the op, device, dtype, or shape is unsupported.
 
 When runtime int4 converts `lm_head`, Anna also prepares a top-k-specific scale/zero layout (`[vocab, group_count]`) for `lm_head_int4_topk_fused`; ordinary linear layers keep the standard matmul layout.
 The XPU int4 sidecar cache also stores experimental decode layouts: GEMV subgroup tensors (`[output_tiles, packed_k, tile]` qweight plus tiled scale/zero) and, for `lm_head`, a tile-major qweight used by fused top-k. Older v1 cache files are ignored and rebuilt with the expanded payload.
@@ -109,6 +109,7 @@ anna-serve \
   --kv-cache-quantization turboquant \
   --kv-cache-quant-bits 4 \
   --weight-quant auto \
+  --enable-flashqla-gdn-prefill \
   --prompt-cache-size 4
 ```
 
@@ -158,6 +159,7 @@ anna-speak --model-dir /path/to/tts --input "Hello." --output out.wav --ref-audi
 | `--prompt-cache-size` | Keep up to **N** exact text prompts’ KV caches in memory for reuse. `0` = off. |
 | `--prompt-cache-max-tokens` | Only cache prompts up to **N** tokens (saves memory on long prompts). `0` = no limit. |
 | `--profile-runtime` | Log synchronized XPU timings / memory for prefill vs decode (profiling). |
+| `--enable-flashqla-gdn-prefill` | Enable the Intel FlashQLA-compatible GDN prefill path on XPU. Unsupported devices, shapes, dtypes, or missing custom ops raise immediately; there is no fallback. |
 | `--kv-cache-quantization` | `none` or `turboquant` (Qwen3.5 + Gemma4). |
 | `--kv-cache-quant-bits` | `2`, `3`, or `4` for TurboQuant. |
 | `--kv-cache-residual-len` | Keep the newest **N** KV positions in full precision before older entries are compressed. |
