@@ -277,7 +277,7 @@ def test_gemma4_processor_prepares_image_video_audio_inputs(tmp_path) -> None:
     assert prepared.input_features is not None
     assert prepared.input_features_mask is not None
     assert isinstance(prepared, PreparedInputs)
-    assert prepared.__class__.__module__ == "anna.mm.gemma4_text_processor"
+    assert prepared.__class__.__module__ == "anna.mm.prepared_inputs"
     assert (prepared.input_ids == tokenizer.image_token_id).any()
     assert (prepared.input_ids == tokenizer.video_token_id).any()
     assert (prepared.input_ids == tokenizer.audio_token_id).any()

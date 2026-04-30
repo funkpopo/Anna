@@ -39,6 +39,27 @@ def test_int4_fused_op_availability_respects_disable_flags(monkeypatch: pytest.M
     assert fused_ops.moe_grouped_int4_mlp_fused_is_available() is False
 
 
+def test_flashqla_gated_delta_wrapper_raises_without_registered_op(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(fused_ops, "_flashqla_gated_delta_op", lambda: None)
+    monkeypatch.setattr(fused_ops, "maybe_load_gated_delta_library", lambda: False)
+    query = torch.empty(1, 64, 1, 8, dtype=torch.float16)
+    key = torch.empty_like(query)
+    value = torch.empty_like(query)
+    g = torch.empty(1, 64, 1, dtype=torch.float32)
+    beta = torch.empty_like(g)
+    state = torch.empty(1, 1, 8, 8, dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="does not fall back"):
+        fused_ops.run_flashqla_gated_delta_prefill(
+            query=query,
+            key=key,
+            value=value,
+            g=g,
+            beta=beta,
+            state=state,
+        )
+
+
 def _reference_rmsnorm_ex(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1296,6 +1317,43 @@ def test_gated_delta_fused_xpu_matches_reference() -> None:
     torch.xpu.synchronize()
     assert torch.allclose(output.float().cpu(), ref_core.float().cpu(), atol=2e-2, rtol=2e-2)
     assert final_state is not None
+    assert torch.allclose(final_state.float().cpu(), ref_state.float().cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_flashqla_gated_delta_prefill_xpu_matches_reference() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "flashqla_gated_delta_prefill"):
+        pytest.skip("Anna fused-op library is not built with flashqla_gated_delta_prefill")
+
+    torch.manual_seed(11)
+    device = "xpu"
+    query = torch.randn(1, 64, 2, 16, device=device, dtype=torch.float16)
+    key = torch.randn(1, 64, 2, 16, device=device, dtype=torch.float16)
+    value = torch.randn(1, 64, 2, 16, device=device, dtype=torch.float16)
+    g = torch.randn(1, 64, 2, device=device, dtype=torch.float32)
+    beta = torch.sigmoid(torch.randn(1, 64, 2, device=device, dtype=torch.float32))
+    initial_state = torch.randn(1, 2, 16, 16, device=device, dtype=torch.float32)
+
+    output, final_state = torch.ops.anna.flashqla_gated_delta_prefill(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state,
+    )
+
+    ref_core, ref_state = torch_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+    torch.xpu.synchronize()
+    assert torch.allclose(output.float().cpu(), ref_core.float().cpu(), atol=2e-2, rtol=2e-2)
     assert torch.allclose(final_state.float().cpu(), ref_state.float().cpu(), atol=2e-2, rtol=2e-2)
 
 

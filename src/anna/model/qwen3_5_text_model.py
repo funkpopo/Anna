@@ -16,6 +16,7 @@ from anna.model.ops import (
     Qwen3RMSNorm,
     Qwen3SparseMoeBlock,
     Qwen3TextRotaryEmbedding,
+    _module_device,
     rotate_half,
 )
 from anna.model.fused_ops import (
@@ -67,13 +68,6 @@ class MultimodalModelOutput:
     past_key_values: Qwen3DynamicCache | None = None
     rope_deltas: torch.Tensor | None = None
 
-
-def _module_device(module: nn.Module) -> torch.device:
-    for parameter in module.parameters():
-        return parameter.device
-    for buffer in module.buffers():
-        return buffer.device
-    return torch.device("cpu")
 
 
 def _lm_head_topk(

@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from anna.api.schemas import ChatCompletionRequest, CompletionRequest, SpeechRequest
+from anna.core.format_utils import format_bytes
 from anna.runtime.qwen3_5_text_engine import (
     AnnaEngineError,
     GenerationConfig,
@@ -36,18 +37,6 @@ _STREAM_DONE = object()
 
 def _engine(request: Request):
     return request.app.state.engine
-
-
-def _format_bytes(num_bytes: int | None) -> str:
-    if num_bytes is None:
-        return "n/a"
-    units = ["B", "KiB", "MiB", "GiB", "TiB"]
-    value = float(num_bytes)
-    for unit in units:
-        if value < 1024.0 or unit == units[-1]:
-            return f"{value:.2f} {unit}"
-        value /= 1024.0
-    return f"{num_bytes} B"
 
 
 def _memory_snapshot(engine: object):
@@ -230,8 +219,8 @@ def _log_generation_result(
             result.completion_tokens,
             elapsed_seconds,
             total_tokens_per_second,
-            _format_bytes(None if memory_before is None else memory_before.free_bytes),
-            _format_bytes(None if memory_after is None else memory_after.free_bytes),
+            format_bytes(None if memory_before is None else memory_before.free_bytes),
+            format_bytes(None if memory_after is None else memory_after.free_bytes),
         )
         return
 
@@ -249,10 +238,10 @@ def _log_generation_result(
         perf.decode_tokens_per_second,
         perf.total_seconds,
         perf.total_tokens_per_second,
-        _format_bytes(None if memory_before is None else memory_before.free_bytes),
-        _format_bytes(None if memory_after is None else memory_after.free_bytes),
-        _format_bytes(None if memory_after is None else memory_after.allocated_bytes),
-        _format_bytes(None if memory_after is None else memory_after.reserved_bytes),
+        format_bytes(None if memory_before is None else memory_before.free_bytes),
+        format_bytes(None if memory_after is None else memory_after.free_bytes),
+        format_bytes(None if memory_after is None else memory_after.allocated_bytes),
+        format_bytes(None if memory_after is None else memory_after.reserved_bytes),
     )
 
 
@@ -836,8 +825,8 @@ def audio_speech(request: Request, payload: SpeechRequest):
         result.duration_seconds,
         result.sample_rate,
         elapsed_seconds,
-        _format_bytes(None if memory_before is None else memory_before.free_bytes),
-        _format_bytes(None if memory_after is None else memory_after.free_bytes),
+        format_bytes(None if memory_before is None else memory_before.free_bytes),
+        format_bytes(None if memory_after is None else memory_after.free_bytes),
     )
     audio_bytes, media_type = _encode_audio_bytes(
         result.audio,

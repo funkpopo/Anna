@@ -45,17 +45,11 @@ def _prepend_env_path(key: str, *paths: Path) -> None:
 
 
 def _write_runtime_paths(build_dir: Path, *paths: Path) -> None:
-    runtime_paths = []
-    seen: set[str] = set()
-    for path in paths:
-        if not path.exists():
-            continue
-        resolved = str(path.resolve())
-        if resolved in seen:
-            continue
-        runtime_paths.append(resolved)
-        seen.add(resolved)
-    (build_dir / "runtime_paths.txt").write_text("\n".join(runtime_paths) + "\n", encoding="utf-8")
+    unique_paths = _unique_existing_paths(*paths)
+    (build_dir / "runtime_paths.txt").write_text(
+        "\n".join(str(path) for path in unique_paths) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _resolve_command_path(candidate: str) -> Path | None:
@@ -384,6 +378,14 @@ def main() -> None:
     sys.path.insert(0, str(repo_root / "src"))
     from anna.model.fused_ops import (  # noqa: PLC0415
         causal_conv1d_fused_is_available,
+        flashqla_chunk_local_cumsum_is_available,
+        flashqla_chunk_gdr_fwd_is_available,
+        flashqla_gated_delta_fused_is_available,
+        flashqla_cumsum_kkt_build_is_available,
+        flashqla_kkt_build_is_available,
+        flashqla_kkt_solve_is_available,
+        flashqla_solve_wu_build_is_available,
+        flashqla_wu_build_is_available,
         gated_delta_fused_is_available,
         gqa_decode_fused_is_available,
         maybe_load_gated_delta_library,
@@ -415,6 +417,14 @@ def main() -> None:
     print(f"qk_norm_rotary_registered={qk_norm_rotary_fused_is_available()}")
     print(f"qk_norm_rotary_ex_registered={qk_norm_rotary_fused_ex_is_available()}")
     print(f"gated_delta_registered={gated_delta_fused_is_available()}")
+    print(f"flashqla_gated_delta_registered={flashqla_gated_delta_fused_is_available()}")
+    print(f"flashqla_chunk_local_cumsum_registered={flashqla_chunk_local_cumsum_is_available()}")
+    print(f"flashqla_cumsum_kkt_build_registered={flashqla_cumsum_kkt_build_is_available()}")
+    print(f"flashqla_kkt_build_registered={flashqla_kkt_build_is_available()}")
+    print(f"flashqla_kkt_solve_registered={flashqla_kkt_solve_is_available()}")
+    print(f"flashqla_wu_build_registered={flashqla_wu_build_is_available()}")
+    print(f"flashqla_solve_wu_build_registered={flashqla_solve_wu_build_is_available()}")
+    print(f"flashqla_chunk_gdr_fwd_registered={flashqla_chunk_gdr_fwd_is_available()}")
     print(f"causal_conv1d_registered={causal_conv1d_fused_is_available()}")
 
 

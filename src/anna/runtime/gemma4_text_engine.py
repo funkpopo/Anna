@@ -8,7 +8,9 @@ from pathlib import Path
 
 import torch
 
-from anna.mm.gemma4_text_processor import Gemma4TextProcessor, PreparedInputs
+from anna.core.format_utils import format_bytes
+from anna.mm.gemma4_text_processor import Gemma4TextProcessor
+from anna.mm.prepared_inputs import PreparedInputs
 from anna.model.gemma4_text_model import Gemma4DynamicCache, Gemma4ForConditionalGeneration
 from anna.model.quantization import convert_module_linears_to_xpu_int4
 from anna.model.turboquant import turboquant_is_available
@@ -16,7 +18,6 @@ from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.memory_release import release_conversion_artifacts
 from anna.runtime.qwen3_5_text_engine import (
     _DEFAULT_REASONING_FORMAT,
-    _format_bytes,
     AnnaQwen3_5TextEngine,
     EngineOptimizationConfig,
     ReasoningFormat,
@@ -426,8 +427,8 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             "Enabled Gemma4 auto prefill chunking on %s: chunk_size=%s estimated_bytes_per_token=%s target_budget=%s",
             self.device_context.device,
             resolved,
-            _format_bytes(estimated_bytes_per_token),
-            _format_bytes(target_chunk_budget),
+            format_bytes(estimated_bytes_per_token),
+            format_bytes(target_chunk_budget),
         )
         return resolved
 
