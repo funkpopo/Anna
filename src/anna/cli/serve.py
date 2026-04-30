@@ -89,6 +89,16 @@ def configure_int4_kernel_environment(args: argparse.Namespace) -> None:
         logger.info("Applied XPU int4 kernel CLI overrides: %s", applied)
 
 
+def configure_flashqla_environment(args: argparse.Namespace) -> None:
+    if not getattr(args, "enable_flashqla_gdn_prefill", False):
+        return
+    os.environ["ANNA_XPU_FLASHQLA_GDN_PREFILL"] = "1"
+    logger.info(
+        "Enabled Intel FlashQLA-compatible GDN prefill via CLI. "
+        "Unsupported devices, shapes, dtypes, or missing custom ops will raise without fallback."
+    )
+
+
 def _build_safety_policy(settings: ServeSettings) -> RuntimeSafetyPolicy | None:
     if (
         settings.min_free_memory_mib is None
@@ -209,6 +219,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile-runtime",
         action="store_true",
         help="Log synchronized XPU forward timings and memory stats for prefill/decode profiling.",
+    )
+    parser.add_argument(
+        "--enable-flashqla-gdn-prefill",
+        action="store_true",
+        help="Enable the Intel FlashQLA-compatible GDN prefill path on XPU. This path does not fall back: "
+        "unsupported shapes/dtypes/devices or missing custom ops raise immediately.",
     )
     parser.add_argument(
         "--kv-cache-quantization",
@@ -373,6 +389,7 @@ def main() -> None:
         no_xpu_env_defaults=args.no_xpu_env_defaults,
     )
     configure_int4_kernel_environment(args)
+    configure_flashqla_environment(args)
     model_dir = resolve_model_dir(args.model_dir)
     model_name = resolve_model_name(model_name=args.model_name, model_dir=model_dir)
     settings = ServeSettings(

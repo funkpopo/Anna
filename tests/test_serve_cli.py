@@ -11,6 +11,7 @@ from anna.cli.serve import (
     _build_scheduler,
     _log_available_routes,
     build_parser,
+    configure_flashqla_environment,
     configure_int4_kernel_environment,
 )
 from anna.core.config import ServeSettings
@@ -58,6 +59,7 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "4",
             "--xpu-int4-gemv-local-size",
             "128",
+            "--enable-flashqla-gdn-prefill",
             "--min-free-memory-mib",
             "256",
             "--reserve-memory-mib",
@@ -86,6 +88,7 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.xpu_int4_gemv_kernel == "subgroup"
     assert args.xpu_int4_gemv_output_tile == 4
     assert args.xpu_int4_gemv_local_size == 128
+    assert args.enable_flashqla_gdn_prefill is True
     assert args.min_free_memory_mib == 256
     assert args.reserve_memory_mib == 128
     assert args.max_estimated_usage_ratio == 0.95
@@ -142,6 +145,26 @@ def test_configure_int4_kernel_environment_defaults_to_torch_matmul(monkeypatch)
 
     assert os.environ["ANNA_XPU_INT4_MATMUL"] == "torch"
     assert os.environ["ANNA_XPU_INT4_GEMV_KERNEL"] == "subgroup"
+
+
+def test_configure_flashqla_environment_applies_cli_override(monkeypatch) -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--model-dir", "model", "--enable-flashqla-gdn-prefill"])
+    monkeypatch.delenv("ANNA_XPU_FLASHQLA_GDN_PREFILL", raising=False)
+
+    configure_flashqla_environment(args)
+
+    assert os.environ["ANNA_XPU_FLASHQLA_GDN_PREFILL"] == "1"
+
+
+def test_configure_flashqla_environment_preserves_existing_env_when_cli_omitted(monkeypatch) -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--model-dir", "model"])
+    monkeypatch.setenv("ANNA_XPU_FLASHQLA_GDN_PREFILL", "1")
+
+    configure_flashqla_environment(args)
+
+    assert os.environ["ANNA_XPU_FLASHQLA_GDN_PREFILL"] == "1"
 
 
 def test_serve_parser_defaults_to_direct_generation() -> None:

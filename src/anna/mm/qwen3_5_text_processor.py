@@ -1,38 +1,16 @@
 from __future__ import annotations
 
-import base64
-import io
 import math
-import os
-import tempfile
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 from PIL import Image
 
+from anna.mm.media_io import collect_message_media_refs, load_image_pil, load_video_frames
+from anna.mm.prepared_inputs import PreparedInputs
 from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig, VisionPreprocessorConfig
 from anna.weights.qwen3_5_text_tokenizer import Qwen3_5TextTokenizer
-
-
-@dataclass(slots=True)
-class PreparedInputs:
-    prompt: str
-    input_ids: torch.Tensor
-    attention_mask: torch.Tensor
-    mm_token_type_ids: torch.Tensor
-    pixel_values: torch.Tensor | None = None
-    image_position_ids: torch.Tensor | None = None
-    image_grid_thw: torch.Tensor | None = None
-    pixel_values_videos: torch.Tensor | None = None
-    video_position_ids: torch.Tensor | None = None
-    video_grid_thw: torch.Tensor | None = None
-    input_features: torch.Tensor | None = None
-    input_features_mask: torch.Tensor | None = None
 
 
 def smart_resize(height: int, width: int, factor: int, min_pixels: int, max_pixels: int) -> tuple[int, int]:
@@ -52,6 +30,9 @@ def smart_resize(height: int, width: int, factor: int, min_pixels: int, max_pixe
 
 
 class Qwen3_5TextMultimodalProcessor:
+    _load_image = staticmethod(load_image_pil)
+    _load_video = staticmethod(load_video_frames)
+
     def __init__(self, config: Qwen3_5TextModelConfig, tokenizer: Qwen3_5TextTokenizer):
         self.config = config
         self.tokenizer = tokenizer
@@ -92,19 +73,19 @@ class Qwen3_5TextMultimodalProcessor:
                 }
             )
         prompt = self.tokenizer.render_messages(messages, **render_kwargs)
-        images = self._collect_media(messages, "image_url")
-        videos = self._collect_media(messages, "video_url")
+        images = collect_message_media_refs(messages, "image_url")
+        videos = collect_message_media_refs(messages, "video_url")
         pixel_values = image_grid_thw = None
         pixel_values_videos = video_grid_thw = None
         video_fps: list[float] = []
 
         if images:
-            pil_images = [self._load_image(media_ref) for media_ref in images]
+            pil_images = [load_image_pil(media_ref) for media_ref in images]
             pixel_values, image_grid_thw = self.preprocess_images(pil_images)
             prompt = self._expand_image_placeholders(prompt, image_grid_thw)
 
         if videos:
-            decoded = [self._load_video(media_ref) for media_ref in videos]
+            decoded = [load_video_frames(media_ref) for media_ref in videos]
             video_frames = [frames for frames, _ in decoded]
             video_fps = [fps for _, fps in decoded]
             pixel_values_videos, video_grid_thw = self.preprocess_videos(video_frames)
@@ -168,80 +149,6 @@ class Qwen3_5TextMultimodalProcessor:
             pixel_values_videos=self._move_tensor(pixel_values_videos, device=resolved_device, dtype=tensor_dtype),
             video_grid_thw=self._move_tensor(video_grid_thw, device=resolved_device, dtype=torch.long),
         )
-
-    def _collect_media(self, messages: list[Any], part_type: str) -> list[Any]:
-        refs: list[Any] = []
-        for message in messages:
-            content = getattr(message, "content", None)
-            if content is None and isinstance(message, dict):
-                content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for item in content:
-                if hasattr(item, "type"):
-                    item_type = getattr(item, "type")
-                    value = getattr(item, part_type, None)
-                else:
-                    item_type = item.get("type")
-                    value = item.get(part_type)
-                if item_type == part_type:
-                    refs.append(value)
-        return refs
-
-    def _resolve_media_url(self, ref: Any) -> str:
-        if isinstance(ref, str):
-            return ref
-        if isinstance(ref, dict):
-            url = ref.get("url")
-            if not url:
-                raise ValueError("Media URL object is missing the 'url' field.")
-            return url
-        raise ValueError("Unsupported media reference format.")
-
-    def _read_bytes(self, media_ref: Any) -> bytes:
-        url = self._resolve_media_url(media_ref)
-        if url.startswith("data:"):
-            _, payload = url.split(",", 1)
-            return base64.b64decode(payload)
-        if url.startswith(("http://", "https://")):
-            with urllib.request.urlopen(url) as response:
-                return response.read()
-        return Path(url).read_bytes()
-
-    def _load_image(self, media_ref: Any) -> Image.Image:
-        return Image.open(io.BytesIO(self._read_bytes(media_ref))).convert("RGB")
-
-    def _load_video(self, media_ref: Any) -> tuple[list[Image.Image], float]:
-        try:
-            import imageio
-        except Exception as exc:  # pragma: no cover - dependency availability is environment-specific
-            raise RuntimeError("Video input requires imageio with ffmpeg support installed.") from exc
-
-        url = self._resolve_media_url(media_ref)
-        temp_path: str | None = None
-        if url.startswith(("http://", "https://", "data:")):
-            suffix = Path(urllib.parse.urlparse(url).path).suffix or ".mp4"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
-                handle.write(self._read_bytes(media_ref))
-                temp_path = handle.name
-            video_path = temp_path
-        else:
-            video_path = url
-
-        reader = None
-        try:
-            reader = imageio.get_reader(video_path, format="FFMPEG")
-            metadata = reader.get_meta_data()
-            fps = float(metadata.get("fps") or 24.0)
-            frames = [Image.fromarray(frame).convert("RGB") for frame in reader]
-        finally:
-            if reader is not None:
-                reader.close()
-            if temp_path is not None:
-                os.unlink(temp_path)
-        if not frames:
-            raise ValueError("Decoded video contained zero frames.")
-        return frames, fps
 
     def _resize_pil(self, image: Image.Image, resized_height: int, resized_width: int) -> Image.Image:
         return image.resize((resized_width, resized_height), resample=Image.Resampling.BICUBIC)

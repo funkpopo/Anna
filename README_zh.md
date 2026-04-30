@@ -85,7 +85,7 @@ Arc int4 fused kernel 调参开关：
 - `ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE`：grouped int4 MoE down projection 的 local size（会向上取 2 的幂，最大 256）。
 
 默认值保持当前保守策略。在 Arc A770/A750 上，建议先配合 `tools/bench_xpu_hotspots.py --arc-profile` 扫描这些值；需要专门扫 int4 时可加 `--arc-int4-only` 跳过 attention/router 等通用热点。可用 `--arc-int4-gemv-kernels wg,subgroup`、`--arc-int4-gemv-local-sizes 32,64,128` 和 `--arc-int4-gemv-output-tiles 1,2,4` 做可复现 standalone GEMV sweep。报告会同时包含普通 `XPUInt4Linear`、`lm_head_int4_topk_fused` 和 `moe_grouped_int4_mlp_fused` 行，便于确认局部 kernel 优化是否真的覆盖 decode 关键路径。
-`anna-serve` 可直接用 CLI 参数替代 SYCL int4 环境变量：`--xpu-int4-matmul sycl --xpu-int4-gemv-kernel subgroup --xpu-int4-gemv-output-tile 4 --xpu-int4-gemv-local-size 128`。当同时设置 `--xpu-int4-matmul sycl --xpu-int4-gemv-kernel subgroup` 时，Anna 会把 tiled subgroup SYCL 路径应用到所有 `XPUInt4Linear` row count，而不是只用于 decode rows。
+`anna-serve` 可直接用 CLI 参数替代 SYCL int4 环境变量：`--xpu-int4-matmul sycl --xpu-int4-gemv-kernel subgroup --xpu-int4-gemv-output-tile 4 --xpu-int4-gemv-local-size 128`。当同时设置 `--xpu-int4-matmul sycl --xpu-int4-gemv-kernel subgroup` 时，Anna 会把 tiled subgroup SYCL 路径应用到所有 `XPUInt4Linear` row count，而不是只用于 decode rows。Intel FlashQLA-compatible GDN prefill 也可以通过 CLI 启用：`--enable-flashqla-gdn-prefill`；它等价于设置 `ANNA_XPU_FLASHQLA_GDN_PREFILL=1`，并且在 op、设备、dtype 或 shape 不支持时会直接报错，不会 fallback。
 
 运行时 int4 转换 `lm_head` 时，Anna 还会额外准备面向 top-k 的 scale/zero 布局（`[vocab, group_count]`）供 `lm_head_int4_topk_fused` 使用；普通 linear 仍保持标准 matmul 布局。
 XPU int4 sidecar cache 也会保存实验性 decode layout：GEMV subgroup 的 tile-major qweight/scale/zero，以及 `lm_head` fused top-k 使用的 tile-major qweight。旧 v1 cache 会自动 miss 并按新 payload 重建。
@@ -109,6 +109,7 @@ anna-serve \
   --kv-cache-quantization turboquant \
   --kv-cache-quant-bits 4 \
   --weight-quant auto \
+  --enable-flashqla-gdn-prefill \
   --prompt-cache-size 4
 ```
 
@@ -160,6 +161,7 @@ anna-speak --model-dir /path/to/tts --input "你好。" --output out.wav --ref-a
 | `--prompt-cache-size` | 最多缓存 **N** 条**完全相同**的文本提示的 KV，便于重复请求。`0` 表示关闭。 |
 | `--prompt-cache-max-tokens` | 只缓存不超过 **N** 个 token 的提示，减轻长提示的内存压力。`0` 表示不设上限。 |
 | `--profile-runtime` | 打开预填 / 解码阶段的 XPU 同步计时与内存等剖析日志。 |
+| `--enable-flashqla-gdn-prefill` | 在 XPU 上启用 Intel FlashQLA-compatible GDN prefill 路径。设备、shape、dtype 或自定义 op 不支持时直接报错；不做 fallback。 |
 | `--kv-cache-quantization` | KV 量化：`none` 或 `turboquant`（Qwen3.5 与 Gemma4 支持）。 |
 | `--kv-cache-quant-bits` | TurboQuant 位宽：`2`、`3` 或 `4`。 |
 | `--kv-cache-residual-len` | 最近的 **N** 个 KV 位置保持高精度，更早的位置再压缩。 |
