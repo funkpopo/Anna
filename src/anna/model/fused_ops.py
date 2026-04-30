@@ -79,6 +79,62 @@ def _gated_delta_op():
     return getattr(namespace, "gated_delta_prefill", None)
 
 
+def _flashqla_gated_delta_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "flashqla_gated_delta_prefill", None)
+
+
+def _flashqla_chunk_local_cumsum_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "flashqla_chunk_local_cumsum", None)
+
+
+def _flashqla_kkt_build_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "flashqla_kkt_build", None)
+
+
+def _flashqla_cumsum_kkt_build_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "flashqla_cumsum_kkt_build", None)
+
+
+def _flashqla_kkt_solve_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "flashqla_kkt_solve_64", None)
+
+
+def _flashqla_wu_build_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "flashqla_wu_build", None)
+
+
+def _flashqla_solve_wu_build_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "flashqla_solve_wu_build", None)
+
+
+def _flashqla_chunk_gdr_fwd_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "flashqla_chunk_gdr_fwd", None)
+
+
 def _gqa_decode_op():
     namespace = getattr(torch.ops, "anna", None)
     if namespace is None:
@@ -241,6 +297,42 @@ def rmsnorm_gated_fused_is_available() -> bool:
 
 def gated_delta_fused_is_available() -> bool:
     return _gated_delta_op() is not None and _gated_delta_decode_op() is not None
+
+
+def flashqla_gated_delta_fused_is_available() -> bool:
+    return _flashqla_gated_delta_op() is not None
+
+
+def flashqla_chunk_local_cumsum_is_available() -> bool:
+    return _flashqla_chunk_local_cumsum_op() is not None
+
+
+def flashqla_kkt_build_is_available() -> bool:
+    return _flashqla_kkt_build_op() is not None
+
+
+def flashqla_cumsum_kkt_build_is_available() -> bool:
+    return _flashqla_cumsum_kkt_build_op() is not None
+
+
+def flashqla_kkt_solve_is_available() -> bool:
+    return _flashqla_kkt_solve_op() is not None
+
+
+def flashqla_wu_build_is_available() -> bool:
+    return _flashqla_wu_build_op() is not None
+
+
+def flashqla_solve_wu_build_is_available() -> bool:
+    return _flashqla_solve_wu_build_op() is not None
+
+
+def flashqla_chunk_gdr_fwd_is_available() -> bool:
+    return _flashqla_chunk_gdr_fwd_op() is not None
+
+
+def loaded_fused_library_paths() -> tuple[str, ...]:
+    return tuple(sorted(_LOADED_LIBRARIES))
 
 
 def causal_conv1d_fused_is_available() -> bool:
@@ -673,6 +765,165 @@ def run_gated_delta_prefill_fused(
             "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
         )
     return op(query, key, value, g, beta, state)
+
+
+def run_flashqla_gated_delta_prefill(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op = _flashqla_gated_delta_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _flashqla_gated_delta_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna flashqla_gated_delta_prefill op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path. This path does not fall back."
+        )
+    return op(query, key, value, g, beta, state)
+
+
+def run_flashqla_chunk_local_cumsum(
+    *,
+    g: torch.Tensor,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    op = _flashqla_chunk_local_cumsum_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _flashqla_chunk_local_cumsum_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna flashqla_chunk_local_cumsum op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path. This path does not fall back."
+        )
+    return op(g, int(chunk_size))
+
+
+def run_flashqla_kkt_build(
+    *,
+    key: torch.Tensor,
+    beta: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    op = _flashqla_kkt_build_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _flashqla_kkt_build_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna flashqla_kkt_build op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path. This path does not fall back."
+        )
+    return op(key, beta, g_cumsum, int(chunk_size))
+
+
+def run_flashqla_cumsum_kkt_build(
+    *,
+    key: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op = _flashqla_cumsum_kkt_build_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _flashqla_cumsum_kkt_build_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna flashqla_cumsum_kkt_build op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path. This path does not fall back."
+        )
+    return op(key, beta, g, int(chunk_size))
+
+
+def run_flashqla_kkt_solve(
+    *,
+    kkt: torch.Tensor,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    op = _flashqla_kkt_solve_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _flashqla_kkt_solve_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna flashqla_kkt_solve_64 op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path. This path does not fall back."
+        )
+    return op(kkt, int(chunk_size))
+
+
+def run_flashqla_wu_build(
+    *,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    beta: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    a: torch.Tensor,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op = _flashqla_wu_build_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _flashqla_wu_build_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna flashqla_wu_build op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path. This path does not fall back."
+        )
+    return op(key, value, beta, g_cumsum, a, int(chunk_size))
+
+
+def run_flashqla_solve_wu_build(
+    *,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    beta: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    kkt: torch.Tensor,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    op = _flashqla_solve_wu_build_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _flashqla_solve_wu_build_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna flashqla_solve_wu_build op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path. This path does not fall back."
+        )
+    return op(key, value, beta, g_cumsum, kkt, int(chunk_size))
+
+
+def run_flashqla_chunk_gdr_fwd(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    a: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    state: torch.Tensor,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op = _flashqla_chunk_gdr_fwd_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _flashqla_chunk_gdr_fwd_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna flashqla_chunk_gdr_fwd op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path. This path does not fall back."
+        )
+    return op(query, key, g_cumsum, a, w, u, state, int(chunk_size))
+
 
 def run_gated_delta_decode_fused(
     *,

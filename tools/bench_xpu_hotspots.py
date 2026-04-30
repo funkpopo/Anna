@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import contextlib
 import os
 import sys
@@ -13,7 +14,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from anna.model.fused_ops import maybe_load_gated_delta_library
-from anna.model.ops import apply_rotary_pos_emb, grouped_query_attention, repeat_kv
+from anna.model.ops import apply_rotary_pos_emb, grouped_query_attention, repeat_kv, torch_recurrent_gated_delta_rule
 from anna.model.quantization import XPUInt4Linear
 from anna.runtime.device import inspect_xpu_device
 
@@ -103,6 +104,48 @@ def _time_op(fn, *, warmup: int, iters: int) -> float:
             fn()
         torch.xpu.synchronize()
     return (time.perf_counter() - started_at) * 1000.0 / max(1, iters)
+
+
+def _benchmark_flashqla_gdn_prefill(
+    *,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    warmup: int,
+    iters: int,
+) -> tuple[float, float, float, float]:
+    query = torch.randn(batch_size, seq_len, num_heads, head_dim, device="xpu", dtype=dtype)
+    key = torch.randn(batch_size, seq_len, num_heads, head_dim, device="xpu", dtype=dtype)
+    value = torch.randn(batch_size, seq_len, num_heads, head_dim, device="xpu", dtype=dtype)
+    g = torch.randn(batch_size, seq_len, num_heads, device="xpu", dtype=torch.float32) * -0.1
+    beta = torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, device="xpu", dtype=torch.float32))
+    initial_state = torch.randn(batch_size, num_heads, head_dim, head_dim, device="xpu", dtype=torch.float32)
+
+    current = lambda: torch.ops.anna.gated_delta_prefill(query, key, value, g, beta, initial_state)
+    flashqla = lambda: torch.ops.anna.flashqla_gated_delta_prefill(query, key, value, g, beta, initial_state)
+    reference = lambda: torch_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+
+    current_ms = _time_op(current, warmup=warmup, iters=iters)
+    flashqla_output, flashqla_state = flashqla()
+    current_output, current_state = current()
+    reference_output, reference_state = reference()
+    flashqla_ms = _time_op(flashqla, warmup=warmup, iters=iters)
+    reference_ms = _time_op(reference, warmup=max(1, warmup // 10), iters=max(1, iters // 10))
+
+    output_diff = float((flashqla_output.float() - reference_output.float()).abs().max().item())
+    current_diff = float((current_output.float() - reference_output.float()).abs().max().item())
+    state_diff = float("inf") if reference_state is None else float((flashqla_state.float() - reference_state.float()).abs().max().item())
+    return current_ms, flashqla_ms, reference_ms, max(output_diff, current_diff, state_diff)
 
 
 def _benchmark_xpu_int4_linear(
@@ -752,6 +795,35 @@ def _format_speedup(baseline_ms: float, fused_ms: float) -> str:
     return f"{baseline_ms / fused_ms:.2f}x"
 
 
+def _append_benchmark_row(
+    rows: list[dict[str, str]],
+    *,
+    op: str,
+    baseline_ms: float | None,
+    fused_ms: float | None,
+    speedup: str,
+    max_abs_diff: float | None,
+) -> None:
+    rows.append(
+        {
+            "op": op,
+            "baseline_ms": "-" if baseline_ms is None else f"{baseline_ms:.4f}",
+            "fused_ms": "-" if fused_ms is None else f"{fused_ms:.4f}",
+            "speedup": speedup,
+            "max_abs_diff": "-" if max_abs_diff is None else f"{max_abs_diff:.6f}",
+        }
+    )
+
+
+def _write_benchmark_csv(path: str, rows: list[dict[str, str]]) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("op", "baseline_ms", "fused_ms", "speedup", "max_abs_diff"))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark current XPU hotspot ops and fused SYCL kernels.")
     parser.add_argument("--batch-size", type=int, default=1)
@@ -804,6 +876,12 @@ def main() -> None:
         type=str,
         default="wg",
         help="Comma-separated experimental GEMV kernel modes for sycl rows: wg or subgroup.",
+    )
+    parser.add_argument(
+        "--csv-output",
+        type=str,
+        default=None,
+        help="Write the general hotspot benchmark rows to this CSV file.",
     )
     args = parser.parse_args()
 
@@ -960,6 +1038,133 @@ def main() -> None:
             warmup=args.warmup,
             iters=args.iters,
         )
+        flashqla_gdn_profile: tuple[float, float, float, float] | None = None
+        if args.seq_len > 1 and args.seq_len % 64 == 0 and hasattr(torch.ops.anna, "flashqla_gated_delta_prefill"):
+            flashqla_gdn_profile = _benchmark_flashqla_gdn_prefill(
+                batch_size=args.batch_size,
+                seq_len=args.seq_len,
+                num_heads=args.num_heads,
+                head_dim=args.head_dim,
+                dtype=dtype,
+                warmup=args.warmup,
+                iters=args.iters,
+            )
+
+        benchmark_rows: list[dict[str, str]] = []
+        _append_benchmark_row(
+            benchmark_rows,
+            op="rmsnorm",
+            baseline_ms=rmsnorm_baseline_ms,
+            fused_ms=rmsnorm_fused_ms,
+            speedup=_format_speedup(rmsnorm_baseline_ms, rmsnorm_fused_ms),
+            max_abs_diff=rmsnorm_diff,
+        )
+        _append_benchmark_row(
+            benchmark_rows,
+            op="qk_norm_rotary",
+            baseline_ms=qk_baseline_ms,
+            fused_ms=qk_fused_ms,
+            speedup=_format_speedup(qk_baseline_ms, qk_fused_ms),
+            max_abs_diff=qk_diff,
+        )
+        _append_benchmark_row(
+            benchmark_rows,
+            op="repeat_kv_materialize",
+            baseline_ms=None,
+            fused_ms=repeat_kv_ms,
+            speedup="-",
+            max_abs_diff=None,
+        )
+        _append_benchmark_row(
+            benchmark_rows,
+            op="sdpa_gqa_prefill",
+            baseline_ms=sdpa_baseline_ms,
+            fused_ms=sdpa_gqa_ms,
+            speedup=_format_speedup(sdpa_baseline_ms, sdpa_gqa_ms),
+            max_abs_diff=sdpa_diff,
+        )
+        _append_benchmark_row(
+            benchmark_rows,
+            op="grouped_query_attention_decode",
+            baseline_ms=gqa_baseline_ms,
+            fused_ms=gqa_grouped_ms,
+            speedup=_format_speedup(gqa_baseline_ms, gqa_grouped_ms),
+            max_abs_diff=gqa_diff,
+        )
+        _append_benchmark_row(
+            benchmark_rows,
+            op="sdpa_gqa_decode_full_visible",
+            baseline_ms=decode_sdpa_baseline_ms,
+            fused_ms=decode_sdpa_gqa_ms,
+            speedup=_format_speedup(decode_sdpa_baseline_ms, decode_sdpa_gqa_ms),
+            max_abs_diff=decode_sdpa_gqa_diff,
+        )
+        _append_benchmark_row(
+            benchmark_rows,
+            op="sdpa_gqa_decode_variable_visible",
+            baseline_ms=decode_variable_baseline_ms,
+            fused_ms=decode_variable_gqa_ms,
+            speedup=_format_speedup(decode_variable_baseline_ms, decode_variable_gqa_ms),
+            max_abs_diff=decode_variable_gqa_diff,
+        )
+        _append_benchmark_row(
+            benchmark_rows,
+            op="gqa_decode_fused_proto",
+            baseline_ms=decode_baseline_ms,
+            fused_ms=decode_gqa_ms,
+            speedup=_format_speedup(decode_baseline_ms, decode_gqa_ms),
+            max_abs_diff=decode_gqa_diff,
+        )
+        _append_benchmark_row(
+            benchmark_rows,
+            op="gqa_decode_gate_3d_contiguous_vs_4d_query_layout",
+            baseline_ms=decode_gate_3d_ms,
+            fused_ms=decode_gate_4d_ms,
+            speedup=_format_speedup(decode_gate_3d_ms, decode_gate_4d_ms),
+            max_abs_diff=decode_gate_diff,
+        )
+        _append_benchmark_row(
+            benchmark_rows,
+            op="paged_gqa_decode_gate_3d_contiguous_vs_4d_query_layout",
+            baseline_ms=paged_decode_gate_3d_ms,
+            fused_ms=paged_decode_gate_4d_ms,
+            speedup=_format_speedup(paged_decode_gate_3d_ms, paged_decode_gate_4d_ms),
+            max_abs_diff=paged_decode_gate_diff,
+        )
+        _append_benchmark_row(
+            benchmark_rows,
+            op="moe_router",
+            baseline_ms=router_baseline_ms,
+            fused_ms=router_fused_ms,
+            speedup=_format_speedup(router_baseline_ms, router_fused_ms),
+            max_abs_diff=router_diff,
+        )
+        _append_benchmark_row(
+            benchmark_rows,
+            op=f"xpu_int4_linear_m{args.int4_m}_k{int4_k}_n{int4_n}_g{args.int4_group_size}",
+            baseline_ms=int4_baseline_ms,
+            fused_ms=int4_candidate_ms,
+            speedup=_format_speedup(int4_baseline_ms, int4_candidate_ms),
+            max_abs_diff=int4_diff,
+        )
+        if flashqla_gdn_profile is not None:
+            current_ms, flashqla_ms, reference_ms, diff = flashqla_gdn_profile
+            _append_benchmark_row(
+                benchmark_rows,
+                op="flashqla_gdn_prefill_current_vs_intel_flashqla",
+                baseline_ms=current_ms,
+                fused_ms=flashqla_ms,
+                speedup=_format_speedup(current_ms, flashqla_ms),
+                max_abs_diff=diff,
+            )
+            _append_benchmark_row(
+                benchmark_rows,
+                op="flashqla_gdn_prefill_reference",
+                baseline_ms=None,
+                fused_ms=reference_ms,
+                speedup="-",
+                max_abs_diff=None,
+            )
 
         print("op,baseline_ms,fused_ms,speedup,max_abs_diff")
         print(
@@ -1008,6 +1213,16 @@ def main() -> None:
             f"{int4_baseline_ms:.4f},{int4_candidate_ms:.4f},"
             f"{_format_speedup(int4_baseline_ms, int4_candidate_ms)},{int4_diff:.6f}"
         )
+        if flashqla_gdn_profile is not None:
+            current_ms, flashqla_ms, reference_ms, diff = flashqla_gdn_profile
+            print(
+                f"flashqla_gdn_prefill_current_vs_intel_flashqla,{current_ms:.4f},{flashqla_ms:.4f},"
+                f"{_format_speedup(current_ms, flashqla_ms)},{diff:.6f}"
+            )
+            print(f"flashqla_gdn_prefill_reference,-,{reference_ms:.4f},-,-")
+        if args.csv_output is not None:
+            _write_benchmark_csv(args.csv_output, benchmark_rows)
+            print(f"csv_output={args.csv_output}")
     if args.arc_profile:
         print(
             "arc_int4_profile,device_name,strategy,M,K,N,group_size,dtype,gemv_kernel,gemv_local_size,gemv_output_tile,"
