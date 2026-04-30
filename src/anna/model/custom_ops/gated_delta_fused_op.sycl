@@ -19,6 +19,45 @@ namespace anna {
 
 namespace {
 
+at::Tensor flashqla_chunk_local_cumsum_xpu(const at::Tensor& g_in, int64_t chunk_size);
+std::tuple<at::Tensor, at::Tensor> flashqla_normalize_qk_xpu(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in);
+at::Tensor flashqla_kkt_build_xpu(
+    const at::Tensor& key_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_cumsum_in,
+    int64_t chunk_size);
+std::tuple<at::Tensor, at::Tensor> flashqla_cumsum_kkt_build_xpu(
+    const at::Tensor& key_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_in,
+    int64_t chunk_size);
+at::Tensor flashqla_kkt_solve_xpu(const at::Tensor& kkt_in, int64_t chunk_size);
+std::tuple<at::Tensor, at::Tensor> flashqla_wu_build_xpu(
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_cumsum_in,
+    const at::Tensor& a_in,
+    int64_t chunk_size);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> flashqla_solve_wu_build_xpu(
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_cumsum_in,
+    const at::Tensor& kkt_in,
+    int64_t chunk_size);
+std::tuple<at::Tensor, at::Tensor> flashqla_chunk_gdr_fwd_xpu(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& g_cumsum_in,
+    const at::Tensor& a_in,
+    const at::Tensor& w_in,
+    const at::Tensor& u_in,
+    const at::Tensor& state_in,
+    int64_t chunk_size);
+
 void validate_gated_delta_inputs(
     const at::Tensor& query_in,
     const at::Tensor& key_in,
@@ -3752,6 +3791,229 @@ std::tuple<at::Tensor, at::Tensor> gated_delta_prefill_meta(
   return {output, final_state};
 }
 
+std::tuple<at::Tensor, at::Tensor> flashqla_gated_delta_prefill_meta(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& g_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& state_in) {
+  validate_gated_delta_inputs(query_in, key_in, value_in, g_in, beta_in, state_in);
+  TORCH_CHECK(query_in.size(1) > 1, "flashqla_gated_delta_prefill expects seq_len > 1");
+  TORCH_CHECK(
+      query_in.scalar_type() == at::kHalf || query_in.scalar_type() == at::kBFloat16,
+      "flashqla_gated_delta_prefill supports float16 and bfloat16 query/key/value inputs");
+  auto meta_options = query_in.options().device(c10::Device(c10::DeviceType::Meta));
+  auto output = at::empty(
+      {query_in.size(0), query_in.size(1), query_in.size(2), value_in.size(3)},
+      meta_options);
+  auto final_state = at::empty(state_in.sizes(), meta_options.dtype(at::kFloat));
+  return {output, final_state};
+}
+
+void validate_flashqla_chunk_local_cumsum_inputs(const at::Tensor& g_in, int64_t chunk_size) {
+  TORCH_CHECK(g_in.dim() == 3, "flashqla_chunk_local_cumsum expects g to be [batch, seq_len, heads]");
+  TORCH_CHECK(g_in.scalar_type() == at::kFloat, "flashqla_chunk_local_cumsum expects float32 g");
+  TORCH_CHECK(g_in.is_contiguous(), "flashqla_chunk_local_cumsum expects contiguous g");
+  TORCH_CHECK(chunk_size == 64, "flashqla_chunk_local_cumsum currently requires chunk_size=64");
+  TORCH_CHECK(g_in.size(1) > 0, "flashqla_chunk_local_cumsum expects seq_len > 0");
+  TORCH_CHECK(g_in.size(2) > 0, "flashqla_chunk_local_cumsum expects heads > 0");
+}
+
+at::Tensor flashqla_chunk_local_cumsum_meta(const at::Tensor& g_in, int64_t chunk_size) {
+  validate_flashqla_chunk_local_cumsum_inputs(g_in, chunk_size);
+  return at::empty(g_in.sizes(), g_in.options().device(c10::Device(c10::DeviceType::Meta)));
+}
+
+void validate_flashqla_kkt_build_inputs(
+    const at::Tensor& key_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_cumsum_in,
+    int64_t chunk_size) {
+  TORCH_CHECK(key_in.dim() == 4, "flashqla_kkt_build expects key to be [batch, seq_len, heads, head_dim]");
+  TORCH_CHECK(beta_in.dim() == 3, "flashqla_kkt_build expects beta to be [batch, seq_len, heads]");
+  TORCH_CHECK(g_cumsum_in.dim() == 3, "flashqla_kkt_build expects g_cumsum to be [batch, seq_len, heads]");
+  TORCH_CHECK(beta_in.sizes() == g_cumsum_in.sizes(), "flashqla_kkt_build beta/g_cumsum shape mismatch");
+  TORCH_CHECK(key_in.size(0) == beta_in.size(0), "flashqla_kkt_build key/beta batch size mismatch");
+  TORCH_CHECK(key_in.size(1) == beta_in.size(1), "flashqla_kkt_build key/beta seq_len mismatch");
+  TORCH_CHECK(key_in.size(2) == beta_in.size(2), "flashqla_kkt_build key/beta head count mismatch");
+  TORCH_CHECK(key_in.size(3) > 0, "flashqla_kkt_build head_dim must be positive");
+  TORCH_CHECK(
+      key_in.scalar_type() == at::kHalf || key_in.scalar_type() == at::kBFloat16 || key_in.scalar_type() == at::kFloat,
+      "flashqla_kkt_build supports float16, bfloat16, and float32 key inputs");
+  TORCH_CHECK(beta_in.scalar_type() == at::kFloat, "flashqla_kkt_build expects float32 beta");
+  TORCH_CHECK(g_cumsum_in.scalar_type() == at::kFloat, "flashqla_kkt_build expects float32 g_cumsum");
+  TORCH_CHECK(key_in.is_contiguous(), "flashqla_kkt_build expects contiguous key");
+  TORCH_CHECK(beta_in.is_contiguous(), "flashqla_kkt_build expects contiguous beta");
+  TORCH_CHECK(g_cumsum_in.is_contiguous(), "flashqla_kkt_build expects contiguous g_cumsum");
+  TORCH_CHECK(chunk_size == 64, "flashqla_kkt_build currently requires chunk_size=64");
+  TORCH_CHECK(key_in.size(1) > 0, "flashqla_kkt_build expects seq_len > 0");
+}
+
+at::Tensor flashqla_kkt_build_meta(
+    const at::Tensor& key_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_cumsum_in,
+    int64_t chunk_size) {
+  validate_flashqla_kkt_build_inputs(key_in, beta_in, g_cumsum_in, chunk_size);
+  auto meta_options = key_in.options().device(c10::Device(c10::DeviceType::Meta)).dtype(at::kFloat);
+  return at::empty({key_in.size(0), key_in.size(1), key_in.size(2), chunk_size}, meta_options);
+}
+
+std::tuple<at::Tensor, at::Tensor> flashqla_cumsum_kkt_build_meta(
+    const at::Tensor& key_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_in,
+    int64_t chunk_size) {
+  validate_flashqla_chunk_local_cumsum_inputs(g_in, chunk_size);
+  validate_flashqla_kkt_build_inputs(key_in, beta_in, g_in, chunk_size);
+  auto float_meta_options = key_in.options().device(c10::Device(c10::DeviceType::Meta)).dtype(at::kFloat);
+  auto g_cumsum = at::empty(g_in.sizes(), float_meta_options);
+  auto kkt = at::empty({key_in.size(0), key_in.size(1), key_in.size(2), chunk_size}, float_meta_options);
+  return {g_cumsum, kkt};
+}
+
+void validate_flashqla_kkt_solve_inputs(const at::Tensor& kkt_in, int64_t chunk_size) {
+  TORCH_CHECK(kkt_in.dim() == 4, "flashqla_kkt_solve_64 expects kkt to be [batch, seq_len, heads, chunk_size]");
+  TORCH_CHECK(kkt_in.scalar_type() == at::kFloat, "flashqla_kkt_solve_64 expects float32 kkt");
+  TORCH_CHECK(kkt_in.is_contiguous(), "flashqla_kkt_solve_64 expects contiguous kkt");
+  TORCH_CHECK(chunk_size == 64, "flashqla_kkt_solve_64 currently requires chunk_size=64");
+  TORCH_CHECK(kkt_in.size(1) > 0, "flashqla_kkt_solve_64 expects seq_len > 0");
+  TORCH_CHECK(kkt_in.size(2) > 0, "flashqla_kkt_solve_64 expects heads > 0");
+  TORCH_CHECK(kkt_in.size(3) == chunk_size, "flashqla_kkt_solve_64 last dimension must equal chunk_size");
+}
+
+at::Tensor flashqla_kkt_solve_meta(const at::Tensor& kkt_in, int64_t chunk_size) {
+  validate_flashqla_kkt_solve_inputs(kkt_in, chunk_size);
+  return at::empty(kkt_in.sizes(), kkt_in.options().device(c10::Device(c10::DeviceType::Meta)));
+}
+
+void validate_flashqla_wu_build_inputs(
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_cumsum_in,
+    const at::Tensor& a_in,
+    int64_t chunk_size) {
+  validate_flashqla_kkt_build_inputs(key_in, beta_in, g_cumsum_in, chunk_size);
+  TORCH_CHECK(value_in.dim() == 4, "flashqla_wu_build expects value to be [batch, seq_len, heads, value_dim]");
+  TORCH_CHECK(value_in.size(0) == key_in.size(0), "flashqla_wu_build key/value batch size mismatch");
+  TORCH_CHECK(value_in.size(1) == key_in.size(1), "flashqla_wu_build key/value seq_len mismatch");
+  TORCH_CHECK(value_in.size(2) == key_in.size(2), "flashqla_wu_build key/value head count mismatch");
+  TORCH_CHECK(value_in.size(3) > 0, "flashqla_wu_build value_dim must be positive");
+  TORCH_CHECK(
+      value_in.scalar_type() == at::kHalf || value_in.scalar_type() == at::kBFloat16 || value_in.scalar_type() == at::kFloat,
+      "flashqla_wu_build supports float16, bfloat16, and float32 value inputs");
+  TORCH_CHECK(value_in.scalar_type() == key_in.scalar_type(), "flashqla_wu_build key/value dtype mismatch");
+  TORCH_CHECK(value_in.is_contiguous(), "flashqla_wu_build expects contiguous value");
+  TORCH_CHECK(a_in.dim() == 4, "flashqla_wu_build expects A to be [batch, seq_len, heads, chunk_size]");
+  TORCH_CHECK(a_in.size(0) == key_in.size(0), "flashqla_wu_build A/key batch size mismatch");
+  TORCH_CHECK(a_in.size(1) == key_in.size(1), "flashqla_wu_build A/key seq_len mismatch");
+  TORCH_CHECK(a_in.size(2) == key_in.size(2), "flashqla_wu_build A/key head count mismatch");
+  TORCH_CHECK(a_in.size(3) == chunk_size, "flashqla_wu_build A last dimension must equal chunk_size");
+  TORCH_CHECK(a_in.scalar_type() == at::kFloat, "flashqla_wu_build expects float32 A");
+  TORCH_CHECK(a_in.is_contiguous(), "flashqla_wu_build expects contiguous A");
+}
+
+std::tuple<at::Tensor, at::Tensor> flashqla_wu_build_meta(
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_cumsum_in,
+    const at::Tensor& a_in,
+    int64_t chunk_size) {
+  validate_flashqla_wu_build_inputs(key_in, value_in, beta_in, g_cumsum_in, a_in, chunk_size);
+  auto meta_options = key_in.options().device(c10::Device(c10::DeviceType::Meta)).dtype(at::kFloat);
+  auto w = at::empty(key_in.sizes(), meta_options);
+  auto u = at::empty(value_in.sizes(), meta_options);
+  return {w, u};
+}
+
+void validate_flashqla_solve_wu_build_inputs(
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_cumsum_in,
+    const at::Tensor& kkt_in,
+    int64_t chunk_size) {
+  validate_flashqla_kkt_solve_inputs(kkt_in, chunk_size);
+  validate_flashqla_kkt_build_inputs(key_in, beta_in, g_cumsum_in, chunk_size);
+  TORCH_CHECK(value_in.dim() == 4, "flashqla_solve_wu_build expects value to be [batch, seq_len, heads, value_dim]");
+  TORCH_CHECK(value_in.size(0) == key_in.size(0), "flashqla_solve_wu_build key/value batch size mismatch");
+  TORCH_CHECK(value_in.size(1) == key_in.size(1), "flashqla_solve_wu_build key/value seq_len mismatch");
+  TORCH_CHECK(value_in.size(2) == key_in.size(2), "flashqla_solve_wu_build key/value head count mismatch");
+  TORCH_CHECK(value_in.size(3) > 0, "flashqla_solve_wu_build value_dim must be positive");
+  TORCH_CHECK(kkt_in.size(0) == key_in.size(0) && kkt_in.size(1) == key_in.size(1) && kkt_in.size(2) == key_in.size(2), "flashqla_solve_wu_build KKT/key shape mismatch");
+  TORCH_CHECK(
+      value_in.scalar_type() == at::kHalf || value_in.scalar_type() == at::kBFloat16 || value_in.scalar_type() == at::kFloat,
+      "flashqla_solve_wu_build supports float16, bfloat16, and float32 value inputs");
+  TORCH_CHECK(value_in.scalar_type() == key_in.scalar_type(), "flashqla_solve_wu_build key/value dtype mismatch");
+  TORCH_CHECK(value_in.is_contiguous(), "flashqla_solve_wu_build expects contiguous value");
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> flashqla_solve_wu_build_meta(
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_cumsum_in,
+    const at::Tensor& kkt_in,
+    int64_t chunk_size) {
+  validate_flashqla_solve_wu_build_inputs(key_in, value_in, beta_in, g_cumsum_in, kkt_in, chunk_size);
+  auto meta_options = key_in.options().device(c10::Device(c10::DeviceType::Meta)).dtype(at::kFloat);
+  auto a = at::empty(kkt_in.sizes(), meta_options);
+  auto w = at::empty(key_in.sizes(), meta_options);
+  auto u = at::empty(value_in.sizes(), meta_options);
+  return {a, w, u};
+}
+
+void validate_flashqla_chunk_gdr_fwd_inputs(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& g_cumsum_in,
+    const at::Tensor& a_in,
+    const at::Tensor& w_in,
+    const at::Tensor& u_in,
+    const at::Tensor& state_in,
+    int64_t chunk_size) {
+  TORCH_CHECK(query_in.dim() == 4, "flashqla_chunk_gdr_fwd expects query to be [batch, seq_len, heads, key_dim]");
+  TORCH_CHECK(key_in.sizes() == query_in.sizes(), "flashqla_chunk_gdr_fwd query/key shape mismatch");
+  TORCH_CHECK(w_in.sizes() == query_in.sizes(), "flashqla_chunk_gdr_fwd query/W shape mismatch");
+  TORCH_CHECK(u_in.dim() == 4, "flashqla_chunk_gdr_fwd expects U to be [batch, seq_len, heads, value_dim]");
+  TORCH_CHECK(u_in.size(0) == query_in.size(0), "flashqla_chunk_gdr_fwd U/query batch size mismatch");
+  TORCH_CHECK(u_in.size(1) == query_in.size(1), "flashqla_chunk_gdr_fwd U/query seq_len mismatch");
+  TORCH_CHECK(u_in.size(2) == query_in.size(2), "flashqla_chunk_gdr_fwd U/query head count mismatch");
+  TORCH_CHECK(g_cumsum_in.size(0) == query_in.size(0) && g_cumsum_in.size(1) == query_in.size(1) && g_cumsum_in.size(2) == query_in.size(2), "flashqla_chunk_gdr_fwd g_cumsum shape mismatch");
+  TORCH_CHECK(a_in.size(0) == query_in.size(0) && a_in.size(1) == query_in.size(1) && a_in.size(2) == query_in.size(2) && a_in.size(3) == chunk_size, "flashqla_chunk_gdr_fwd A shape mismatch");
+  TORCH_CHECK(state_in.size(0) == query_in.size(0) && state_in.size(1) == query_in.size(2) && state_in.size(2) == query_in.size(3) && state_in.size(3) == u_in.size(3), "flashqla_chunk_gdr_fwd state shape mismatch");
+  TORCH_CHECK(query_in.scalar_type() == key_in.scalar_type(), "flashqla_chunk_gdr_fwd query/key dtype mismatch");
+  TORCH_CHECK(query_in.scalar_type() == at::kHalf || query_in.scalar_type() == at::kBFloat16 || query_in.scalar_type() == at::kFloat, "flashqla_chunk_gdr_fwd supports float16, bfloat16, and float32 query/key inputs");
+  TORCH_CHECK(g_cumsum_in.scalar_type() == at::kFloat, "flashqla_chunk_gdr_fwd expects float32 g_cumsum");
+  TORCH_CHECK(a_in.scalar_type() == at::kFloat, "flashqla_chunk_gdr_fwd expects float32 A");
+  TORCH_CHECK(w_in.scalar_type() == at::kFloat, "flashqla_chunk_gdr_fwd expects float32 W");
+  TORCH_CHECK(u_in.scalar_type() == at::kFloat, "flashqla_chunk_gdr_fwd expects float32 U");
+  TORCH_CHECK(state_in.scalar_type() == at::kFloat, "flashqla_chunk_gdr_fwd expects float32 state");
+  TORCH_CHECK(query_in.is_contiguous() && key_in.is_contiguous() && g_cumsum_in.is_contiguous(), "flashqla_chunk_gdr_fwd expects contiguous query/key/g_cumsum");
+  TORCH_CHECK(a_in.is_contiguous() && w_in.is_contiguous() && u_in.is_contiguous() && state_in.is_contiguous(), "flashqla_chunk_gdr_fwd expects contiguous A/W/U/state");
+  TORCH_CHECK(chunk_size == 64, "flashqla_chunk_gdr_fwd currently requires chunk_size=64");
+  TORCH_CHECK(query_in.size(3) <= 256, "flashqla_chunk_gdr_fwd currently supports key_dim <= 256");
+  TORCH_CHECK(query_in.size(1) > 0, "flashqla_chunk_gdr_fwd expects seq_len > 0");
+}
+
+std::tuple<at::Tensor, at::Tensor> flashqla_chunk_gdr_fwd_meta(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& g_cumsum_in,
+    const at::Tensor& a_in,
+    const at::Tensor& w_in,
+    const at::Tensor& u_in,
+    const at::Tensor& state_in,
+    int64_t chunk_size) {
+  validate_flashqla_chunk_gdr_fwd_inputs(query_in, key_in, g_cumsum_in, a_in, w_in, u_in, state_in, chunk_size);
+  auto output = at::empty(u_in.sizes(), query_in.options().device(c10::Device(c10::DeviceType::Meta)));
+  auto final_state = at::empty(state_in.sizes(), state_in.options().device(c10::Device(c10::DeviceType::Meta)));
+  return {output, final_state};
+}
+
 at::Tensor gated_delta_decode_meta(
     const at::Tensor& query_in,
     const at::Tensor& key_in,
@@ -4009,6 +4271,967 @@ std::tuple<at::Tensor, at::Tensor> gated_delta_prefill_xpu(
   return {output, final_state};
 }
 
+std::tuple<at::Tensor, at::Tensor> flashqla_gated_delta_prefill_xpu(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& g_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& state_in) {
+  validate_gated_delta_inputs(query_in, key_in, value_in, g_in, beta_in, state_in);
+  validate_gated_delta_xpu_inputs(query_in, key_in, value_in, g_in, beta_in, state_in);
+  TORCH_CHECK(query_in.size(1) > 1, "flashqla_gated_delta_prefill expects seq_len > 1");
+  TORCH_CHECK(
+      query_in.scalar_type() == at::kHalf || query_in.scalar_type() == at::kBFloat16,
+      "flashqla_gated_delta_prefill supports float16 and bfloat16 query/key/value inputs");
+  const int64_t chunk_size = 64;
+  auto normalized_qk = flashqla_normalize_qk_xpu(query_in, key_in);
+  auto normalized_query = std::get<0>(normalized_qk);
+  auto normalized_key = std::get<1>(normalized_qk);
+  auto cumsum_kkt = flashqla_cumsum_kkt_build_xpu(normalized_key, beta_in, g_in, chunk_size);
+  auto g_cumsum = std::get<0>(cumsum_kkt);
+  auto kkt = std::get<1>(cumsum_kkt);
+  auto a = flashqla_kkt_solve_xpu(kkt, chunk_size);
+  auto wu = flashqla_wu_build_xpu(normalized_key, value_in, beta_in, g_cumsum, a, chunk_size);
+  return flashqla_chunk_gdr_fwd_xpu(
+      normalized_query,
+      normalized_key,
+      g_cumsum,
+      a,
+      std::get<0>(wu),
+      std::get<1>(wu),
+      state_in,
+      chunk_size);
+}
+
+void launch_flashqla_chunk_local_cumsum_kernel(
+    sycl::queue& queue,
+    const float* g_ptr,
+    float* output_ptr,
+    int64_t batch_size,
+    int64_t sequence_length,
+    int64_t num_heads,
+    int64_t chunk_size) {
+  const int64_t num_chunks = (sequence_length + chunk_size - 1) / chunk_size;
+  const int64_t total_work = batch_size * num_heads * num_chunks;
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_work)), [=](sycl::item<1> item) {
+      const int64_t linear_idx = static_cast<int64_t>(item.get_id(0));
+      const int64_t chunk_idx = linear_idx % num_chunks;
+      const int64_t bh = linear_idx / num_chunks;
+      const int64_t h = bh % num_heads;
+      const int64_t b = bh / num_heads;
+      const int64_t chunk_start = chunk_idx * chunk_size;
+      const int64_t chunk_end = sycl::min<int64_t>(sequence_length, chunk_start + chunk_size);
+      float acc = 0.0f;
+      for (int64_t t = chunk_start; t < chunk_end; ++t) {
+        const int64_t offset = (b * sequence_length + t) * num_heads + h;
+        acc += g_ptr[offset];
+        output_ptr[offset] = acc;
+      }
+    });
+  });
+}
+
+at::Tensor flashqla_chunk_local_cumsum_xpu(const at::Tensor& g_in, int64_t chunk_size) {
+  validate_flashqla_chunk_local_cumsum_inputs(g_in, chunk_size);
+  TORCH_CHECK(g_in.device().type() == c10::DeviceType::XPU, "flashqla_chunk_local_cumsum expects an XPU tensor");
+  auto output = at::empty_like(g_in);
+  auto stream = c10::xpu::getCurrentXPUStream(g_in.device().index());
+  launch_flashqla_chunk_local_cumsum_kernel(
+      stream.queue(),
+      g_in.const_data_ptr<float>(),
+      output.mutable_data_ptr<float>(),
+      g_in.size(0),
+      g_in.size(1),
+      g_in.size(2),
+      chunk_size);
+  return output;
+}
+
+template <typename scalar_t>
+void launch_flashqla_normalize_qk_kernel(
+    sycl::queue& queue,
+    const scalar_t* query_ptr,
+    const scalar_t* key_ptr,
+    scalar_t* query_out_ptr,
+    scalar_t* key_out_ptr,
+    int64_t total_rows,
+    int64_t head_dim) {
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_rows)), [=](sycl::item<1> item) {
+      const int64_t row = static_cast<int64_t>(item.get_id(0));
+      const int64_t base = row * head_dim;
+      float query_sum = 0.0f;
+      float key_sum = 0.0f;
+      for (int64_t k = 0; k < head_dim; ++k) {
+        const float q = load_as_float(query_ptr, base + k);
+        const float key = load_as_float(key_ptr, base + k);
+        query_sum += q * q;
+        key_sum += key * key;
+      }
+      const float query_scale = sycl::rsqrt(query_sum + 1e-6f);
+      const float key_scale = sycl::rsqrt(key_sum + 1e-6f);
+      for (int64_t k = 0; k < head_dim; ++k) {
+        query_out_ptr[base + k] = static_cast<scalar_t>(load_as_float(query_ptr, base + k) * query_scale);
+        key_out_ptr[base + k] = static_cast<scalar_t>(load_as_float(key_ptr, base + k) * key_scale);
+      }
+    });
+  });
+}
+
+std::tuple<at::Tensor, at::Tensor> flashqla_normalize_qk_xpu(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in) {
+  TORCH_CHECK(query_in.dim() == 4, "flashqla_normalize_qk expects query to be [batch, seq_len, heads, head_dim]");
+  TORCH_CHECK(key_in.sizes() == query_in.sizes(), "flashqla_normalize_qk query/key shape mismatch");
+  TORCH_CHECK(query_in.device().type() == c10::DeviceType::XPU, "flashqla_normalize_qk expects an XPU query tensor");
+  TORCH_CHECK(key_in.device() == query_in.device(), "flashqla_normalize_qk key must share query device");
+  TORCH_CHECK(query_in.scalar_type() == key_in.scalar_type(), "flashqla_normalize_qk query/key dtype mismatch");
+  TORCH_CHECK(query_in.is_contiguous() && key_in.is_contiguous(), "flashqla_normalize_qk expects contiguous query/key");
+  auto query_out = at::empty_like(query_in);
+  auto key_out = at::empty_like(key_in);
+  auto stream = c10::xpu::getCurrentXPUStream(query_in.device().index());
+  const int64_t total_rows = query_in.size(0) * query_in.size(1) * query_in.size(2);
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      query_in.scalar_type(),
+      "flashqla_normalize_qk_xpu",
+      [&] {
+        launch_flashqla_normalize_qk_kernel(
+            stream.queue(),
+            query_in.const_data_ptr<scalar_t>(),
+            key_in.const_data_ptr<scalar_t>(),
+            query_out.mutable_data_ptr<scalar_t>(),
+            key_out.mutable_data_ptr<scalar_t>(),
+            total_rows,
+            query_in.size(3));
+      });
+  return {query_out, key_out};
+}
+
+template <typename scalar_t>
+void launch_flashqla_kkt_build_kernel(
+    sycl::queue& queue,
+    const scalar_t* key_ptr,
+    const float* beta_ptr,
+    const float* g_cumsum_ptr,
+    float* output_ptr,
+    int64_t batch_size,
+    int64_t sequence_length,
+    int64_t num_heads,
+    int64_t head_dim,
+    int64_t chunk_size) {
+  const int64_t total_rows = batch_size * sequence_length * num_heads;
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_rows)), [=](sycl::item<1> item) {
+      const int64_t linear_idx = static_cast<int64_t>(item.get_id(0));
+      const int64_t h = linear_idx % num_heads;
+      const int64_t t = (linear_idx / num_heads) % sequence_length;
+      const int64_t b = linear_idx / (sequence_length * num_heads);
+      const int64_t chunk_start = (t / chunk_size) * chunk_size;
+      const int64_t row_in_chunk = t - chunk_start;
+      const int64_t key_row_base = ((b * sequence_length + t) * num_heads + h) * head_dim;
+      const int64_t scalar_offset = (b * sequence_length + t) * num_heads + h;
+      const float beta_value = beta_ptr[scalar_offset];
+      const float g_row = g_cumsum_ptr[scalar_offset];
+      const int64_t out_base = ((b * sequence_length + t) * num_heads + h) * chunk_size;
+
+      for (int64_t col = 0; col < chunk_size; ++col) {
+        const int64_t source_t = chunk_start + col;
+        float value = 0.0f;
+        if (col < row_in_chunk && source_t < sequence_length) {
+          const int64_t key_col_base = ((b * sequence_length + source_t) * num_heads + h) * head_dim;
+          const int64_t col_scalar_offset = (b * sequence_length + source_t) * num_heads + h;
+          float dot = 0.0f;
+          for (int64_t k = 0; k < head_dim; ++k) {
+            dot += load_as_float(key_ptr, key_row_base + k) * load_as_float(key_ptr, key_col_base + k);
+          }
+          value = dot * beta_value * sycl::exp(g_row - g_cumsum_ptr[col_scalar_offset]);
+        }
+        output_ptr[out_base + col] = value;
+      }
+    });
+  });
+}
+
+at::Tensor flashqla_kkt_build_xpu(
+    const at::Tensor& key_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_cumsum_in,
+    int64_t chunk_size) {
+  validate_flashqla_kkt_build_inputs(key_in, beta_in, g_cumsum_in, chunk_size);
+  auto device = key_in.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "flashqla_kkt_build expects an XPU key tensor");
+  TORCH_CHECK(beta_in.device() == device, "flashqla_kkt_build beta must be on the same device as key");
+  TORCH_CHECK(g_cumsum_in.device() == device, "flashqla_kkt_build g_cumsum must be on the same device as key");
+  auto output = at::empty(
+      {key_in.size(0), key_in.size(1), key_in.size(2), chunk_size},
+      key_in.options().dtype(at::kFloat));
+  auto stream = c10::xpu::getCurrentXPUStream(key_in.device().index());
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      key_in.scalar_type(),
+      "flashqla_kkt_build_xpu",
+      [&] {
+        launch_flashqla_kkt_build_kernel(
+            stream.queue(),
+            key_in.const_data_ptr<scalar_t>(),
+            beta_in.const_data_ptr<float>(),
+            g_cumsum_in.const_data_ptr<float>(),
+            output.mutable_data_ptr<float>(),
+            key_in.size(0),
+            key_in.size(1),
+            key_in.size(2),
+            key_in.size(3),
+            chunk_size);
+      });
+  return output;
+}
+
+template <typename scalar_t>
+void launch_flashqla_cumsum_kkt_build_kernel(
+    sycl::queue& queue,
+    const scalar_t* key_ptr,
+    const float* beta_ptr,
+    const float* g_ptr,
+    float* g_cumsum_ptr,
+    float* kkt_ptr,
+    int64_t batch_size,
+    int64_t sequence_length,
+    int64_t num_heads,
+    int64_t head_dim,
+    int64_t chunk_size) {
+  const int64_t num_chunks = (sequence_length + chunk_size - 1) / chunk_size;
+  const int64_t total_work = batch_size * num_heads * num_chunks;
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> g_local(sycl::range<1>(64), cgh);
+    cgh.parallel_for(
+        sycl::nd_range<1>(
+            sycl::range<1>(static_cast<size_t>(total_work * chunk_size)),
+            sycl::range<1>(static_cast<size_t>(chunk_size))),
+        [=](sycl::nd_item<1> item) {
+      const int64_t linear_idx = static_cast<int64_t>(item.get_group(0));
+      const int64_t row = static_cast<int64_t>(item.get_local_id(0));
+      const int64_t chunk_idx = linear_idx % num_chunks;
+      const int64_t bh = linear_idx / num_chunks;
+      const int64_t h = bh % num_heads;
+      const int64_t b = bh / num_heads;
+      const int64_t chunk_start = chunk_idx * chunk_size;
+      const int64_t chunk_end = sycl::min<int64_t>(sequence_length, chunk_start + chunk_size);
+
+      if (row == 0) {
+        float acc = 0.0f;
+        for (int64_t scan_row = 0; scan_row < chunk_size; ++scan_row) {
+          const int64_t t = chunk_start + scan_row;
+          if (t < chunk_end) {
+            const int64_t scalar_offset = (b * sequence_length + t) * num_heads + h;
+            acc += g_ptr[scalar_offset];
+            g_local[scan_row] = acc;
+            g_cumsum_ptr[scalar_offset] = acc;
+          } else {
+            g_local[scan_row] = acc;
+          }
+        }
+      }
+      item.barrier(sycl::access::fence_space::local_space);
+
+      const int64_t t = chunk_start + row;
+      if (t < chunk_end) {
+        const int64_t row_scalar = (b * sequence_length + t) * num_heads + h;
+        const int64_t row_key_base = row_scalar * head_dim;
+        const float beta_value = beta_ptr[row_scalar];
+        const int64_t out_base = row_scalar * chunk_size;
+        for (int64_t col = 0; col < chunk_size; ++col) {
+          float value = 0.0f;
+          const int64_t source_t = chunk_start + col;
+          if (col < row && source_t < chunk_end) {
+            const int64_t col_scalar = (b * sequence_length + source_t) * num_heads + h;
+            const int64_t col_key_base = col_scalar * head_dim;
+            float dot = 0.0f;
+            for (int64_t k = 0; k < head_dim; ++k) {
+              dot += load_as_float(key_ptr, row_key_base + k) * load_as_float(key_ptr, col_key_base + k);
+            }
+            value = dot * beta_value * sycl::exp(g_local[row] - g_local[col]);
+          }
+          kkt_ptr[out_base + col] = value;
+        }
+      }
+    });
+  });
+}
+
+std::tuple<at::Tensor, at::Tensor> flashqla_cumsum_kkt_build_xpu(
+    const at::Tensor& key_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_in,
+    int64_t chunk_size) {
+  validate_flashqla_chunk_local_cumsum_inputs(g_in, chunk_size);
+  validate_flashqla_kkt_build_inputs(key_in, beta_in, g_in, chunk_size);
+  auto device = key_in.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "flashqla_cumsum_kkt_build expects an XPU key tensor");
+  TORCH_CHECK(beta_in.device() == device, "flashqla_cumsum_kkt_build beta must be on the same device as key");
+  TORCH_CHECK(g_in.device() == device, "flashqla_cumsum_kkt_build g must be on the same device as key");
+  auto g_cumsum = at::empty_like(g_in);
+  auto kkt = at::empty({key_in.size(0), key_in.size(1), key_in.size(2), chunk_size}, key_in.options().dtype(at::kFloat));
+  auto stream = c10::xpu::getCurrentXPUStream(key_in.device().index());
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      key_in.scalar_type(),
+      "flashqla_cumsum_kkt_build_xpu",
+      [&] {
+        launch_flashqla_cumsum_kkt_build_kernel(
+            stream.queue(),
+            key_in.const_data_ptr<scalar_t>(),
+            beta_in.const_data_ptr<float>(),
+            g_in.const_data_ptr<float>(),
+            g_cumsum.mutable_data_ptr<float>(),
+            kkt.mutable_data_ptr<float>(),
+            key_in.size(0),
+            key_in.size(1),
+            key_in.size(2),
+            key_in.size(3),
+            chunk_size);
+      });
+  return {g_cumsum, kkt};
+}
+
+void launch_flashqla_kkt_solve_kernel(
+    sycl::queue& queue,
+    const float* kkt_ptr,
+    float* output_ptr,
+    int64_t batch_size,
+    int64_t sequence_length,
+    int64_t num_heads,
+    int64_t chunk_size) {
+  const int64_t num_chunks = (sequence_length + chunk_size - 1) / chunk_size;
+  const int64_t total_work = batch_size * num_heads * num_chunks;
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> a(sycl::range<1>(64 * 64), cgh);
+    cgh.parallel_for(
+        sycl::nd_range<1>(
+            sycl::range<1>(static_cast<size_t>(total_work * chunk_size)),
+            sycl::range<1>(static_cast<size_t>(chunk_size))),
+        [=](sycl::nd_item<1> item) {
+      const int64_t linear_idx = static_cast<int64_t>(item.get_group(0));
+      const int64_t local_col = static_cast<int64_t>(item.get_local_id(0));
+      const int64_t chunk_idx = linear_idx % num_chunks;
+      const int64_t bh = linear_idx / num_chunks;
+      const int64_t h = bh % num_heads;
+      const int64_t b = bh / num_heads;
+      const int64_t chunk_start = chunk_idx * chunk_size;
+
+      for (int64_t row = 0; row < chunk_size; ++row) {
+        const int64_t t = chunk_start + row;
+        float value = 0.0f;
+        if (t < sequence_length && local_col < row) {
+          const int64_t kkt_offset = ((b * sequence_length + t) * num_heads + h) * chunk_size + local_col;
+          value = -kkt_ptr[kkt_offset];
+        }
+        a[row * chunk_size + local_col] = value;
+      }
+      item.barrier(sycl::access::fence_space::local_space);
+
+      for (int64_t row = 1; row < chunk_size; ++row) {
+        if (local_col < row) {
+          float value = a[row * chunk_size + local_col];
+          for (int64_t mid = local_col + 1; mid < row; ++mid) {
+            value += a[row * chunk_size + mid] * a[mid * chunk_size + local_col];
+          }
+          a[row * chunk_size + local_col] = value;
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+      }
+
+      for (int64_t row = 0; row < chunk_size; ++row) {
+        const int64_t t = chunk_start + row;
+        if (t >= sequence_length) {
+          continue;
+        }
+        const int64_t out_base = ((b * sequence_length + t) * num_heads + h) * chunk_size;
+        output_ptr[out_base + local_col] = (row == local_col) ? 1.0f : a[row * chunk_size + local_col];
+      }
+    });
+  });
+}
+
+at::Tensor flashqla_kkt_solve_xpu(const at::Tensor& kkt_in, int64_t chunk_size) {
+  validate_flashqla_kkt_solve_inputs(kkt_in, chunk_size);
+  TORCH_CHECK(kkt_in.device().type() == c10::DeviceType::XPU, "flashqla_kkt_solve_64 expects an XPU tensor");
+  auto output = at::empty_like(kkt_in);
+  auto stream = c10::xpu::getCurrentXPUStream(kkt_in.device().index());
+  launch_flashqla_kkt_solve_kernel(
+      stream.queue(),
+      kkt_in.const_data_ptr<float>(),
+      output.mutable_data_ptr<float>(),
+      kkt_in.size(0),
+      kkt_in.size(1),
+      kkt_in.size(2),
+      chunk_size);
+  return output;
+}
+
+template <typename scalar_t>
+void launch_flashqla_wu_build_kernel(
+    sycl::queue& queue,
+    const scalar_t* key_ptr,
+    const scalar_t* value_ptr,
+    const float* beta_ptr,
+    const float* g_cumsum_ptr,
+    const float* a_ptr,
+    float* w_ptr,
+    float* u_ptr,
+    int64_t batch_size,
+    int64_t sequence_length,
+    int64_t num_heads,
+    int64_t key_dim,
+    int64_t value_dim,
+    int64_t chunk_size) {
+  const int64_t total_work = batch_size * sequence_length * num_heads * (key_dim + value_dim);
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_work)), [=](sycl::item<1> item) {
+      const int64_t linear_idx = static_cast<int64_t>(item.get_id(0));
+      const int64_t dim_idx = linear_idx % (key_dim + value_dim);
+      const int64_t h = (linear_idx / (key_dim + value_dim)) % num_heads;
+      const int64_t t = (linear_idx / ((key_dim + value_dim) * num_heads)) % sequence_length;
+      const int64_t b = linear_idx / ((key_dim + value_dim) * num_heads * sequence_length);
+      const int64_t chunk_start = (t / chunk_size) * chunk_size;
+      const int64_t a_base = ((b * sequence_length + t) * num_heads + h) * chunk_size;
+
+      if (dim_idx < key_dim) {
+        const int64_t k_idx = dim_idx;
+        float acc = 0.0f;
+        for (int64_t col = 0; col < chunk_size; ++col) {
+          const int64_t source_t = chunk_start + col;
+          if (source_t >= sequence_length) {
+            continue;
+          }
+          const int64_t source_scalar = (b * sequence_length + source_t) * num_heads + h;
+          const int64_t source_key = source_scalar * key_dim + k_idx;
+          acc += a_ptr[a_base + col] * load_as_float(key_ptr, source_key) * beta_ptr[source_scalar] * sycl::exp(g_cumsum_ptr[source_scalar]);
+        }
+        w_ptr[((b * sequence_length + t) * num_heads + h) * key_dim + k_idx] = acc;
+      } else {
+        const int64_t v_idx = dim_idx - key_dim;
+        float acc = 0.0f;
+        for (int64_t col = 0; col < chunk_size; ++col) {
+          const int64_t source_t = chunk_start + col;
+          if (source_t >= sequence_length) {
+            continue;
+          }
+          const int64_t source_scalar = (b * sequence_length + source_t) * num_heads + h;
+          const int64_t source_value = source_scalar * value_dim + v_idx;
+          acc += a_ptr[a_base + col] * load_as_float(value_ptr, source_value) * beta_ptr[source_scalar];
+        }
+        u_ptr[((b * sequence_length + t) * num_heads + h) * value_dim + v_idx] = acc;
+      }
+    });
+  });
+}
+
+std::tuple<at::Tensor, at::Tensor> flashqla_wu_build_xpu(
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_cumsum_in,
+    const at::Tensor& a_in,
+    int64_t chunk_size) {
+  validate_flashqla_wu_build_inputs(key_in, value_in, beta_in, g_cumsum_in, a_in, chunk_size);
+  auto device = key_in.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "flashqla_wu_build expects an XPU key tensor");
+  TORCH_CHECK(value_in.device() == device, "flashqla_wu_build value must be on the same device as key");
+  TORCH_CHECK(beta_in.device() == device, "flashqla_wu_build beta must be on the same device as key");
+  TORCH_CHECK(g_cumsum_in.device() == device, "flashqla_wu_build g_cumsum must be on the same device as key");
+  TORCH_CHECK(a_in.device() == device, "flashqla_wu_build A must be on the same device as key");
+  auto w = at::empty(key_in.sizes(), key_in.options().dtype(at::kFloat));
+  auto u = at::empty(value_in.sizes(), value_in.options().dtype(at::kFloat));
+  auto stream = c10::xpu::getCurrentXPUStream(key_in.device().index());
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      key_in.scalar_type(),
+      "flashqla_wu_build_xpu",
+      [&] {
+        launch_flashqla_wu_build_kernel(
+            stream.queue(),
+            key_in.const_data_ptr<scalar_t>(),
+            value_in.const_data_ptr<scalar_t>(),
+            beta_in.const_data_ptr<float>(),
+            g_cumsum_in.const_data_ptr<float>(),
+            a_in.const_data_ptr<float>(),
+            w.mutable_data_ptr<float>(),
+            u.mutable_data_ptr<float>(),
+            key_in.size(0),
+            key_in.size(1),
+            key_in.size(2),
+            key_in.size(3),
+            value_in.size(3),
+            chunk_size);
+      });
+  return {w, u};
+}
+
+template <typename scalar_t>
+void launch_flashqla_solve_wu_build_kernel(
+    sycl::queue& queue,
+    const scalar_t* key_ptr,
+    const scalar_t* value_ptr,
+    const float* beta_ptr,
+    const float* g_cumsum_ptr,
+    const float* kkt_ptr,
+    float* a_out_ptr,
+    float* w_ptr,
+    float* u_ptr,
+    int64_t batch_size,
+    int64_t sequence_length,
+    int64_t num_heads,
+    int64_t key_dim,
+    int64_t value_dim,
+    int64_t chunk_size) {
+  const int64_t num_chunks = (sequence_length + chunk_size - 1) / chunk_size;
+  const int64_t total_work = batch_size * num_heads * num_chunks;
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_work)), [=](sycl::item<1> item) {
+      const int64_t linear_idx = static_cast<int64_t>(item.get_id(0));
+      const int64_t chunk_idx = linear_idx % num_chunks;
+      const int64_t bh = linear_idx / num_chunks;
+      const int64_t h = bh % num_heads;
+      const int64_t b = bh / num_heads;
+      const int64_t chunk_start = chunk_idx * chunk_size;
+      float a[64][64];
+
+      for (int64_t row = 0; row < chunk_size; ++row) {
+        const int64_t t = chunk_start + row;
+        for (int64_t col = 0; col < chunk_size; ++col) {
+          float value = 0.0f;
+          if (t < sequence_length && col < row) {
+            const int64_t kkt_offset = ((b * sequence_length + t) * num_heads + h) * chunk_size + col;
+            value = -kkt_ptr[kkt_offset];
+          }
+          a[row][col] = value;
+        }
+      }
+
+      for (int64_t row = 1; row < chunk_size; ++row) {
+        for (int64_t col = 0; col < row; ++col) {
+          float value = a[row][col];
+          for (int64_t mid = col + 1; mid < row; ++mid) {
+            value += a[row][mid] * a[mid][col];
+          }
+          a[row][col] = value;
+        }
+      }
+
+      for (int64_t row = 0; row < chunk_size; ++row) {
+        const int64_t t = chunk_start + row;
+        if (t >= sequence_length) {
+          continue;
+        }
+        const int64_t scalar_base = (b * sequence_length + t) * num_heads + h;
+        const int64_t a_base = scalar_base * chunk_size;
+        const int64_t w_base = scalar_base * key_dim;
+        const int64_t u_base = scalar_base * value_dim;
+
+        for (int64_t col = 0; col < chunk_size; ++col) {
+          a_out_ptr[a_base + col] = (row == col) ? 1.0f : a[row][col];
+        }
+
+        for (int64_t k_idx = 0; k_idx < key_dim; ++k_idx) {
+          float acc = 0.0f;
+          for (int64_t col = 0; col < chunk_size; ++col) {
+            const int64_t source_t = chunk_start + col;
+            if (source_t >= sequence_length) {
+              continue;
+            }
+            const int64_t source_scalar = (b * sequence_length + source_t) * num_heads + h;
+            const int64_t source_key = source_scalar * key_dim + k_idx;
+            const float a_value = (row == col) ? 1.0f : a[row][col];
+            acc += a_value * load_as_float(key_ptr, source_key) * beta_ptr[source_scalar] * sycl::exp(g_cumsum_ptr[source_scalar]);
+          }
+          w_ptr[w_base + k_idx] = acc;
+        }
+
+        for (int64_t v_idx = 0; v_idx < value_dim; ++v_idx) {
+          float acc = 0.0f;
+          for (int64_t col = 0; col < chunk_size; ++col) {
+            const int64_t source_t = chunk_start + col;
+            if (source_t >= sequence_length) {
+              continue;
+            }
+            const int64_t source_scalar = (b * sequence_length + source_t) * num_heads + h;
+            const int64_t source_value = source_scalar * value_dim + v_idx;
+            const float a_value = (row == col) ? 1.0f : a[row][col];
+            acc += a_value * load_as_float(value_ptr, source_value) * beta_ptr[source_scalar];
+          }
+          u_ptr[u_base + v_idx] = acc;
+        }
+      }
+    });
+  });
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> flashqla_solve_wu_build_xpu(
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& g_cumsum_in,
+    const at::Tensor& kkt_in,
+    int64_t chunk_size) {
+  validate_flashqla_solve_wu_build_inputs(key_in, value_in, beta_in, g_cumsum_in, kkt_in, chunk_size);
+  auto device = key_in.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "flashqla_solve_wu_build expects an XPU key tensor");
+  TORCH_CHECK(value_in.device() == device, "flashqla_solve_wu_build value must be on the same device as key");
+  TORCH_CHECK(beta_in.device() == device, "flashqla_solve_wu_build beta must be on the same device as key");
+  TORCH_CHECK(g_cumsum_in.device() == device, "flashqla_solve_wu_build g_cumsum must be on the same device as key");
+  TORCH_CHECK(kkt_in.device() == device, "flashqla_solve_wu_build KKT must be on the same device as key");
+  auto a = at::empty(kkt_in.sizes(), key_in.options().dtype(at::kFloat));
+  auto w = at::empty(key_in.sizes(), key_in.options().dtype(at::kFloat));
+  auto u = at::empty(value_in.sizes(), value_in.options().dtype(at::kFloat));
+  auto stream = c10::xpu::getCurrentXPUStream(key_in.device().index());
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      key_in.scalar_type(),
+      "flashqla_solve_wu_build_xpu",
+      [&] {
+        launch_flashqla_solve_wu_build_kernel(
+            stream.queue(),
+            key_in.const_data_ptr<scalar_t>(),
+            value_in.const_data_ptr<scalar_t>(),
+            beta_in.const_data_ptr<float>(),
+            g_cumsum_in.const_data_ptr<float>(),
+            kkt_in.const_data_ptr<float>(),
+            a.mutable_data_ptr<float>(),
+            w.mutable_data_ptr<float>(),
+            u.mutable_data_ptr<float>(),
+            key_in.size(0),
+            key_in.size(1),
+            key_in.size(2),
+            key_in.size(3),
+            value_in.size(3),
+            chunk_size);
+      });
+  return {a, w, u};
+}
+
+template <typename scalar_t>
+void launch_flashqla_chunk_gdr_fwd_single_chunk_output_kernel(
+    sycl::queue& queue,
+    const scalar_t* query_ptr,
+    const scalar_t* key_ptr,
+    const float* g_cumsum_ptr,
+    const float* w_ptr,
+    const float* u_ptr,
+    const float* state_ptr,
+    scalar_t* output_ptr,
+    int64_t batch_size,
+    int64_t sequence_length,
+    int64_t chunk_start,
+    int64_t chunk_length,
+    int64_t num_heads,
+    int64_t key_dim,
+    int64_t value_dim) {
+  const int64_t total_work = batch_size * chunk_length * num_heads * value_dim;
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_work)), [=](sycl::item<1> item) {
+      const int64_t linear_idx = static_cast<int64_t>(item.get_id(0));
+      const int64_t v_idx = linear_idx % value_dim;
+      const int64_t h = (linear_idx / value_dim) % num_heads;
+      const int64_t row = (linear_idx / (value_dim * num_heads)) % chunk_length;
+      const int64_t b = linear_idx / (value_dim * num_heads * chunk_length);
+      const int64_t t = chunk_start + row;
+      const int64_t scalar_offset = (b * sequence_length + t) * num_heads + h;
+      const float inv_sqrt_key_dim = 1.0f / sycl::sqrt(static_cast<float>(key_dim));
+
+      float recurrent = 0.0f;
+      for (int64_t k = 0; k < key_dim; ++k) {
+        const int64_t vec_offset = scalar_offset * key_dim + k;
+        recurrent += load_as_float(query_ptr, vec_offset) *
+            state_ptr[((b * num_heads + h) * key_dim + k) * value_dim + v_idx];
+      }
+      recurrent *= sycl::exp(g_cumsum_ptr[scalar_offset]) * inv_sqrt_key_dim;
+
+      float local = 0.0f;
+      for (int64_t col = 0; col <= row; ++col) {
+        const int64_t source_t = chunk_start + col;
+        const int64_t source_scalar = (b * sequence_length + source_t) * num_heads + h;
+        float dot = 0.0f;
+        float v_prime = 0.0f;
+        for (int64_t k = 0; k < key_dim; ++k) {
+          dot += load_as_float(query_ptr, scalar_offset * key_dim + k) *
+              load_as_float(key_ptr, source_scalar * key_dim + k);
+          v_prime += w_ptr[source_scalar * key_dim + k] *
+              state_ptr[((b * num_heads + h) * key_dim + k) * value_dim + v_idx];
+        }
+        const float v_new = u_ptr[source_scalar * value_dim + v_idx] - v_prime;
+        local += dot * sycl::exp(g_cumsum_ptr[scalar_offset] - g_cumsum_ptr[source_scalar]) *
+            v_new * inv_sqrt_key_dim;
+      }
+
+      output_ptr[scalar_offset * value_dim + v_idx] = static_cast<scalar_t>(recurrent + local);
+    });
+  });
+}
+
+template <typename scalar_t>
+void launch_flashqla_chunk_gdr_fwd_single_chunk_state_kernel(
+    sycl::queue& queue,
+    const scalar_t* key_ptr,
+    const float* g_cumsum_ptr,
+    const float* w_ptr,
+    const float* u_ptr,
+    const float* state_ptr,
+    float* final_state_ptr,
+    int64_t batch_size,
+    int64_t sequence_length,
+    int64_t chunk_start,
+    int64_t chunk_length,
+    int64_t num_heads,
+    int64_t key_dim,
+    int64_t value_dim) {
+  const int64_t total_work = batch_size * num_heads * key_dim * value_dim;
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_work)), [=](sycl::item<1> item) {
+      const int64_t linear_idx = static_cast<int64_t>(item.get_id(0));
+      const int64_t v_idx = linear_idx % value_dim;
+      const int64_t k_idx = (linear_idx / value_dim) % key_dim;
+      const int64_t h = (linear_idx / (value_dim * key_dim)) % num_heads;
+      const int64_t b = linear_idx / (value_dim * key_dim * num_heads);
+      const int64_t last_t = chunk_start + chunk_length - 1;
+      const int64_t last_scalar = (b * sequence_length + last_t) * num_heads + h;
+      const float g_last = g_cumsum_ptr[last_scalar];
+      float updated = state_ptr[((b * num_heads + h) * key_dim + k_idx) * value_dim + v_idx] * sycl::exp(g_last);
+
+      for (int64_t row = 0; row < chunk_length; ++row) {
+        const int64_t source_t = chunk_start + row;
+        const int64_t source_scalar = (b * sequence_length + source_t) * num_heads + h;
+        float v_prime = 0.0f;
+        for (int64_t k = 0; k < key_dim; ++k) {
+          v_prime += w_ptr[source_scalar * key_dim + k] *
+              state_ptr[((b * num_heads + h) * key_dim + k) * value_dim + v_idx];
+        }
+        const float v_new = u_ptr[source_scalar * value_dim + v_idx] - v_prime;
+        updated += load_as_float(key_ptr, source_scalar * key_dim + k_idx) *
+            sycl::exp(g_last - g_cumsum_ptr[source_scalar]) * v_new;
+      }
+
+      final_state_ptr[((b * num_heads + h) * key_dim + k_idx) * value_dim + v_idx] = updated;
+    });
+  });
+}
+
+template <typename scalar_t>
+void launch_flashqla_chunk_gdr_fwd_kernel(
+    sycl::queue& queue,
+    const scalar_t* query_ptr,
+    const scalar_t* key_ptr,
+    const float* g_cumsum_ptr,
+    const float* a_ptr,
+    const float* w_ptr,
+    const float* u_ptr,
+    const float* state_ptr,
+    scalar_t* output_ptr,
+    float* final_state_ptr,
+    int64_t batch_size,
+    int64_t sequence_length,
+    int64_t num_heads,
+    int64_t key_dim,
+    int64_t value_dim,
+    int64_t chunk_size) {
+  const int64_t total_work = batch_size * num_heads * value_dim;
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(static_cast<size_t>(total_work)), [=](sycl::item<1> item) {
+      const int64_t linear_idx = static_cast<int64_t>(item.get_id(0));
+      const int64_t v_idx = linear_idx % value_dim;
+      const int64_t bh = linear_idx / value_dim;
+      const int64_t h = bh % num_heads;
+      const int64_t b = bh / num_heads;
+      float state_col[256];
+      float v_new[64];
+      for (int64_t k = 0; k < key_dim; ++k) {
+        state_col[k] = state_ptr[((b * num_heads + h) * key_dim + k) * value_dim + v_idx];
+      }
+
+      for (int64_t chunk_start = 0; chunk_start < sequence_length; chunk_start += chunk_size) {
+        const int64_t chunk_end = sycl::min<int64_t>(sequence_length, chunk_start + chunk_size);
+        for (int64_t row = 0; row < chunk_size; ++row) {
+          v_new[row] = 0.0f;
+        }
+        for (int64_t t = chunk_start; t < chunk_end; ++t) {
+          const int64_t row = t - chunk_start;
+          const int64_t scalar_offset = (b * sequence_length + t) * num_heads + h;
+          float v_prime = 0.0f;
+          float recurrent = 0.0f;
+          for (int64_t k = 0; k < key_dim; ++k) {
+            const int64_t vec_offset = scalar_offset * key_dim + k;
+            v_prime += w_ptr[vec_offset] * state_col[k];
+            recurrent += load_as_float(query_ptr, vec_offset) * state_col[k];
+          }
+          v_new[row] = u_ptr[scalar_offset * value_dim + v_idx] - v_prime;
+          recurrent *= sycl::exp(g_cumsum_ptr[scalar_offset]) / sycl::sqrt(static_cast<float>(key_dim));
+          float local = 0.0f;
+          for (int64_t col = 0; col <= row; ++col) {
+            const int64_t source_t = chunk_start + col;
+            const int64_t source_scalar = (b * sequence_length + source_t) * num_heads + h;
+            float dot = 0.0f;
+            for (int64_t k = 0; k < key_dim; ++k) {
+              dot += load_as_float(query_ptr, scalar_offset * key_dim + k) *
+                  load_as_float(key_ptr, source_scalar * key_dim + k);
+            }
+            local += dot * sycl::exp(g_cumsum_ptr[scalar_offset] - g_cumsum_ptr[source_scalar]) *
+                v_new[col] / sycl::sqrt(static_cast<float>(key_dim));
+          }
+          output_ptr[scalar_offset * value_dim + v_idx] = static_cast<scalar_t>(recurrent + local);
+        }
+        const int64_t last_t = chunk_end - 1;
+        const int64_t last_scalar = (b * sequence_length + last_t) * num_heads + h;
+        const float g_last = g_cumsum_ptr[last_scalar];
+        for (int64_t k = 0; k < key_dim; ++k) {
+          float updated = state_col[k] * sycl::exp(g_last);
+          for (int64_t row = 0; row < chunk_end - chunk_start; ++row) {
+            const int64_t source_t = chunk_start + row;
+            const int64_t source_scalar = (b * sequence_length + source_t) * num_heads + h;
+            updated += load_as_float(key_ptr, source_scalar * key_dim + k) *
+                sycl::exp(g_last - g_cumsum_ptr[source_scalar]) * v_new[row];
+          }
+          state_col[k] = updated;
+        }
+      }
+
+      for (int64_t k = 0; k < key_dim; ++k) {
+        final_state_ptr[((b * num_heads + h) * key_dim + k) * value_dim + v_idx] = state_col[k];
+      }
+    });
+  });
+}
+
+std::tuple<at::Tensor, at::Tensor> flashqla_chunk_gdr_fwd_xpu(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& g_cumsum_in,
+    const at::Tensor& a_in,
+    const at::Tensor& w_in,
+    const at::Tensor& u_in,
+    const at::Tensor& state_in,
+    int64_t chunk_size) {
+  validate_flashqla_chunk_gdr_fwd_inputs(query_in, key_in, g_cumsum_in, a_in, w_in, u_in, state_in, chunk_size);
+  auto device = query_in.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "flashqla_chunk_gdr_fwd expects an XPU query tensor");
+  TORCH_CHECK(key_in.device() == device && g_cumsum_in.device() == device && a_in.device() == device, "flashqla_chunk_gdr_fwd tensors must share query device");
+  TORCH_CHECK(w_in.device() == device && u_in.device() == device && state_in.device() == device, "flashqla_chunk_gdr_fwd tensors must share query device");
+  auto output = at::empty(u_in.sizes(), query_in.options());
+  auto final_state = at::empty_like(state_in);
+  auto stream = c10::xpu::getCurrentXPUStream(query_in.device().index());
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      query_in.scalar_type(),
+      "flashqla_chunk_gdr_fwd_xpu",
+      [&] {
+        if (query_in.size(1) <= chunk_size) {
+          launch_flashqla_chunk_gdr_fwd_single_chunk_output_kernel(
+              stream.queue(),
+              query_in.const_data_ptr<scalar_t>(),
+              key_in.const_data_ptr<scalar_t>(),
+              g_cumsum_in.const_data_ptr<float>(),
+              w_in.const_data_ptr<float>(),
+              u_in.const_data_ptr<float>(),
+              state_in.const_data_ptr<float>(),
+              output.mutable_data_ptr<scalar_t>(),
+              query_in.size(0),
+              query_in.size(1),
+              0,
+              query_in.size(1),
+              query_in.size(2),
+              query_in.size(3),
+              u_in.size(3));
+          launch_flashqla_chunk_gdr_fwd_single_chunk_state_kernel(
+              stream.queue(),
+              key_in.const_data_ptr<scalar_t>(),
+              g_cumsum_in.const_data_ptr<float>(),
+              w_in.const_data_ptr<float>(),
+              u_in.const_data_ptr<float>(),
+              state_in.const_data_ptr<float>(),
+              final_state.mutable_data_ptr<float>(),
+              query_in.size(0),
+              query_in.size(1),
+              0,
+              query_in.size(1),
+              query_in.size(2),
+              query_in.size(3),
+              u_in.size(3));
+        } else if (query_in.size(1) % chunk_size == 0) {
+          auto scratch_state = at::empty_like(state_in);
+          at::Tensor scratch_state_alt;
+          const float* current_state_ptr = state_in.const_data_ptr<float>();
+          const int64_t num_chunks = query_in.size(1) / chunk_size;
+          if (num_chunks > 2) {
+            scratch_state_alt = at::empty_like(state_in);
+          }
+          for (int64_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+            const int64_t chunk_start = chunk_idx * chunk_size;
+            float* next_state_ptr = (chunk_idx == num_chunks - 1)
+                ? final_state.mutable_data_ptr<float>()
+                : ((chunk_idx % 2 == 0) ? scratch_state.mutable_data_ptr<float>() : scratch_state_alt.mutable_data_ptr<float>());
+            launch_flashqla_chunk_gdr_fwd_single_chunk_output_kernel(
+                stream.queue(),
+                query_in.const_data_ptr<scalar_t>(),
+                key_in.const_data_ptr<scalar_t>(),
+                g_cumsum_in.const_data_ptr<float>(),
+                w_in.const_data_ptr<float>(),
+                u_in.const_data_ptr<float>(),
+                current_state_ptr,
+                output.mutable_data_ptr<scalar_t>(),
+                query_in.size(0),
+                query_in.size(1),
+                chunk_start,
+                chunk_size,
+                query_in.size(2),
+                query_in.size(3),
+                u_in.size(3));
+            launch_flashqla_chunk_gdr_fwd_single_chunk_state_kernel(
+                stream.queue(),
+                key_in.const_data_ptr<scalar_t>(),
+                g_cumsum_in.const_data_ptr<float>(),
+                w_in.const_data_ptr<float>(),
+                u_in.const_data_ptr<float>(),
+                current_state_ptr,
+                next_state_ptr,
+                query_in.size(0),
+                query_in.size(1),
+                chunk_start,
+                chunk_size,
+                query_in.size(2),
+                query_in.size(3),
+                u_in.size(3));
+            current_state_ptr = next_state_ptr;
+          }
+        } else {
+          launch_flashqla_chunk_gdr_fwd_kernel(
+              stream.queue(),
+              query_in.const_data_ptr<scalar_t>(),
+              key_in.const_data_ptr<scalar_t>(),
+              g_cumsum_in.const_data_ptr<float>(),
+              a_in.const_data_ptr<float>(),
+              w_in.const_data_ptr<float>(),
+              u_in.const_data_ptr<float>(),
+              state_in.const_data_ptr<float>(),
+              output.mutable_data_ptr<scalar_t>(),
+              final_state.mutable_data_ptr<float>(),
+              query_in.size(0),
+              query_in.size(1),
+              query_in.size(2),
+              query_in.size(3),
+              u_in.size(3),
+              chunk_size);
+        }
+      });
+  return {output, final_state};
+}
+
 at::Tensor gated_delta_decode_xpu(
     const at::Tensor& query_in,
     const at::Tensor& key_in,
@@ -4234,6 +5457,68 @@ TORCH_LIBRARY(anna, m) {
       "Tensor state"
       ") -> (Tensor, Tensor)");
   m.def(
+      "flashqla_gated_delta_prefill("
+      "Tensor query, "
+      "Tensor key, "
+      "Tensor value, "
+      "Tensor g, "
+      "Tensor beta, "
+      "Tensor state"
+      ") -> (Tensor, Tensor)");
+  m.def(
+      "flashqla_chunk_local_cumsum("
+      "Tensor g, "
+      "int chunk_size=64"
+      ") -> Tensor");
+  m.def(
+      "flashqla_kkt_build("
+      "Tensor key, "
+      "Tensor beta, "
+      "Tensor g_cumsum, "
+      "int chunk_size=64"
+      ") -> Tensor");
+  m.def(
+      "flashqla_cumsum_kkt_build("
+      "Tensor key, "
+      "Tensor beta, "
+      "Tensor g, "
+      "int chunk_size=64"
+      ") -> (Tensor, Tensor)");
+  m.def(
+      "flashqla_kkt_solve_64("
+      "Tensor kkt, "
+      "int chunk_size=64"
+      ") -> Tensor");
+  m.def(
+      "flashqla_wu_build("
+      "Tensor key, "
+      "Tensor value, "
+      "Tensor beta, "
+      "Tensor g_cumsum, "
+      "Tensor A, "
+      "int chunk_size=64"
+      ") -> (Tensor, Tensor)");
+  m.def(
+      "flashqla_solve_wu_build("
+      "Tensor key, "
+      "Tensor value, "
+      "Tensor beta, "
+      "Tensor g_cumsum, "
+      "Tensor kkt, "
+      "int chunk_size=64"
+      ") -> (Tensor, Tensor, Tensor)");
+  m.def(
+      "flashqla_chunk_gdr_fwd("
+      "Tensor query, "
+      "Tensor key, "
+      "Tensor g_cumsum, "
+      "Tensor A, "
+      "Tensor W, "
+      "Tensor U, "
+      "Tensor state, "
+      "int chunk_size=64"
+      ") -> (Tensor, Tensor)");
+  m.def(
       "gated_delta_decode("
       "Tensor query, "
       "Tensor key, "
@@ -4263,6 +5548,14 @@ TORCH_LIBRARY_IMPL(anna, Meta, m) {
   m.impl("causal_conv1d_prefill", anna::causal_conv1d_prefill_meta);
   m.impl("causal_conv1d_decode", anna::causal_conv1d_decode_meta);
   m.impl("gated_delta_prefill", anna::gated_delta_prefill_meta);
+  m.impl("flashqla_gated_delta_prefill", anna::flashqla_gated_delta_prefill_meta);
+  m.impl("flashqla_chunk_local_cumsum", anna::flashqla_chunk_local_cumsum_meta);
+  m.impl("flashqla_cumsum_kkt_build", anna::flashqla_cumsum_kkt_build_meta);
+  m.impl("flashqla_kkt_build", anna::flashqla_kkt_build_meta);
+  m.impl("flashqla_kkt_solve_64", anna::flashqla_kkt_solve_meta);
+  m.impl("flashqla_wu_build", anna::flashqla_wu_build_meta);
+  m.impl("flashqla_solve_wu_build", anna::flashqla_solve_wu_build_meta);
+  m.impl("flashqla_chunk_gdr_fwd", anna::flashqla_chunk_gdr_fwd_meta);
   m.impl("gated_delta_decode", anna::gated_delta_decode_meta);
 }
 
@@ -4285,5 +5578,13 @@ TORCH_LIBRARY_IMPL(anna, XPU, m) {
   m.impl("causal_conv1d_prefill", anna::causal_conv1d_prefill_xpu);
   m.impl("causal_conv1d_decode", anna::causal_conv1d_decode_xpu);
   m.impl("gated_delta_prefill", anna::gated_delta_prefill_xpu);
+  m.impl("flashqla_gated_delta_prefill", anna::flashqla_gated_delta_prefill_xpu);
+  m.impl("flashqla_chunk_local_cumsum", anna::flashqla_chunk_local_cumsum_xpu);
+  m.impl("flashqla_cumsum_kkt_build", anna::flashqla_cumsum_kkt_build_xpu);
+  m.impl("flashqla_kkt_build", anna::flashqla_kkt_build_xpu);
+  m.impl("flashqla_kkt_solve_64", anna::flashqla_kkt_solve_xpu);
+  m.impl("flashqla_wu_build", anna::flashqla_wu_build_xpu);
+  m.impl("flashqla_solve_wu_build", anna::flashqla_solve_wu_build_xpu);
+  m.impl("flashqla_chunk_gdr_fwd", anna::flashqla_chunk_gdr_fwd_xpu);
   m.impl("gated_delta_decode", anna::gated_delta_decode_xpu);
 }

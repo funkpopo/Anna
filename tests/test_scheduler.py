@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from anna.mm.gemma4_text_processor import PreparedInputs as GemmaPreparedInputs
-from anna.mm.qwen3_5_text_processor import PreparedInputs
+from anna.mm.prepared_inputs import PreparedInputs
 from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig, Qwen3_5TextConfig
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
 from anna.runtime.device import RuntimeSafetyPolicy
@@ -401,7 +400,7 @@ def test_scheduler_streaming_final_event_includes_usage_stats() -> None:
         scheduler.shutdown()
 
 
-def test_scheduler_batching_preserves_gemma_prepared_input_type() -> None:
+def test_scheduler_batching_preserves_prepared_input_dataclass_type() -> None:
     scheduler = object.__new__(AnnaScheduler)
     scheduler.engine = type(
         "Engine",
@@ -417,7 +416,7 @@ def test_scheduler_batching_preserves_gemma_prepared_input_type() -> None:
         },
     )()
 
-    prepared = GemmaPreparedInputs(
+    prepared = PreparedInputs(
         prompt="",
         input_ids=torch.tensor([[4, 5, 6]], dtype=torch.long),
         attention_mask=torch.ones((1, 3), dtype=torch.long),
@@ -427,5 +426,5 @@ def test_scheduler_batching_preserves_gemma_prepared_input_type() -> None:
 
     batched = scheduler._batch_text_inputs([request])
 
-    assert isinstance(batched, GemmaPreparedInputs)
-    assert batched.__class__.__module__ == "anna.mm.gemma4_text_processor"
+    assert isinstance(batched, PreparedInputs)
+    assert batched.__class__.__module__ == "anna.mm.prepared_inputs"
