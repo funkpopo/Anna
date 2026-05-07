@@ -176,6 +176,19 @@ inline int64_t int4_group_index(int64_t in_idx, int64_t group_count, int64_t gro
   return sycl::min<int64_t>(group_idx, group_count - 1);
 }
 
+int64_t resolve_env_int64(const char* env_name, int64_t fallback) {
+  const char* raw = std::getenv(env_name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return fallback;
+  }
+  char* end = nullptr;
+  const long parsed = std::strtol(raw, &end, 10);
+  if (end == raw) {
+    return fallback;
+  }
+  return static_cast<int64_t>(parsed);
+}
+
 int64_t resolve_power_of_two_env_local_size(const char* env_name, int64_t fallback, int64_t max_value) {
   const char* raw = std::getenv(env_name);
   if (raw == nullptr || raw[0] == '\0') {
@@ -651,7 +664,7 @@ void validate_xpu_int4_gemv_tiled_inputs(
   TORCH_CHECK(qzeros.is_contiguous(), "qzeros must be contiguous");
   TORCH_CHECK(qweight.size(0) > 0, "qweight output tile count must be positive");
   TORCH_CHECK(qweight.size(1) * 8 >= in_features, "qweight packed columns are smaller than in_features");
-  TORCH_CHECK(qweight.size(2) == 1 || qweight.size(2) == 2 || qweight.size(2) == 4, "output_tile must be 1, 2, or 4");
+  TORCH_CHECK(qweight.size(2) == 1 || qweight.size(2) == 2 || qweight.size(2) == 4 || qweight.size(2) == 8, "output_tile must be 1, 2, 4, or 8");
   TORCH_CHECK(qscale.size(1) == qweight.size(0), "qscale output tile count must match qweight");
   TORCH_CHECK(qscale.size(2) == qweight.size(2), "qscale output tile width must match qweight");
   TORCH_CHECK(qzeros.sizes() == qscale.sizes(), "qzeros shape must match qscale");
@@ -2066,15 +2079,27 @@ void launch_xpu_int4_gemv_subgroup_m1_kernel(
           float acc1 = 0.0f;
           float acc2 = 0.0f;
           float acc3 = 0.0f;
+          float acc4 = 0.0f;
+          float acc5 = 0.0f;
+          float acc6 = 0.0f;
+          float acc7 = 0.0f;
           int64_t current_group = -1;
           float scale0 = 0.0f;
           float scale1 = 0.0f;
           float scale2 = 0.0f;
           float scale3 = 0.0f;
+          float scale4 = 0.0f;
+          float scale5 = 0.0f;
+          float scale6 = 0.0f;
+          float scale7 = 0.0f;
           int32_t zero0 = 0;
           int32_t zero1 = 0;
           int32_t zero2 = 0;
           int32_t zero3 = 0;
+          int32_t zero4 = 0;
+          int32_t zero5 = 0;
+          int32_t zero6 = 0;
+          int32_t zero7 = 0;
 
           for (int64_t packed_idx = lane; packed_idx < packed_cols; packed_idx += subgroup_size) {
             const int64_t hidden_pack_base = packed_idx << 3;
@@ -2082,6 +2107,10 @@ void launch_xpu_int4_gemv_subgroup_m1_kernel(
             uint32_t packed1 = 0;
             uint32_t packed2 = 0;
             uint32_t packed3 = 0;
+            uint32_t packed4 = 0;
+            uint32_t packed5 = 0;
+            uint32_t packed6 = 0;
+            uint32_t packed7 = 0;
             if (out_base < out_features) {
               packed0 = static_cast<uint32_t>(qweight_ptr[out_base * packed_cols + packed_idx]);
             }
@@ -2093,6 +2122,18 @@ void launch_xpu_int4_gemv_subgroup_m1_kernel(
             }
             if (output_tile >= 4 && out_base + 3 < out_features) {
               packed3 = static_cast<uint32_t>(qweight_ptr[(out_base + 3) * packed_cols + packed_idx]);
+            }
+            if (output_tile >= 8 && out_base + 4 < out_features) {
+              packed4 = static_cast<uint32_t>(qweight_ptr[(out_base + 4) * packed_cols + packed_idx]);
+            }
+            if (output_tile >= 8 && out_base + 5 < out_features) {
+              packed5 = static_cast<uint32_t>(qweight_ptr[(out_base + 5) * packed_cols + packed_idx]);
+            }
+            if (output_tile >= 8 && out_base + 6 < out_features) {
+              packed6 = static_cast<uint32_t>(qweight_ptr[(out_base + 6) * packed_cols + packed_idx]);
+            }
+            if (output_tile >= 8 && out_base + 7 < out_features) {
+              packed7 = static_cast<uint32_t>(qweight_ptr[(out_base + 7) * packed_cols + packed_idx]);
             }
             for (int64_t nibble = 0; nibble < 8; ++nibble) {
               const int64_t hidden_idx = hidden_pack_base + nibble;
@@ -2118,6 +2159,22 @@ void launch_xpu_int4_gemv_subgroup_m1_kernel(
                   scale3 = qscale_ptr[scale_base + 3];
                   zero3 = static_cast<int32_t>(qzeros_ptr[scale_base + 3]);
                 }
+                if (output_tile >= 8 && out_base + 4 < out_features) {
+                  scale4 = qscale_ptr[scale_base + 4];
+                  zero4 = static_cast<int32_t>(qzeros_ptr[scale_base + 4]);
+                }
+                if (output_tile >= 8 && out_base + 5 < out_features) {
+                  scale5 = qscale_ptr[scale_base + 5];
+                  zero5 = static_cast<int32_t>(qzeros_ptr[scale_base + 5]);
+                }
+                if (output_tile >= 8 && out_base + 6 < out_features) {
+                  scale6 = qscale_ptr[scale_base + 6];
+                  zero6 = static_cast<int32_t>(qzeros_ptr[scale_base + 6]);
+                }
+                if (output_tile >= 8 && out_base + 7 < out_features) {
+                  scale7 = qscale_ptr[scale_base + 7];
+                  zero7 = static_cast<int32_t>(qzeros_ptr[scale_base + 7]);
+                }
                 current_group = group_idx;
               }
               const float hidden = load_as_float(hidden_ptr, hidden_idx);
@@ -2138,6 +2195,22 @@ void launch_xpu_int4_gemv_subgroup_m1_kernel(
                 const int32_t qvalue3 = static_cast<int32_t>((packed3 >> shift) & 0xFu);
                 acc3 += hidden * static_cast<float>(qvalue3 - zero3) * scale3;
               }
+              if (output_tile >= 8 && out_base + 4 < out_features) {
+                const int32_t qvalue4 = static_cast<int32_t>((packed4 >> shift) & 0xFu);
+                acc4 += hidden * static_cast<float>(qvalue4 - zero4) * scale4;
+              }
+              if (output_tile >= 8 && out_base + 5 < out_features) {
+                const int32_t qvalue5 = static_cast<int32_t>((packed5 >> shift) & 0xFu);
+                acc5 += hidden * static_cast<float>(qvalue5 - zero5) * scale5;
+              }
+              if (output_tile >= 8 && out_base + 6 < out_features) {
+                const int32_t qvalue6 = static_cast<int32_t>((packed6 >> shift) & 0xFu);
+                acc6 += hidden * static_cast<float>(qvalue6 - zero6) * scale6;
+              }
+              if (output_tile >= 8 && out_base + 7 < out_features) {
+                const int32_t qvalue7 = static_cast<int32_t>((packed7 >> shift) & 0xFu);
+                acc7 += hidden * static_cast<float>(qvalue7 - zero7) * scale7;
+              }
             }
           }
 
@@ -2145,6 +2218,10 @@ void launch_xpu_int4_gemv_subgroup_m1_kernel(
           acc1 = sycl::reduce_over_group(subgroup, acc1, sycl::plus<float>());
           acc2 = sycl::reduce_over_group(subgroup, acc2, sycl::plus<float>());
           acc3 = sycl::reduce_over_group(subgroup, acc3, sycl::plus<float>());
+          acc4 = sycl::reduce_over_group(subgroup, acc4, sycl::plus<float>());
+          acc5 = sycl::reduce_over_group(subgroup, acc5, sycl::plus<float>());
+          acc6 = sycl::reduce_over_group(subgroup, acc6, sycl::plus<float>());
+          acc7 = sycl::reduce_over_group(subgroup, acc7, sycl::plus<float>());
 
           if (lane == 0) {
             if (out_base < out_features) {
@@ -2158,6 +2235,18 @@ void launch_xpu_int4_gemv_subgroup_m1_kernel(
             }
             if (output_tile >= 4 && out_base + 3 < out_features) {
               output_ptr[out_base + 3] = static_cast<scalar_t>(acc3);
+            }
+            if (output_tile >= 8 && out_base + 4 < out_features) {
+              output_ptr[out_base + 4] = static_cast<scalar_t>(acc4);
+            }
+            if (output_tile >= 8 && out_base + 5 < out_features) {
+              output_ptr[out_base + 5] = static_cast<scalar_t>(acc5);
+            }
+            if (output_tile >= 8 && out_base + 6 < out_features) {
+              output_ptr[out_base + 6] = static_cast<scalar_t>(acc6);
+            }
+            if (output_tile >= 8 && out_base + 7 < out_features) {
+              output_ptr[out_base + 7] = static_cast<scalar_t>(acc7);
             }
           }
         });
@@ -2180,42 +2269,47 @@ void launch_xpu_int4_gemv_tiled_layout_subgroup_m1_kernel(
     int64_t group_count,
     int64_t group_size,
     int64_t local_size,
-    int64_t output_tile) {
+    int64_t output_tile,
+    int64_t row_tile) {
   const int64_t required_subgroup_size = 16;
   const int64_t subgroups_per_work_group = std::max<int64_t>(1, local_size / required_subgroup_size);
   const int64_t work_groups = (output_tiles + subgroups_per_work_group - 1) / subgroups_per_work_group;
+  const int64_t row_blocks = (row_count + row_tile - 1) / row_tile;
 
   queue.submit([&](sycl::handler& cgh) {
     cgh.parallel_for(
         sycl::nd_range<2>(
-            sycl::range<2>(static_cast<size_t>(row_count), static_cast<size_t>(work_groups * local_size)),
+            sycl::range<2>(static_cast<size_t>(row_blocks), static_cast<size_t>(work_groups * local_size)),
             sycl::range<2>(1, static_cast<size_t>(local_size))),
         [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
           auto subgroup = item.get_sub_group();
           const int64_t subgroup_size = static_cast<int64_t>(subgroup.get_local_range()[0]);
-          const int64_t row = static_cast<int64_t>(item.get_group(0));
+          const int64_t row_block = static_cast<int64_t>(item.get_group(0));
           const int64_t subgroups_per_wg = static_cast<int64_t>(item.get_local_range(1)) / subgroup_size;
           const int64_t tile_idx =
               static_cast<int64_t>(item.get_group(1)) * subgroups_per_wg +
               static_cast<int64_t>(subgroup.get_group_linear_id());
           const int64_t out_base = tile_idx * output_tile;
           const int64_t lane = static_cast<int64_t>(subgroup.get_local_id()[0]);
-          const int64_t hidden_base = row * in_features;
-          const int64_t output_base = row * out_features;
 
-          float acc0 = 0.0f;
-          float acc1 = 0.0f;
-          float acc2 = 0.0f;
-          float acc3 = 0.0f;
+          float acc[4][8] = {};
           int64_t current_group = -1;
           float scale0 = 0.0f;
           float scale1 = 0.0f;
           float scale2 = 0.0f;
           float scale3 = 0.0f;
+          float scale4 = 0.0f;
+          float scale5 = 0.0f;
+          float scale6 = 0.0f;
+          float scale7 = 0.0f;
           int32_t zero0 = 0;
           int32_t zero1 = 0;
           int32_t zero2 = 0;
           int32_t zero3 = 0;
+          int32_t zero4 = 0;
+          int32_t zero5 = 0;
+          int32_t zero6 = 0;
+          int32_t zero7 = 0;
 
           if (tile_idx < output_tiles) {
             for (int64_t packed_idx = lane; packed_idx < packed_cols; packed_idx += subgroup_size) {
@@ -2227,6 +2321,14 @@ void launch_xpu_int4_gemv_tiled_layout_subgroup_m1_kernel(
                   output_tile >= 4 ? static_cast<uint32_t>(qweight_ptr[weight_base + 2]) : 0;
               const uint32_t packed3 =
                   output_tile >= 4 ? static_cast<uint32_t>(qweight_ptr[weight_base + 3]) : 0;
+              const uint32_t packed4 =
+                  output_tile >= 8 ? static_cast<uint32_t>(qweight_ptr[weight_base + 4]) : 0;
+              const uint32_t packed5 =
+                  output_tile >= 8 ? static_cast<uint32_t>(qweight_ptr[weight_base + 5]) : 0;
+              const uint32_t packed6 =
+                  output_tile >= 8 ? static_cast<uint32_t>(qweight_ptr[weight_base + 6]) : 0;
+              const uint32_t packed7 =
+                  output_tile >= 8 ? static_cast<uint32_t>(qweight_ptr[weight_base + 7]) : 0;
               const int64_t hidden_pack_base = packed_idx << 3;
               for (int64_t nibble = 0; nibble < 8; ++nibble) {
                 const int64_t hidden_idx = hidden_pack_base + nibble;
@@ -2248,39 +2350,113 @@ void launch_xpu_int4_gemv_tiled_layout_subgroup_m1_kernel(
                     zero2 = static_cast<int32_t>(qzeros_ptr[scale_base + 2]);
                     zero3 = static_cast<int32_t>(qzeros_ptr[scale_base + 3]);
                   }
+                  if (output_tile >= 8) {
+                    scale4 = qscale_ptr[scale_base + 4];
+                    scale5 = qscale_ptr[scale_base + 5];
+                    scale6 = qscale_ptr[scale_base + 6];
+                    scale7 = qscale_ptr[scale_base + 7];
+                    zero4 = static_cast<int32_t>(qzeros_ptr[scale_base + 4]);
+                    zero5 = static_cast<int32_t>(qzeros_ptr[scale_base + 5]);
+                    zero6 = static_cast<int32_t>(qzeros_ptr[scale_base + 6]);
+                    zero7 = static_cast<int32_t>(qzeros_ptr[scale_base + 7]);
+                  }
                   current_group = group_idx;
                 }
-                const float hidden = load_as_float(hidden_ptr, hidden_base + hidden_idx);
                 const int64_t shift = nibble * 4;
-                acc0 += hidden * static_cast<float>(static_cast<int32_t>((packed0 >> shift) & 0xFu) - zero0) * scale0;
-                if (output_tile >= 2) {
-                  acc1 += hidden * static_cast<float>(static_cast<int32_t>((packed1 >> shift) & 0xFu) - zero1) * scale1;
-                }
-                if (output_tile >= 4) {
-                  acc2 += hidden * static_cast<float>(static_cast<int32_t>((packed2 >> shift) & 0xFu) - zero2) * scale2;
-                  acc3 += hidden * static_cast<float>(static_cast<int32_t>((packed3 >> shift) & 0xFu) - zero3) * scale3;
+                const float weight0 =
+                    static_cast<float>(static_cast<int32_t>((packed0 >> shift) & 0xFu) - zero0) * scale0;
+                const float weight1 = output_tile >= 2
+                    ? static_cast<float>(static_cast<int32_t>((packed1 >> shift) & 0xFu) - zero1) * scale1
+                    : 0.0f;
+                const float weight2 = output_tile >= 4
+                    ? static_cast<float>(static_cast<int32_t>((packed2 >> shift) & 0xFu) - zero2) * scale2
+                    : 0.0f;
+                const float weight3 = output_tile >= 4
+                    ? static_cast<float>(static_cast<int32_t>((packed3 >> shift) & 0xFu) - zero3) * scale3
+                    : 0.0f;
+                const float weight4 = output_tile >= 8
+                    ? static_cast<float>(static_cast<int32_t>((packed4 >> shift) & 0xFu) - zero4) * scale4
+                    : 0.0f;
+                const float weight5 = output_tile >= 8
+                    ? static_cast<float>(static_cast<int32_t>((packed5 >> shift) & 0xFu) - zero5) * scale5
+                    : 0.0f;
+                const float weight6 = output_tile >= 8
+                    ? static_cast<float>(static_cast<int32_t>((packed6 >> shift) & 0xFu) - zero6) * scale6
+                    : 0.0f;
+                const float weight7 = output_tile >= 8
+                    ? static_cast<float>(static_cast<int32_t>((packed7 >> shift) & 0xFu) - zero7) * scale7
+                    : 0.0f;
+
+                for (int64_t row_offset = 0; row_offset < 4; ++row_offset) {
+                  if (row_offset >= row_tile) {
+                    break;
+                  }
+                  const int64_t row = row_block * row_tile + row_offset;
+                  if (row >= row_count) {
+                    break;
+                  }
+                  const float hidden = load_as_float(hidden_ptr, row * in_features + hidden_idx);
+                  acc[row_offset][0] += hidden * weight0;
+                  if (output_tile >= 2) {
+                    acc[row_offset][1] += hidden * weight1;
+                  }
+                  if (output_tile >= 4) {
+                    acc[row_offset][2] += hidden * weight2;
+                    acc[row_offset][3] += hidden * weight3;
+                  }
+                  if (output_tile >= 8) {
+                    acc[row_offset][4] += hidden * weight4;
+                    acc[row_offset][5] += hidden * weight5;
+                    acc[row_offset][6] += hidden * weight6;
+                    acc[row_offset][7] += hidden * weight7;
+                  }
                 }
               }
             }
           }
 
-          acc0 = sycl::reduce_over_group(subgroup, acc0, sycl::plus<float>());
-          acc1 = sycl::reduce_over_group(subgroup, acc1, sycl::plus<float>());
-          acc2 = sycl::reduce_over_group(subgroup, acc2, sycl::plus<float>());
-          acc3 = sycl::reduce_over_group(subgroup, acc3, sycl::plus<float>());
+          for (int64_t row_offset = 0; row_offset < 4; ++row_offset) {
+            if (row_offset >= row_tile) {
+              break;
+            }
+            const int64_t row = row_block * row_tile + row_offset;
+            if (row >= row_count) {
+              break;
+            }
+            for (int64_t output_offset = 0; output_offset < 8; ++output_offset) {
+              if (output_offset >= output_tile) {
+                break;
+              }
+              acc[row_offset][output_offset] =
+                  sycl::reduce_over_group(subgroup, acc[row_offset][output_offset], sycl::plus<float>());
+            }
 
-          if (lane == 0 && tile_idx < output_tiles) {
-            if (out_base < out_features) {
-              output_ptr[output_base + out_base] = static_cast<scalar_t>(acc0);
-            }
-            if (output_tile >= 2 && out_base + 1 < out_features) {
-              output_ptr[output_base + out_base + 1] = static_cast<scalar_t>(acc1);
-            }
-            if (output_tile >= 4 && out_base + 2 < out_features) {
-              output_ptr[output_base + out_base + 2] = static_cast<scalar_t>(acc2);
-            }
-            if (output_tile >= 4 && out_base + 3 < out_features) {
-              output_ptr[output_base + out_base + 3] = static_cast<scalar_t>(acc3);
+            if (lane == 0 && tile_idx < output_tiles) {
+              const int64_t output_base = row * out_features;
+              if (out_base < out_features) {
+                output_ptr[output_base + out_base] = static_cast<scalar_t>(acc[row_offset][0]);
+              }
+              if (output_tile >= 2 && out_base + 1 < out_features) {
+                output_ptr[output_base + out_base + 1] = static_cast<scalar_t>(acc[row_offset][1]);
+              }
+              if (output_tile >= 4 && out_base + 2 < out_features) {
+                output_ptr[output_base + out_base + 2] = static_cast<scalar_t>(acc[row_offset][2]);
+              }
+              if (output_tile >= 4 && out_base + 3 < out_features) {
+                output_ptr[output_base + out_base + 3] = static_cast<scalar_t>(acc[row_offset][3]);
+              }
+              if (output_tile >= 8 && out_base + 4 < out_features) {
+                output_ptr[output_base + out_base + 4] = static_cast<scalar_t>(acc[row_offset][4]);
+              }
+              if (output_tile >= 8 && out_base + 5 < out_features) {
+                output_ptr[output_base + out_base + 5] = static_cast<scalar_t>(acc[row_offset][5]);
+              }
+              if (output_tile >= 8 && out_base + 6 < out_features) {
+                output_ptr[output_base + out_base + 6] = static_cast<scalar_t>(acc[row_offset][6]);
+              }
+              if (output_tile >= 8 && out_base + 7 < out_features) {
+                output_ptr[output_base + out_base + 7] = static_cast<scalar_t>(acc[row_offset][7]);
+              }
             }
           }
         });
@@ -2346,8 +2522,8 @@ at::Tensor xpu_int4_gemv_xpu(
       !use_subgroup_m1 || (local_size >= 16 && local_size % 16 == 0),
       "ANNA_XPU_INT4_GEMV_KERNEL=subgroup requires ANNA_XPU_INT4_GEMV_LOCAL_SIZE to be at least 16 and a multiple of 16");
   TORCH_CHECK(
-      !use_subgroup_m1 || output_tile <= 4,
-      "ANNA_XPU_INT4_GEMV_KERNEL=subgroup supports ANNA_XPU_INT4_GEMV_OUTPUT_TILE <= 4");
+      !use_subgroup_m1 || output_tile <= 8,
+      "ANNA_XPU_INT4_GEMV_KERNEL=subgroup supports ANNA_XPU_INT4_GEMV_OUTPUT_TILE <= 8");
 
   auto output = at::empty({row_count, out_features}, hidden_states.options());
   auto stream = c10::xpu::getCurrentXPUStream(hidden_states.device().index());
@@ -2434,6 +2610,7 @@ at::Tensor xpu_int4_gemv_tiled_xpu(
       "ANNA_XPU_INT4_GEMV_LOCAL_SIZE",
       256,
       256);
+  const int64_t row_tile = std::max<int64_t>(1, std::min<int64_t>(4, resolve_env_int64("ANNA_XPU_INT4_GEMV_ROW_TILE", row_count >= 2 ? 2 : 1)));
   TORCH_CHECK(
       local_size >= 16 && local_size % 16 == 0,
       "xpu_int4_gemv_tiled requires ANNA_XPU_INT4_GEMV_LOCAL_SIZE to be at least 16 and a multiple of 16");
@@ -2462,7 +2639,8 @@ at::Tensor xpu_int4_gemv_tiled_xpu(
             group_count,
             group_size,
             local_size,
-            output_tile);
+            output_tile,
+            row_tile);
       });
 
   return output;

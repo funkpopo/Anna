@@ -68,6 +68,13 @@ def _int4_gemv_local_size(value: str) -> int:
     return parsed
 
 
+def _int4_gemv_row_tile(value: str) -> int:
+    parsed = int(value)
+    if parsed not in {1, 2, 4}:
+        raise argparse.ArgumentTypeError("value must be one of: 1, 2, 4")
+    return parsed
+
+
 def configure_int4_kernel_environment(args: argparse.Namespace) -> None:
     updates = {
         "ANNA_XPU_INT4_MATMUL": args.xpu_int4_matmul,
@@ -78,6 +85,9 @@ def configure_int4_kernel_environment(args: argparse.Namespace) -> None:
         "ANNA_XPU_INT4_GEMV_LOCAL_SIZE": None
         if args.xpu_int4_gemv_local_size is None
         else str(args.xpu_int4_gemv_local_size),
+        "ANNA_XPU_INT4_GEMV_ROW_TILE": None
+        if args.xpu_int4_gemv_row_tile is None
+        else str(args.xpu_int4_gemv_row_tile),
     }
     applied: dict[str, str] = {}
     for name, value in updates.items():
@@ -312,6 +322,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=_int4_gemv_local_size,
         default=None,
         help="Override ANNA_XPU_INT4_GEMV_LOCAL_SIZE. Must be a power of two in [16, 256].",
+    )
+    parser.add_argument(
+        "--xpu-int4-gemv-row-tile",
+        type=_int4_gemv_row_tile,
+        default=None,
+        help="Override ANNA_XPU_INT4_GEMV_ROW_TILE for tiled subgroup multi-row blocks. Valid values: 1, 2, 4.",
     )
     parser.add_argument(
         "--resident-expert-layers",
