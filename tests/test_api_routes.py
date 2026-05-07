@@ -160,6 +160,45 @@ def test_streaming_chat_closes_engine_iterator_when_response_generator_closes() 
     assert events.closed is True
 
 
+def test_streaming_chat_closes_engine_iterator_after_final_usage_event() -> None:
+    from anna.api.routes import _stream_sse_chat
+    from anna.runtime.qwen3_5_text_engine import StreamEvent
+
+    class _FinalEvents:
+        def __init__(self) -> None:
+            self.closed = False
+            self.index = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index == 0:
+                self.index += 1
+                return StreamEvent(text="hello", finish_reason=None)
+            if self.index == 1:
+                self.index += 1
+                return StreamEvent(text="", finish_reason="stop", prompt_tokens=2, completion_tokens=1)
+            raise AssertionError("final usage event should close the iterator before another next()")
+
+        def close(self) -> None:
+            self.closed = True
+
+    events = _FinalEvents()
+    chunks = list(
+        _stream_sse_chat(
+            response_id="chatcmpl-test",
+            created=1,
+            model="fake-model",
+            events=events,
+            include_usage=False,
+        )
+    )
+
+    assert events.closed is True
+    assert any("data: [DONE]" in chunk for chunk in chunks)
+
+
 def test_streaming_disconnect_does_not_close_iterator_while_worker_is_iterating() -> None:
     from anna.api.routes import _stream_until_done_or_disconnected
     from anna.runtime.qwen3_5_text_engine import GenerationConfig

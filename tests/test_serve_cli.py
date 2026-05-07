@@ -59,6 +59,8 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "4",
             "--xpu-int4-gemv-local-size",
             "128",
+            "--xpu-int4-gemv-row-tile",
+            "4",
             "--enable-flashqla-gdn-prefill",
             "--min-free-memory-mib",
             "256",
@@ -88,6 +90,7 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.xpu_int4_gemv_kernel == "subgroup"
     assert args.xpu_int4_gemv_output_tile == 4
     assert args.xpu_int4_gemv_local_size == 128
+    assert args.xpu_int4_gemv_row_tile == 4
     assert args.enable_flashqla_gdn_prefill is True
     assert args.min_free_memory_mib == 256
     assert args.reserve_memory_mib == 128
@@ -113,6 +116,8 @@ def test_configure_int4_kernel_environment_applies_cli_overrides(monkeypatch) ->
             "4",
             "--xpu-int4-gemv-local-size",
             "128",
+            "--xpu-int4-gemv-row-tile",
+            "4",
         ]
     )
 
@@ -121,6 +126,7 @@ def test_configure_int4_kernel_environment_applies_cli_overrides(monkeypatch) ->
         "ANNA_XPU_INT4_GEMV_KERNEL",
         "ANNA_XPU_INT4_GEMV_OUTPUT_TILE",
         "ANNA_XPU_INT4_GEMV_LOCAL_SIZE",
+        "ANNA_XPU_INT4_GEMV_ROW_TILE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -130,6 +136,7 @@ def test_configure_int4_kernel_environment_applies_cli_overrides(monkeypatch) ->
     assert os.environ["ANNA_XPU_INT4_GEMV_KERNEL"] == "subgroup"
     assert os.environ["ANNA_XPU_INT4_GEMV_OUTPUT_TILE"] == "4"
     assert os.environ["ANNA_XPU_INT4_GEMV_LOCAL_SIZE"] == "128"
+    assert os.environ["ANNA_XPU_INT4_GEMV_ROW_TILE"] == "4"
 
 
 def test_configure_int4_kernel_environment_defaults_to_torch_matmul(monkeypatch) -> None:
@@ -140,6 +147,7 @@ def test_configure_int4_kernel_environment_defaults_to_torch_matmul(monkeypatch)
     monkeypatch.setenv("ANNA_XPU_INT4_GEMV_KERNEL", "subgroup")
     monkeypatch.delenv("ANNA_XPU_INT4_GEMV_OUTPUT_TILE", raising=False)
     monkeypatch.delenv("ANNA_XPU_INT4_GEMV_LOCAL_SIZE", raising=False)
+    monkeypatch.delenv("ANNA_XPU_INT4_GEMV_ROW_TILE", raising=False)
 
     configure_int4_kernel_environment(args)
 

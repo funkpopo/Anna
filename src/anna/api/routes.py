@@ -35,6 +35,12 @@ _T = TypeVar("_T")
 _STREAM_DONE = object()
 
 
+def _close_iterator(iterator: object) -> None:
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        close()
+
+
 def _engine(request: Request):
     return request.app.state.engine
 
@@ -413,6 +419,7 @@ def _stream_sse_chat(
     final_usage = None
     final_perf = None
     final_finish_reason = "stop"
+    events_closed = False
     try:
         role_chunk = {
             "id": response_id,
@@ -432,6 +439,8 @@ def _stream_sse_chat(
                 final_usage = _usage_payload(event.prompt_tokens, event.completion_tokens)
                 final_perf = event.perf
                 final_finish_reason = event.finish_reason or final_finish_reason
+                _close_iterator(events)
+                events_closed = True
             payload = _chat_chunk_payload(
                 response_id=response_id,
                 created=created,
@@ -489,9 +498,8 @@ def _stream_sse_chat(
 
         yield "data: [DONE]\n\n"
     finally:
-        close = getattr(events, "close", None)
-        if callable(close):
-            close()
+        if not events_closed:
+            _close_iterator(events)
 
 
 def _stream_sse_completion(
@@ -509,6 +517,7 @@ def _stream_sse_completion(
     final_usage = None
     final_perf = None
     final_finish_reason = "stop"
+    events_closed = False
     try:
         for event in events:
             payload = {
@@ -524,6 +533,8 @@ def _stream_sse_completion(
                 final_usage = _usage_payload(event.prompt_tokens, event.completion_tokens)
                 final_perf = event.perf
                 final_finish_reason = event.finish_reason or final_finish_reason
+                _close_iterator(events)
+                events_closed = True
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
     except AnnaEngineError as exc:
         yield _sse_error_frame(exc)
@@ -540,9 +551,8 @@ def _stream_sse_completion(
         )
         yield "data: [DONE]\n\n"
     finally:
-        close = getattr(events, "close", None)
-        if callable(close):
-            close()
+        if not events_closed:
+            _close_iterator(events)
 
     if include_usage and final_usage is not None:
         usage_chunk = {
