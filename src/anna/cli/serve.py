@@ -88,6 +88,7 @@ def configure_int4_kernel_environment(args: argparse.Namespace) -> None:
         "ANNA_XPU_INT4_GEMV_ROW_TILE": None
         if args.xpu_int4_gemv_row_tile is None
         else str(args.xpu_int4_gemv_row_tile),
+        "ANNA_XPU_INT4_GEMV_SCALE_DTYPE": args.xpu_int4_gemv_scale_dtype,
     }
     applied: dict[str, str] = {}
     for name, value in updates.items():
@@ -328,6 +329,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=_int4_gemv_row_tile,
         default=None,
         help="Override ANNA_XPU_INT4_GEMV_ROW_TILE for tiled subgroup multi-row blocks. Valid values: 1, 2, 4.",
+    )
+    parser.add_argument(
+        "--xpu-int4-gemv-scale-dtype",
+        choices=("fp32", "fp16", "bf16"),
+        default=None,
+        help="Override ANNA_XPU_INT4_GEMV_SCALE_DTYPE for tiled subgroup qscale storage.",
     )
     parser.add_argument(
         "--resident-expert-layers",

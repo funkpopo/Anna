@@ -578,6 +578,43 @@ def test_xpu_int4_gemv_tiled_layout_row_tile_matches_reference(monkeypatch: pyte
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+@pytest.mark.parametrize("scale_dtype", ["fp16", "bf16"])
+def test_xpu_int4_gemv_tiled_layout_compact_scale_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    scale_dtype: str,
+) -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "xpu_int4_gemv_tiled"):
+        pytest.skip("Anna fused-op library is not built with xpu_int4_gemv_tiled")
+
+    torch.manual_seed(14)
+    dense = torch.nn.Linear(512, 768, bias=False, device="xpu", dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=128, compute_dtype=torch.bfloat16, device="xpu")
+    hidden_states = torch.randn(7, 512, device="xpu", dtype=torch.bfloat16)
+
+    monkeypatch.setenv("ANNA_XPU_INT4_GEMV_SCALE_DTYPE", scale_dtype)
+    gemv_qweight, gemv_qscale, gemv_qzeros = quantized.gemv_subgroup_tensors(output_tile=4)
+    expected_dtype = torch.float16 if scale_dtype == "fp16" else torch.bfloat16
+    assert gemv_qscale.dtype == expected_dtype
+
+    monkeypatch.setenv("ANNA_XPU_INT4_GEMV_LOCAL_SIZE", "128")
+    monkeypatch.setenv("ANNA_XPU_INT4_GEMV_ROW_TILE", "2")
+    output = torch.ops.anna.xpu_int4_gemv_tiled(
+        hidden_states,
+        gemv_qweight,
+        gemv_qscale,
+        gemv_qzeros,
+        quantized.group_size,
+        quantized.in_features,
+        quantized.out_features,
+    )
+    reference = quantized(hidden_states)
+
+    torch.xpu.synchronize()
+    assert output.shape == (7, 768)
+    assert torch.allclose(output.cpu(), reference.cpu(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
 def test_xpu_int4_linear_sycl_subgroup_strategy_supports_multiple_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "xpu_int4_gemv_tiled"):
         pytest.skip("Anna fused-op library is not built with xpu_int4_gemv_tiled")

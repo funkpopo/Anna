@@ -27,6 +27,14 @@ _XPU_INT4_LAYOUT_CACHE_VERSION = 2
 _XPU_INT4_LAYOUT_NAME = "anna_xpu_int4_linear_v1"
 _XPU_INT4_GEMV_CACHE_TILE = 4
 _XPU_INT4_LM_HEAD_CACHE_TILE = 4
+_XPU_INT4_GEMV_SCALE_DTYPES = {
+    "fp32": torch.float32,
+    "float32": torch.float32,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +77,11 @@ def _int4_shifts(*, device: torch.device | str | None = None) -> torch.Tensor:
 
 def _dtype_cache_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
+
+
+def _xpu_int4_gemv_scale_dtype_from_env() -> torch.dtype:
+    raw = os.getenv("ANNA_XPU_INT4_GEMV_SCALE_DTYPE", "fp32").strip().lower()
+    return _XPU_INT4_GEMV_SCALE_DTYPES.get(raw, torch.float32)
 
 
 def _safe_cache_key(value: str) -> str:
@@ -177,6 +190,7 @@ def _load_xpu_int4_linear_from_cache(
                     persistent=True,
                 )
                 quantized.gemv_output_tile = int(metadata.get("gemv_output_tile", _XPU_INT4_GEMV_CACHE_TILE))
+                quantized.gemv_scale_dtype = payload["gemv_qscale"].dtype
             if "lm_head_qweight" in payload and "lm_head_qscale" in payload and "lm_head_qzeros" in payload:
                 quantized.register_buffer(
                     "lm_head_qweight",
@@ -224,6 +238,7 @@ def _save_xpu_int4_linear_to_cache(
             "compute_dtype": _dtype_cache_name(quantized.compute_dtype),
             "has_bias": quantized.bias is not None,
             "gemv_output_tile": int(getattr(quantized, "gemv_output_tile", 0)),
+            "gemv_scale_dtype": _dtype_cache_name(getattr(quantized, "gemv_scale_dtype", torch.float32)),
             "lm_head_output_tile": int(getattr(quantized, "lm_head_output_tile", 0)),
         },
         "qweight": quantized.qweight.detach().to(device="cpu").contiguous(),
@@ -532,9 +547,17 @@ class XPUInt4Linear(nn.Module):
         self.lm_head_output_tile = output_tile
         return self
 
-    def prepare_gemv_subgroup_layout(self, *, output_tile: int = 4) -> "XPUInt4Linear":
+    def prepare_gemv_subgroup_layout(
+        self,
+        *,
+        output_tile: int = 4,
+        scale_dtype: torch.dtype | None = None,
+    ) -> "XPUInt4Linear":
         if output_tile not in {1, 2, 4}:
             raise ValueError("GEMV subgroup layout only supports output_tile values 1, 2, or 4.")
+        scale_dtype = scale_dtype or torch.float32
+        if scale_dtype not in {torch.float32, torch.float16, torch.bfloat16}:
+            raise ValueError("GEMV subgroup scale dtype must be float32, float16, or bfloat16.")
         padded_out_features = ((self.out_features + output_tile - 1) // output_tile) * output_tile
         packed_cols = self.qweight.shape[1]
         group_count = self.qscale.shape[0]
@@ -550,7 +573,7 @@ class XPUInt4Linear(nn.Module):
 
         qscale = torch.zeros(
             (group_count, padded_out_features),
-            dtype=self.qscale.dtype,
+            dtype=scale_dtype,
             device=self.qscale.device,
         )
         qzeros = torch.zeros(
@@ -558,7 +581,7 @@ class XPUInt4Linear(nn.Module):
             dtype=self.qzeros.dtype,
             device=self.qzeros.device,
         )
-        qscale[:, : self.out_features] = self.qscale
+        qscale[:, : self.out_features] = self.qscale.to(dtype=scale_dtype)
         qzeros[:, : self.out_features] = self.qzeros
         qscale = qscale.view(group_count, padded_out_features // output_tile, output_tile).contiguous()
         qzeros = qzeros.view(group_count, padded_out_features // output_tile, output_tile).contiguous()
@@ -576,23 +599,28 @@ class XPUInt4Linear(nn.Module):
         else:
             self.register_buffer("gemv_qzeros", qzeros, persistent=True)
         self.gemv_output_tile = output_tile
+        self.gemv_scale_dtype = scale_dtype
         return self
 
     def gemv_subgroup_tensors(self, *, output_tile: int = 4) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        scale_dtype = _xpu_int4_gemv_scale_dtype_from_env()
         qweight = getattr(self, "gemv_qweight", None)
         qscale = getattr(self, "gemv_qscale", None)
         qzeros = getattr(self, "gemv_qzeros", None)
         current_tile = int(getattr(self, "gemv_output_tile", 0))
+        current_scale_dtype = getattr(self, "gemv_scale_dtype", torch.float32)
         if (
             qweight is None
             or qscale is None
             or qzeros is None
             or current_tile != output_tile
+            or current_scale_dtype != scale_dtype
+            or qscale.dtype != scale_dtype
             or qweight.device != self.qweight.device
             or qscale.device != self.qscale.device
             or qzeros.device != self.qzeros.device
         ):
-            self.prepare_gemv_subgroup_layout(output_tile=output_tile)
+            self.prepare_gemv_subgroup_layout(output_tile=output_tile, scale_dtype=scale_dtype)
             qweight = self.gemv_qweight
             qscale = self.gemv_qscale
             qzeros = self.gemv_qzeros
@@ -1132,7 +1160,10 @@ def convert_module_linears_to_xpu_int4(
                 compute_dtype=resolved_compute_dtype,
                 device=device,
             )
-            replacement.prepare_gemv_subgroup_layout(output_tile=_XPU_INT4_GEMV_CACHE_TILE)
+            replacement.prepare_gemv_subgroup_layout(
+                output_tile=_XPU_INT4_GEMV_CACHE_TILE,
+                scale_dtype=_xpu_int4_gemv_scale_dtype_from_env(),
+            )
             if module_name == "lm_head" or module_name.endswith(".lm_head"):
                 replacement.prepare_lm_head_topk_layout()
             if cache_path is not None and fingerprint is not None:

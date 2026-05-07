@@ -592,6 +592,42 @@ def test_stream_chat_preserves_final_usage_stats() -> None:
     assert events[-1].perf == perf
 
 
+def test_stream_chat_closes_inner_stream_when_outer_generator_closes() -> None:
+    class _ClosableInnerStream:
+        def __init__(self) -> None:
+            self.closed = False
+            self.index = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index == 0:
+                self.index += 1
+                return StreamEvent(text="partial", finish_reason=None)
+            raise AssertionError("test should close the outer stream before consuming another event")
+
+        def close(self) -> None:
+            self.closed = True
+
+    inner = _ClosableInnerStream()
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine._prepare_messages = MethodType(lambda self, messages, *, enable_thinking: object(), engine)
+    engine.tokenizer = _EngineChatTokenizer()
+    engine._stream = MethodType(lambda self, prepared, *, config: inner, engine)
+
+    events = engine.stream_chat(
+        [{"role": "user", "content": "你好"}],
+        config=GenerationConfig(),
+        reasoning_format="none",
+    )
+
+    assert next(events).text == "partial"
+    events.close()
+
+    assert inner.closed is True
+
+
 def test_stream_direct_emits_final_usage_stats() -> None:
     perf = GenerationPerfStats(
         total_seconds=0.8,
