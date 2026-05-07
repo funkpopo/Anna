@@ -1363,6 +1363,7 @@ class AnnaQwen3_5TextEngine:
                     "gemv_local_size": os.getenv("ANNA_XPU_INT4_GEMV_LOCAL_SIZE"),
                     "gemv_output_tile": os.getenv("ANNA_XPU_INT4_GEMV_OUTPUT_TILE"),
                     "gemv_row_tile": os.getenv("ANNA_XPU_INT4_GEMV_ROW_TILE"),
+                    "gemv_scale_dtype": os.getenv("ANNA_XPU_INT4_GEMV_SCALE_DTYPE"),
                     "lm_head_local_size": os.getenv("ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE"),
                     "lm_head_block_topk_threshold": os.getenv("ANNA_XPU_INT4_LM_HEAD_BLOCK_TOPK_THRESHOLD", "65536"),
                     "lm_head_block_size": os.getenv("ANNA_XPU_INT4_LM_HEAD_BLOCK_SIZE", "4096"),
@@ -1432,7 +1433,13 @@ class AnnaQwen3_5TextEngine:
             prompt,
             tensor_device=self._preprocess_device(),
         )
-        yield from self._stream(prepared, config=config)
+        events = self._stream(prepared, config=config)
+        try:
+            yield from events
+        finally:
+            close = getattr(events, "close", None)
+            if callable(close):
+                close()
 
     def generate_chat(
         self,
@@ -1499,46 +1506,52 @@ class AnnaQwen3_5TextEngine:
         if resolved_reasoning_format != "none":
             reasoning_parser = self.tokenizer.create_reasoning_parser(enable_thinking=enable_thinking)
         tool_call_parser = self.tokenizer.create_tool_call_stream_parser()
-        for event in self._stream(prepared, config=config):
-            outputs: list[StreamEvent] = []
-            if event.reasoning_text:
-                outputs.append(StreamEvent(text="", reasoning_text=event.reasoning_text))
+        events = self._stream(prepared, config=config)
+        try:
+            for event in events:
+                outputs: list[StreamEvent] = []
+                if event.reasoning_text:
+                    outputs.append(StreamEvent(text="", reasoning_text=event.reasoning_text))
 
-            if reasoning_parser is None:
-                if event.text:
-                    outputs.extend(self._project_tool_stream_outputs(tool_call_parser.feed(event.text)))
-            else:
-                if event.text:
-                    for kind, chunk in reasoning_parser.feed(event.text):
-                        if kind == "reasoning":
-                            outputs.append(StreamEvent(text="", reasoning_text=chunk))
-                        elif chunk:
-                            outputs.extend(self._project_tool_stream_outputs(tool_call_parser.feed(chunk)))
+                if reasoning_parser is None:
+                    if event.text:
+                        outputs.extend(self._project_tool_stream_outputs(tool_call_parser.feed(event.text)))
+                else:
+                    if event.text:
+                        for kind, chunk in reasoning_parser.feed(event.text):
+                            if kind == "reasoning":
+                                outputs.append(StreamEvent(text="", reasoning_text=chunk))
+                            elif chunk:
+                                outputs.extend(self._project_tool_stream_outputs(tool_call_parser.feed(chunk)))
+                    if event.finish_reason is not None:
+                        for kind, chunk in reasoning_parser.flush():
+                            if kind == "reasoning":
+                                outputs.append(StreamEvent(text="", reasoning_text=chunk))
+                            elif chunk:
+                                outputs.extend(self._project_tool_stream_outputs(tool_call_parser.feed(chunk)))
+
                 if event.finish_reason is not None:
-                    for kind, chunk in reasoning_parser.flush():
-                        if kind == "reasoning":
-                            outputs.append(StreamEvent(text="", reasoning_text=chunk))
-                        elif chunk:
-                            outputs.extend(self._project_tool_stream_outputs(tool_call_parser.feed(chunk)))
+                    outputs.extend(self._project_tool_stream_outputs(tool_call_parser.flush()))
+                    for output in outputs:
+                        yield output
+                    finish_reason = (
+                        "tool_calls" if event.finish_reason == "stop" and tool_call_parser.saw_tool_calls else event.finish_reason
+                    )
+                    yield StreamEvent(
+                        text="",
+                        finish_reason=finish_reason,
+                        prompt_tokens=event.prompt_tokens,
+                        completion_tokens=event.completion_tokens,
+                        perf=event.perf,
+                    )
+                    continue
 
-            if event.finish_reason is not None:
-                outputs.extend(self._project_tool_stream_outputs(tool_call_parser.flush()))
                 for output in outputs:
                     yield output
-                finish_reason = (
-                    "tool_calls" if event.finish_reason == "stop" and tool_call_parser.saw_tool_calls else event.finish_reason
-                )
-                yield StreamEvent(
-                    text="",
-                    finish_reason=finish_reason,
-                    prompt_tokens=event.prompt_tokens,
-                    completion_tokens=event.completion_tokens,
-                    perf=event.perf,
-                )
-                continue
-
-            for output in outputs:
-                yield output
+        finally:
+            close = getattr(events, "close", None)
+            if callable(close):
+                close()
 
     def _project_tool_stream_outputs(
         self,

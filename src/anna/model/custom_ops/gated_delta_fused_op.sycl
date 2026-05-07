@@ -657,7 +657,9 @@ void validate_xpu_int4_gemv_tiled_inputs(
   TORCH_CHECK(out_features > 0, "out_features must be positive");
   TORCH_CHECK(hidden_states.size(1) == in_features, "hidden_states last dimension must match in_features");
   TORCH_CHECK(qweight.scalar_type() == at::kInt, "qweight must be int32");
-  TORCH_CHECK(qscale.scalar_type() == at::kFloat, "qscale must be float32");
+  TORCH_CHECK(
+      qscale.scalar_type() == at::kFloat || qscale.scalar_type() == at::kHalf || qscale.scalar_type() == at::kBFloat16,
+      "qscale must be float32, float16, or bfloat16");
   TORCH_CHECK(qzeros.scalar_type() == at::kChar, "qzeros must be int8");
   TORCH_CHECK(qweight.is_contiguous(), "qweight must be contiguous");
   TORCH_CHECK(qscale.is_contiguous(), "qscale must be contiguous");
@@ -2253,12 +2255,12 @@ void launch_xpu_int4_gemv_subgroup_m1_kernel(
   });
 }
 
-template <typename scalar_t>
+template <typename scalar_t, typename scale_t>
 void launch_xpu_int4_gemv_tiled_layout_subgroup_m1_kernel(
     sycl::queue& queue,
     const scalar_t* hidden_ptr,
     const int32_t* qweight_ptr,
-    const float* qscale_ptr,
+    const scale_t* qscale_ptr,
     const int8_t* qzeros_ptr,
     scalar_t* output_ptr,
     int64_t row_count,
@@ -2338,23 +2340,23 @@ void launch_xpu_int4_gemv_tiled_layout_subgroup_m1_kernel(
                 const int64_t group_idx = int4_group_index(hidden_idx, group_count, group_size);
                 if (group_idx != current_group) {
                   const int64_t scale_base = (group_idx * output_tiles + tile_idx) * output_tile;
-                  scale0 = qscale_ptr[scale_base];
+                  scale0 = load_as_float(qscale_ptr, scale_base);
                   zero0 = static_cast<int32_t>(qzeros_ptr[scale_base]);
                   if (output_tile >= 2) {
-                    scale1 = qscale_ptr[scale_base + 1];
+                    scale1 = load_as_float(qscale_ptr, scale_base + 1);
                     zero1 = static_cast<int32_t>(qzeros_ptr[scale_base + 1]);
                   }
                   if (output_tile >= 4) {
-                    scale2 = qscale_ptr[scale_base + 2];
-                    scale3 = qscale_ptr[scale_base + 3];
+                    scale2 = load_as_float(qscale_ptr, scale_base + 2);
+                    scale3 = load_as_float(qscale_ptr, scale_base + 3);
                     zero2 = static_cast<int32_t>(qzeros_ptr[scale_base + 2]);
                     zero3 = static_cast<int32_t>(qzeros_ptr[scale_base + 3]);
                   }
                   if (output_tile >= 8) {
-                    scale4 = qscale_ptr[scale_base + 4];
-                    scale5 = qscale_ptr[scale_base + 5];
-                    scale6 = qscale_ptr[scale_base + 6];
-                    scale7 = qscale_ptr[scale_base + 7];
+                    scale4 = load_as_float(qscale_ptr, scale_base + 4);
+                    scale5 = load_as_float(qscale_ptr, scale_base + 5);
+                    scale6 = load_as_float(qscale_ptr, scale_base + 6);
+                    scale7 = load_as_float(qscale_ptr, scale_base + 7);
                     zero4 = static_cast<int32_t>(qzeros_ptr[scale_base + 4]);
                     zero5 = static_cast<int32_t>(qzeros_ptr[scale_base + 5]);
                     zero6 = static_cast<int32_t>(qzeros_ptr[scale_base + 6]);
@@ -2624,23 +2626,35 @@ at::Tensor xpu_int4_gemv_tiled_xpu(
       hidden_states.scalar_type(),
       "xpu_int4_gemv_tiled_xpu",
       [&] {
-        launch_xpu_int4_gemv_tiled_layout_subgroup_m1_kernel(
-            stream.queue(),
-            hidden_states.const_data_ptr<scalar_t>(),
-            qweight.const_data_ptr<int32_t>(),
-            qscale.const_data_ptr<float>(),
-            qzeros.const_data_ptr<int8_t>(),
-            output.mutable_data_ptr<scalar_t>(),
-            row_count,
-            in_features,
-            out_features,
-            packed_cols,
-            output_tiles,
-            group_count,
-            group_size,
-            local_size,
-            output_tile,
-            row_tile);
+        auto launch = [&](auto scale_tag) {
+          using scale_t = decltype(scale_tag);
+          launch_xpu_int4_gemv_tiled_layout_subgroup_m1_kernel<scalar_t, scale_t>(
+              stream.queue(),
+              hidden_states.const_data_ptr<scalar_t>(),
+              qweight.const_data_ptr<int32_t>(),
+              qscale.const_data_ptr<scale_t>(),
+              qzeros.const_data_ptr<int8_t>(),
+              output.mutable_data_ptr<scalar_t>(),
+              row_count,
+              in_features,
+              out_features,
+              packed_cols,
+              output_tiles,
+              group_count,
+              group_size,
+              local_size,
+              output_tile,
+              row_tile);
+        };
+        if (qscale.scalar_type() == at::kFloat) {
+          launch(float{});
+        } else if (qscale.scalar_type() == at::kHalf) {
+          launch(c10::Half{});
+        } else if (qscale.scalar_type() == at::kBFloat16) {
+          launch(c10::BFloat16{});
+        } else {
+          TORCH_CHECK(false, "xpu_int4_gemv_tiled qscale must be float32, float16, or bfloat16");
+        }
       });
 
   return output;

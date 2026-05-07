@@ -452,6 +452,8 @@ def _stream_sse_chat(
                 usage=None if include_usage else _MISSING,
             )
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            if final_usage is not None:
+                break
     except AnnaEngineError as exc:
         yield _sse_error_frame(exc)
         yield "data: [DONE]\n\n"
@@ -536,6 +538,8 @@ def _stream_sse_completion(
                 _close_iterator(events)
                 events_closed = True
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            if final_usage is not None:
+                break
     except AnnaEngineError as exc:
         yield _sse_error_frame(exc)
         yield "data: [DONE]\n\n"
