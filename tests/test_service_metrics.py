@@ -10,6 +10,9 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     metrics.record_request_submitted(waiting=True)
     metrics.record_request_submitted(waiting=False)
     metrics.record_requests_started_from_queue(1)
+    metrics.record_queue_wait(0.25)
+    metrics.record_prefill_step(0.5)
+    metrics.record_decode_step(0.125)
     metrics.record_prompt_tokens(12)
     metrics.record_generation_tokens(5)
     metrics.record_prompt_cache_lookup(hit=True)
@@ -28,6 +31,15 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     assert snapshot.prompt_cache_hits_total == 1
     assert snapshot.running_requests == 0
     assert snapshot.waiting_requests == 0
+    assert snapshot.queue_wait_count == 1
+    assert snapshot.queue_wait_seconds_total == 0.25
+    assert snapshot.queue_wait_seconds_max == 0.25
+    assert snapshot.prefill_step_count == 1
+    assert snapshot.prefill_step_seconds_total == 0.5
+    assert snapshot.prefill_step_seconds_max == 0.5
+    assert snapshot.decode_step_count == 1
+    assert snapshot.decode_step_seconds_total == 0.125
+    assert snapshot.decode_step_seconds_max == 0.125
     assert metrics.activity_event.is_set() is True
 
 
@@ -49,6 +61,15 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
         waiting_requests=1,
         kv_cache_used_pages=6,
         kv_cache_total_pages=12,
+        queue_wait_seconds_total=0.25,
+        queue_wait_count=1,
+        queue_wait_seconds_max=0.25,
+        prefill_step_seconds_total=0.5,
+        prefill_step_count=2,
+        prefill_step_seconds_max=0.4,
+        decode_step_seconds_total=0.125,
+        decode_step_count=5,
+        decode_step_seconds_max=0.05,
     )
 
     line = AnnaServiceMetricsLogger.format_interval(previous, current)
@@ -56,6 +77,9 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
     assert "Interval prompt: 8.0 tok/s" in line
     assert "Interval generation: 5.0 tok/s" in line
     assert "Running: 2 reqs" in line
+    assert "Queue wait avg/max: 250.0/250.0 ms" in line
+    assert "Prefill step avg/max: 250.0/400.0 ms" in line
+    assert "Decode step avg/max: 25.0/50.0 ms" in line
     assert "Waiting: 1 reqs" in line
     assert "GPU KV cache usage: 50.0% (6/12 pages)" in line
     assert "Prompt cache hit rate: 75.0%" in line

@@ -193,6 +193,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip a tiny XPU prefill+decode after load (fused ops may load on first client request instead).",
     )
     parser.add_argument(
+        "--warmup-prefill-tokens",
+        type=_positive_int,
+        default=2,
+        help="Number of text tokens used by the post-load XPU warmup prefill. Ignored with --no-inference-warmup.",
+    )
+    parser.add_argument(
+        "--warmup-decode-steps",
+        type=_positive_int,
+        default=1,
+        help="Number of single-token decode steps used by the post-load XPU warmup. Ignored with --no-inference-warmup.",
+    )
+    parser.add_argument(
+        "--warmup-batch-size",
+        type=_positive_int,
+        default=1,
+        help="Batch size used by the post-load XPU warmup. Ignored with --no-inference-warmup.",
+    )
+    parser.add_argument(
         "--profile-runtime",
         action="store_true",
         help="Log synchronized XPU forward timings and memory stats for prefill/decode profiling.",
@@ -381,6 +399,9 @@ def main() -> None:
         generation_memory_safety_factor=args.generation_memory_safety_factor,
         scheduler_max_batch_size=args.scheduler_max_batch_size,
         scheduler_batch_wait_ms=args.scheduler_batch_wait_ms,
+        warmup_prefill_tokens=args.warmup_prefill_tokens,
+        warmup_decode_steps=args.warmup_decode_steps,
+        warmup_batch_size=args.warmup_batch_size,
         metrics_log_interval_seconds=args.metrics_log_interval_seconds,
         host=args.host,
         port=args.port,
@@ -414,7 +435,11 @@ def main() -> None:
         cached_experts_per_layer=settings.cached_experts_per_layer,
     )
     if not args.no_inference_warmup and hasattr(engine, "warmup_inference_kernels"):
-        engine.warmup_inference_kernels()
+        engine.warmup_inference_kernels(
+            prefill_tokens=settings.warmup_prefill_tokens,
+            decode_steps=settings.warmup_decode_steps,
+            batch_size=settings.warmup_batch_size,
+        )
     scheduler = _build_scheduler(engine, settings)
     metrics_logger = _build_metrics_logger(engine, settings)
     app = create_app(engine, scheduler=scheduler)

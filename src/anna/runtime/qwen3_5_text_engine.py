@@ -1982,7 +1982,13 @@ class AnnaQwen3_5TextEngine:
             **model_kwargs,
         )
 
-    def warmup_inference_kernels(self) -> None:
+    def warmup_inference_kernels(
+        self,
+        *,
+        prefill_tokens: int = 2,
+        decode_steps: int = 1,
+        batch_size: int = 1,
+    ) -> None:
         from anna.model.fused_ops import maybe_load_gated_delta_library
 
         maybe_load_gated_delta_library()
@@ -1993,9 +1999,12 @@ class AnnaQwen3_5TextEngine:
         bos = getattr(self.tokenizer, "bos_token_id", None)
         token_id = int(bos) if bos is not None and 0 <= int(bos) < cfg.vocab_size else pad
         device = self.device_context.device
+        prefill_tokens = max(2, int(prefill_tokens))
+        decode_steps = max(1, int(decode_steps))
+        batch_size = max(1, int(batch_size))
         with torch.inference_mode():
             # Fused causal_conv1d_prefill / gated_delta_prefill require seq_len > 1 (see SYCL TORCH_CHECK).
-            input_ids = torch.tensor([[token_id, token_id]], device=device, dtype=torch.long)
+            input_ids = torch.full((batch_size, prefill_tokens), token_id, device=device, dtype=torch.long)
             attention_mask = torch.ones_like(input_ids)
             outputs = self._forward_generation_model(
                 input_ids=input_ids,
@@ -2007,16 +2016,24 @@ class AnnaQwen3_5TextEngine:
             )
             past = outputs.past_key_values
             if past is not None:
-                self._forward_generation_model(
-                    input_ids=torch.tensor([[token_id]], device=device, dtype=torch.long),
-                    attention_mask=None,
-                    past_key_values=past,
-                    model_kwargs={},
-                    use_cache=True,
-                    logits_to_keep=1,
-                )
+                decode_ids = torch.full((batch_size, 1), token_id, device=device, dtype=torch.long)
+                for _ in range(decode_steps):
+                    outputs = self._forward_generation_model(
+                        input_ids=decode_ids,
+                        attention_mask=None,
+                        past_key_values=past,
+                        model_kwargs={},
+                        use_cache=True,
+                        logits_to_keep=1,
+                    )
+                    past = outputs.past_key_values
                 past.release()
-        logger.info("XPU inference warmup finished (2-token prefill + 1-token decode).")
+        logger.info(
+            "XPU inference warmup finished (prefill_tokens=%s decode_steps=%s batch_size=%s).",
+            prefill_tokens,
+            decode_steps,
+            batch_size,
+        )
 
     @staticmethod
     def _prune_trivial_attention_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:

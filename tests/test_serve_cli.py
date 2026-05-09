@@ -66,6 +66,12 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "4",
             "--kv-cache-residual-len",
             "96",
+            "--warmup-prefill-tokens",
+            "512",
+            "--warmup-decode-steps",
+            "8",
+            "--warmup-batch-size",
+            "4",
             "--metrics-log-interval-seconds",
             "3.5",
         ]
@@ -85,6 +91,9 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.kv_cache_quantization == "turboquant"
     assert args.kv_cache_quant_bits == 4
     assert args.kv_cache_residual_len == 96
+    assert args.warmup_prefill_tokens == 512
+    assert args.warmup_decode_steps == 8
+    assert args.warmup_batch_size == 4
     assert args.metrics_log_interval_seconds == 3.5
 
 
