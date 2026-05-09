@@ -22,19 +22,10 @@ _AUTO_ROUND_QUANT_METHODS = frozenset({"auto-round", "auto_round"})
 _AUTO_ROUND_PACKING_FORMATS = frozenset({"auto_round:auto_gptq"})
 _FLOAT_OVERRIDE_DATA_TYPES = frozenset({"fp", "float", "float16", "fp16", "bfloat16", "bf16"})
 _REGEX_META_CHARS = frozenset("\\[](){}?*+^$|")
-_XPU_INT4_MATMUL_STRATEGIES = frozenset({"auto", "torch", "dequant", "sycl"})
+_XPU_INT4_MATMUL_STRATEGIES = frozenset({"auto", "torch", "dequant"})
 _XPU_INT4_LAYOUT_CACHE_VERSION = 2
 _XPU_INT4_LAYOUT_NAME = "anna_xpu_int4_linear_v1"
-_XPU_INT4_GEMV_CACHE_TILE = 4
 _XPU_INT4_LM_HEAD_CACHE_TILE = 4
-_XPU_INT4_GEMV_SCALE_DTYPES = {
-    "fp32": torch.float32,
-    "float32": torch.float32,
-    "fp16": torch.float16,
-    "float16": torch.float16,
-    "bf16": torch.bfloat16,
-    "bfloat16": torch.bfloat16,
-}
 
 logger = logging.getLogger(__name__)
 
@@ -77,11 +68,6 @@ def _int4_shifts(*, device: torch.device | str | None = None) -> torch.Tensor:
 
 def _dtype_cache_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
-
-
-def _xpu_int4_gemv_scale_dtype_from_env() -> torch.dtype:
-    raw = os.getenv("ANNA_XPU_INT4_GEMV_SCALE_DTYPE", "fp32").strip().lower()
-    return _XPU_INT4_GEMV_SCALE_DTYPES.get(raw, torch.float32)
 
 
 def _safe_cache_key(value: str) -> str:
@@ -173,24 +159,6 @@ def _load_xpu_int4_linear_from_cache(
                 quantized.qzeros.copy_(payload["qzeros"].to(device=quantized.qzeros.device))
                 if quantized.bias is not None:
                     quantized.bias.copy_(payload["bias"].to(device=quantized.bias.device, dtype=quantized.bias.dtype))
-            if "gemv_qweight" in payload and "gemv_qscale" in payload and "gemv_qzeros" in payload:
-                quantized.register_buffer(
-                    "gemv_qweight",
-                    payload["gemv_qweight"].to(device=quantized.qweight.device).contiguous(),
-                    persistent=True,
-                )
-                quantized.register_buffer(
-                    "gemv_qscale",
-                    payload["gemv_qscale"].to(device=quantized.qscale.device).contiguous(),
-                    persistent=True,
-                )
-                quantized.register_buffer(
-                    "gemv_qzeros",
-                    payload["gemv_qzeros"].to(device=quantized.qzeros.device).contiguous(),
-                    persistent=True,
-                )
-                quantized.gemv_output_tile = int(metadata.get("gemv_output_tile", _XPU_INT4_GEMV_CACHE_TILE))
-                quantized.gemv_scale_dtype = payload["gemv_qscale"].dtype
             if "lm_head_qweight" in payload and "lm_head_qscale" in payload and "lm_head_qzeros" in payload:
                 quantized.register_buffer(
                     "lm_head_qweight",
@@ -237,8 +205,6 @@ def _save_xpu_int4_linear_to_cache(
             "padded_in_features": quantized.padded_in_features,
             "compute_dtype": _dtype_cache_name(quantized.compute_dtype),
             "has_bias": quantized.bias is not None,
-            "gemv_output_tile": int(getattr(quantized, "gemv_output_tile", 0)),
-            "gemv_scale_dtype": _dtype_cache_name(getattr(quantized, "gemv_scale_dtype", torch.float32)),
             "lm_head_output_tile": int(getattr(quantized, "lm_head_output_tile", 0)),
         },
         "qweight": quantized.qweight.detach().to(device="cpu").contiguous(),
@@ -247,9 +213,6 @@ def _save_xpu_int4_linear_to_cache(
         "bias": None if quantized.bias is None else quantized.bias.detach().to(device="cpu").contiguous(),
     }
     for name in (
-        "gemv_qweight",
-        "gemv_qscale",
-        "gemv_qzeros",
         "lm_head_qweight",
         "lm_head_qscale",
         "lm_head_qzeros",
@@ -547,85 +510,6 @@ class XPUInt4Linear(nn.Module):
         self.lm_head_output_tile = output_tile
         return self
 
-    def prepare_gemv_subgroup_layout(
-        self,
-        *,
-        output_tile: int = 4,
-        scale_dtype: torch.dtype | None = None,
-    ) -> "XPUInt4Linear":
-        if output_tile not in {1, 2, 4}:
-            raise ValueError("GEMV subgroup layout only supports output_tile values 1, 2, or 4.")
-        scale_dtype = scale_dtype or torch.float32
-        if scale_dtype not in {torch.float32, torch.float16, torch.bfloat16}:
-            raise ValueError("GEMV subgroup scale dtype must be float32, float16, or bfloat16.")
-        padded_out_features = ((self.out_features + output_tile - 1) // output_tile) * output_tile
-        packed_cols = self.qweight.shape[1]
-        group_count = self.qscale.shape[0]
-
-        qweight = torch.zeros(
-            (padded_out_features, packed_cols),
-            dtype=self.qweight.dtype,
-            device=self.qweight.device,
-        )
-        qweight[: self.out_features, :] = self.qweight
-        qweight = qweight.view(padded_out_features // output_tile, output_tile, packed_cols)
-        qweight = qweight.permute(0, 2, 1).contiguous()
-
-        qscale = torch.zeros(
-            (group_count, padded_out_features),
-            dtype=scale_dtype,
-            device=self.qscale.device,
-        )
-        qzeros = torch.zeros(
-            (group_count, padded_out_features),
-            dtype=self.qzeros.dtype,
-            device=self.qzeros.device,
-        )
-        qscale[:, : self.out_features] = self.qscale.to(dtype=scale_dtype)
-        qzeros[:, : self.out_features] = self.qzeros
-        qscale = qscale.view(group_count, padded_out_features // output_tile, output_tile).contiguous()
-        qzeros = qzeros.view(group_count, padded_out_features // output_tile, output_tile).contiguous()
-
-        if "gemv_qweight" in self._buffers:
-            self._buffers["gemv_qweight"] = qweight
-        else:
-            self.register_buffer("gemv_qweight", qweight, persistent=True)
-        if "gemv_qscale" in self._buffers:
-            self._buffers["gemv_qscale"] = qscale
-        else:
-            self.register_buffer("gemv_qscale", qscale, persistent=True)
-        if "gemv_qzeros" in self._buffers:
-            self._buffers["gemv_qzeros"] = qzeros
-        else:
-            self.register_buffer("gemv_qzeros", qzeros, persistent=True)
-        self.gemv_output_tile = output_tile
-        self.gemv_scale_dtype = scale_dtype
-        return self
-
-    def gemv_subgroup_tensors(self, *, output_tile: int = 4) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        scale_dtype = _xpu_int4_gemv_scale_dtype_from_env()
-        qweight = getattr(self, "gemv_qweight", None)
-        qscale = getattr(self, "gemv_qscale", None)
-        qzeros = getattr(self, "gemv_qzeros", None)
-        current_tile = int(getattr(self, "gemv_output_tile", 0))
-        current_scale_dtype = getattr(self, "gemv_scale_dtype", torch.float32)
-        if (
-            qweight is None
-            or qscale is None
-            or qzeros is None
-            or current_tile != output_tile
-            or current_scale_dtype != scale_dtype
-            or qscale.dtype != scale_dtype
-            or qweight.device != self.qweight.device
-            or qscale.device != self.qscale.device
-            or qzeros.device != self.qzeros.device
-        ):
-            self.prepare_gemv_subgroup_layout(output_tile=output_tile, scale_dtype=scale_dtype)
-            qweight = self.gemv_qweight
-            qscale = self.gemv_qscale
-            qzeros = self.gemv_qzeros
-        return qweight, qscale, qzeros
-
     def lm_head_topk_tensors(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         qweight = getattr(self, "lm_head_qweight", None)
         qscale = getattr(self, "lm_head_qscale", None)
@@ -771,69 +655,6 @@ class XPUInt4Linear(nn.Module):
             output = output + self.bias.to(device=output.device, dtype=output.dtype)
         return output
 
-    def _forward_sycl_int4_gemv(self, x_padded: torch.Tensor) -> torch.Tensor:
-        namespace = getattr(torch.ops, "anna", None)
-        op = None if namespace is None else getattr(namespace, "xpu_int4_gemv", None)
-        if op is None:
-            from anna.model.fused_ops import maybe_load_gated_delta_library
-
-            maybe_load_gated_delta_library()
-            namespace = getattr(torch.ops, "anna", None)
-            op = None if namespace is None else getattr(namespace, "xpu_int4_gemv", None)
-        if op is None:
-            raise RuntimeError(
-                "Anna xpu_int4_gemv op is not registered. Build/load the custom op first, "
-                "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
-            )
-        kernel_mode = os.getenv("ANNA_XPU_INT4_GEMV_KERNEL", "wg").strip().lower()
-        tiled_op = None if namespace is None else getattr(namespace, "xpu_int4_gemv_tiled", None)
-        if kernel_mode == "subgroup" and tiled_op is not None:
-            output_tile_raw = os.getenv("ANNA_XPU_INT4_GEMV_OUTPUT_TILE", "4").strip()
-            try:
-                output_tile = int(output_tile_raw)
-            except ValueError:
-                output_tile = 4
-            if output_tile not in {1, 2, 4}:
-                output_tile = 4
-            gemv_qweight, gemv_qscale, gemv_qzeros = self.gemv_subgroup_tensors(output_tile=output_tile)
-            output = tiled_op(
-                x_padded,
-                gemv_qweight,
-                gemv_qscale,
-                gemv_qzeros,
-                self.group_size,
-                self.padded_in_features,
-                self.out_features,
-            )
-        else:
-            output = op(
-                x_padded,
-                self.qweight,
-                self.qscale,
-                self.qzeros,
-                self.group_size,
-                self.padded_in_features,
-            )
-        if self.bias is not None:
-            output = output + self.bias.to(device=output.device, dtype=output.dtype)
-        return output
-
-    def _should_auto_use_sycl_int4_gemv(self, x_padded: torch.Tensor) -> bool:
-        if os.getenv("ANNA_XPU_AUTO_INT4_GEMV", "").strip().lower() not in {"1", "true", "yes", "on"}:
-            return False
-        if os.getenv("ANNA_XPU_DISABLE_AUTO_INT4_GEMV", "").strip().lower() in {"1", "true", "yes", "on"}:
-            return False
-        return (
-            x_padded.device.type == "xpu"
-            and x_padded.shape[0] == 1
-            and self.in_features == 4096
-            and self.out_features == 4096
-            and self.padded_in_features == 4096
-            and self.group_size == 128
-            and self.bias is None
-            and self.compute_dtype in {torch.float16, torch.bfloat16}
-        )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
@@ -852,25 +673,9 @@ class XPUInt4Linear(nn.Module):
             strategy = self._matmul_strategy()
             if strategy == "dequant":
                 output = self._forward_dequant(x_padded)
-            elif strategy == "sycl":
-                output = self._forward_sycl_int4_gemv(x_padded)
             else:
                 try:
-                    if strategy == "auto" and self._should_auto_use_sycl_int4_gemv(x_padded):
-                        try:
-                            output = self._forward_sycl_int4_gemv(x_padded)
-                        except Exception:
-                            logger.warning(
-                                "Falling back to PyTorch XPU int4 linear after auto sycl GEMV failure: "
-                                "in_features=%s out_features=%s group_size=%s",
-                                self.in_features,
-                                self.out_features,
-                                self.group_size,
-                                exc_info=True,
-                            )
-                            output = self._forward_torch_xpu_int4(x_padded)
-                    else:
-                        output = self._forward_torch_xpu_int4(x_padded)
+                    output = self._forward_torch_xpu_int4(x_padded)
                 except Exception:
                     if strategy == "torch":
                         raise
@@ -1073,19 +878,10 @@ def estimate_module_xpu_int4_bytes(
             )
             lm_head_qscale = getattr(child, "lm_head_qscale", None)
             lm_head_qzeros = getattr(child, "lm_head_qzeros", None)
-            gemv_qweight = getattr(child, "gemv_qweight", None)
-            gemv_qscale = getattr(child, "gemv_qscale", None)
-            gemv_qzeros = getattr(child, "gemv_qzeros", None)
             if lm_head_qscale is not None:
                 total += lm_head_qscale.nelement() * lm_head_qscale.element_size()
             if lm_head_qzeros is not None:
                 total += lm_head_qzeros.nelement() * lm_head_qzeros.element_size()
-            if gemv_qweight is not None:
-                total += gemv_qweight.nelement() * gemv_qweight.element_size()
-            if gemv_qscale is not None:
-                total += gemv_qscale.nelement() * gemv_qscale.element_size()
-            if gemv_qzeros is not None:
-                total += gemv_qzeros.nelement() * gemv_qzeros.element_size()
             if child.bias is not None:
                 total += child.bias.nelement() * child.bias.element_size()
         elif isinstance(child, (AutoRoundGPTQLinear, AWQLinear, DenseLinear, nn.Linear)):
@@ -1159,10 +955,6 @@ def convert_module_linears_to_xpu_int4(
                 group_size=resolved_group_size,
                 compute_dtype=resolved_compute_dtype,
                 device=device,
-            )
-            replacement.prepare_gemv_subgroup_layout(
-                output_tile=_XPU_INT4_GEMV_CACHE_TILE,
-                scale_dtype=_xpu_int4_gemv_scale_dtype_from_env(),
             )
             if module_name == "lm_head" or module_name.endswith(".lm_head"):
                 replacement.prepare_lm_head_topk_layout()

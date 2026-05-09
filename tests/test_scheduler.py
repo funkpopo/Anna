@@ -91,6 +91,8 @@ class _FakeModel:
         self.decode_batch_sizes: list[int] = []
         self.text_prefill_batch_sizes: list[int] = []
         self.text_decode_batch_sizes: list[int] = []
+        self.text_prefill_topk_batch_sizes: list[int] = []
+        self.text_decode_topk_batch_sizes: list[int] = []
         self.text_prefill_chunk_lengths: list[int] = []
         self.model = _FakePrefillRunner(self)
         self.lm_head = _FakeLMHead(self)
@@ -164,6 +166,43 @@ class _FakeModel:
             },
         )()
 
+    def forward_text_only_topk(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Qwen3DynamicCache | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | None = None,
+        top_k: int = 1,
+    ):
+        del attention_mask, use_cache, logits_to_keep
+        batch_size = input_ids.shape[0]
+        candidate_logits = torch.full((batch_size, 1, top_k), -1000.0)
+        candidate_token_ids = torch.zeros((batch_size, 1, top_k), dtype=torch.long)
+        if past_key_values is None or input_ids.shape[1] > 1:
+            seq_len = input_ids.shape[1]
+            self.text_prefill_topk_batch_sizes.append(batch_size)
+            planned = [1, 2]
+            for idx in range(batch_size):
+                candidate_logits[idx, 0, 0] = 1000.0
+                candidate_token_ids[idx, 0, 0] = planned[idx]
+            cache = self._make_cache(batch_size=batch_size, seq_len=seq_len)
+        else:
+            self.text_decode_topk_batch_sizes.append(batch_size)
+            candidate_logits[:, 0, 0] = 1000.0
+            candidate_token_ids[:, 0, 0] = 9
+            cache = past_key_values
+        return type(
+            "TextTopKOutput",
+            (),
+            {
+                "candidate_logits": candidate_logits,
+                "candidate_token_ids": candidate_token_ids,
+                "past_key_values": cache,
+            },
+        )()
+
 
 def _prepared(prompt_tokens: list[int]) -> PreparedInputs:
     input_ids = torch.tensor([prompt_tokens], dtype=torch.long)
@@ -207,8 +246,8 @@ def test_scheduler_batches_same_length_requests() -> None:
     engine.set_scheduler(scheduler)
 
     try:
-        request_a = scheduler._submit(_prepared([4, 5]), config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0), stream=False)
-        request_b = scheduler._submit(_prepared([6, 7]), config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0), stream=False)
+        request_a = scheduler._submit(_prepared([4, 5]), config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.1), stream=False)
+        request_b = scheduler._submit(_prepared([6, 7]), config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.1), stream=False)
 
         assert request_a.done.wait(timeout=2.0)
         assert request_b.done.wait(timeout=2.0)
@@ -269,12 +308,12 @@ def test_scheduler_chunks_long_same_length_prefills() -> None:
     try:
         request_a = scheduler._submit(
             _prepared([4, 5, 6, 7]),
-            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.1),
             stream=False,
         )
         request_b = scheduler._submit(
             _prepared([8, 9, 10, 11]),
-            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.1),
             stream=False,
         )
 
@@ -323,12 +362,12 @@ def test_scheduler_batches_mixed_length_requests_during_decode() -> None:
     try:
         request_a = scheduler._submit(
             _prepared([4, 5]),
-            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.1),
             stream=False,
         )
         request_b = scheduler._submit(
             _prepared([6, 7, 8]),
-            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.1),
             stream=False,
         )
 
@@ -348,6 +387,61 @@ def test_scheduler_batches_mixed_length_requests_during_decode() -> None:
         assert snapshot.generation_tokens_total == 2
         assert snapshot.running_requests == 0
         assert snapshot.waiting_requests == 0
+    finally:
+        scheduler.shutdown()
+
+
+def test_scheduler_uses_topk_forward_for_eligible_batches() -> None:
+    config = Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            vocab_size=16,
+            eos_token_id=9,
+            pad_token_id=0,
+            cache_block_size=2,
+            layer_types=["full_attention"],
+        )
+    )
+    fake_model = _FakeModel(config)
+    engine = AnnaQwen3_5TextEngine(
+        model=fake_model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="fake",
+        device_context=_FakeDeviceContext(),
+    )
+    scheduler = AnnaScheduler(engine, max_batch_size=4, batch_wait_ms=20.0)
+    engine.set_scheduler(scheduler)
+
+    try:
+        request_a = scheduler._submit(
+            _prepared([4, 5]),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=1),
+            stream=False,
+        )
+        request_b = scheduler._submit(
+            _prepared([6, 7]),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=1),
+            stream=False,
+        )
+
+        assert request_a.done.wait(timeout=2.0)
+        assert request_b.done.wait(timeout=2.0)
+        assert request_a.error is None
+        assert request_b.error is None
+        assert fake_model.text_prefill_topk_batch_sizes == [2]
+        assert fake_model.text_decode_topk_batch_sizes == [2]
+        assert fake_model.text_prefill_batch_sizes == []
+        assert fake_model.text_decode_batch_sizes == []
     finally:
         scheduler.shutdown()
 
@@ -387,7 +481,7 @@ def test_scheduler_streaming_final_event_includes_usage_stats() -> None:
         events = list(
             scheduler.stream(
                 _prepared([4, 5]),
-                config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+                config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.1),
             )
         )
 
