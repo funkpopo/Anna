@@ -26,6 +26,7 @@ from anna.model.fused_ops import (
     run_lm_head_topk_fused,
 )
 from anna.model.quantization import XPUInt4Linear
+from anna.model.xpu_decode_profile import xpu_profile_region
 
 _ENABLE_INT4_LM_HEAD_TOPK_FUSED = os.getenv("ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED", "").strip().lower() in {
     "1",
@@ -89,25 +90,28 @@ def _lm_head_topk(
         and lm_head_int4_topk_fused_is_available()
     ):
         qweight, qscale, qzeros = lm_head.lm_head_topk_tensors()
-        return run_lm_head_int4_topk_fused(
-            hidden_states=hidden_states,
-            qweight=qweight,
-            qscale=qscale,
-            qzeros=qzeros,
-            group_size=lm_head.group_size,
-            in_features=lm_head.in_features,
-            top_k=top_k,
-        )
+        with xpu_profile_region("lm_head"):
+            return run_lm_head_int4_topk_fused(
+                hidden_states=hidden_states,
+                qweight=qweight,
+                qscale=qscale,
+                qzeros=qzeros,
+                group_size=lm_head.group_size,
+                in_features=lm_head.in_features,
+                top_k=top_k,
+            )
     if (
         hidden_states.device.type == "xpu"
         and isinstance(lm_head, nn.Linear)
         and lm_head.bias is None
         and lm_head_topk_fused_is_available()
     ):
-        return run_lm_head_topk_fused(hidden_states=hidden_states, weight=lm_head.weight, top_k=top_k)
-    logits = lm_head(hidden_states)
-    k = min(int(top_k), int(logits.shape[-1]))
-    return torch.topk(logits, k=k, dim=-1)
+        with xpu_profile_region("lm_head"):
+            return run_lm_head_topk_fused(hidden_states=hidden_states, weight=lm_head.weight, top_k=top_k)
+    with xpu_profile_region("lm_head"):
+        logits = lm_head(hidden_states)
+        k = min(int(top_k), int(logits.shape[-1]))
+        return torch.topk(logits, k=k, dim=-1)
 
 
 def _align_tensor_device(tensor: torch.Tensor | None, device: torch.device) -> torch.Tensor | None:
@@ -862,7 +866,8 @@ class Qwen3_5TextForCausalLM(nn.Module):
         lm_head_device = _module_device(self.lm_head)
         if hidden_states.device != lm_head_device:
             hidden_states = hidden_states.to(device=lm_head_device)
-        logits = self.lm_head(hidden_states)
+        with xpu_profile_region("lm_head"):
+            logits = self.lm_head(hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)
 
     def forward_topk(
@@ -960,7 +965,8 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         lm_head_device = _module_device(self.lm_head)
         if hidden_states.device != lm_head_device:
             hidden_states = hidden_states.to(device=lm_head_device)
-        logits = self.lm_head(hidden_states)
+        with xpu_profile_region("lm_head"):
+            logits = self.lm_head(hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)
 
     def forward_text_only_topk(
@@ -1023,7 +1029,8 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         lm_head_device = _module_device(self.lm_head)
         if hidden_states.device != lm_head_device:
             hidden_states = hidden_states.to(device=lm_head_device)
-        logits = self.lm_head(hidden_states)
+        with xpu_profile_region("lm_head"):
+            logits = self.lm_head(hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values, rope_deltas=outputs.rope_deltas)
 
     def forward_topk(

@@ -382,6 +382,37 @@ def test_dynamic_cache_stack_and_split_round_trips_turboquant_batches() -> None:
     assert ((split[1].visible_value_cache(1) - value_b).float() ** 2).mean().item() < 1.0
 
 
+def test_dynamic_cache_stack_and_split_can_reuse_turboquant_rows_for_decode() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config)
+    cache_a = Qwen3DynamicCache(
+        config,
+        allocator=allocator,
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+    cache_b = Qwen3DynamicCache(
+        config,
+        allocator=allocator,
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+    cache_a.update(torch.randn(1, 2, 3, 16), torch.randn(1, 2, 3, 16), layer_idx=1)
+    cache_b.update(torch.randn(1, 2, 4, 16), torch.randn(1, 2, 4, 16), layer_idx=1)
+    row_a = cache_a.turboquant_rows[1][0]
+    row_b = cache_b.turboquant_rows[1][0]
+
+    stacked = Qwen3DynamicCache.stack([cache_a, cache_b], config, clone_turboquant_rows=False)
+    split = stacked.split_batch(clone_turboquant_rows=False)
+
+    assert stacked.turboquant_rows[1][0] is row_a
+    assert stacked.turboquant_rows[1][1] is row_b
+    assert split[0].turboquant_rows[1][0] is row_a
+    assert split[1].turboquant_rows[1][0] is row_b
+
+
 def test_dynamic_cache_clone_preserves_contents_with_distinct_page_tables() -> None:
     config = _tiny_config()
     allocator = Qwen3PageAllocator(config)
