@@ -54,42 +54,8 @@ def _safety_factor(value: str) -> float:
     return parsed
 
 
-def _int4_gemv_output_tile(value: str) -> int:
-    parsed = int(value)
-    if parsed not in {1, 2, 4}:
-        raise argparse.ArgumentTypeError("value must be one of: 1, 2, 4")
-    return parsed
-
-
-def _int4_gemv_local_size(value: str) -> int:
-    parsed = int(value)
-    if parsed < 16 or parsed > 256 or parsed & (parsed - 1):
-        raise argparse.ArgumentTypeError("value must be a power of two in [16, 256]")
-    return parsed
-
-
-def _int4_gemv_row_tile(value: str) -> int:
-    parsed = int(value)
-    if parsed not in {1, 2, 4}:
-        raise argparse.ArgumentTypeError("value must be one of: 1, 2, 4")
-    return parsed
-
-
 def configure_int4_kernel_environment(args: argparse.Namespace) -> None:
-    updates = {
-        "ANNA_XPU_INT4_MATMUL": args.xpu_int4_matmul,
-        "ANNA_XPU_INT4_GEMV_KERNEL": args.xpu_int4_gemv_kernel,
-        "ANNA_XPU_INT4_GEMV_OUTPUT_TILE": None
-        if args.xpu_int4_gemv_output_tile is None
-        else str(args.xpu_int4_gemv_output_tile),
-        "ANNA_XPU_INT4_GEMV_LOCAL_SIZE": None
-        if args.xpu_int4_gemv_local_size is None
-        else str(args.xpu_int4_gemv_local_size),
-        "ANNA_XPU_INT4_GEMV_ROW_TILE": None
-        if args.xpu_int4_gemv_row_tile is None
-        else str(args.xpu_int4_gemv_row_tile),
-        "ANNA_XPU_INT4_GEMV_SCALE_DTYPE": args.xpu_int4_gemv_scale_dtype,
-    }
+    updates = {"ANNA_XPU_INT4_MATMUL": args.xpu_int4_matmul}
     applied: dict[str, str] = {}
     for name, value in updates.items():
         if value is None:
@@ -302,39 +268,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--xpu-int4-matmul",
-        choices=("auto", "torch", "dequant", "sycl"),
-        default="torch",
-        help="XPU int4 dense linear execution strategy. Defaults to torch; use sycl to enable the experimental standalone GEMV path.",
-    )
-    parser.add_argument(
-        "--xpu-int4-gemv-kernel",
-        choices=("wg", "subgroup"),
+        choices=("auto", "torch", "dequant"),
         default=None,
-        help="Override ANNA_XPU_INT4_GEMV_KERNEL for the experimental standalone SYCL GEMV path.",
-    )
-    parser.add_argument(
-        "--xpu-int4-gemv-output-tile",
-        type=_int4_gemv_output_tile,
-        default=None,
-        help="Override ANNA_XPU_INT4_GEMV_OUTPUT_TILE for experimental M=1 GEMV. Valid values: 1, 2, 4.",
-    )
-    parser.add_argument(
-        "--xpu-int4-gemv-local-size",
-        type=_int4_gemv_local_size,
-        default=None,
-        help="Override ANNA_XPU_INT4_GEMV_LOCAL_SIZE. Must be a power of two in [16, 256].",
-    )
-    parser.add_argument(
-        "--xpu-int4-gemv-row-tile",
-        type=_int4_gemv_row_tile,
-        default=None,
-        help="Override ANNA_XPU_INT4_GEMV_ROW_TILE for tiled subgroup multi-row blocks. Valid values: 1, 2, 4.",
-    )
-    parser.add_argument(
-        "--xpu-int4-gemv-scale-dtype",
-        choices=("fp32", "fp16", "bf16"),
-        default=None,
-        help="Override ANNA_XPU_INT4_GEMV_SCALE_DTYPE for tiled subgroup qscale storage.",
+        help="XPU int4 dense linear execution strategy. Omit to use the runtime default, currently torch int4pack.",
     )
     parser.add_argument(
         "--resident-expert-layers",

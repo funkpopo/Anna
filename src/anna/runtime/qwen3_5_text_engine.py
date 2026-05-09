@@ -1358,12 +1358,6 @@ class AnnaQwen3_5TextEngine:
                 "kv_cache_residual_len": self.optimization_config.kv_cache_residual_len,
                 "xpu_int4_kernels": {
                     "matmul_strategy": os.getenv("ANNA_XPU_INT4_MATMUL", "auto"),
-                    "auto_gemv_enabled": os.getenv("ANNA_XPU_AUTO_INT4_GEMV"),
-                    "gemv_kernel": os.getenv("ANNA_XPU_INT4_GEMV_KERNEL"),
-                    "gemv_local_size": os.getenv("ANNA_XPU_INT4_GEMV_LOCAL_SIZE"),
-                    "gemv_output_tile": os.getenv("ANNA_XPU_INT4_GEMV_OUTPUT_TILE"),
-                    "gemv_row_tile": os.getenv("ANNA_XPU_INT4_GEMV_ROW_TILE"),
-                    "gemv_scale_dtype": os.getenv("ANNA_XPU_INT4_GEMV_SCALE_DTYPE"),
                     "lm_head_local_size": os.getenv("ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE"),
                     "lm_head_block_topk_threshold": os.getenv("ANNA_XPU_INT4_LM_HEAD_BLOCK_TOPK_THRESHOLD", "65536"),
                     "lm_head_block_size": os.getenv("ANNA_XPU_INT4_LM_HEAD_BLOCK_SIZE", "4096"),

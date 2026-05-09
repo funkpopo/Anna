@@ -11,7 +11,7 @@ import torch
 
 from anna.mm.prepared_inputs import PreparedInputsLike
 from anna.runtime.streaming import IncrementalTextAssembler
-from anna.sampling.sampler import sample_next_token
+from anna.sampling.sampler import sample_next_token, sample_next_token_from_candidates
 
 if TYPE_CHECKING:
     from anna.runtime.qwen3_5_text_engine import (
@@ -138,12 +138,13 @@ class AnnaScheduler:
                         self._condition.wait(timeout=self.batch_wait_seconds)
 
                     pending_batch: list[SchedulerRequest] = []
-                    while self._pending and len(pending_batch) < self.max_batch_size:
-                        request = self._pending.popleft()
-                        if self._is_request_cancelled(request):
-                            self._drop_cancelled_request(request)
-                        else:
-                            pending_batch.append(request)
+                    if not active:
+                        while self._pending and len(pending_batch) < self.max_batch_size:
+                            request = self._pending.popleft()
+                            if self._is_request_cancelled(request):
+                                self._drop_cancelled_request(request)
+                            else:
+                                pending_batch.append(request)
 
                 if pending_batch:
                     try:
@@ -241,15 +242,25 @@ class AnnaScheduler:
                     )
                     chunk = self.engine.device_context.move_prepared_inputs(chunk)
                     with self.engine.execution_lock:
-                        outputs = self.engine._profiled_forward_generation_model(
-                            stage=f"scheduler_prefill[{start_idx}:{end_idx}]",
-                            input_ids=chunk.input_ids,
-                            attention_mask=chunk.attention_mask,
-                            past_key_values=past_key_values,
-                            model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=True),
-                            use_cache=True,
-                            logits_to_keep=1,
-                        )
+                        if end_idx == prompt_length:
+                            outputs = self._forward_batch_maybe_topk(
+                                stage=f"scheduler_prefill[{start_idx}:{end_idx}]",
+                                requests=requests,
+                                input_ids=chunk.input_ids,
+                                attention_mask=chunk.attention_mask,
+                                past_key_values=past_key_values,
+                                model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=True),
+                            )
+                        else:
+                            outputs = self.engine._profiled_forward_generation_model(
+                                stage=f"scheduler_prefill[{start_idx}:{end_idx}]",
+                                input_ids=chunk.input_ids,
+                                attention_mask=chunk.attention_mask,
+                                past_key_values=past_key_values,
+                                model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=True),
+                                use_cache=True,
+                                logits_to_keep=1,
+                            )
                     past_key_values = outputs.past_key_values
                     if metrics is not None:
                         chunk_tokens = (end_idx - start_idx) * len(requests)
@@ -259,13 +270,13 @@ class AnnaScheduler:
             else:
                 batched = self.engine.device_context.move_prepared_inputs(batched)
                 with self.engine.execution_lock:
-                    outputs = self.engine._profiled_forward_generation_model(
+                    outputs = self._forward_batch_maybe_topk(
                         stage="scheduler_prefill",
+                        requests=requests,
                         input_ids=batched.input_ids,
                         attention_mask=batched.attention_mask,
+                        past_key_values=None,
                         model_kwargs=self.engine._build_prefill_model_kwargs(batched, include_media=True),
-                        use_cache=True,
-                        logits_to_keep=1,
                     )
                     past_key_values = outputs.past_key_values
         except RuntimeError as exc:
@@ -290,14 +301,7 @@ class AnnaScheduler:
                 self._drop_cancelled_request(request)
                 continue
             request.past_key_values = split_caches[row_idx]
-            next_token = sample_next_token(
-                outputs.logits[row_idx, -1],
-                generated_ids=request.repetition_history,
-                temperature=request.config.temperature,
-                top_p=request.config.top_p,
-                top_k=request.config.top_k,
-                repetition_penalty=request.config.repetition_penalty,
-            )
+            next_token = self._sample_next_token_from_outputs(outputs, row_idx=row_idx, request=request)
             token_id = int(next_token.item())
             if request.first_token_at is None:
                 request.first_token_at = time.perf_counter()
@@ -347,12 +351,11 @@ class AnnaScheduler:
 
         try:
             with self.engine.execution_lock:
-                outputs = self.engine._profiled_forward_generation_model(
+                outputs = self._forward_batch_maybe_topk(
                     stage="scheduler_decode",
+                    requests=requests,
                     input_ids=input_ids,
                     past_key_values=batch_cache,
-                    use_cache=True,
-                    logits_to_keep=1,
                 )
         except RuntimeError as exc:
             raise self.engine._handle_runtime_failure(exc) from exc
@@ -368,14 +371,7 @@ class AnnaScheduler:
                 self._drop_cancelled_request(request)
                 continue
             request.past_key_values = split_caches[row_idx]
-            next_token = sample_next_token(
-                outputs.logits[row_idx, -1],
-                generated_ids=request.repetition_history,
-                temperature=request.config.temperature,
-                top_p=request.config.top_p,
-                top_k=request.config.top_k,
-                repetition_penalty=request.config.repetition_penalty,
-            )
+            next_token = self._sample_next_token_from_outputs(outputs, row_idx=row_idx, request=request)
             token_id = int(next_token.item())
             if request.first_token_at is None:
                 request.first_token_at = time.perf_counter()
@@ -405,6 +401,68 @@ class AnnaScheduler:
             request.input_ids = next_token.view(1, 1)
             next_active.append(request)
         return next_active
+
+    def _shared_fused_lm_head_candidate_count(self, requests: list[SchedulerRequest]) -> int | None:
+        candidate_counts = [self.engine._fused_lm_head_candidate_count(request.config) for request in requests]
+        first = candidate_counts[0] if candidate_counts else None
+        if first is None:
+            return None
+        if any(candidate != first for candidate in candidate_counts):
+            return None
+        return int(first)
+
+    def _forward_batch_maybe_topk(
+        self,
+        *,
+        stage: str,
+        requests: list[SchedulerRequest],
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: object | None = None,
+        model_kwargs: dict[str, object] | None = None,
+    ):
+        candidate_count = self._shared_fused_lm_head_candidate_count(requests)
+        outputs = (
+            self.engine._forward_generation_model_topk(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                model_kwargs=model_kwargs,
+                use_cache=True,
+                logits_to_keep=1,
+                top_k=candidate_count,
+            )
+            if candidate_count is not None
+            else None
+        )
+        if outputs is not None:
+            return outputs
+        return self.engine._profiled_forward_generation_model(
+            stage=stage,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            model_kwargs=model_kwargs,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+
+    def _sample_next_token_from_outputs(self, outputs, *, row_idx: int, request: SchedulerRequest) -> torch.Tensor:
+        if hasattr(outputs, "candidate_logits") and hasattr(outputs, "candidate_token_ids"):
+            return sample_next_token_from_candidates(
+                outputs.candidate_logits[row_idx, -1],
+                outputs.candidate_token_ids[row_idx, -1],
+                temperature=request.config.temperature,
+                top_p=request.config.top_p,
+            )
+        return sample_next_token(
+            outputs.logits[row_idx, -1],
+            generated_ids=request.repetition_history,
+            temperature=request.config.temperature,
+            top_p=request.config.top_p,
+            top_k=request.config.top_k,
+            repetition_penalty=request.config.repetition_penalty,
+        )
 
     def _batch_text_inputs(self, requests: list[SchedulerRequest]) -> PreparedInputsLike:
         max_prompt_length = max(request.prompt_length for request in requests)

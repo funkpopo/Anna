@@ -51,18 +51,6 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "--offload-vision",
             "--weight-quant",
             "int4",
-            "--xpu-int4-matmul",
-            "sycl",
-            "--xpu-int4-gemv-kernel",
-            "subgroup",
-            "--xpu-int4-gemv-output-tile",
-            "4",
-            "--xpu-int4-gemv-local-size",
-            "128",
-            "--xpu-int4-gemv-row-tile",
-            "4",
-            "--xpu-int4-gemv-scale-dtype",
-            "bf16",
             "--enable-flashqla-gdn-prefill",
             "--min-free-memory-mib",
             "256",
@@ -88,12 +76,7 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.reasoning_format == "deepseek"
     assert args.offload_vision is True
     assert args.weight_quant == "int4"
-    assert args.xpu_int4_matmul == "sycl"
-    assert args.xpu_int4_gemv_kernel == "subgroup"
-    assert args.xpu_int4_gemv_output_tile == 4
-    assert args.xpu_int4_gemv_local_size == 128
-    assert args.xpu_int4_gemv_row_tile == 4
-    assert args.xpu_int4_gemv_scale_dtype == "bf16"
+    assert args.xpu_int4_matmul is None
     assert args.enable_flashqla_gdn_prefill is True
     assert args.min_free_memory_mib == 256
     assert args.reserve_memory_mib == 128
@@ -105,62 +88,33 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.metrics_log_interval_seconds == 3.5
 
 
-def test_configure_int4_kernel_environment_applies_cli_overrides(monkeypatch) -> None:
+def test_configure_int4_kernel_environment_applies_matmul_override(monkeypatch) -> None:
     parser = build_parser()
     args = parser.parse_args(
         [
             "--model-dir",
             "model",
             "--xpu-int4-matmul",
-            "sycl",
-            "--xpu-int4-gemv-kernel",
-            "subgroup",
-            "--xpu-int4-gemv-output-tile",
-            "4",
-            "--xpu-int4-gemv-local-size",
-            "128",
-            "--xpu-int4-gemv-row-tile",
-            "4",
-            "--xpu-int4-gemv-scale-dtype",
-            "bf16",
+            "dequant",
         ]
     )
 
-    for name in (
-        "ANNA_XPU_INT4_MATMUL",
-        "ANNA_XPU_INT4_GEMV_KERNEL",
-        "ANNA_XPU_INT4_GEMV_OUTPUT_TILE",
-        "ANNA_XPU_INT4_GEMV_LOCAL_SIZE",
-        "ANNA_XPU_INT4_GEMV_ROW_TILE",
-        "ANNA_XPU_INT4_GEMV_SCALE_DTYPE",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("ANNA_XPU_INT4_MATMUL", raising=False)
 
     configure_int4_kernel_environment(args)
 
-    assert os.environ["ANNA_XPU_INT4_MATMUL"] == "sycl"
-    assert os.environ["ANNA_XPU_INT4_GEMV_KERNEL"] == "subgroup"
-    assert os.environ["ANNA_XPU_INT4_GEMV_OUTPUT_TILE"] == "4"
-    assert os.environ["ANNA_XPU_INT4_GEMV_LOCAL_SIZE"] == "128"
-    assert os.environ["ANNA_XPU_INT4_GEMV_ROW_TILE"] == "4"
-    assert os.environ["ANNA_XPU_INT4_GEMV_SCALE_DTYPE"] == "bf16"
+    assert os.environ["ANNA_XPU_INT4_MATMUL"] == "dequant"
 
 
-def test_configure_int4_kernel_environment_defaults_to_torch_matmul(monkeypatch) -> None:
+def test_configure_int4_kernel_environment_preserves_runtime_default(monkeypatch) -> None:
     parser = build_parser()
     args = parser.parse_args(["--model-dir", "model"])
 
-    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "sycl")
-    monkeypatch.setenv("ANNA_XPU_INT4_GEMV_KERNEL", "subgroup")
-    monkeypatch.delenv("ANNA_XPU_INT4_GEMV_OUTPUT_TILE", raising=False)
-    monkeypatch.delenv("ANNA_XPU_INT4_GEMV_LOCAL_SIZE", raising=False)
-    monkeypatch.delenv("ANNA_XPU_INT4_GEMV_ROW_TILE", raising=False)
-    monkeypatch.delenv("ANNA_XPU_INT4_GEMV_SCALE_DTYPE", raising=False)
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "dequant")
 
     configure_int4_kernel_environment(args)
 
-    assert os.environ["ANNA_XPU_INT4_MATMUL"] == "torch"
-    assert os.environ["ANNA_XPU_INT4_GEMV_KERNEL"] == "subgroup"
+    assert os.environ["ANNA_XPU_INT4_MATMUL"] == "dequant"
 
 
 def test_configure_flashqla_environment_applies_cli_override(monkeypatch) -> None:
