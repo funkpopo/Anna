@@ -46,7 +46,17 @@ class SchedulerRequest:
     events: queue.Queue[object] = field(default_factory=queue.Queue)
     generation_started_at: float | None = None
     first_token_at: float | None = None
+    queued_at: float = field(default_factory=time.perf_counter)
     cancelled: bool = False
+
+
+@dataclass(slots=True)
+class SchedulerPrefillGroup:
+    requests: list[SchedulerRequest]
+    batched: PreparedInputsLike
+    past_key_values: object | None
+    next_start_idx: int
+    prompt_tokens_recorded: int = 0
 
 
 class AnnaScheduler:
@@ -126,7 +136,7 @@ class AnnaScheduler:
         return request
 
     def _run_loop(self) -> None:
-        active: list[SchedulerRequest] = []
+        active: list[SchedulerRequest | SchedulerPrefillGroup] = []
         try:
             while True:
                 with self._condition:
@@ -155,19 +165,39 @@ class AnnaScheduler:
                 if not active:
                     continue
 
-                next_active: list[SchedulerRequest] = []
-                active = [request for request in active if not self._drop_cancelled_request(request)]
-                ready = [request for request in active if request.past_key_values is not None]
-                for request in active:
-                    if request.past_key_values is None:
-                        self._fail_request(request, RuntimeError("Missing decode cache for active request."))
+                next_active: list[SchedulerRequest | SchedulerPrefillGroup] = []
+                active_requests = [item for item in active if isinstance(item, SchedulerRequest)]
+                prefill_groups = [item for item in active if isinstance(item, SchedulerPrefillGroup)]
+                active_requests = [request for request in active_requests if not self._drop_cancelled_request(request)]
+                prefill_groups = [group for group in prefill_groups if self._filter_prefill_group(group)]
+                ready = [
+                    request
+                    for request in active_requests
+                    if request.past_key_values is not None and request.input_ids is not None
+                ]
+                pending_decode = [
+                    request
+                    for request in active_requests
+                    if not (request.past_key_values is not None and request.input_ids is not None)
+                ]
+                for request in pending_decode:
+                    self._fail_request(request, RuntimeError("Missing decode cache for active request."))
 
-                for chunk_start in range(0, len(ready), self.max_batch_size):
-                    chunk = ready[chunk_start : chunk_start + self.max_batch_size]
+                if ready:
+                    for chunk_start in range(0, len(ready), self.max_batch_size):
+                        chunk = ready[chunk_start : chunk_start + self.max_batch_size]
+                        try:
+                            next_active.extend(self._decode_batch(chunk))
+                        except Exception as exc:  # pragma: no cover - worker-level best effort
+                            self._fail_requests(chunk, self._normalize_error(exc))
+                    next_active.extend(prefill_groups)
+                elif prefill_groups:
+                    group = prefill_groups[0]
                     try:
-                        next_active.extend(self._decode_batch(chunk))
+                        next_active.extend(self._prefill_group_step(group))
                     except Exception as exc:  # pragma: no cover - worker-level best effort
-                        self._fail_requests(chunk, self._normalize_error(exc))
+                        self._fail_requests(group.requests, self._normalize_error(exc))
+                    next_active.extend(prefill_groups[1:])
 
                 active = next_active
         except BaseException as exc:  # pragma: no cover - catastrophic worker failure
@@ -177,9 +207,18 @@ class AnnaScheduler:
                     pending.append(self._pending.popleft())
             fatal = self._normalize_worker_crash(exc)
             self._fatal_error = fatal
-            self._fail_requests(active + pending, fatal)
+            failed_active: list[SchedulerRequest] = []
+            for item in active:
+                if isinstance(item, SchedulerPrefillGroup):
+                    failed_active.extend(item.requests)
+                    release = getattr(item.past_key_values, "release", None)
+                    if callable(release):
+                        release()
+                else:
+                    failed_active.append(item)
+            self._fail_requests(failed_active + pending, fatal)
 
-    def _prefill_batch(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest]:
+    def _prefill_batch(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest | SchedulerPrefillGroup]:
         for request in requests:
             if self._is_request_cancelled(request):
                 self._drop_cancelled_request(request)
@@ -191,6 +230,8 @@ class AnnaScheduler:
             metrics.record_requests_started_from_queue(len(requests))
         for request in requests:
             request.generation_started_at = time.perf_counter()
+            if metrics is not None:
+                metrics.record_queue_wait(request.generation_started_at - request.queued_at)
             request.prompt_ids, request.prompt_length, request.config = self.engine._validate_generation_request(
                 request.prepared,
                 config=request.config,
@@ -213,7 +254,7 @@ class AnnaScheduler:
             active.extend(self._prefill_same_length_group(group))
         return active
 
-    def _prefill_same_length_group(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest]:
+    def _prefill_same_length_group(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest | SchedulerPrefillGroup]:
         for request in requests:
             if self._is_request_cancelled(request):
                 self._drop_cancelled_request(request)
@@ -224,76 +265,88 @@ class AnnaScheduler:
         self._guard_batch_memory(requests)
         prompt_length = int(batched.input_ids.shape[1])
         configured_chunk_size = int(getattr(self.engine.optimization_config, "prefill_chunk_size", 0))
-        outputs = None
-        past_key_values = None
-        prompt_tokens_recorded = 0
-        metrics = getattr(self.engine, "metrics", None)
+        past_key_values = (
+            self.engine._reserve_prefill_cache(batched)
+            if configured_chunk_size > 0 and prompt_length > configured_chunk_size
+            else None
+        )
+        return self._prefill_group_step(
+            SchedulerPrefillGroup(
+                requests=requests,
+                batched=batched,
+                past_key_values=past_key_values,
+                next_start_idx=0,
+            )
+        )
 
+    def _prefill_group_step(self, group: SchedulerPrefillGroup) -> list[SchedulerRequest | SchedulerPrefillGroup]:
+        requests = [request for request in group.requests if not self._drop_cancelled_request(request)]
+        group.requests = requests
+        if not requests:
+            release = getattr(group.past_key_values, "release", None)
+            if callable(release):
+                release()
+            return []
+        prompt_length = int(group.batched.input_ids.shape[1])
+        configured_chunk_size = int(getattr(self.engine.optimization_config, "prefill_chunk_size", 0))
+        chunk_size = prompt_length if configured_chunk_size <= 0 else min(configured_chunk_size, prompt_length)
+        start_idx = group.next_start_idx
+        end_idx = min(prompt_length, start_idx + chunk_size)
+        is_final_chunk = end_idx >= prompt_length
+        chunk = type(group.batched)(
+            prompt="",
+            input_ids=group.batched.input_ids[:, start_idx:end_idx],
+            attention_mask=group.batched.attention_mask[:, :end_idx] if start_idx == 0 else None,
+            mm_token_type_ids=group.batched.mm_token_type_ids[:, start_idx:end_idx],
+        )
+        chunk = self.engine.device_context.move_prepared_inputs(chunk)
         try:
-            if configured_chunk_size > 0 and prompt_length > configured_chunk_size:
-                past_key_values = self.engine._reserve_prefill_cache(batched)
-                for start_idx in range(0, prompt_length, configured_chunk_size):
-                    end_idx = min(prompt_length, start_idx + configured_chunk_size)
-                    chunk = type(batched)(
-                        prompt="",
-                        input_ids=batched.input_ids[:, start_idx:end_idx],
-                        attention_mask=batched.attention_mask[:, :end_idx] if start_idx == 0 else None,
-                        mm_token_type_ids=batched.mm_token_type_ids[:, start_idx:end_idx],
-                    )
-                    chunk = self.engine.device_context.move_prepared_inputs(chunk)
-                    with self.engine.execution_lock:
-                        if end_idx == prompt_length:
-                            outputs = self._forward_batch_maybe_topk(
-                                stage=f"scheduler_prefill[{start_idx}:{end_idx}]",
-                                requests=requests,
-                                input_ids=chunk.input_ids,
-                                attention_mask=chunk.attention_mask,
-                                past_key_values=past_key_values,
-                                model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=True),
-                            )
-                        else:
-                            outputs = self.engine._profiled_forward_generation_model(
-                                stage=f"scheduler_prefill[{start_idx}:{end_idx}]",
-                                input_ids=chunk.input_ids,
-                                attention_mask=chunk.attention_mask,
-                                past_key_values=past_key_values,
-                                model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=True),
-                                use_cache=True,
-                                logits_to_keep=1,
-                            )
-                    past_key_values = outputs.past_key_values
-                    if metrics is not None:
-                        chunk_tokens = (end_idx - start_idx) * len(requests)
-                        if chunk_tokens > 0:
-                            metrics.record_prompt_tokens(chunk_tokens)
-                            prompt_tokens_recorded += chunk_tokens
-            else:
-                batched = self.engine.device_context.move_prepared_inputs(batched)
-                with self.engine.execution_lock:
+            started_at = time.perf_counter()
+            with self.engine.execution_lock:
+                if is_final_chunk:
                     outputs = self._forward_batch_maybe_topk(
-                        stage="scheduler_prefill",
+                        stage="scheduler_prefill" if start_idx == 0 else f"scheduler_prefill[{start_idx}:{end_idx}]",
                         requests=requests,
-                        input_ids=batched.input_ids,
-                        attention_mask=batched.attention_mask,
-                        past_key_values=None,
-                        model_kwargs=self.engine._build_prefill_model_kwargs(batched, include_media=True),
+                        input_ids=chunk.input_ids,
+                        attention_mask=chunk.attention_mask,
+                        past_key_values=group.past_key_values,
+                        model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=start_idx == 0),
                     )
-                    past_key_values = outputs.past_key_values
+                else:
+                    outputs = self.engine._profiled_forward_generation_model(
+                        stage=f"scheduler_prefill[{start_idx}:{end_idx}]",
+                        input_ids=chunk.input_ids,
+                        attention_mask=chunk.attention_mask,
+                        past_key_values=group.past_key_values,
+                        model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=start_idx == 0),
+                        use_cache=True,
+                        logits_to_keep=1,
+                    )
         except RuntimeError as exc:
-            release = getattr(past_key_values, "release", None)
+            release = getattr(group.past_key_values, "release", None)
             if callable(release):
                 release()
             raise self.engine._handle_runtime_failure(exc) from exc
 
-        if outputs is None:
-            raise RuntimeError("Scheduler prefill did not produce model outputs.")
+        metrics = getattr(self.engine, "metrics", None)
+        if metrics is not None:
+            metrics.record_prefill_step(time.perf_counter() - started_at)
+        group.past_key_values = outputs.past_key_values
+        if metrics is not None:
+            chunk_tokens = max(0, end_idx - start_idx) * len(requests)
+            if chunk_tokens > 0:
+                metrics.record_prompt_tokens(chunk_tokens)
+                group.prompt_tokens_recorded += chunk_tokens
+        if not is_final_chunk:
+            group.next_start_idx = end_idx
+            return [group]
 
         total_prompt_tokens = sum(request.prompt_length for request in requests)
-        if metrics is not None and prompt_tokens_recorded < total_prompt_tokens:
-            metrics.record_prompt_tokens(total_prompt_tokens - prompt_tokens_recorded)
+        if metrics is not None and group.prompt_tokens_recorded < total_prompt_tokens:
+            metrics.record_prompt_tokens(total_prompt_tokens - group.prompt_tokens_recorded)
         split_caches = outputs.past_key_values.split_batch() if outputs.past_key_values is not None else [None] * len(requests)
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
-        active: list[SchedulerRequest] = []
+        active: list[SchedulerRequest | SchedulerPrefillGroup] = []
         for row_idx, request in enumerate(requests):
             if self._is_request_cancelled(request):
                 if split_caches[row_idx] is not None:
@@ -350,6 +403,7 @@ class AnnaScheduler:
         batch_cache = stack(caches, self.engine.config.text_config)
 
         try:
+            started_at = time.perf_counter()
             with self.engine.execution_lock:
                 outputs = self._forward_batch_maybe_topk(
                     stage="scheduler_decode",
@@ -360,10 +414,13 @@ class AnnaScheduler:
         except RuntimeError as exc:
             raise self.engine._handle_runtime_failure(exc) from exc
 
+        metrics = getattr(self.engine, "metrics", None)
+        if metrics is not None:
+            metrics.record_decode_step(time.perf_counter() - started_at)
+
         split_caches = outputs.past_key_values.split_batch() if outputs.past_key_values is not None else [None] * len(requests)
         next_active: list[SchedulerRequest] = []
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
-        metrics = getattr(self.engine, "metrics", None)
         for row_idx, request in enumerate(requests):
             if self._is_request_cancelled(request):
                 if split_caches[row_idx] is not None:
@@ -599,6 +656,16 @@ class AnnaScheduler:
             if metrics is not None:
                 metrics.record_request_finished(success=False)
         return True
+
+    def _filter_prefill_group(self, group: SchedulerPrefillGroup) -> bool:
+        group.requests = [request for request in group.requests if not self._drop_cancelled_request(request)]
+        if group.requests:
+            return True
+        release = getattr(group.past_key_values, "release", None)
+        if callable(release):
+            release()
+        group.past_key_values = None
+        return False
 
     def _is_request_cancelled(self, request: SchedulerRequest) -> bool:
         return request.cancelled or (
