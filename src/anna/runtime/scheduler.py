@@ -344,7 +344,13 @@ class AnnaScheduler:
         total_prompt_tokens = sum(request.prompt_length for request in requests)
         if metrics is not None and group.prompt_tokens_recorded < total_prompt_tokens:
             metrics.record_prompt_tokens(total_prompt_tokens - group.prompt_tokens_recorded)
-        split_caches = outputs.past_key_values.split_batch() if outputs.past_key_values is not None else [None] * len(requests)
+        if outputs.past_key_values is not None:
+            split_started_at = time.perf_counter()
+            split_caches = outputs.past_key_values.split_batch()
+            if metrics is not None:
+                metrics.record_cache_split(time.perf_counter() - split_started_at)
+        else:
+            split_caches = [None] * len(requests)
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
         active: list[SchedulerRequest | SchedulerPrefillGroup] = []
         for row_idx, request in enumerate(requests):
@@ -400,7 +406,12 @@ class AnnaScheduler:
         stack = getattr(cache_type, "stack", None)
         if not callable(stack):
             raise RuntimeError(f"Cache type {cache_type.__name__} does not support scheduler batching.")
-        batch_cache = stack(caches, self.engine.config.text_config)
+        metrics = getattr(self.engine, "metrics", None)
+        stack_started_at = time.perf_counter()
+        stack_kwargs = {"clone_turboquant_rows": False} if cache_type.__name__ == "Qwen3DynamicCache" else {}
+        batch_cache = stack(caches, self.engine.config.text_config, **stack_kwargs)
+        if metrics is not None:
+            metrics.record_cache_stack(time.perf_counter() - stack_started_at)
 
         try:
             started_at = time.perf_counter()
@@ -414,11 +425,21 @@ class AnnaScheduler:
         except RuntimeError as exc:
             raise self.engine._handle_runtime_failure(exc) from exc
 
-        metrics = getattr(self.engine, "metrics", None)
         if metrics is not None:
             metrics.record_decode_step(time.perf_counter() - started_at)
 
-        split_caches = outputs.past_key_values.split_batch() if outputs.past_key_values is not None else [None] * len(requests)
+        if outputs.past_key_values is not None:
+            split_started_at = time.perf_counter()
+            split_kwargs = (
+                {"clone_turboquant_rows": False}
+                if type(outputs.past_key_values).__name__ == "Qwen3DynamicCache"
+                else {}
+            )
+            split_caches = outputs.past_key_values.split_batch(**split_kwargs)
+            if metrics is not None:
+                metrics.record_cache_split(time.perf_counter() - split_started_at)
+        else:
+            split_caches = [None] * len(requests)
         next_active: list[SchedulerRequest] = []
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
         for row_idx, request in enumerate(requests):

@@ -1063,7 +1063,13 @@ class Qwen3DynamicCache:
         return out
 
     @classmethod
-    def stack(cls, caches: list["Qwen3DynamicCache"], config: Qwen3_5TextConfig) -> "Qwen3DynamicCache":
+    def stack(
+        cls,
+        caches: list["Qwen3DynamicCache"],
+        config: Qwen3_5TextConfig,
+        *,
+        clone_turboquant_rows: bool = True,
+    ) -> "Qwen3DynamicCache":
         if not caches:
             return cls(config)
 
@@ -1096,7 +1102,12 @@ class Qwen3DynamicCache:
             if stacked.uses_turboquant_for_layer(layer_idx):
                 for batch_idx, row in enumerate(rows):
                     turboquant_row = row.turboquant_rows[layer_idx][0]
-                    stacked.turboquant_rows[layer_idx][batch_idx] = None if turboquant_row is None else turboquant_row.clone()
+                    if turboquant_row is None:
+                        stacked.turboquant_rows[layer_idx][batch_idx] = None
+                    elif clone_turboquant_rows:
+                        stacked.turboquant_rows[layer_idx][batch_idx] = turboquant_row.clone()
+                    else:
+                        stacked.turboquant_rows[layer_idx][batch_idx] = turboquant_row
                 continue
             stacked.page_tables[layer_idx] = [list(row.page_tables[layer_idx][0]) for row in rows]
 
@@ -1151,7 +1162,7 @@ class Qwen3DynamicCache:
 
         return stacked
 
-    def split_batch(self) -> list["Qwen3DynamicCache"]:
+    def split_batch(self, *, clone_turboquant_rows: bool = True) -> list["Qwen3DynamicCache"]:
         batch_size = self.get_batch_size()
         if batch_size <= 1:
             return [self]
@@ -1183,7 +1194,9 @@ class Qwen3DynamicCache:
                 outputs[idx].page_tables[layer_idx][0] = list(self.page_tables[layer_idx][idx])
                 turboquant_row = self.turboquant_rows[layer_idx][idx]
                 if turboquant_row is not None:
-                    outputs[idx].turboquant_rows[layer_idx][0] = turboquant_row.clone()
+                    outputs[idx].turboquant_rows[layer_idx][0] = (
+                        turboquant_row.clone() if clone_turboquant_rows else turboquant_row
+                    )
             if self.conv_states[layer_idx] is not None:
                 for idx, chunk in enumerate(self.conv_states[layer_idx].split(1, dim=0)):
                     outputs[idx].conv_states[layer_idx] = chunk.clone()

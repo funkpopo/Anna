@@ -7,6 +7,8 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 
+from anna.model.xpu_decode_profile import xpu_profile_region
+
 _mse_quantizers: dict[tuple[int, int, str], Any] = {}
 _ip_quantizers: dict[tuple[int, int, str], Any] = {}
 _KEEP_DECODE_CACHE = os.getenv("ANNA_TURBOQUANT_KEEP_DECODE_CACHE", "").strip().lower() in {
@@ -564,17 +566,18 @@ class TurboQuantKVRow:
 
         assert self.device is not None
         assert self.dtype is not None
-        quantized_keys = dequantize_turboquant_keys(
-            self._quantized_keys,
-            bits=self.bits,
-            device=self.device,
-            dtype=self.dtype,
-        ).contiguous()
-        quantized_values = dequantize_turboquant_values(
-            self._quantized_values,
-            device=self.device,
-            dtype=self.dtype,
-        ).contiguous()
+        with xpu_profile_region("turboquant_dequant"):
+            quantized_keys = dequantize_turboquant_keys(
+                self._quantized_keys,
+                bits=self.bits,
+                device=self.device,
+                dtype=self.dtype,
+            ).contiguous()
+            quantized_values = dequantize_turboquant_values(
+                self._quantized_values,
+                device=self.device,
+                dtype=self.dtype,
+            ).contiguous()
         if _KEEP_DECODE_CACHE:
             self._decode_quantized_keys = quantized_keys
             self._decode_quantized_values = quantized_values
@@ -651,17 +654,22 @@ class TurboQuantKVRow:
             bits=self.bits,
             group_size=self.value_group_size,
         )
-        new_decode_keys = dequantize_turboquant_keys(
-            quantized_keys,
-            bits=self.bits,
-            device=self.device,
-            dtype=self.dtype,
-        ).contiguous() if _KEEP_DECODE_CACHE else None
-        new_decode_values = dequantize_turboquant_values(
-            quantized_values,
-            device=self.device,
-            dtype=self.dtype,
-        ).contiguous() if _KEEP_DECODE_CACHE else None
+        if _KEEP_DECODE_CACHE:
+            with xpu_profile_region("turboquant_dequant"):
+                new_decode_keys = dequantize_turboquant_keys(
+                    quantized_keys,
+                    bits=self.bits,
+                    device=self.device,
+                    dtype=self.dtype,
+                ).contiguous()
+                new_decode_values = dequantize_turboquant_values(
+                    quantized_values,
+                    device=self.device,
+                    dtype=self.dtype,
+                ).contiguous()
+        else:
+            new_decode_keys = None
+            new_decode_values = None
         self._quantized_keys = _concat_key_states(self._quantized_keys, quantized_keys)
         self._quantized_values = _concat_value_states(self._quantized_values, quantized_values)
         self._residual_keys = residual_keys[:, overflow:, :].contiguous()

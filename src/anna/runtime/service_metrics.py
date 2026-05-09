@@ -3,10 +3,21 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
 logger = logging.getLogger(__name__)
+
+_LATENCY_SAMPLE_LIMIT = 4096
+
+
+def _quantile(samples: tuple[float, ...], q: float) -> float:
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * q))))
+    return ordered[index]
 
 
 @dataclass(slots=True)
@@ -30,9 +41,17 @@ class ServiceMetricsSnapshot:
     prefill_step_seconds_total: float = 0.0
     prefill_step_count: int = 0
     prefill_step_seconds_max: float = 0.0
+    prefill_step_recent_seconds: tuple[float, ...] = ()
     decode_step_seconds_total: float = 0.0
     decode_step_count: int = 0
     decode_step_seconds_max: float = 0.0
+    decode_step_recent_seconds: tuple[float, ...] = ()
+    cache_stack_seconds_total: float = 0.0
+    cache_stack_count: int = 0
+    cache_stack_seconds_max: float = 0.0
+    cache_split_seconds_total: float = 0.0
+    cache_split_count: int = 0
+    cache_split_seconds_max: float = 0.0
 
     @property
     def kv_cache_usage_ratio(self) -> float:
@@ -60,9 +79,17 @@ class AnnaServiceMetrics:
         self._prefill_step_seconds_total = 0.0
         self._prefill_step_count = 0
         self._prefill_step_seconds_max = 0.0
+        self._prefill_step_recent_seconds: deque[float] = deque(maxlen=_LATENCY_SAMPLE_LIMIT)
         self._decode_step_seconds_total = 0.0
         self._decode_step_count = 0
         self._decode_step_seconds_max = 0.0
+        self._decode_step_recent_seconds: deque[float] = deque(maxlen=_LATENCY_SAMPLE_LIMIT)
+        self._cache_stack_seconds_total = 0.0
+        self._cache_stack_count = 0
+        self._cache_stack_seconds_max = 0.0
+        self._cache_split_seconds_total = 0.0
+        self._cache_split_count = 0
+        self._cache_split_seconds_max = 0.0
 
     def record_request_submitted(self, *, waiting: bool) -> None:
         with self._lock:
@@ -96,6 +123,7 @@ class AnnaServiceMetrics:
             self._prefill_step_seconds_total += normalized
             self._prefill_step_count += 1
             self._prefill_step_seconds_max = max(self._prefill_step_seconds_max, normalized)
+            self._prefill_step_recent_seconds.append(normalized)
         self._activity_event.set()
 
     def record_decode_step(self, seconds: float) -> None:
@@ -104,6 +132,23 @@ class AnnaServiceMetrics:
             self._decode_step_seconds_total += normalized
             self._decode_step_count += 1
             self._decode_step_seconds_max = max(self._decode_step_seconds_max, normalized)
+            self._decode_step_recent_seconds.append(normalized)
+        self._activity_event.set()
+
+    def record_cache_stack(self, seconds: float) -> None:
+        normalized = max(0.0, float(seconds))
+        with self._lock:
+            self._cache_stack_seconds_total += normalized
+            self._cache_stack_count += 1
+            self._cache_stack_seconds_max = max(self._cache_stack_seconds_max, normalized)
+        self._activity_event.set()
+
+    def record_cache_split(self, seconds: float) -> None:
+        normalized = max(0.0, float(seconds))
+        with self._lock:
+            self._cache_split_seconds_total += normalized
+            self._cache_split_count += 1
+            self._cache_split_seconds_max = max(self._cache_split_seconds_max, normalized)
         self._activity_event.set()
 
     def record_request_finished(self, *, success: bool) -> None:
@@ -161,9 +206,17 @@ class AnnaServiceMetrics:
                 prefill_step_seconds_total=self._prefill_step_seconds_total,
                 prefill_step_count=self._prefill_step_count,
                 prefill_step_seconds_max=self._prefill_step_seconds_max,
+                prefill_step_recent_seconds=tuple(self._prefill_step_recent_seconds),
                 decode_step_seconds_total=self._decode_step_seconds_total,
                 decode_step_count=self._decode_step_count,
                 decode_step_seconds_max=self._decode_step_seconds_max,
+                decode_step_recent_seconds=tuple(self._decode_step_recent_seconds),
+                cache_stack_seconds_total=self._cache_stack_seconds_total,
+                cache_stack_count=self._cache_stack_count,
+                cache_stack_seconds_max=self._cache_stack_seconds_max,
+                cache_split_seconds_total=self._cache_split_seconds_total,
+                cache_split_count=self._cache_split_count,
+                cache_split_seconds_max=self._cache_split_seconds_max,
             )
 
 
@@ -211,6 +264,10 @@ class AnnaServiceMetricsLogger:
         prefill_step_count = max(0, current.prefill_step_count - previous.prefill_step_count)
         decode_step_total = max(0.0, current.decode_step_seconds_total - previous.decode_step_seconds_total)
         decode_step_count = max(0, current.decode_step_count - previous.decode_step_count)
+        cache_stack_total = max(0.0, current.cache_stack_seconds_total - previous.cache_stack_seconds_total)
+        cache_stack_count = max(0, current.cache_stack_count - previous.cache_stack_count)
+        cache_split_total = max(0.0, current.cache_split_seconds_total - previous.cache_split_seconds_total)
+        cache_split_count = max(0, current.cache_split_count - previous.cache_split_count)
         prompt_tokens_per_second = prompt_tokens / elapsed
         generation_tokens_per_second = generation_tokens / elapsed
         prompt_cache_hit_rate = 0.0 if cache_queries <= 0 else (cache_hits / cache_queries) * 100.0
@@ -218,13 +275,27 @@ class AnnaServiceMetricsLogger:
         queue_wait_avg_ms = 0.0 if queue_wait_count <= 0 else (queue_wait_total / queue_wait_count) * 1000.0
         prefill_step_avg_ms = 0.0 if prefill_step_count <= 0 else (prefill_step_total / prefill_step_count) * 1000.0
         decode_step_avg_ms = 0.0 if decode_step_count <= 0 else (decode_step_total / decode_step_count) * 1000.0
+        cache_stack_avg_ms = 0.0 if cache_stack_count <= 0 else (cache_stack_total / cache_stack_count) * 1000.0
+        cache_split_avg_ms = 0.0 if cache_split_count <= 0 else (cache_split_total / cache_split_count) * 1000.0
+        prefill_recent = current.prefill_step_recent_seconds
+        decode_recent = current.decode_step_recent_seconds
+        prefill_p50_ms = _quantile(prefill_recent, 0.50) * 1000.0
+        prefill_p95_ms = _quantile(prefill_recent, 0.95) * 1000.0
+        prefill_p99_ms = _quantile(prefill_recent, 0.99) * 1000.0
+        decode_p50_ms = _quantile(decode_recent, 0.50) * 1000.0
+        decode_p95_ms = _quantile(decode_recent, 0.95) * 1000.0
+        decode_p99_ms = _quantile(decode_recent, 0.99) * 1000.0
         return (
             "Engine metrics: Interval prompt: "
             f"{prompt_tokens_per_second:.1f} tok/s, Interval generation: "
             f"{generation_tokens_per_second:.1f} tok/s, Running: {current.running_requests} reqs, "
             f"Queue wait avg/max: {queue_wait_avg_ms:.1f}/{current.queue_wait_seconds_max * 1000.0:.1f} ms, "
             f"Prefill step avg/max: {prefill_step_avg_ms:.1f}/{current.prefill_step_seconds_max * 1000.0:.1f} ms, "
+            f"Prefill step p50/p95/p99: {prefill_p50_ms:.1f}/{prefill_p95_ms:.1f}/{prefill_p99_ms:.1f} ms, "
             f"Decode step avg/max: {decode_step_avg_ms:.1f}/{current.decode_step_seconds_max * 1000.0:.1f} ms, "
+            f"Decode step p50/p95/p99: {decode_p50_ms:.1f}/{decode_p95_ms:.1f}/{decode_p99_ms:.1f} ms, "
+            f"Cache stack avg/max: {cache_stack_avg_ms:.1f}/{current.cache_stack_seconds_max * 1000.0:.1f} ms, "
+            f"Cache split avg/max: {cache_split_avg_ms:.1f}/{current.cache_split_seconds_max * 1000.0:.1f} ms, "
             f"Waiting: {current.waiting_requests} reqs, GPU KV cache usage: {kv_cache_usage:.1f}% "
             f"({current.kv_cache_used_pages}/{current.kv_cache_total_pages} pages), "
             f"Prompt cache hit rate: {prompt_cache_hit_rate:.1f}%"
@@ -248,6 +319,8 @@ class AnnaServiceMetricsLogger:
             current.queue_wait_count - previous.queue_wait_count,
             current.prefill_step_count - previous.prefill_step_count,
             current.decode_step_count - previous.decode_step_count,
+            current.cache_stack_count - previous.cache_stack_count,
+            current.cache_split_count - previous.cache_split_count,
         )
         return any(delta != 0 for delta in deltas)
 

@@ -13,6 +13,8 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     metrics.record_queue_wait(0.25)
     metrics.record_prefill_step(0.5)
     metrics.record_decode_step(0.125)
+    metrics.record_cache_stack(0.03125)
+    metrics.record_cache_split(0.0625)
     metrics.record_prompt_tokens(12)
     metrics.record_generation_tokens(5)
     metrics.record_prompt_cache_lookup(hit=True)
@@ -37,9 +39,17 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     assert snapshot.prefill_step_count == 1
     assert snapshot.prefill_step_seconds_total == 0.5
     assert snapshot.prefill_step_seconds_max == 0.5
+    assert snapshot.prefill_step_recent_seconds == (0.5,)
     assert snapshot.decode_step_count == 1
     assert snapshot.decode_step_seconds_total == 0.125
     assert snapshot.decode_step_seconds_max == 0.125
+    assert snapshot.decode_step_recent_seconds == (0.125,)
+    assert snapshot.cache_stack_count == 1
+    assert snapshot.cache_stack_seconds_total == 0.03125
+    assert snapshot.cache_stack_seconds_max == 0.03125
+    assert snapshot.cache_split_count == 1
+    assert snapshot.cache_split_seconds_total == 0.0625
+    assert snapshot.cache_split_seconds_max == 0.0625
     assert metrics.activity_event.is_set() is True
 
 
@@ -67,9 +77,17 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
         prefill_step_seconds_total=0.5,
         prefill_step_count=2,
         prefill_step_seconds_max=0.4,
+        prefill_step_recent_seconds=(0.1, 0.4),
         decode_step_seconds_total=0.125,
         decode_step_count=5,
         decode_step_seconds_max=0.05,
+        decode_step_recent_seconds=(0.005, 0.01, 0.02, 0.04, 0.05),
+        cache_stack_seconds_total=0.06,
+        cache_stack_count=3,
+        cache_stack_seconds_max=0.03,
+        cache_split_seconds_total=0.08,
+        cache_split_count=4,
+        cache_split_seconds_max=0.04,
     )
 
     line = AnnaServiceMetricsLogger.format_interval(previous, current)
@@ -79,7 +97,11 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
     assert "Running: 2 reqs" in line
     assert "Queue wait avg/max: 250.0/250.0 ms" in line
     assert "Prefill step avg/max: 250.0/400.0 ms" in line
+    assert "Prefill step p50/p95/p99: 100.0/400.0/400.0 ms" in line
     assert "Decode step avg/max: 25.0/50.0 ms" in line
+    assert "Decode step p50/p95/p99: 20.0/50.0/50.0 ms" in line
+    assert "Cache stack avg/max: 20.0/30.0 ms" in line
+    assert "Cache split avg/max: 20.0/40.0 ms" in line
     assert "Waiting: 1 reqs" in line
     assert "GPU KV cache usage: 50.0% (6/12 pages)" in line
     assert "Prompt cache hit rate: 75.0%" in line
