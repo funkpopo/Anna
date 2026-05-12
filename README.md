@@ -175,6 +175,7 @@ anna-speak --model-dir /path/to/tts --input "Hello." --output out.wav --ref-audi
 | `--no-inference-warmup` | Skip a small post-load prefill+decode on XPU (first real request may pay lazy kernel load). |
 | `--enable-thinking` / `--disable-thinking` | Default for chat when the client omits thinking flags. |
 | `--max-completion-tokens` | Default token cap for requests that omit `max_tokens` / `max_completion_tokens`. |
+| `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--presence-penalty`, `--repetition-penalty` | Default sampling controls for chat/completion requests that omit those fields. |
 | `--reasoning-format` | `none` vs `deepseek`-style split (`reasoning_content` vs main `content`). |
 | `--min-free-memory-mib` | Minimum **free** XPU memory (MiB) before starting generation (admission). |
 | `--reserve-memory-mib` | Extra **reserved** margin (MiB) during admission. |

@@ -239,6 +239,7 @@ class AnnaScheduler:
             request.repetition_history, request.repetition_history_ids = self.engine._init_repetition_penalty_state(
                 request.prompt_ids,
                 request.config.repetition_penalty,
+                request.config.presence_penalty,
             )
             request.assembler = IncrementalTextAssembler(
                 tokenizer=self.engine.tokenizer,
@@ -532,6 +533,7 @@ class AnnaScheduler:
                 outputs.candidate_token_ids[row_idx, -1],
                 temperature=request.config.temperature,
                 top_p=request.config.top_p,
+                min_p=request.config.min_p,
             )
         return sample_next_token(
             outputs.logits[row_idx, -1],
@@ -539,6 +541,8 @@ class AnnaScheduler:
             temperature=request.config.temperature,
             top_p=request.config.top_p,
             top_k=request.config.top_k,
+            min_p=request.config.min_p,
+            presence_penalty=request.config.presence_penalty,
             repetition_penalty=request.config.repetition_penalty,
         )
 

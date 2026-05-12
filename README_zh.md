@@ -177,6 +177,7 @@ anna-speak --model-dir /path/to/tts --input "你好。" --output out.wav --ref-a
 | `--no-inference-warmup` | 加载后**不做**一小轮预热推理；融合核可能在**第一次真实请求**时才加载。 |
 | `--enable-thinking` / `--disable-thinking` | 客户端未指定思考相关字段时，聊天是否默认开启思考。 |
 | `--max-completion-tokens` | 请求里未写 `max_tokens` / `max_completion_tokens` 时的默认输出长度上限。 |
+| `--temperature`、`--top-p`、`--top-k`、`--min-p`、`--presence-penalty`、`--repetition-penalty` | 请求里未写对应字段时，聊天 / completion 接口使用的默认采样参数。 |
 | `--reasoning-format` | 推理内容格式：`none` 或与 `deepseek` 类似地把推理放进 `reasoning_content`。 |
 | `--min-free-memory-mib` | 开始生成前要求至少剩余这么多 XPU 显存（MiB），用于准入控制。 |
 | `--reserve-memory-mib` | 准入时额外预留的显存余量（MiB）。 |

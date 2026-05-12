@@ -46,6 +46,18 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "--disable-thinking",
             "--max-completion-tokens",
             "1024",
+            "--temperature",
+            "1.0",
+            "--top-p",
+            "0.95",
+            "--top-k",
+            "20",
+            "--min-p",
+            "0.0",
+            "--presence-penalty",
+            "1.5",
+            "--repetition-penalty",
+            "1.0",
             "--reasoning-format",
             "deepseek",
             "--offload-vision",
@@ -79,6 +91,12 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
 
     assert args.default_enable_thinking is False
     assert args.max_completion_tokens == 1024
+    assert args.temperature == 1.0
+    assert args.top_p == 0.95
+    assert args.top_k == 20
+    assert args.min_p == 0.0
+    assert args.presence_penalty == 1.5
+    assert args.repetition_penalty == 1.0
     assert args.reasoning_format == "deepseek"
     assert args.offload_vision is True
     assert args.weight_quant == "int4"

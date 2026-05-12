@@ -21,6 +21,23 @@ def apply_repetition_penalty(
     return output
 
 
+def apply_presence_penalty(
+    logits: torch.Tensor,
+    generated_ids: torch.Tensor | None,
+    penalty: float,
+) -> torch.Tensor:
+    if generated_ids is None or generated_ids.numel() == 0 or penalty == 0.0:
+        return logits
+
+    output = logits.clone()
+    if generated_ids.device != output.device:
+        generated_ids = generated_ids.to(device=output.device)
+    unique_ids = torch.unique(generated_ids)
+    values = output.index_select(0, unique_ids) - penalty
+    output.index_copy_(0, unique_ids, values)
+    return output
+
+
 def apply_top_k(logits: torch.Tensor, top_k: int) -> torch.Tensor:
     if top_k <= 0 or top_k >= logits.shape[-1]:
         return logits
@@ -45,6 +62,15 @@ def apply_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
     return filtered
 
 
+def apply_min_p(logits: torch.Tensor, min_p: float) -> torch.Tensor:
+    if min_p <= 0.0:
+        return logits
+    probs = torch.softmax(logits, dim=-1)
+    max_prob = torch.max(probs, dim=-1, keepdim=True).values
+    keep = probs >= max_prob * min_p
+    return torch.where(keep, logits, torch.full_like(logits, float("-inf")))
+
+
 def sample_next_token(
     logits: torch.Tensor,
     *,
@@ -52,9 +78,12 @@ def sample_next_token(
     temperature: float = 0.7,
     top_p: float = 0.95,
     top_k: int = 50,
+    min_p: float = 0.0,
+    presence_penalty: float = 0.0,
     repetition_penalty: float = 1.0,
 ) -> torch.Tensor:
     next_logits = apply_repetition_penalty(logits, generated_ids, repetition_penalty)
+    next_logits = apply_presence_penalty(next_logits, generated_ids, presence_penalty)
 
     if temperature <= 0.0:
         return torch.argmax(next_logits, dim=-1)
@@ -62,6 +91,7 @@ def sample_next_token(
     next_logits = next_logits / temperature
     next_logits = apply_top_k(next_logits, top_k)
     next_logits = apply_top_p(next_logits, top_p)
+    next_logits = apply_min_p(next_logits, min_p)
     probs = torch.softmax(next_logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
@@ -72,6 +102,7 @@ def sample_next_token_from_candidates(
     *,
     temperature: float = 0.7,
     top_p: float = 0.95,
+    min_p: float = 0.0,
 ) -> torch.Tensor:
     if candidate_logits.shape != candidate_token_ids.shape:
         raise ValueError("candidate_logits and candidate_token_ids must have the same shape")
@@ -83,6 +114,7 @@ def sample_next_token_from_candidates(
 
     next_logits = candidate_logits / temperature
     next_logits = apply_top_p(next_logits, top_p)
+    next_logits = apply_min_p(next_logits, min_p)
     probs = torch.softmax(next_logits, dim=-1)
     selected = torch.multinomial(probs, num_samples=1)
     return candidate_token_ids.gather(dim=-1, index=selected).squeeze(-1)

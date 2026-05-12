@@ -47,6 +47,13 @@ def _ratio(value: str) -> float:
     return parsed
 
 
+def _probability(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("value must be in the range [0, 1]")
+    return parsed
+
+
 def _safety_factor(value: str) -> float:
     parsed = float(value)
     if parsed < 1.0:
@@ -261,6 +268,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Default completion token limit for API requests that omit max_completion_tokens/max_tokens. Defaults to the model config/generation_config value when present; otherwise Anna auto-estimates a safe per-request limit.",
     )
     parser.add_argument(
+        "--temperature",
+        type=_non_negative_float,
+        default=None,
+        help="Default sampling temperature for API requests that omit temperature. Defaults to 0.7.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=_ratio,
+        default=None,
+        help="Default nucleus sampling probability for API requests that omit top_p. Defaults to 0.95.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=_non_negative_int,
+        default=None,
+        help="Default top-k sampling limit for API requests that omit top_k. Set 0 to disable. Defaults to 50.",
+    )
+    parser.add_argument(
+        "--min-p",
+        type=_probability,
+        default=None,
+        help="Default min-p sampling threshold for API requests that omit min_p. Defaults to 0.0.",
+    )
+    parser.add_argument(
+        "--presence-penalty",
+        type=float,
+        default=None,
+        help="Default additive presence penalty for API requests that omit presence_penalty. Defaults to 0.0.",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=None,
+        help="Default multiplicative repetition penalty for API requests that omit repetition_penalty. Defaults to 1.0.",
+    )
+    parser.add_argument(
         "--reasoning-format",
         choices=("none", "deepseek"),
         default="deepseek",
@@ -384,6 +427,12 @@ def main() -> None:
         kv_cache_quant_bits=args.kv_cache_quant_bits,
         kv_cache_residual_len=args.kv_cache_residual_len,
         default_max_completion_tokens=args.max_completion_tokens,
+        default_temperature=args.temperature,
+        default_top_p=args.top_p,
+        default_top_k=args.top_k,
+        default_min_p=args.min_p,
+        default_presence_penalty=args.presence_penalty,
+        default_repetition_penalty=args.repetition_penalty,
         default_enable_thinking=args.default_enable_thinking,
         reasoning_format=args.reasoning_format,
         offload_mode=args.offload_mode,
@@ -424,6 +473,12 @@ def main() -> None:
         kv_cache_residual_len=settings.kv_cache_residual_len,
         safety_policy=_build_safety_policy(settings),
         default_max_completion_tokens=settings.default_max_completion_tokens,
+        default_temperature=settings.default_temperature,
+        default_top_p=settings.default_top_p,
+        default_top_k=settings.default_top_k,
+        default_min_p=settings.default_min_p,
+        default_presence_penalty=settings.default_presence_penalty,
+        default_repetition_penalty=settings.default_repetition_penalty,
         default_enable_thinking=settings.default_enable_thinking,
         reasoning_format=settings.reasoning_format,
         offload_mode=settings.offload_mode,
