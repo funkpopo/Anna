@@ -162,6 +162,8 @@ class GenerationConfig:
     temperature: float = 0.7
     top_p: float = 0.95
     top_k: int = 50
+    min_p: float = 0.0
+    presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
     stop_strings: list[str] = field(default_factory=list)
     cancellation_event: threading.Event | None = field(default=None, repr=False, compare=False)
@@ -219,6 +221,12 @@ class AnnaQwen3_5TextEngine:
         device_context: DeviceContext,
         quantized_replacements: int = 0,
         default_max_completion_tokens: int | None = None,
+        default_temperature: float | None = None,
+        default_top_p: float | None = None,
+        default_top_k: int | None = None,
+        default_min_p: float | None = None,
+        default_presence_penalty: float | None = None,
+        default_repetition_penalty: float | None = None,
         default_enable_thinking: bool = True,
         reasoning_format: ReasoningFormat | str = _DEFAULT_REASONING_FORMAT,
         offload_mode: str = "none",
@@ -238,6 +246,14 @@ class AnnaQwen3_5TextEngine:
         self.quantized_replacements = quantized_replacements
         self.default_max_completion_tokens = (
             None if default_max_completion_tokens is None else max(1, int(default_max_completion_tokens))
+        )
+        self.default_temperature = 0.7 if default_temperature is None else max(0.0, float(default_temperature))
+        self.default_top_p = 0.95 if default_top_p is None else min(1.0, max(0.0, float(default_top_p)))
+        self.default_top_k = 50 if default_top_k is None else max(0, int(default_top_k))
+        self.default_min_p = 0.0 if default_min_p is None else min(1.0, max(0.0, float(default_min_p)))
+        self.default_presence_penalty = 0.0 if default_presence_penalty is None else float(default_presence_penalty)
+        self.default_repetition_penalty = (
+            1.0 if default_repetition_penalty is None else max(0.1, float(default_repetition_penalty))
         )
         self.default_enable_thinking = bool(default_enable_thinking)
         self.reasoning_format = normalize_reasoning_format(reasoning_format)
@@ -436,6 +452,12 @@ class AnnaQwen3_5TextEngine:
         kv_cache_residual_len: int = 128,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
+        default_temperature: float | None = None,
+        default_top_p: float | None = None,
+        default_top_k: int | None = None,
+        default_min_p: float | None = None,
+        default_presence_penalty: float | None = None,
+        default_repetition_penalty: float | None = None,
         default_enable_thinking: bool = True,
         reasoning_format: ReasoningFormat | str = _DEFAULT_REASONING_FORMAT,
         offload_mode: str = "auto",
@@ -700,12 +722,18 @@ class AnnaQwen3_5TextEngine:
         )
 
         logger.info(
-            "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, default_enable_thinking=%s, reasoning_format=%s, offload=%s, offload_vision=%s, expert_quant=%s, weight_quant=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, full_attention_cache_mirror=%s, weight_load_device=%s); tensors loaded=%s skipped=%s quantized=%s",
+            "Loaded model %s on %s (compute=%s, requested=%s, default_max_completion_tokens=%s, default_temperature=%s, default_top_p=%s, default_top_k=%s, default_min_p=%s, default_presence_penalty=%s, default_repetition_penalty=%s, default_enable_thinking=%s, reasoning_format=%s, offload=%s, offload_vision=%s, expert_quant=%s, weight_quant=%s, resident_expert_layers=%s, resident_expert_layer_indices=%s, cached_experts_per_layer=%s, full_attention_cache_mirror=%s, weight_load_device=%s); tensors loaded=%s skipped=%s quantized=%s",
             resolved_model_id,
             device_context.device,
             device_context.dtype,
             device_context.reported_dtype,
             resolved_default_max_completion_tokens,
+            default_temperature if default_temperature is not None else 0.7,
+            default_top_p if default_top_p is not None else 0.95,
+            default_top_k if default_top_k is not None else 50,
+            default_min_p if default_min_p is not None else 0.0,
+            default_presence_penalty if default_presence_penalty is not None else 0.0,
+            default_repetition_penalty if default_repetition_penalty is not None else 1.0,
             bool(default_enable_thinking),
             normalize_reasoning_format(reasoning_format),
             resolved_offload_mode,
@@ -730,6 +758,12 @@ class AnnaQwen3_5TextEngine:
             device_context=device_context,
             quantized_replacements=report.quantized_replacements,
             default_max_completion_tokens=resolved_default_max_completion_tokens,
+            default_temperature=default_temperature,
+            default_top_p=default_top_p,
+            default_top_k=default_top_k,
+            default_min_p=default_min_p,
+            default_presence_penalty=default_presence_penalty,
+            default_repetition_penalty=default_repetition_penalty,
             default_enable_thinking=default_enable_thinking,
             reasoning_format=reasoning_format,
             offload_mode=resolved_offload_mode,
@@ -1332,6 +1366,12 @@ class AnnaQwen3_5TextEngine:
             "requested_dtype": self.device_context.requested_dtype,
             "reported_dtype": self.device_context.reported_dtype,
             "default_max_completion_tokens": self.default_max_completion_tokens,
+            "default_temperature": self.default_temperature,
+            "default_top_p": self.default_top_p,
+            "default_top_k": self.default_top_k,
+            "default_min_p": self.default_min_p,
+            "default_presence_penalty": self.default_presence_penalty,
+            "default_repetition_penalty": self.default_repetition_penalty,
             "default_enable_thinking": self.default_enable_thinking,
             "reasoning_format": self.reasoning_format,
             "quantization": quant_method,
@@ -1934,6 +1974,8 @@ class AnnaQwen3_5TextEngine:
     def _fused_lm_head_candidate_count(self, config: GenerationConfig) -> int | None:
         if config.repetition_penalty != 1.0:
             return None
+        if config.presence_penalty != 0.0:
+            return None
         if config.temperature <= 0.0:
             return 1
         if config.top_k <= 0:
@@ -2094,6 +2136,16 @@ class AnnaQwen3_5TextEngine:
                 status_code=400,
                 code="context_length_exceeded",
             )
+        if config.temperature < 0.0:
+            raise AnnaEngineError("temperature must be >= 0.")
+        if not 0.0 < config.top_p <= 1.0:
+            raise AnnaEngineError("top_p must be in the range (0, 1].")
+        if config.top_k < 0:
+            raise AnnaEngineError("top_k must be >= 0.")
+        if not 0.0 <= config.min_p <= 1.0:
+            raise AnnaEngineError("min_p must be in the range [0, 1].")
+        if config.repetition_penalty < 0.1:
+            raise AnnaEngineError("repetition_penalty must be >= 0.1.")
         if config.max_new_tokens is None:
             resolved_max_new_tokens = self._resolve_auto_max_new_tokens(
                 prepared,
@@ -2491,8 +2543,13 @@ class AnnaQwen3_5TextEngine:
             return "", emitted_text
         return current_text[len(emitted_text) :], current_text
 
-    def _init_repetition_penalty_state(self, prompt_ids: list[int], penalty: float) -> tuple[torch.Tensor | None, set[int] | None]:
-        if penalty == 1.0:
+    def _init_repetition_penalty_state(
+        self,
+        prompt_ids: list[int],
+        penalty: float,
+        presence_penalty: float = 0.0,
+    ) -> tuple[torch.Tensor | None, set[int] | None]:
+        if penalty == 1.0 and presence_penalty == 0.0:
             return None, None
         unique_ids = list(dict.fromkeys(prompt_ids))
         if not unique_ids:
@@ -2547,6 +2604,7 @@ class AnnaQwen3_5TextEngine:
         repetition_history, repetition_history_ids = self._init_repetition_penalty_state(
             prompt_ids,
             config.repetition_penalty,
+            config.presence_penalty,
         )
         started_at = time.perf_counter()
         first_token_at = None
@@ -2606,6 +2664,7 @@ class AnnaQwen3_5TextEngine:
                             candidate_token_ids,
                             temperature=config.temperature,
                             top_p=config.top_p,
+                            min_p=config.min_p,
                         )
                     else:
                         next_token = sample_next_token(
@@ -2614,6 +2673,8 @@ class AnnaQwen3_5TextEngine:
                             temperature=config.temperature,
                             top_p=config.top_p,
                             top_k=config.top_k,
+                            min_p=config.min_p,
+                            presence_penalty=config.presence_penalty,
                             repetition_penalty=config.repetition_penalty,
                         )
                     token_id = int(next_token.item())
@@ -2684,6 +2745,7 @@ class AnnaQwen3_5TextEngine:
         repetition_history, repetition_history_ids = self._init_repetition_penalty_state(
             prompt_ids,
             config.repetition_penalty,
+            config.presence_penalty,
         )
         text_assembler = IncrementalTextAssembler(
             tokenizer=self.tokenizer,
@@ -2748,6 +2810,7 @@ class AnnaQwen3_5TextEngine:
                             candidate_token_ids,
                             temperature=config.temperature,
                             top_p=config.top_p,
+                            min_p=config.min_p,
                         )
                     else:
                         next_token = sample_next_token(
@@ -2756,6 +2819,8 @@ class AnnaQwen3_5TextEngine:
                             temperature=config.temperature,
                             top_p=config.top_p,
                             top_k=config.top_k,
+                            min_p=config.min_p,
+                            presence_penalty=config.presence_penalty,
                             repetition_penalty=config.repetition_penalty,
                         )
                     token_id = int(next_token.item())

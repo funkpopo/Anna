@@ -37,6 +37,12 @@ class ServeSettings:
     kv_cache_quant_bits: int = 4
     kv_cache_residual_len: int = 128
     default_max_completion_tokens: int | None = None
+    default_temperature: float | None = None
+    default_top_p: float | None = None
+    default_top_k: int | None = None
+    default_min_p: float | None = None
+    default_presence_penalty: float | None = None
+    default_repetition_penalty: float | None = None
     default_enable_thinking: bool = True
     reasoning_format: str = "deepseek"
     offload_mode: str = "auto"

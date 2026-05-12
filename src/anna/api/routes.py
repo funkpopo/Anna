@@ -166,6 +166,16 @@ def _default_max_completion_tokens(engine: object) -> int | None:
     return None if value is None else max(1, int(value))
 
 
+def _default_float(engine: object, attr: str, fallback: float) -> float:
+    value = getattr(engine, attr, fallback)
+    return fallback if value is None else float(value)
+
+
+def _default_int(engine: object, attr: str, fallback: int) -> int:
+    value = getattr(engine, attr, fallback)
+    return fallback if value is None else int(value)
+
+
 def _default_reasoning_format(engine: object) -> ReasoningFormat:
     value = getattr(engine, "reasoning_format", None)
     return normalize_reasoning_format(value)
@@ -616,10 +626,20 @@ async def chat_completions(request: Request, payload: ChatCompletionRequest):
     engine = _engine(request)
     config = GenerationConfig(
         max_new_tokens=payload.max_completion_tokens or payload.max_tokens or _default_max_completion_tokens(engine),
-        temperature=payload.temperature,
-        top_p=payload.top_p,
-        top_k=payload.top_k,
-        repetition_penalty=payload.repetition_penalty,
+        temperature=payload.temperature if payload.temperature is not None else _default_float(engine, "default_temperature", 0.7),
+        top_p=payload.top_p if payload.top_p is not None else _default_float(engine, "default_top_p", 0.95),
+        top_k=payload.top_k if payload.top_k is not None else _default_int(engine, "default_top_k", 50),
+        min_p=payload.min_p if payload.min_p is not None else _default_float(engine, "default_min_p", 0.0),
+        presence_penalty=(
+            payload.presence_penalty
+            if payload.presence_penalty is not None
+            else _default_float(engine, "default_presence_penalty", 0.0)
+        ),
+        repetition_penalty=(
+            payload.repetition_penalty
+            if payload.repetition_penalty is not None
+            else _default_float(engine, "default_repetition_penalty", 1.0)
+        ),
         stop_strings=_normalize_stop(payload.stop),
         cancellation_event=threading.Event(),
     )
@@ -715,10 +735,20 @@ async def completions(request: Request, payload: CompletionRequest):
     engine = _engine(request)
     config = GenerationConfig(
         max_new_tokens=payload.max_tokens or _default_max_completion_tokens(engine),
-        temperature=payload.temperature,
-        top_p=payload.top_p,
-        top_k=payload.top_k,
-        repetition_penalty=payload.repetition_penalty,
+        temperature=payload.temperature if payload.temperature is not None else _default_float(engine, "default_temperature", 0.7),
+        top_p=payload.top_p if payload.top_p is not None else _default_float(engine, "default_top_p", 0.95),
+        top_k=payload.top_k if payload.top_k is not None else _default_int(engine, "default_top_k", 50),
+        min_p=payload.min_p if payload.min_p is not None else _default_float(engine, "default_min_p", 0.0),
+        presence_penalty=(
+            payload.presence_penalty
+            if payload.presence_penalty is not None
+            else _default_float(engine, "default_presence_penalty", 0.0)
+        ),
+        repetition_penalty=(
+            payload.repetition_penalty
+            if payload.repetition_penalty is not None
+            else _default_float(engine, "default_repetition_penalty", 1.0)
+        ),
         stop_strings=_normalize_stop(payload.stop),
         cancellation_event=threading.Event(),
     )

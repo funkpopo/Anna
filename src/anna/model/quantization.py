@@ -644,6 +644,8 @@ class XPUInt4Linear(nn.Module):
         op = getattr(torch.ops.aten, "_weight_int4pack_mm_with_scales_and_zeros", None)
         if op is None:
             raise RuntimeError("aten._weight_int4pack_mm_with_scales_and_zeros is unavailable")
+        if not x_padded.is_contiguous():
+            x_padded = x_padded.contiguous()
         output = op(
             x_padded,
             self.qweight,

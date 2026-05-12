@@ -80,10 +80,12 @@ class ChatCompletionRequest(BaseModel):
     reasoning_format: Literal["none", "deepseek"] | None = None
     max_tokens: int | None = Field(default=None, ge=1)
     max_completion_tokens: int | None = Field(default=None, ge=1)
-    temperature: float = Field(default=0.7, ge=0.0)
-    top_p: float = Field(default=0.95, gt=0.0, le=1.0)
-    top_k: int = Field(default=50, ge=0)
-    repetition_penalty: float = Field(default=1.0, ge=0.1)
+    temperature: float | None = Field(default=None, ge=0.0)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=0)
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    repetition_penalty: float | None = Field(default=None, ge=0.1)
     stream: bool = False
     stream_options: StreamOptions | None = None
     stream_include_usage: bool | None = None
@@ -94,10 +96,12 @@ class CompletionRequest(BaseModel):
     model: str | None = None
     prompt: str
     max_tokens: int | None = Field(default=None, ge=1)
-    temperature: float = Field(default=0.7, ge=0.0)
-    top_p: float = Field(default=0.95, gt=0.0, le=1.0)
-    top_k: int = Field(default=50, ge=0)
-    repetition_penalty: float = Field(default=1.0, ge=0.1)
+    temperature: float | None = Field(default=None, ge=0.0)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=0)
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    repetition_penalty: float | None = Field(default=None, ge=0.1)
     stream: bool = False
     stream_options: StreamOptions | None = None
     stream_include_usage: bool | None = None

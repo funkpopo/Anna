@@ -94,6 +94,12 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         device_context: DeviceContext,
         quantized_replacements: int = 0,
         default_max_completion_tokens: int | None = None,
+        default_temperature: float | None = None,
+        default_top_p: float | None = None,
+        default_top_k: int | None = None,
+        default_min_p: float | None = None,
+        default_presence_penalty: float | None = None,
+        default_repetition_penalty: float | None = None,
         default_enable_thinking: bool = True,
         reasoning_format: ReasoningFormat | str = _DEFAULT_REASONING_FORMAT,
         offload_mode: str = "none",
@@ -112,6 +118,14 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         self.quantized_replacements = quantized_replacements
         self.default_max_completion_tokens = (
             None if default_max_completion_tokens is None else max(1, int(default_max_completion_tokens))
+        )
+        self.default_temperature = 0.7 if default_temperature is None else max(0.0, float(default_temperature))
+        self.default_top_p = 0.95 if default_top_p is None else min(1.0, max(0.0, float(default_top_p)))
+        self.default_top_k = 50 if default_top_k is None else max(0, int(default_top_k))
+        self.default_min_p = 0.0 if default_min_p is None else min(1.0, max(0.0, float(default_min_p)))
+        self.default_presence_penalty = 0.0 if default_presence_penalty is None else float(default_presence_penalty)
+        self.default_repetition_penalty = (
+            1.0 if default_repetition_penalty is None else max(0.1, float(default_repetition_penalty))
         )
         self.default_enable_thinking = bool(default_enable_thinking)
         self.reasoning_format = normalize_reasoning_format(reasoning_format)
@@ -156,6 +170,12 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         kv_cache_residual_len: int = 128,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
+        default_temperature: float | None = None,
+        default_top_p: float | None = None,
+        default_top_k: int | None = None,
+        default_min_p: float | None = None,
+        default_presence_penalty: float | None = None,
+        default_repetition_penalty: float | None = None,
         default_enable_thinking: bool = True,
         reasoning_format: ReasoningFormat | str = _DEFAULT_REASONING_FORMAT,
         offload_mode: str = "auto",
@@ -259,6 +279,12 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             device_context=device_context,
             quantized_replacements=runtime_weight_quantized_replacements,
             default_max_completion_tokens=resolved_default_max_completion_tokens,
+            default_temperature=default_temperature,
+            default_top_p=default_top_p,
+            default_top_k=default_top_k,
+            default_min_p=default_min_p,
+            default_presence_penalty=default_presence_penalty,
+            default_repetition_penalty=default_repetition_penalty,
             default_enable_thinking=default_enable_thinking,
             reasoning_format=reasoning_format,
             offload_mode=resolved_offload_mode,
@@ -517,6 +543,12 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             "requested_dtype": self.device_context.requested_dtype,
             "reported_dtype": self.device_context.reported_dtype,
             "default_max_completion_tokens": self.default_max_completion_tokens,
+            "default_temperature": self.default_temperature,
+            "default_top_p": self.default_top_p,
+            "default_top_k": self.default_top_k,
+            "default_min_p": self.default_min_p,
+            "default_presence_penalty": self.default_presence_penalty,
+            "default_repetition_penalty": self.default_repetition_penalty,
             "default_enable_thinking": self.default_enable_thinking,
             "reasoning_format": self.reasoning_format,
             "quantization": "dense",

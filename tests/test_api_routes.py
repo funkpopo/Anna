@@ -44,10 +44,22 @@ class _CapturingEngine:
         self,
         *,
         default_max_completion_tokens: int | None = 768,
+        default_temperature: float = 0.7,
+        default_top_p: float = 0.95,
+        default_top_k: int = 50,
+        default_min_p: float = 0.0,
+        default_presence_penalty: float = 0.0,
+        default_repetition_penalty: float = 1.0,
         default_enable_thinking: bool = True,
         reasoning_format: str = "deepseek",
     ) -> None:
         self.default_max_completion_tokens = default_max_completion_tokens
+        self.default_temperature = default_temperature
+        self.default_top_p = default_top_p
+        self.default_top_k = default_top_k
+        self.default_min_p = default_min_p
+        self.default_presence_penalty = default_presence_penalty
+        self.default_repetition_penalty = default_repetition_penalty
         self.default_enable_thinking = default_enable_thinking
         self.reasoning_format = reasoning_format
         self.last_chat_config = None
@@ -294,6 +306,70 @@ def test_chat_completion_request_max_completion_tokens_overrides_engine_default(
     assert response.status_code == 200
     assert engine.last_chat_config is not None
     assert engine.last_chat_config.max_new_tokens == 64
+
+
+def test_chat_completion_uses_engine_default_sampling_when_request_omits_it() -> None:
+    engine = _CapturingEngine(
+        default_temperature=1.0,
+        default_top_p=0.95,
+        default_top_k=20,
+        default_min_p=0.0,
+        default_presence_penalty=1.5,
+        default_repetition_penalty=1.0,
+    )
+    client = TestClient(create_app(engine))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert engine.last_chat_config is not None
+    assert engine.last_chat_config.temperature == 1.0
+    assert engine.last_chat_config.top_p == 0.95
+    assert engine.last_chat_config.top_k == 20
+    assert engine.last_chat_config.min_p == 0.0
+    assert engine.last_chat_config.presence_penalty == 1.5
+    assert engine.last_chat_config.repetition_penalty == 1.0
+
+
+def test_completion_request_sampling_overrides_engine_defaults() -> None:
+    engine = _CapturingEngine(
+        default_temperature=1.0,
+        default_top_p=0.95,
+        default_top_k=20,
+        default_min_p=0.0,
+        default_presence_penalty=1.5,
+        default_repetition_penalty=1.0,
+    )
+    client = TestClient(create_app(engine))
+
+    response = client.post(
+        "/v1/completions",
+        json={
+            "model": "fake-model",
+            "prompt": "hello",
+            "temperature": 0.6,
+            "top_p": 0.8,
+            "top_k": 8,
+            "min_p": 0.1,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.05,
+        },
+    )
+
+    assert response.status_code == 200
+    assert engine.last_completion_config is not None
+    assert engine.last_completion_config.temperature == 0.6
+    assert engine.last_completion_config.top_p == 0.8
+    assert engine.last_completion_config.top_k == 8
+    assert engine.last_completion_config.min_p == 0.1
+    assert engine.last_completion_config.presence_penalty == 0.0
+    assert engine.last_completion_config.repetition_penalty == 1.05
 
 
 def test_chat_completion_forwards_function_calling_request_fields() -> None:
