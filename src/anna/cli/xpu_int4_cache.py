@@ -85,7 +85,6 @@ def main() -> None:
         config=config,
         device_context=device_context,  # type: ignore[arg-type]
     )
-    cache_dir = model_dir / ".anna" / "xpu_int4_cache"
     quant_config = getattr(config, "quantization_config", None)
     quant_config_enabled = bool(getattr(quant_config, "is_enabled", False))
 
@@ -97,10 +96,10 @@ def main() -> None:
     print(f"quantization_config_enabled={quant_config_enabled}")
     print(f"requested_weight_quant={args.weight_quant}")
     print(f"resolved_weight_quant={resolved_weight_quant}")
-    print(f"xpu_int4_cache_enabled={resolved_weight_quant == 'int4'}")
-    print(f"xpu_int4_cache_dir={cache_dir}")
-    print(f"xpu_int4_cache_exists={cache_dir.exists()}")
-    print(f"xpu_int4_cache_files={len(tuple(cache_dir.glob('*.pt'))) if cache_dir.exists() else 0}")
+    print("xpu_int4_cache_enabled=False")
+    print("xpu_int4_cache_dir=")
+    print("xpu_int4_cache_exists=False")
+    print("xpu_int4_cache_files=0")
 
 
 if __name__ == "__main__":

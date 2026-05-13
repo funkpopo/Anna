@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68", "wheel", "setuptools-rust>=1.10"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -43,6 +43,11 @@ where = ["src"]
 
 [tool.setuptools.dynamic]
 version = {attr = "anna.__version__"}
+
+[[tool.setuptools-rust.ext-modules]]
+target = "anna._rust"
+path = "crates/anna-rust/Cargo.toml"
+binding = "PyO3"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

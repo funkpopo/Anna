@@ -207,7 +207,7 @@ def test_xpu_int4_linear_strategy_env_parsing(monkeypatch: pytest.MonkeyPatch) -
     assert XPUInt4Linear._matmul_strategy() == "auto"
 
 
-def test_convert_module_linears_to_xpu_int4_uses_layout_cache(
+def test_convert_module_linears_to_xpu_int4_ignores_persistent_layout_cache(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -224,27 +224,16 @@ def test_convert_module_linears_to_xpu_int4_uses_layout_cache(
     )
 
     assert converted == 3
-    assert len(list(cache_dir.glob("*.pt"))) == 3
+    assert not cache_dir.exists()
 
     def _raise_if_repacked(*args, **kwargs):
-        raise AssertionError("cache hit should avoid repacking dense weights")
+        raise AssertionError("persistent layout cache is disabled")
 
     monkeypatch.setattr(XPUInt4Linear, "_quantize_weight", staticmethod(_raise_if_repacked))
-    converted_from_cache = convert_module_linears_to_xpu_int4(
-        second,
-        group_size=32,
-        device=torch.device("cpu"),
-        cache_dir=cache_dir,
-    )
-
-    assert converted_from_cache == 3
-    assert isinstance(second.proj, XPUInt4Linear)
-    assert torch.equal(second.proj.qweight, first.proj.qweight)
-    assert torch.equal(second.proj.qscale, first.proj.qscale)
-    assert torch.equal(second.proj.qzeros, first.proj.qzeros)
-    payload = torch.load(next(cache_dir.glob("proj-*.pt")), map_location="cpu", weights_only=False)
-    assert payload["metadata"]["layout"] == "anna_xpu_int4_linear_v1"
-    assert payload["metadata"]["version"] == 2
-    assert "gemv_qweight" not in payload
-    assert "gemv_qscale" not in payload
-    assert "gemv_qzeros" not in payload
+    with pytest.raises(AssertionError, match="persistent layout cache is disabled"):
+        convert_module_linears_to_xpu_int4(
+            second,
+            group_size=32,
+            device=torch.device("cpu"),
+            cache_dir=cache_dir,
+        )
