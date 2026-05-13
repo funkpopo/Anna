@@ -93,7 +93,7 @@ class GenerateSettings:
     max_new_tokens: int | None = None
     temperature: float = 0.7
     top_p: float = 0.95
-    top_k: int = 50
+    top_k: int = 20
     repetition_penalty: float = 1.0
 
 
@@ -116,12 +116,12 @@ class SpeakSettings:
     do_sample: bool = True
     temperature: float = 0.9
     top_p: float = 1.0
-    top_k: int = 50
+    top_k: int = 20
     repetition_penalty: float = 1.05
     subtalker_do_sample: bool = True
     subtalker_temperature: float = 0.9
     subtalker_top_p: float = 1.0
-    subtalker_top_k: int = 50
+    subtalker_top_k: int = 20
     non_streaming_mode: bool = True
 
 

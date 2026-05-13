@@ -188,6 +188,14 @@ def test_generate_without_streaming_overhead_decodes_once() -> None:
     assert result.completion_tokens == 3
 
 
+def test_stop_token_ids_include_model_config_eos_token_id() -> None:
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.tokenizer = SimpleNamespace(eos_token_ids={11})
+    engine.config = SimpleNamespace(text_config=SimpleNamespace(eos_token_id=22))
+
+    assert engine._stop_token_ids() == {11, 22}
+
+
 def test_generate_text_prepares_prompt_on_preprocess_device() -> None:
     class DummyProcessor:
         def __init__(self) -> None:

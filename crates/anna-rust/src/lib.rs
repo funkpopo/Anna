@@ -1,6 +1,6 @@
 use half::{bf16, f16};
 use pyo3::exceptions::{PyFileNotFoundError, PyKeyError, PyRuntimeError, PyValueError};
-use pyo3::types::PyBytes;
+use pyo3::types::PyByteArray;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -412,7 +412,7 @@ fn quantize_safetensors_linear_int4<'py>(
     in_features: usize,
     group_size: usize,
     padded_in_features: usize,
-) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+) -> PyResult<(Bound<'py, PyByteArray>, Bound<'py, PyByteArray>, Bound<'py, PyByteArray>)> {
     let spec = QuantizeLinearSpec {
         name: "<single>".to_owned(),
         data_start,
@@ -437,9 +437,9 @@ fn quantize_safetensors_linear_int4<'py>(
     let quantized = py.allow_threads(|| quantize_linear_raw(&spec, &raw))?;
 
     Ok((
-        PyBytes::new_bound(py, &quantized.qweight),
-        PyBytes::new_bound(py, &quantized.qscale),
-        PyBytes::new_bound(py, &quantized.qzeros),
+        PyByteArray::new_bound(py, &quantized.qweight),
+        PyByteArray::new_bound(py, &quantized.qscale),
+        PyByteArray::new_bound(py, &quantized.qzeros),
     ))
 }
 
@@ -449,7 +449,7 @@ fn quantize_safetensors_linear_int4_batch<'py>(
     shard_path: &str,
     header_len: u64,
     specs: Vec<(String, u64, u64, String, usize, usize, usize, usize)>,
-) -> PyResult<Vec<(String, Bound<'py, PyBytes>, Bound<'py, PyBytes>, Bound<'py, PyBytes>, usize, usize, usize)>> {
+) -> PyResult<Vec<(String, Bound<'py, PyByteArray>, Bound<'py, PyByteArray>, Bound<'py, PyByteArray>, usize, usize, usize)>> {
     let specs = specs
         .into_iter()
         .map(
@@ -495,9 +495,9 @@ fn quantize_safetensors_linear_int4_batch<'py>(
         .map(|item| {
             (
                 item.name,
-                PyBytes::new_bound(py, &item.qweight),
-                PyBytes::new_bound(py, &item.qscale),
-                PyBytes::new_bound(py, &item.qzeros),
+                PyByteArray::new_bound(py, &item.qweight),
+                PyByteArray::new_bound(py, &item.qscale),
+                PyByteArray::new_bound(py, &item.qzeros),
                 item.out_features,
                 item.padded_in_features,
                 item.group_size,

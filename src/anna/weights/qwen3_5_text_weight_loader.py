@@ -191,13 +191,13 @@ def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, 
                             qweight_bytes, qscale_bytes, qzeros_bytes, out_features, padded_in_features, group_size = (
                                 direct_int4_payloads[module_name]
                             )
-                            qweight = torch.frombuffer(bytearray(qweight_bytes), dtype=torch.int32).reshape(
+                            qweight = torch.frombuffer(qweight_bytes, dtype=torch.int32).reshape(
                                 out_features, padded_in_features // 8
                             )
-                            qscale = torch.frombuffer(bytearray(qscale_bytes), dtype=torch.float32).reshape(
+                            qscale = torch.frombuffer(qscale_bytes, dtype=torch.float32).reshape(
                                 padded_in_features // group_size, out_features
                             )
-                            qzeros = torch.frombuffer(bytearray(qzeros_bytes), dtype=torch.int8).reshape(
+                            qzeros = torch.frombuffer(qzeros_bytes, dtype=torch.int8).reshape(
                                 padded_in_features // group_size, out_features
                             )
                             with torch.no_grad():
