@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
 
+from anna.core.native import SafetensorsShardPlan, inspect_safetensors_load_plan, inspect_safetensors_manifest
 from anna.model.gemma4_config import Gemma4Config
 from anna.model.gemma4_text_model import Gemma4ForConditionalGeneration
 from anna.model.quantization import _release_cpu_memory_caches
@@ -28,32 +28,16 @@ def load_gemma4_text_model_config(model_dir: str | Path) -> Gemma4Config:
 
 
 def _iter_weight_files(model_dir: Path) -> list[Path]:
-    index_path = model_dir / "model.safetensors.index.json"
-    if index_path.exists():
-        index_data = json.loads(index_path.read_text(encoding="utf-8"))
-        unique_paths = sorted(set(index_data["weight_map"].values()))
-        return [model_dir / path for path in unique_paths]
-
-    direct_file = model_dir / "model.safetensors"
-    if direct_file.exists():
-        return [direct_file]
-
-    files = sorted(model_dir.glob("*.safetensors"))
-    if not files:
-        raise FileNotFoundError(f"No safetensors weights found in {model_dir}")
-    return files
+    return inspect_safetensors_manifest(model_dir)[0]
 
 
 def estimate_gemma4_text_model_weight_bytes(model_dir: str | Path) -> int:
     model_path = Path(model_dir)
-    index_path = model_path / "model.safetensors.index.json"
-    if index_path.exists():
-        index_data = json.loads(index_path.read_text(encoding="utf-8"))
-        metadata = index_data.get("metadata", {})
-        total_size = metadata.get("total_size")
-        if total_size is not None:
-            return int(total_size)
-    return sum(weight_file.stat().st_size for weight_file in _iter_weight_files(model_path))
+    return inspect_safetensors_manifest(model_path)[1]
+
+
+def _load_plan(model_dir: Path) -> tuple[list[SafetensorsShardPlan], int]:
+    return inspect_safetensors_load_plan(model_dir)
 
 
 def build_gemma4_text_model(
@@ -90,10 +74,12 @@ def load_gemma4_text_model_weights(
     loaded = 0
     skipped = 0
     st_device = safetensors_pt_device_str(tensor_targets)
+    load_plan, _total_bytes = _load_plan(model_path)
 
-    for weight_file in _iter_weight_files(model_path):
+    for shard_plan in load_plan:
+        weight_file = shard_plan.path
         with safe_open(str(weight_file), framework="pt", device=st_device) as handle:
-            for key in handle.keys():
+            for key in shard_plan.keys:
                 if key not in tensor_targets:
                     skipped += 1
                     continue

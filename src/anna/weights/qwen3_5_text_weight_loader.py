@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -10,6 +9,12 @@ import torch
 from safetensors import safe_open
 
 from anna.core.gguf_model import has_gguf_model
+from anna.core.native import (
+    SafetensorsShardPlan,
+    inspect_safetensors_load_plan,
+    inspect_safetensors_manifest,
+    quantize_safetensors_linear_int4_batch,
+)
 from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.quantization import (
@@ -43,20 +48,7 @@ def load_qwen3_5_text_model_config(model_dir: str | Path) -> Qwen3_5TextModelCon
 
 
 def _iter_weight_files(model_dir: Path) -> list[Path]:
-    index_path = model_dir / "model.safetensors.index.json"
-    if index_path.exists():
-        index_data = json.loads(index_path.read_text(encoding="utf-8"))
-        unique_paths = sorted(set(index_data["weight_map"].values()))
-        return [model_dir / path for path in unique_paths]
-
-    direct_file = model_dir / "model.safetensors"
-    if direct_file.exists():
-        return [direct_file]
-
-    files = sorted(model_dir.glob("*.safetensors"))
-    if not files:
-        raise FileNotFoundError(f"No safetensors weights found in {model_dir}")
-    return files
+    return inspect_safetensors_manifest(model_dir)[0]
 
 
 def estimate_qwen3_5_text_model_weight_bytes(model_dir: str | Path) -> int:
@@ -65,14 +57,11 @@ def estimate_qwen3_5_text_model_weight_bytes(model_dir: str | Path) -> int:
         from anna.weights.gguf_support import estimate_qwen3_5_text_model_weight_bytes_from_gguf
 
         return estimate_qwen3_5_text_model_weight_bytes_from_gguf(model_path)
-    index_path = model_path / "model.safetensors.index.json"
-    if index_path.exists():
-        index_data = json.loads(index_path.read_text(encoding="utf-8"))
-        metadata = index_data.get("metadata", {})
-        total_size = metadata.get("total_size")
-        if total_size is not None:
-            return int(total_size)
-    return sum(weight_file.stat().st_size for weight_file in _iter_weight_files(model_path))
+    return inspect_safetensors_manifest(model_path)[1]
+
+
+def _load_plan(model_dir: Path) -> tuple[list[SafetensorsShardPlan], int]:
+    return inspect_safetensors_load_plan(model_dir)
 
 
 def build_qwen3_5_text_model(
@@ -126,9 +115,8 @@ def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, 
     module_targets = dict(model.named_modules())
     loaded = 0
     skipped = 0
-    weight_files = _iter_weight_files(model_path)
-    total_shards = len(weight_files)
-    total_bytes = sum(weight_file.stat().st_size for weight_file in weight_files)
+    load_plan, total_bytes = _load_plan(model_path)
+    total_shards = len(load_plan)
     loaded_bytes = 0
     st_device = safetensors_pt_device_str(tensor_targets)
 
@@ -140,8 +128,10 @@ def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, 
         st_device,
     )
 
-    for shard_idx, weight_file in enumerate(weight_files, start=1):
-        shard_size = weight_file.stat().st_size
+    for shard_idx, shard_plan in enumerate(load_plan, start=1):
+        weight_file = shard_plan.path
+        shard_size = shard_plan.size_bytes
+        tensor_entries = {entry.name: entry for entry in shard_plan.tensors}
         logger.info(
             "Loading Qwen3.5 weight shard %s/%s: %s (%s bytes)",
             shard_idx,
@@ -150,27 +140,71 @@ def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, 
             shard_size,
         )
         with safe_open(str(weight_file), framework="pt", device=st_device) as handle:
-            for key in handle.keys():
+            direct_int4_requests = []
+            direct_int4_keys: set[str] = set()
+            for key in shard_plan.keys:
+                if key in tensor_targets or not key.endswith(".weight"):
+                    continue
+                module_name = key[: -len(".weight")]
+                module = module_targets.get(module_name)
+                if not isinstance(module, XPUInt4Linear):
+                    continue
+                tensor_entry = tensor_entries[key]
+                if tuple(tensor_entry.shape) != (module.out_features, module.in_features):
+                    raise ValueError(
+                        f"Shape mismatch for {key}: expected {(module.out_features, module.in_features)}, got {tuple(tensor_entry.shape)}"
+                    )
+                direct_int4_requests.append(
+                    (module_name, tensor_entry, module.group_size, module.padded_in_features)
+                )
+                direct_int4_keys.add(key)
+            direct_int4_payloads = {}
+            if direct_int4_requests:
+                for (
+                    module_name,
+                    qweight_bytes,
+                    qscale_bytes,
+                    qzeros_bytes,
+                    out_features,
+                    padded_in_features,
+                    group_size,
+                ) in quantize_safetensors_linear_int4_batch(
+                    shard_path=weight_file,
+                    header_len=shard_plan.header_len,
+                    requests=direct_int4_requests,
+                ):
+                    direct_int4_payloads[str(module_name)] = (
+                        qweight_bytes,
+                        qscale_bytes,
+                        qzeros_bytes,
+                        int(out_features),
+                        int(padded_in_features),
+                        int(group_size),
+                    )
+
+            for key in shard_plan.keys:
                 if key not in tensor_targets:
                     if key.endswith(".weight"):
                         module_name = key[: -len(".weight")]
                         module = module_targets.get(module_name)
-                        if isinstance(module, XPUInt4Linear):
-                            source = handle.get_tensor(key)
-                            if tuple(source.shape) != (module.out_features, module.in_features):
-                                raise ValueError(
-                                    f"Shape mismatch for {key}: expected {(module.out_features, module.in_features)}, got {tuple(source.shape)}"
-                                )
-                            qweight, qscale, qzeros = XPUInt4Linear._quantize_weight(
-                                source,
-                                group_size=module.group_size,
-                                padded_in_features=module.padded_in_features,
+                        if isinstance(module, XPUInt4Linear) and key in direct_int4_keys:
+                            qweight_bytes, qscale_bytes, qzeros_bytes, out_features, padded_in_features, group_size = (
+                                direct_int4_payloads[module_name]
+                            )
+                            qweight = torch.frombuffer(bytearray(qweight_bytes), dtype=torch.int32).reshape(
+                                out_features, padded_in_features // 8
+                            )
+                            qscale = torch.frombuffer(bytearray(qscale_bytes), dtype=torch.float32).reshape(
+                                padded_in_features // group_size, out_features
+                            )
+                            qzeros = torch.frombuffer(bytearray(qzeros_bytes), dtype=torch.int8).reshape(
+                                padded_in_features // group_size, out_features
                             )
                             with torch.no_grad():
                                 module.qweight.copy_(qweight.to(device=module.qweight.device))
                                 module.qscale.copy_(qscale.to(device=module.qscale.device))
                                 module.qzeros.copy_(qzeros.to(device=module.qzeros.device))
-                            del source, qweight, qscale, qzeros
+                            del qweight, qscale, qzeros
                             loaded += 1
                             continue
                     skipped += 1

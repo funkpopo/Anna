@@ -908,10 +908,7 @@ def convert_module_linears_to_xpu_int4(
 ) -> int:
     count = 0
     gc_every = 16
-    resolved_cache_dir = Path(cache_dir) if cache_dir is not None else None
-    env_cache_dir = os.getenv("ANNA_XPU_INT4_CACHE_DIR")
-    if resolved_cache_dir is None and env_cache_dir:
-        resolved_cache_dir = Path(env_cache_dir)
+    resolved_cache_dir = None
     module_names = [module_name for module_name, _child in module.named_modules() if module_name]
     for module_name in module_names:
         try:

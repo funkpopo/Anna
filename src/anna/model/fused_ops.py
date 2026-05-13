@@ -31,13 +31,32 @@ def _op_disabled(env_name: str) -> bool:
 
 
 def _default_library_candidates() -> list[str]:
-    repo_root = Path(__file__).resolve().parents[3]
-    build_dir = repo_root / ".build" / "anna_gated_delta_fused"
-    candidates: list[Path] = [
-        build_dir / "anna_gated_delta_fused.pyd",
-        build_dir / "anna_gated_delta_fused.dll",
-        build_dir / "anna_gated_delta_fused.so",
-    ]
+    roots: list[Path] = []
+    env_root = os.getenv("ANNA_PROJECT_ROOT")
+    if env_root:
+        roots.append(Path(env_root).expanduser())
+    roots.append(Path.cwd())
+    roots.append(Path(__file__).resolve().parents[3])
+
+    candidates: list[Path] = []
+    seen_roots: set[str] = set()
+    for root in roots:
+        try:
+            resolved_root = root.resolve()
+        except OSError:
+            resolved_root = root
+        root_key = str(resolved_root)
+        if root_key in seen_roots:
+            continue
+        seen_roots.add(root_key)
+        build_dir = resolved_root / ".build" / "anna_gated_delta_fused"
+        candidates.extend(
+            [
+                build_dir / "anna_gated_delta_fused.pyd",
+                build_dir / "anna_gated_delta_fused.dll",
+                build_dir / "anna_gated_delta_fused.so",
+            ]
+        )
     return [str(candidate) for candidate in candidates if candidate.exists()]
 
 

@@ -20,10 +20,14 @@ build/
 dist/
 *.egg-info/
 pip-wheel-metadata/
+*.whl
 
 # Native/SYCL build artifacts
+target/
+crates/*/target/
 *.obj
 *.o
+*.dll
 *.exp
 *.lib
 *.ilk
