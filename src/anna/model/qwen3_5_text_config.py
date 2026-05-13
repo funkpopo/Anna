@@ -17,6 +17,10 @@ def _int_from_candidates(*values: Any) -> int:
     value = _first_non_null(*values)
     if value is None:
         raise ValueError("Expected an integer config value, but every candidate was null.")
+    if isinstance(value, list):
+        if not value:
+            raise ValueError("Expected an integer config value, but got an empty list.")
+        value = value[0]
     return int(value)
 
 
@@ -293,7 +297,15 @@ class Qwen3_5TextModelConfig:
         generation_config_data: dict[str, Any] | None = None,
     ) -> "Qwen3_5TextModelConfig":
         text_config_data = config_data.get("text_config", {})
-        text_config = Qwen3_5TextConfig.from_dict(config_data)
+        text_config_source = dict(config_data)
+        if generation_config_data and generation_config_data.get("eos_token_id") is not None:
+            text_config_source["eos_token_id"] = generation_config_data["eos_token_id"]
+            if isinstance(text_config_source.get("text_config"), dict):
+                text_config_source["text_config"] = {
+                    **text_config_source["text_config"],
+                    "eos_token_id": generation_config_data["eos_token_id"],
+                }
+        text_config = Qwen3_5TextConfig.from_dict(text_config_source)
         quantization_config = QuantizationConfig.from_dict(config_data.get("quantization_config"))
         if text_config.is_moe_model and quantization_config.is_enabled:
             # Qwen3.5 MoE router gates are stored as dense float weights in the checkpoint even when

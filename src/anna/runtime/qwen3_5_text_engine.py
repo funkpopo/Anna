@@ -2586,6 +2586,14 @@ class AnnaQwen3_5TextEngine:
                 code="client_disconnected",
             )
 
+    def _stop_token_ids(self) -> set[int]:
+        token_ids = set(self.tokenizer.eos_token_ids)
+        text_config = getattr(getattr(self, "config", None), "text_config", None)
+        eos_token_id = getattr(text_config, "eos_token_id", None)
+        if eos_token_id is not None:
+            token_ids.add(int(eos_token_id))
+        return token_ids
+
     @torch.inference_mode()
     def _generate_token_ids(
         self,
@@ -2596,7 +2604,7 @@ class AnnaQwen3_5TextEngine:
         prepared = self._move_prepared_for_generation(prepared, config=config)
 
         completion_ids: list[int] = []
-        stop_token_ids = set(self.tokenizer.eos_token_ids)
+        stop_token_ids = self._stop_token_ids()
         repetition_history, repetition_history_ids = self._init_repetition_penalty_state(
             prompt_ids,
             config.repetition_penalty,
@@ -2737,7 +2745,7 @@ class AnnaQwen3_5TextEngine:
         prompt_ids, prompt_length, config = self._validate_generation_request(prepared, config=config)
         prepared = self._move_prepared_for_generation(prepared, config=config)
         completion_ids: list[int] = []
-        stop_token_ids = set(self.tokenizer.eos_token_ids)
+        stop_token_ids = self._stop_token_ids()
         repetition_history, repetition_history_ids = self._init_repetition_penalty_state(
             prompt_ids,
             config.repetition_penalty,

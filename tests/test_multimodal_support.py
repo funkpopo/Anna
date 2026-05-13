@@ -48,6 +48,29 @@ def _tokenizer() -> Qwen3_5TextTokenizer:
     )
 
 
+def test_qwen_tokenizer_eos_token_ids_include_metadata_special_tokens() -> None:
+    backend = _FakeBackend()
+    backend._token_ids.update(
+        {
+            "<|actual_eos|>": 201,
+            "<|extra_stop|>": 202,
+            "<|dict_stop|>": 203,
+        }
+    )
+    tokenizer = Qwen3_5TextTokenizer(
+        backend,
+        metadata={
+            "eos_token": {"content": "<|actual_eos|>"},
+            "additional_special_tokens": [
+                "<|extra_stop|>",
+                {"content": "<|dict_stop|>"},
+            ],
+        },
+    )
+
+    assert tokenizer.eos_token_ids == {201, 202, 203}
+
+
 def _config() -> Qwen3_5TextModelConfig:
     return Qwen3_5TextModelConfig(
         text_config=Qwen3_5TextConfig(
@@ -238,6 +261,31 @@ def test_qwen3_config_uses_top_level_pad_token_when_text_config_value_is_null() 
 
     assert config.text_config.eos_token_id == 248044
     assert config.text_config.pad_token_id == 248055
+
+
+def test_qwen3_config_uses_generation_config_eos_token_id() -> None:
+    config = Qwen3_5TextModelConfig.from_dict(
+        {
+            "eos_token_id": 248046,
+            "text_config": {
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_num_key_heads": 4,
+                "linear_num_value_heads": 4,
+                "vocab_size": 256,
+                "layer_types": ["linear_attention", "full_attention"],
+            },
+        },
+        generation_config_data={"eos_token_id": [248044]},
+    )
+
+    assert config.text_config.eos_token_id == 248044
 
 
 def test_tokenizer_renders_native_multimodal_placeholders() -> None:

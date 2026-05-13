@@ -85,9 +85,28 @@ class Qwen3_5TextTokenizer:
 
     @property
     def eos_token_ids(self) -> set[int]:
-        # Qwen chat templates should never surface a fresh role boundary in assistant content.
-        tokens = {"<|im_start|>", "<|im_end|>", "<|endoftext|>"}
+        tokens = self._metadata_special_token_strings("eos_token")
+        tokens.update(self._metadata_special_token_strings("additional_special_tokens"))
         return {token_id for token in tokens if (token_id := self.token_id(token)) is not None}
+
+    def _metadata_special_token_strings(self, key: str) -> set[str]:
+        value = self.metadata.get(key)
+        if value is None:
+            return set()
+        if isinstance(value, str):
+            return {value}
+        if isinstance(value, dict):
+            content = value.get("content")
+            return {content} if isinstance(content, str) else set()
+        if isinstance(value, list):
+            tokens: set[str] = set()
+            for item in value:
+                if isinstance(item, str):
+                    tokens.add(item)
+                elif isinstance(item, dict) and isinstance(item.get("content"), str):
+                    tokens.add(item["content"])
+            return tokens
+        return set()
 
     @staticmethod
     def _message_value(message: Any, key: str, default: Any = None) -> Any:
