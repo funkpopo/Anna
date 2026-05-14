@@ -11,7 +11,13 @@ from anna.model.xpu_decode_profile import xpu_profile_region
 
 _mse_quantizers: dict[tuple[int, int, str], Any] = {}
 _ip_quantizers: dict[tuple[int, int, str], Any] = {}
-_KEEP_DECODE_CACHE = os.getenv("ANNA_TURBOQUANT_KEEP_DECODE_CACHE", "").strip().lower() in {
+_KEEP_DECODE_CACHE = os.getenv("ANNA_TURBOQUANT_KEEP_DECODE_CACHE", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_SYNC_AFTER_QUANTIZE = os.getenv("ANNA_TURBOQUANT_SYNC_AFTER_QUANTIZE", "").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -674,6 +680,8 @@ class TurboQuantKVRow:
         self._quantized_values = _concat_value_states(self._quantized_values, quantized_values)
         self._residual_keys = residual_keys[:, overflow:, :].contiguous()
         self._residual_values = residual_values[:, overflow:, :].contiguous()
+        if _SYNC_AFTER_QUANTIZE and self.device is not None and self.device.type == "xpu" and hasattr(torch, "xpu"):
+            torch.xpu.synchronize()
 
         # Incrementally extend decode tensors instead of invalidating the full prefix. A full
         # re-dequant on every append was O(total_quantized_tokens) per layer per decode step.

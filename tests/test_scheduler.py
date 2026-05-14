@@ -425,12 +425,12 @@ def test_scheduler_uses_topk_forward_for_eligible_batches() -> None:
     try:
         request_a = scheduler._submit(
             _prepared([4, 5]),
-            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=1),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=1, presence_penalty=0.0),
             stream=False,
         )
         request_b = scheduler._submit(
             _prepared([6, 7]),
-            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=1),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=1, presence_penalty=0.0),
             stream=False,
         )
 

@@ -2,44 +2,42 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-Anna is a **local inference runtime** for large language and speech models, with an **OpenAI-compatible HTTP API**. It is built around **PyTorch** and is especially tuned for **Intel Arc (XPU)**—while **CPU** works for development and tests.
+Anna is a local inference runtime for large language, multimodal, and speech models. It provides an OpenAI-compatible HTTP API and command-line tools for local generation, serving, benchmarking, and Qwen3-TTS speech synthesis.
 
-You point Anna at a folder on disk that contains a model (`config.json` + weights, or a Qwen **GGUF** plus optional vision projector). Anna then serves chat, text completion, multimodal chat, or text-to-speech, depending on the model type.
+The runtime is built on PyTorch and is optimized for Intel Arc / XPU. CPU execution is useful for development and smaller tests.
 
-## What you get
+## Features
 
-- **HTTP API**: `/healthz`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/audio/speech`
-- **Streaming and non-streaming** responses; optional **reasoning** split into `reasoning_content`; **tool / function calling**
-- **Multimodal chat** (images / video; Gemma 4 also supports audio) when the model supports it
-- **CLIs**: `anna-serve`, `anna-generate`, `anna-bench`, `anna-speak`
-- **Runtime options** aimed at Arc: `torch.compile`, prefill chunking, prompt KV reuse, TurboQuant KV cache, runtime int4 weights, MoE expert offload and caching, optional continuous batching, optional SYCL fused ops
+- OpenAI-compatible endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/audio/speech`, `/v1/models`
+- Non-streaming and streaming text generation
+- Chat, plain text completion, multimodal chat, function calling, and reasoning output
+- Qwen3-TTS speech synthesis
+- Intel XPU options for `torch.compile`, KV-cache quantization, int4 weight quantization, MoE expert offload, prompt cache, and continuous batching
+- CLI tools: `anna-serve`, `anna-generate`, `anna-bench`, `anna-speak`, `anna-xpu-int4-cache`
 
-## Supported model families
+## Supported Models
 
-Anna picks the backend from the top-level `model_type` in `config.json`:
+Anna loads a local model directory. A normal Hugging Face-style directory should contain `config.json` and model weights. A Qwen GGUF layout is also supported for compatible Qwen3.5 MoE models.
 
-| When `model_type` is… | Runtime | Typical use |
+Model family detection is based on `config.json`:
+
+| `model_type` | Runtime | Main use |
 | --- | --- | --- |
-| Anything except `qwen3_tts` and `gemma4` (e.g. `qwen3_5`, `qwen3_5_moe`, `qwen3_5_vl`) | Qwen3.5 text / VL | Chat, completions, multimodal (image/video), tools |
-| `gemma4` | Gemma 4 | Same, plus audio in chat |
-| `qwen3_tts` | Qwen3-TTS | Speech synthesis only |
+| `qwen3_tts` | Qwen3-TTS | Speech synthesis |
+| `gemma4` | Gemma 4 | Text, chat, multimodal chat with audio |
+| anything else | Qwen3.5 text / VL | Text, chat, image/video multimodal chat |
 
-**CLI fit:**
-
-- `anna-generate` and `anna-bench`: text-generation families only (not `qwen3_tts`).
-- `anna-speak`: `qwen3_tts` only.
-- `anna-serve`: any supported family; which API routes succeed depends on the loaded model.
+Use `anna-generate` and `anna-bench` for text-generation models. Use `anna-speak` for Qwen3-TTS. Use `anna-serve` for any supported family; unsupported routes return an API error for the loaded model.
 
 ## Requirements
 
-- **Python 3.11+**
-- A **local model directory** (Hugging Face–style layout, or Qwen GGUF + optional `mmproj-*.gguf`)
-- **PyTorch** installed for your machine (`torch>=2.7` per `pyproject.toml`). For Arc, use a build with **XPU** support.
-- **Video** inputs: `imageio`, `imageio-ffmpeg` (installed with the package)
-- **Qwen3-TTS**: `qwen-tts` (declared dependency)
-- **Optional** fused XPU operator: Intel **oneAPI** DPC++ and, on Windows, **Visual Studio** Build Tools
+- Python 3.11+
+- PyTorch 2.7+ installed for your hardware
+- A local model directory
+- For Intel Arc / XPU: a PyTorch build with XPU support and the Intel GPU runtime
+- Optional fused XPU operator build: Intel oneAPI DPC++ compiler, and Visual Studio Build Tools on Windows
 
-Install the Python package; PyTorch and oneAPI are **not** installed by `pip install -e .` alone—you choose those for your hardware.
+The package declares Python dependencies in `pyproject.toml`. PyTorch and Intel GPU drivers should be installed according to your target machine.
 
 ## Installation
 
@@ -49,247 +47,269 @@ cd Anna
 python -m venv .venv
 ```
 
-**Windows (PowerShell):** `.\.venv\Scripts\Activate.ps1`  
-**Linux/macOS:** `source .venv/bin/activate`
+Activate the virtual environment:
+
+```powershell
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+```
+
+```bash
+# Linux / macOS
+source .venv/bin/activate
+```
+
+Install Anna:
 
 ```bash
 python -m pip install -U pip
 python -m pip install -e .
-# Optional: python -m pip install -e ".[dev]"
 ```
 
-**Check PyTorch / XPU:**
+For development and tests:
 
 ```bash
-python -c "import torch; print(torch.__version__); print(getattr(torch, 'xpu', None) and torch.xpu.is_available())"
+python -m pip install -e ".[dev]"
+pytest
 ```
 
-**Optional fused op** (better XPU performance when available):
+Check PyTorch and XPU availability:
+
+```bash
+python -c "import torch; print(torch.__version__); print(torch.xpu.is_available() if hasattr(torch, 'xpu') else False)"
+```
+
+Optional: build the fused XPU operator:
 
 ```bash
 python tools/build_gated_delta_fused_op.py
 ```
 
-Output goes under `.build/anna_gated_delta_fused`. You can point to the built library with `ANNA_GATED_DELTA_OP_LIB` (see below).
+## Quick Start
 
-Arc int4 fused-kernel tuning knobs:
-
-- `ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE`: work-group local size for `lm_head_int4_topk_fused` (rounded up to a power of two, max 64; the blocked top-k path uses at least 64 for correctness).
-- `ANNA_XPU_INT4_LM_HEAD_BLOCK_TOPK_THRESHOLD`: vocabulary threshold for the two-stage blocked `lm_head_int4_topk_fused` path (default 65536).
-- `ANNA_XPU_INT4_LM_HEAD_BLOCK_SIZE`: vocabulary block size for blocked `lm_head_int4_topk_fused` (default 4096).
-- `ANNA_XPU_INT4_MOE_GATE_LOCAL_SIZE`: local size for grouped int4 MoE gate/up projection (rounded up to a power of two, max 256).
-- `ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE`: local size for grouped int4 MoE down projection (rounded up to a power of two, max 256).
-
-These default to the existing conservative choices. On Arc A770/A750, sweep these values with `tools/bench_xpu_hotspots.py --arc-profile`; add `--arc-int4-only` for focused int4 sweeps that skip the general attention/router hotspot suite. The report includes ordinary `XPUInt4Linear`, `lm_head_int4_topk_fused`, and `moe_grouped_int4_mlp_fused` rows so kernel-local wins can be checked against decode-critical paths. The former standalone SYCL GEMV path for `XPUInt4Linear` has been retired because it did not consistently match the PyTorch int4pack backend.
-The Intel FlashQLA-compatible GDN prefill path can be enabled from the CLI with `--enable-flashqla-gdn-prefill`; this maps to `ANNA_XPU_FLASHQLA_GDN_PREFILL=1` and deliberately does not fall back if the op, device, dtype, or shape is unsupported.
-
-When runtime int4 converts `lm_head`, Anna also prepares a top-k-specific scale/zero layout (`[vocab, group_count]`) for `lm_head_int4_topk_fused`; ordinary linear layers keep the standard matmul layout.
-The XPU int4 sidecar cache stores the base int4 tensors and, for `lm_head`, a tile-major qweight used by fused top-k. Older cache files that contain retired GEMV subgroup payloads are still safe to ignore or rebuild.
-
-## Quick start
-
-**API server:**
+Start the OpenAI-compatible server:
 
 ```bash
 anna-serve --model-dir /path/to/model --host 127.0.0.1 --port 8000
 ```
 
-**XPU-oriented example:**
+Send a chat request:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-model",
+    "messages": [
+      {"role": "user", "content": "Explain KV cache in one paragraph."}
+    ],
+    "max_completion_tokens": 128
+  }'
+```
+
+Use streaming:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Write a short haiku about local AI."}],
+    "stream": true,
+    "stream_options": {"include_usage": true}
+  }'
+```
+
+Run one-shot generation from the CLI:
+
+```bash
+anna-generate \
+  --model-dir /path/to/text-model \
+  --prompt "Explain KV cache in one paragraph." \
+  --max-new-tokens 128
+```
+
+Run a benchmark:
+
+```bash
+anna-bench \
+  --model-dir /path/to/model \
+  --prompt "Hello" \
+  --warmup 1 \
+  --runs 3
+```
+
+Synthesize speech with Qwen3-TTS:
+
+```bash
+anna-speak \
+  --model-dir /path/to/qwen3-tts \
+  --input "Hello from Anna." \
+  --output out.wav
+```
+
+## Intel XPU Examples
+
+Select a specific XPU device:
 
 ```bash
 anna-serve \
   --model-dir /path/to/model \
   --device xpu \
   --xpu-device-index 0 \
+  --dtype bfloat16
+```
+
+Use memory-saving runtime options:
+
+```bash
+anna-serve \
+  --model-dir /path/to/model \
+  --device xpu \
   --dtype bfloat16 \
   --kv-cache-quantization turboquant \
   --kv-cache-quant-bits 4 \
   --weight-quant auto \
-  --enable-flashqla-gdn-prefill \
   --prompt-cache-size 4
 ```
 
-**One-shot text generation:**
+Enable continuous batching for API serving:
 
 ```bash
-anna-generate --model-dir /path/to/text-model --prompt "Explain KV cache in one paragraph."
+anna-serve \
+  --model-dir /path/to/model \
+  --device xpu \
+  --scheduler-max-batch-size 4 \
+  --scheduler-batch-wait-ms 2
 ```
 
-**Benchmark (text or multimodal):**
+Check whether Anna will create an XPU int4 sidecar cache:
 
 ```bash
-anna-bench --model-dir /path/to/model --prompt "Hello" --warmup 1 --runs 3
+anna-xpu-int4-cache \
+  --model-dir /path/to/model \
+  --weight-quant auto \
+  --xpu-total-memory-gib 16
 ```
 
-**Check runtime XPU int4 cache eligibility:**
+## Multimodal Requests
+
+For supported vision models, use OpenAI-style content parts:
 
 ```bash
-anna-xpu-int4-cache --model-dir /path/to/model --weight-quant auto --xpu-total-memory-gib 16
-```
-
-For safetensors Qwen3.5 models without an existing quantization config, this reports whether `--weight-quant auto` resolves to `int4` and shows the sidecar cache directory, usually `<model-dir>/.anna/xpu_int4_cache`.
-
-**TTS (example: base voice clone):**
-
-```bash
-anna-speak --model-dir /path/to/tts --input "Hello." --output out.wav --ref-audio ref.wav --ref-text "Reference text."
-```
-
----
-
-## Command-line reference (what each flag does)
-
-### Shared ideas (text runtimes: serve / generate / bench)
-
-| Option | Meaning |
-| --- | --- |
-| `--model-dir` | **Required.** Directory with the model (or GGUF layout Anna understands). |
-| `--model-name` | Name shown in logs / API; default is derived from the path. |
-| `--device` | `auto`, `cpu`, or `xpu`. `auto` picks XPU when available. |
-| `--xpu-device-index N` | Binds **Level Zero** to device index `N` via `ONEAPI_DEVICE_SELECTOR=level_zero:N`. Use when you have both iGPU and Arc and need the right GPU. |
-| `--no-xpu-env-defaults` | Do **not** set Anna’s recommended Level Zero env vars (see **XPU environment** below). |
-| `--dtype` | `auto`, `float32`, `float16`, or `bfloat16`. |
-| `--compile-mode` | `torch.compile` mode: `none`, `auto`, `default`, `reduce-overhead`, `max-autotune`. **Default:** `auto` on **serve**, `none` on **generate** and **bench** (first compile can add latency). |
-| `--compile-fullgraph` | Ask for full-graph capture when compile is enabled. |
-| `--prefill-chunk-size` | Split long **text-only** prefills into chunks (tokens). `0` = let Anna auto-size on XPU. |
-| `--prompt-cache-size` | Keep up to **N** exact text prompts’ KV caches in memory for reuse. `0` = off. |
-| `--prompt-cache-max-tokens` | Only cache prompts up to **N** tokens (saves memory on long prompts). `0` = no limit. |
-| `--profile-runtime` | Log synchronized XPU timings / memory for prefill vs decode (profiling). |
-| `--enable-flashqla-gdn-prefill` | Enable the Intel FlashQLA-compatible GDN prefill path on XPU. Unsupported devices, shapes, dtypes, or missing custom ops raise immediately; there is no fallback. |
-| `--kv-cache-quantization` | `none` or `turboquant` (Qwen3.5 + Gemma4). |
-| `--kv-cache-quant-bits` | `2`, `3`, or `4` for TurboQuant. |
-| `--kv-cache-residual-len` | Keep the newest **N** KV positions in full precision before older entries are compressed. |
-| `--offload-mode` | `auto`, `none`, or `experts`. `experts` enables MoE expert offload when applicable. |
-| `--offload-vision` | Keep the **vision tower on CPU** even if the main model runs on XPU (saves VRAM for text-only or tight budgets). |
-| `--expert-quant` | `auto`, `none`, `int4` for **expert** weights on XPU. `auto` can enable int4 under offload. |
-| `--weight-quant` | `auto`, `none`, `int4` for **dense** linear weights on XPU. `auto` may enable int4 when memory is tight. |
-| `--resident-expert-layers` | Keep the **first N** sparse MoE layers fully on the accelerator; omit for auto in expert offload. |
-| `--resident-expert-layer-indices` | Comma-separated **0-based** layer indices to keep resident; **overrides** `--resident-expert-layers`. |
-| `--cached-experts-per-layer` | Max **offloaded experts** cached per MoE layer on XPU; `0` disables; omit for auto. |
-| `--log-level` | Logging verbosity (e.g. `info`). |
-
-### `anna-serve` only
-
-| Option | Meaning |
-| --- | --- |
-| `--no-inference-warmup` | Skip a small post-load prefill+decode on XPU (first real request may pay lazy kernel load). |
-| `--enable-thinking` / `--disable-thinking` | Default for chat when the client omits thinking flags. |
-| `--max-completion-tokens` | Default token cap for requests that omit `max_tokens` / `max_completion_tokens`. |
-| `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--presence-penalty`, `--repetition-penalty` | Default sampling controls for chat/completion requests that omit those fields. |
-| `--reasoning-format` | `none` vs `deepseek`-style split (`reasoning_content` vs main `content`). |
-| `--min-free-memory-mib` | Minimum **free** XPU memory (MiB) before starting generation (admission). |
-| `--reserve-memory-mib` | Extra **reserved** margin (MiB) during admission. |
-| `--max-estimated-usage-ratio` | Reject requests when estimated usage exceeds this fraction of total XPU memory (between 0 and 1, exclusive of 0). |
-| `--generation-memory-safety-factor` | Multiplier on estimated generation memory (≥ 1). |
-| `--scheduler-max-batch-size` | If **&gt; 1**, enables **continuous batching** (batched decode). `1` = one request per step (lower latency, more kernel launches). |
-| `--scheduler-batch-wait-ms` | When batching, how long to wait to fill a batch (trades throughput vs tail latency). |
-| `--metrics-log-interval-seconds` | Print aggregated metrics every **N** seconds; `0` disables. |
-| `--host`, `--port` | Bind address for Uvicorn. |
-
-### `anna-generate` only
-
-| Option | Meaning |
-| --- | --- |
-| `--prompt` | **Required.** Input text. |
-| `--max-new-tokens` | Hard cap on **new** tokens; default follows model config or an internal safe estimate. |
-| `--temperature`, `--top-p`, `--top-k`, `--repetition-penalty` | Sampling controls for generation. |
-
-### `anna-bench` only
-
-| Option | Meaning |
-| --- | --- |
-| `--image` / `--video` | Optional local paths; builds a **multimodal** chat-style prompt (no audio benchmark path yet). |
-| `--warmup` | Runs before timed `runs` (JIT / cache warm-up). |
-| `--runs` | Timed iterations; prints latency and throughput stats. |
-| `--max-new-tokens`, `--temperature`, `--top-p`, `--top-k`, `--repetition-penalty` | Same role and defaults as generate. |
-
-### `anna-speak` (Qwen3-TTS)
-
-Does **not** add `--xpu-device-index` / `--no-xpu-env-defaults`; for Arc you may set `ONEAPI_DEVICE_SELECTOR` yourself if needed.
-
-| Option | Meaning |
-| --- | --- |
-| `--input` | Text to synthesize. |
-| `--output` | Output audio path. |
-| `--language` | Optional language hint. |
-| `--speaker` | CustomVoice: speaker name. |
-| `--instruct` | Style / instruction for VoiceDesign or CustomVoice. |
-| `--ref-audio`, `--ref-text` | Base **voice clone**: reference clip and transcript. |
-| `--x-vector-only-mode` | Base model: embedding only, skip transcript conditioning. |
-| `--response-format` | `wav` or `flac`. |
-| `--max-new-tokens` | Cap on generated speech tokens. |
-| `--do-sample` / `--no-do-sample` | Stochastic vs greedy for main generation. |
-| `--temperature`, `--top-p`, `--top-k`, `--repetition-penalty` | Main sampler. |
-| `--subtalker-do-sample`, `--no-subtalker-do-sample`, `--subtalker-temperature`, `--subtalker-top-p`, `--subtalker-top-k` | Sub-module sampling. |
-| `--non-streaming-mode` (default) vs `--streaming-style-input` | Text feeding mode for the TTS stack. |
-
-### XPU / Level Zero auto-setup
-
-When `--device` is `auto` or `xpu` and you do **not** pass `--no-xpu-env-defaults`, Anna sets recommended variables before load, including:
-
-- `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1`
-- `ZES_ENABLE_SYSMAN=1`
-- `ONEAPI_DEVICE_SELECTOR=level_zero:<index>` if `--xpu-device-index` is set
-
-Use `--no-xpu-env-defaults` if you manage these globally.
-
----
-
-## Optional environment variables (advanced)
-
-| Variable | Purpose |
-| --- | --- |
-| `ANNA_XPU_INT4_MATMUL` | `auto` (default), `torch`, or `dequant`. `auto` resolves to the PyTorch int4pack backend; the former standalone SYCL GEMV path has been retired. |
-| `ANNA_GATED_DELTA_OP_LIB` | Path to the compiled **gated delta** fused op library if not auto-discovered. |
-| `ANNA_XPU_DISABLE_MOE_GROUPED_INT4`, `ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK` | Set to disable specific fused ops (e.g. `1` / `true`). |
-| `ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED` | `1` / `true` / `yes` / `on` to opt into int4 LM-head top-k fused path when available. |
-| `ANNA_PREFIX_KV_SHARE` | Set to `0` to disable prefix KV sharing behavior in ops (default enabled). |
-| `ANNA_DPCPP`, `ANNA_VCVARS64`, `ANNA_ONEAPI_RUNTIME_PATHS` | Build script hints for `tools/build_gated_delta_fused_op.py` on Windows / oneAPI layout. |
-
----
-
-## API overview
-
-Same routes are always registered; behavior depends on the loaded model.
-
-- `GET /healthz` — health and runtime metrics snapshot where supported  
-- `GET /v1/models`  
-- `POST /v1/chat/completions` — multimodal `content` arrays, tools, thinking / reasoning options  
-- `POST /v1/completions` — **text-only** prompt  
-- `POST /v1/audio/speech` — TTS when the model is `qwen3_tts`
-
-**List models:**
-
-```bash
-curl http://127.0.0.1:8000/v1/models
-```
-
-**Chat:**
-
-```bash
-curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"local-model","messages":[{"role":"user","content":"Hello"}]}'
+  -d '{
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": "Describe this image."},
+          {"type": "image_url", "image_url": {"url": "/path/to/image.jpg"}}
+        ]
+      }
+    ],
+    "max_completion_tokens": 128
+  }'
 ```
 
-**TTS (base clone example):**
+`image_url`, `video_url`, and `audio_url` content parts are accepted by the API schema. Actual support depends on the loaded model family.
+
+## API Routes
+
+| Route | Method | Purpose |
+| --- | --- | --- |
+| `/healthz` | `GET` | Runtime health and model status |
+| `/v1/models` | `GET` | List the loaded model ID |
+| `/v1/chat/completions` | `POST` | Chat and multimodal chat |
+| `/v1/completions` | `POST` | Plain text completion |
+| `/v1/audio/speech` | `POST` | Qwen3-TTS speech synthesis |
+
+## `anna-serve` Options
+
+`anna-serve` has one required option. All other options are optional and have runtime defaults.
+
+| Required option | Meaning |
+| --- | --- |
+| `--model-dir PATH` | Local model directory. Use a Hugging Face-style model folder with `config.json` and weights, or a compatible GGUF layout. |
+
+Common service options:
+
+| Optional option | Default | Meaning |
+| --- | --- | --- |
+| `--model-name NAME` | derived from path | Model ID exposed by `/v1/models` and API responses. |
+| `--host HOST` | `127.0.0.1` | Server bind address. Use `0.0.0.0` to listen on all interfaces. |
+| `--port PORT` | `8000` | Server port. |
+| `--log-level LEVEL` | `info` | Uvicorn and Anna logging level. |
+| `--device DEVICE` | `auto` | `auto`, `cpu`, or `xpu`. `auto` prefers XPU when available. |
+| `--dtype DTYPE` | `auto` | Compute dtype such as `auto`, `float32`, `float16`, or `bfloat16`. |
+| `--max-completion-tokens N` | model/default estimate | Default output token cap for API requests that omit `max_tokens` / `max_completion_tokens`. |
+| `--temperature FLOAT` | `0.7` | Default sampling temperature when the request omits it. |
+| `--top-p FLOAT` | `0.8` | Default nucleus sampling probability. |
+| `--top-k N` | `20` | Default top-k sampling limit. Set `0` to disable. |
+| `--min-p FLOAT` | `0.0` | Default min-p sampling threshold. |
+| `--presence-penalty FLOAT` | `1.5` | Default additive presence penalty. |
+| `--repetition-penalty FLOAT` | `1.0` | Default multiplicative repetition penalty. |
+| `--enable-thinking` / `--disable-thinking` | enabled | Default thinking behavior for chat requests that omit thinking fields. |
+| `--reasoning-format none\|deepseek` | `deepseek` | Reasoning output format. `deepseek` returns `reasoning_content` separately when available. |
+
+Performance and memory options:
+
+| Optional option | Default | Meaning |
+| --- | --- | --- |
+| `--compile-mode MODE` | `auto` | `none`, `auto`, `default`, `reduce-overhead`, or `max-autotune`. First requests can pay compile cost. |
+| `--compile-fullgraph` | off | Request full-graph capture when `torch.compile` is enabled. |
+| `--prefill-chunk-size N` | `0` | Split long text-only prefills into chunks. `0` lets Anna auto-size on XPU. |
+| `--prompt-cache-size N` | `0` | Keep up to N exact text prompt KV caches resident. `0` disables prompt cache. |
+| `--prompt-cache-max-tokens N` | `0` | Only cache prompts up to N tokens. `0` means no token limit. |
+| `--kv-cache-quantization none\|turboquant` | `none` | Quantize compatible KV caches. |
+| `--kv-cache-quant-bits 2\|3\|4` | `4` | TurboQuant KV-cache bit width. |
+| `--kv-cache-residual-len N` | `128` | Keep the newest N KV tokens in full precision. |
+| `--offload-mode auto\|none\|experts` | `auto` | MoE expert offload strategy. |
+| `--offload-vision` | off | Keep the vision tower on CPU even when the language model runs on XPU. |
+| `--expert-quant auto\|none\|int4` | `auto` | Quantization for MoE expert weights on XPU. |
+| `--weight-quant auto\|none\|int4` | `auto` | Quantization for dense language-model weights on XPU. |
+| `--resident-expert-layers N` | auto | Keep the first N sparse MoE layers fully resident on the execution device. |
+| `--resident-expert-layer-indices LIST` | unset | Comma-separated 0-based sparse layer indices to keep resident. Overrides `--resident-expert-layers`. |
+| `--cached-experts-per-layer N` | auto | Max offloaded experts cached on XPU per sparse MoE layer. `0` disables. |
+
+XPU and server runtime options:
+
+| Optional option | Default | Meaning |
+| --- | --- | --- |
+| `--xpu-device-index N` | unset | Select an Intel XPU with `ONEAPI_DEVICE_SELECTOR=level_zero:N`. |
+| `--no-xpu-env-defaults` | off | Do not set Anna's recommended Level Zero environment defaults before XPU startup. |
+| `--xpu-int4-matmul auto\|torch\|dequant` | runtime default | XPU int4 dense linear execution strategy. |
+| `--enable-flashqla-gdn-prefill` | off | Enable the Intel FlashQLA-compatible GDN prefill path on XPU. Unsupported shapes/devices/dtypes raise immediately. |
+| `--no-inference-warmup` | off | Skip the small post-load XPU warmup. First client request may then pay lazy kernel load. |
+| `--warmup-prefill-tokens N` | `2` | Text token count used by post-load XPU warmup prefill. |
+| `--warmup-decode-steps N` | `1` | Decode steps used by post-load XPU warmup. |
+| `--warmup-batch-size N` | `1` | Batch size used by post-load XPU warmup. |
+| `--profile-runtime` | off | Log synchronized XPU timing and memory stats. |
+| `--min-free-memory-mib N` | `1024` | Minimum free XPU memory required before generation starts. |
+| `--reserve-memory-mib N` | `512` | Extra XPU memory margin preserved during request admission. |
+| `--max-estimated-usage-ratio R` | `0.9` | Reject requests whose estimated usage exceeds this fraction of total XPU memory. |
+| `--generation-memory-safety-factor R` | `2.0` | Multiplier applied to estimated generation memory. |
+| `--scheduler-max-batch-size N` | `1` | Enable continuous batching when greater than `1`. |
+| `--scheduler-batch-wait-ms MS` | `2.0` | Wait time used to coalesce requests when batching is enabled. |
+| `--scheduler-prefill-interval-steps N` | `1` | Prefill scheduling interval while continuous batching is active. |
+| `--metrics-log-interval-seconds S` | `10.0` | Emit aggregated runtime metrics every S seconds. `0` disables metrics logging. |
+
+For the full option list, run:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{"model":"local-model","input":"Hello","ref_audio":"ref.wav","ref_text":"...","response_format":"wav"}' \
-  --output speech.wav
+anna-serve --help
+anna-generate --help
+anna-bench --help
+anna-speak --help
 ```
 
----
+## Troubleshooting
 
-## Development
-
-```bash
-python -m pytest
-```
-
-For fused-kernel work, build the custom op first, then run tests or CLIs against `.build/anna_gated_delta_fused`.
+- If XPU is not detected, confirm that your PyTorch build supports XPU and that Intel GPU drivers are installed.
+- If the wrong GPU is selected on a system with multiple Intel GPUs, pass `--xpu-device-index N`.
+- If the first request is slow, it may be paying model load, kernel load, or `torch.compile` cost.
+- If memory is tight on XPU, try `--dtype bfloat16`, `--kv-cache-quantization turboquant`, `--weight-quant auto`, `--offload-mode experts`, or a lower token limit.
+- If a route fails, verify that the loaded model family supports that task.
 
 ## License
 
