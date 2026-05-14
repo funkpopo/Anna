@@ -792,19 +792,22 @@ class TurboQuantKVRow:
 
         attn_scores = torch.cat(score_parts, dim=-1)
         attn_probs = torch.softmax(attn_scores.to(torch.float32), dim=-1).to(dtype=compute_dtype)
-        attn_output = torch.zeros(grouped_shape, device=query.device, dtype=compute_dtype)
+        attn_output: torch.Tensor | None = None
         offset = 0
         if quantized_values is not None and quantized_len > 0:
-            attn_output = attn_output + torch.matmul(
+            attn_output = torch.matmul(
                 attn_probs[..., offset : offset + quantized_len],
                 quantized_values.to(dtype=compute_dtype).unsqueeze(1),
             )
             offset += quantized_len
         if self._residual_values is not None and residual_len > 0:
-            attn_output = attn_output + torch.matmul(
+            residual_output = torch.matmul(
                 attn_probs[..., offset : offset + residual_len],
                 self._residual_values.to(dtype=compute_dtype).unsqueeze(1),
             )
+            attn_output = residual_output if attn_output is None else attn_output + residual_output
+        if attn_output is None:
+            return query.new_zeros((int(query.shape[0]), 1, self.head_dim))
         return attn_output.reshape(int(query.shape[0]), 1, self.head_dim).to(dtype=query.dtype)
 
     def clone(self) -> "TurboQuantKVRow":

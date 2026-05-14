@@ -68,3 +68,23 @@ def test_speak_parser_accepts_custom_voice_arguments() -> None:
     assert args.non_streaming_mode is False
     assert args.do_sample is False
     assert args.subtalker_do_sample is False
+
+
+def test_speak_parser_uses_updated_sampling_defaults() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "--model-dir",
+            "model",
+            "--input",
+            "Hello from Anna.",
+            "--output",
+            "out.wav",
+        ]
+    )
+
+    assert args.temperature == 0.7
+    assert args.top_p == 0.8
+    assert args.top_k == 20
+    assert args.repetition_penalty == 1.0

@@ -627,13 +627,13 @@ async def chat_completions(request: Request, payload: ChatCompletionRequest):
     config = GenerationConfig(
         max_new_tokens=payload.max_completion_tokens or payload.max_tokens or _default_max_completion_tokens(engine),
         temperature=payload.temperature if payload.temperature is not None else _default_float(engine, "default_temperature", 0.7),
-        top_p=payload.top_p if payload.top_p is not None else _default_float(engine, "default_top_p", 0.95),
-        top_k=payload.top_k if payload.top_k is not None else _default_int(engine, "default_top_k", 50),
+        top_p=payload.top_p if payload.top_p is not None else _default_float(engine, "default_top_p", 0.8),
+        top_k=payload.top_k if payload.top_k is not None else _default_int(engine, "default_top_k", 20),
         min_p=payload.min_p if payload.min_p is not None else _default_float(engine, "default_min_p", 0.0),
         presence_penalty=(
             payload.presence_penalty
             if payload.presence_penalty is not None
-            else _default_float(engine, "default_presence_penalty", 0.0)
+            else _default_float(engine, "default_presence_penalty", 1.5)
         ),
         repetition_penalty=(
             payload.repetition_penalty
@@ -736,13 +736,13 @@ async def completions(request: Request, payload: CompletionRequest):
     config = GenerationConfig(
         max_new_tokens=payload.max_tokens or _default_max_completion_tokens(engine),
         temperature=payload.temperature if payload.temperature is not None else _default_float(engine, "default_temperature", 0.7),
-        top_p=payload.top_p if payload.top_p is not None else _default_float(engine, "default_top_p", 0.95),
-        top_k=payload.top_k if payload.top_k is not None else _default_int(engine, "default_top_k", 50),
+        top_p=payload.top_p if payload.top_p is not None else _default_float(engine, "default_top_p", 0.8),
+        top_k=payload.top_k if payload.top_k is not None else _default_int(engine, "default_top_k", 20),
         min_p=payload.min_p if payload.min_p is not None else _default_float(engine, "default_min_p", 0.0),
         presence_penalty=(
             payload.presence_penalty
             if payload.presence_penalty is not None
-            else _default_float(engine, "default_presence_penalty", 0.0)
+            else _default_float(engine, "default_presence_penalty", 1.5)
         ),
         repetition_penalty=(
             payload.repetition_penalty

@@ -76,10 +76,10 @@ def sample_next_token(
     *,
     generated_ids: torch.Tensor | None = None,
     temperature: float = 0.7,
-    top_p: float = 0.95,
-    top_k: int = 50,
+    top_p: float = 0.8,
+    top_k: int = 20,
     min_p: float = 0.0,
-    presence_penalty: float = 0.0,
+    presence_penalty: float = 1.5,
     repetition_penalty: float = 1.0,
 ) -> torch.Tensor:
     next_logits = apply_repetition_penalty(logits, generated_ids, repetition_penalty)
@@ -101,7 +101,7 @@ def sample_next_token_from_candidates(
     candidate_token_ids: torch.Tensor,
     *,
     temperature: float = 0.7,
-    top_p: float = 0.95,
+    top_p: float = 0.8,
     min_p: float = 0.0,
 ) -> torch.Tensor:
     if candidate_logits.shape != candidate_token_ids.shape:

@@ -201,7 +201,7 @@ anna-speak --model-dir /path/to/tts --input "Hello." --output out.wav --ref-audi
 | `--image` / `--video` | Optional local paths; builds a **multimodal** chat-style prompt (no audio benchmark path yet). |
 | `--warmup` | Runs before timed `runs` (JIT / cache warm-up). |
 | `--runs` | Timed iterations; prints latency and throughput stats. |
-| `--max-new-tokens`, `--temperature`, `--top-p`, `--top-k`, `--repetition-penalty` | Same role as generate; bench defaults favor deterministic timing (`temperature=0`, `top_p=1`, `top_k=0`). |
+| `--max-new-tokens`, `--temperature`, `--top-p`, `--top-k`, `--repetition-penalty` | Same role and defaults as generate. |
 
 ### `anna-speak` (Qwen3-TTS)
 
