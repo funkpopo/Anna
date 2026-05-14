@@ -128,8 +128,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Completion token limit. Defaults to the model config/generation_config value when present; otherwise Anna auto-estimates a safe limit.",
     )
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--top-p", type=float, default=0.8)
+    parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--log-level", default="info")
     return parser

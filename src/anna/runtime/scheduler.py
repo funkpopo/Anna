@@ -66,10 +66,13 @@ class AnnaScheduler:
         *,
         max_batch_size: int = 4,
         batch_wait_ms: float = 2.0,
+        prefill_interval_steps: int = 1,
     ) -> None:
         self.engine = engine
         self.max_batch_size = max(1, max_batch_size)
         self.batch_wait_seconds = max(0.0, batch_wait_ms) / 1000.0
+        self.prefill_interval_steps = max(1, int(prefill_interval_steps))
+        self._decode_steps_since_prefill = 0
         self._pending: deque[SchedulerRequest] = deque()
         self._condition = threading.Condition()
         self._stop = False
@@ -148,7 +151,8 @@ class AnnaScheduler:
                         self._condition.wait(timeout=self.batch_wait_seconds)
 
                     pending_batch: list[SchedulerRequest] = []
-                    if not active:
+                    should_admit_pending = not active or self._should_admit_prefill(active)
+                    if should_admit_pending:
                         while self._pending and len(pending_batch) < self.max_batch_size:
                             request = self._pending.popleft()
                             if self._is_request_cancelled(request):
@@ -188,13 +192,24 @@ class AnnaScheduler:
                         chunk = ready[chunk_start : chunk_start + self.max_batch_size]
                         try:
                             next_active.extend(self._decode_batch(chunk))
+                            self._decode_steps_since_prefill += 1
                         except Exception as exc:  # pragma: no cover - worker-level best effort
                             self._fail_requests(chunk, self._normalize_error(exc))
-                    next_active.extend(prefill_groups)
+                    if prefill_groups and self._should_run_prefill_step():
+                        group = prefill_groups[0]
+                        try:
+                            next_active.extend(self._prefill_group_step(group))
+                            self._decode_steps_since_prefill = 0
+                        except Exception as exc:  # pragma: no cover - worker-level best effort
+                            self._fail_requests(group.requests, self._normalize_error(exc))
+                        next_active.extend(prefill_groups[1:])
+                    else:
+                        next_active.extend(prefill_groups)
                 elif prefill_groups:
                     group = prefill_groups[0]
                     try:
                         next_active.extend(self._prefill_group_step(group))
+                        self._decode_steps_since_prefill = 0
                     except Exception as exc:  # pragma: no cover - worker-level best effort
                         self._fail_requests(group.requests, self._normalize_error(exc))
                     next_active.extend(prefill_groups[1:])
@@ -254,6 +269,16 @@ class AnnaScheduler:
         for _, group in sorted(groups.items()):
             active.extend(self._prefill_same_length_group(group))
         return active
+
+    def _should_admit_prefill(self, active: list[SchedulerRequest | SchedulerPrefillGroup]) -> bool:
+        if not self._pending:
+            return False
+        if any(isinstance(item, SchedulerPrefillGroup) for item in active):
+            return False
+        return self._decode_steps_since_prefill >= self.prefill_interval_steps
+
+    def _should_run_prefill_step(self) -> bool:
+        return self._decode_steps_since_prefill >= self.prefill_interval_steps
 
     def _prefill_same_length_group(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest | SchedulerPrefillGroup]:
         for request in requests:

@@ -134,6 +134,7 @@ def _build_scheduler(engine, settings: ServeSettings) -> AnnaScheduler | None:
         engine,
         max_batch_size=settings.scheduler_max_batch_size,
         batch_wait_ms=settings.scheduler_batch_wait_ms,
+        prefill_interval_steps=settings.scheduler_prefill_interval_steps,
     )
     engine.set_scheduler(scheduler)
     return scheduler
@@ -277,13 +278,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--top-p",
         type=_ratio,
         default=None,
-        help="Default nucleus sampling probability for API requests that omit top_p. Defaults to 0.95.",
+        help="Default nucleus sampling probability for API requests that omit top_p. Defaults to 0.8.",
     )
     parser.add_argument(
         "--top-k",
         type=_non_negative_int,
         default=None,
-        help="Default top-k sampling limit for API requests that omit top_k. Set 0 to disable. Defaults to 50.",
+        help="Default top-k sampling limit for API requests that omit top_k. Set 0 to disable. Defaults to 20.",
     )
     parser.add_argument(
         "--min-p",
@@ -295,7 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--presence-penalty",
         type=float,
         default=None,
-        help="Default additive presence penalty for API requests that omit presence_penalty. Defaults to 0.0.",
+        help="Default additive presence penalty for API requests that omit presence_penalty. Defaults to 1.5.",
     )
     parser.add_argument(
         "--repetition-penalty",
@@ -389,6 +390,14 @@ def build_parser() -> argparse.ArgumentParser:
         "coalescing at the cost of tail latency. Ignored if max batch is 1.",
     )
     parser.add_argument(
+        "--scheduler-prefill-interval-steps",
+        type=_positive_int,
+        default=1,
+        help="When continuous batching is enabled, run at most one pending prefill chunk after this many "
+        "batched decode steps. Lower values improve TTFT for newly queued prompts; higher values protect "
+        "inter-token latency for active decodes.",
+    )
+    parser.add_argument(
         "--metrics-log-interval-seconds",
         type=_non_negative_float,
         default=10.0,
@@ -448,6 +457,7 @@ def main() -> None:
         generation_memory_safety_factor=args.generation_memory_safety_factor,
         scheduler_max_batch_size=args.scheduler_max_batch_size,
         scheduler_batch_wait_ms=args.scheduler_batch_wait_ms,
+        scheduler_prefill_interval_steps=args.scheduler_prefill_interval_steps,
         warmup_prefill_tokens=args.warmup_prefill_tokens,
         warmup_decode_steps=args.warmup_decode_steps,
         warmup_batch_size=args.warmup_batch_size,

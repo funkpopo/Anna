@@ -120,10 +120,10 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             None if default_max_completion_tokens is None else max(1, int(default_max_completion_tokens))
         )
         self.default_temperature = 0.7 if default_temperature is None else max(0.0, float(default_temperature))
-        self.default_top_p = 0.95 if default_top_p is None else min(1.0, max(0.0, float(default_top_p)))
-        self.default_top_k = 50 if default_top_k is None else max(0, int(default_top_k))
+        self.default_top_p = 0.8 if default_top_p is None else min(1.0, max(0.0, float(default_top_p)))
+        self.default_top_k = 20 if default_top_k is None else max(0, int(default_top_k))
         self.default_min_p = 0.0 if default_min_p is None else min(1.0, max(0.0, float(default_min_p)))
-        self.default_presence_penalty = 0.0 if default_presence_penalty is None else float(default_presence_penalty)
+        self.default_presence_penalty = 1.5 if default_presence_penalty is None else float(default_presence_penalty)
         self.default_repetition_penalty = (
             1.0 if default_repetition_penalty is None else max(0.1, float(default_repetition_penalty))
         )

@@ -58,6 +58,7 @@ class ServeSettings:
     generation_memory_safety_factor: float | None = None
     scheduler_max_batch_size: int = 1
     scheduler_batch_wait_ms: float = 2.0
+    scheduler_prefill_interval_steps: int = 1
     warmup_prefill_tokens: int = 2
     warmup_decode_steps: int = 1
     warmup_batch_size: int = 1
@@ -92,7 +93,7 @@ class GenerateSettings:
     cached_experts_per_layer: int | None = None
     max_new_tokens: int | None = None
     temperature: float = 0.7
-    top_p: float = 0.95
+    top_p: float = 0.8
     top_k: int = 20
     repetition_penalty: float = 1.0
 
@@ -114,10 +115,10 @@ class SpeakSettings:
     response_format: str = "wav"
     max_new_tokens: int | None = None
     do_sample: bool = True
-    temperature: float = 0.9
-    top_p: float = 1.0
+    temperature: float = 0.7
+    top_p: float = 0.8
     top_k: int = 20
-    repetition_penalty: float = 1.05
+    repetition_penalty: float = 1.0
     subtalker_do_sample: bool = True
     subtalker_temperature: float = 0.9
     subtalker_top_p: float = 1.0
@@ -151,9 +152,9 @@ class BenchmarkSettings:
     resident_expert_layer_indices: tuple[int, ...] | None = None
     cached_experts_per_layer: int | None = None
     max_new_tokens: int | None = None
-    temperature: float = 0.0
-    top_p: float = 1.0
-    top_k: int = 0
+    temperature: float = 0.7
+    top_p: float = 0.8
+    top_k: int = 20
     repetition_penalty: float = 1.0
     warmup: int = 1
     runs: int = 3

@@ -127,10 +127,10 @@ class SpeechRequest(BaseModel):
     response_format: Literal["wav", "flac", "pcm"] = "wav"
     max_new_tokens: int | None = Field(default=None, ge=1)
     do_sample: bool = True
-    temperature: float = Field(default=0.9, ge=0.0)
-    top_p: float = Field(default=1.0, gt=0.0, le=1.0)
-    top_k: int = Field(default=50, ge=0)
-    repetition_penalty: float = Field(default=1.05, ge=0.1)
+    temperature: float = Field(default=0.7, ge=0.0)
+    top_p: float = Field(default=0.8, gt=0.0, le=1.0)
+    top_k: int = Field(default=20, ge=0)
+    repetition_penalty: float = Field(default=1.0, ge=0.1)
     subtalker_do_sample: bool = True
     subtalker_temperature: float = Field(default=0.9, ge=0.0)
     subtalker_top_p: float = Field(default=1.0, gt=0.0, le=1.0)

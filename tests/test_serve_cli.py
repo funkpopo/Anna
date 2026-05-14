@@ -84,6 +84,8 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "8",
             "--warmup-batch-size",
             "4",
+            "--scheduler-prefill-interval-steps",
+            "3",
             "--metrics-log-interval-seconds",
             "3.5",
         ]
@@ -112,6 +114,7 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.warmup_prefill_tokens == 512
     assert args.warmup_decode_steps == 8
     assert args.warmup_batch_size == 4
+    assert args.scheduler_prefill_interval_steps == 3
     assert args.metrics_log_interval_seconds == 3.5
 
 
@@ -170,6 +173,7 @@ def test_serve_parser_defaults_to_direct_generation() -> None:
     args = parser.parse_args(["--model-dir", "model"])
 
     assert args.scheduler_max_batch_size == 1
+    assert args.scheduler_prefill_interval_steps == 1
     assert args.metrics_log_interval_seconds == 10.0
 
 
@@ -204,6 +208,25 @@ def test_build_scheduler_skips_continuous_batching_when_disabled() -> None:
 
     assert scheduler is None
     assert engine.scheduler is None
+
+
+def test_build_scheduler_passes_prefill_interval_to_scheduler() -> None:
+    engine = _FakeEngine()
+    settings = ServeSettings(
+        model_dir=Path("dummy"),
+        scheduler_max_batch_size=4,
+        scheduler_prefill_interval_steps=3,
+    )
+
+    scheduler = _build_scheduler(engine, settings)
+
+    try:
+        assert scheduler is not None
+        assert scheduler.prefill_interval_steps == 3
+        assert engine.scheduler is scheduler
+    finally:
+        if scheduler is not None:
+            scheduler.shutdown()
 
 
 def test_build_metrics_logger_can_be_disabled() -> None:

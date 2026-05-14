@@ -25,10 +25,10 @@ def _stringify_dtype(dtype) -> str:
 class Qwen3TTSSynthesisConfig:
     max_new_tokens: int | None = None
     do_sample: bool = True
-    temperature: float = 0.9
-    top_p: float = 1.0
-    top_k: int = 50
-    repetition_penalty: float = 1.05
+    temperature: float = 0.7
+    top_p: float = 0.8
+    top_k: int = 20
+    repetition_penalty: float = 1.0
     subtalker_do_sample: bool = True
     subtalker_temperature: float = 0.9
     subtalker_top_p: float = 1.0

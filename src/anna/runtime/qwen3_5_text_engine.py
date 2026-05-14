@@ -160,10 +160,10 @@ class AnnaEngineError(RuntimeError):
 class GenerationConfig:
     max_new_tokens: int | None = None
     temperature: float = 0.7
-    top_p: float = 0.95
-    top_k: int = 50
+    top_p: float = 0.8
+    top_k: int = 20
     min_p: float = 0.0
-    presence_penalty: float = 0.0
+    presence_penalty: float = 1.5
     repetition_penalty: float = 1.0
     stop_strings: list[str] = field(default_factory=list)
     cancellation_event: threading.Event | None = field(default=None, repr=False, compare=False)
@@ -248,10 +248,10 @@ class AnnaQwen3_5TextEngine:
             None if default_max_completion_tokens is None else max(1, int(default_max_completion_tokens))
         )
         self.default_temperature = 0.7 if default_temperature is None else max(0.0, float(default_temperature))
-        self.default_top_p = 0.95 if default_top_p is None else min(1.0, max(0.0, float(default_top_p)))
-        self.default_top_k = 50 if default_top_k is None else max(0, int(default_top_k))
+        self.default_top_p = 0.8 if default_top_p is None else min(1.0, max(0.0, float(default_top_p)))
+        self.default_top_k = 20 if default_top_k is None else max(0, int(default_top_k))
         self.default_min_p = 0.0 if default_min_p is None else min(1.0, max(0.0, float(default_min_p)))
-        self.default_presence_penalty = 0.0 if default_presence_penalty is None else float(default_presence_penalty)
+        self.default_presence_penalty = 1.5 if default_presence_penalty is None else float(default_presence_penalty)
         self.default_repetition_penalty = (
             1.0 if default_repetition_penalty is None else max(0.1, float(default_repetition_penalty))
         )
@@ -728,10 +728,10 @@ class AnnaQwen3_5TextEngine:
             device_context.reported_dtype,
             resolved_default_max_completion_tokens,
             default_temperature if default_temperature is not None else 0.7,
-            default_top_p if default_top_p is not None else 0.95,
-            default_top_k if default_top_k is not None else 50,
+            default_top_p if default_top_p is not None else 0.8,
+            default_top_k if default_top_k is not None else 20,
             default_min_p if default_min_p is not None else 0.0,
-            default_presence_penalty if default_presence_penalty is not None else 0.0,
+            default_presence_penalty if default_presence_penalty is not None else 1.5,
             default_repetition_penalty if default_repetition_penalty is not None else 1.0,
             bool(default_enable_thinking),
             normalize_reasoning_format(reasoning_format),

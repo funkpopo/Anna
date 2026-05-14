@@ -203,7 +203,7 @@ anna-speak --model-dir /path/to/tts --input "你好。" --output out.wav --ref-a
 | `--image` / `--video` | 本地图片 / 视频路径；会走多模态聊天式推理（暂无单独音频 benchmark）。 |
 | `--warmup` | 正式计时的 `runs` 之前先跑几轮，用于预热。 |
 | `--runs` | 计时轮数；输出平均延迟、吞吐等。 |
-| `--max-new-tokens`、采样相关参数 | 与 `generate` 含义相同；bench 默认更偏确定性与测速（如 `temperature=0`）。 |
+| `--max-new-tokens`、采样相关参数 | 与 `generate` 含义和默认值相同。 |
 
 ### 仅 `anna-speak`（Qwen3-TTS）
 
