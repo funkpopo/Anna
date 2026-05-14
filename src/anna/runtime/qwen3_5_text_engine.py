@@ -2561,11 +2561,12 @@ class AnnaQwen3_5TextEngine:
         history_tensor: torch.Tensor | None,
         history_ids: set[int] | None,
         next_token: torch.Tensor,
+        token_id: int | None = None,
     ) -> tuple[torch.Tensor | None, set[int] | None]:
         if history_tensor is None or history_ids is None:
             return history_tensor, history_ids
 
-        token_id = int(next_token.item())
+        token_id = self._token_id_from_tensor(next_token) if token_id is None else int(token_id)
         if token_id in history_ids:
             return history_tensor, history_ids
 
@@ -2576,6 +2577,10 @@ class AnnaQwen3_5TextEngine:
         if history_tensor.numel() == 0:
             return appended, history_ids
         return torch.cat([history_tensor, appended]), history_ids
+
+    @staticmethod
+    def _token_id_from_tensor(next_token: torch.Tensor) -> int:
+        return int(next_token.detach().reshape(-1).to(device="cpu")[0])
 
     def _raise_if_generation_cancelled(self, config: GenerationConfig) -> None:
         if config.cancellation_event is not None and config.cancellation_event.is_set():
@@ -2681,7 +2686,7 @@ class AnnaQwen3_5TextEngine:
                             presence_penalty=config.presence_penalty,
                             repetition_penalty=config.repetition_penalty,
                         )
-                    token_id = int(next_token.item())
+                    token_id = self._token_id_from_tensor(next_token)
                     if first_token_at is None:
                         first_token_at = time.perf_counter()
 
@@ -2710,6 +2715,7 @@ class AnnaQwen3_5TextEngine:
                         history_tensor=repetition_history,
                         history_ids=repetition_history_ids,
                         next_token=next_token,
+                        token_id=token_id,
                     )
 
                     input_ids = next_token.view(1, 1)
@@ -2827,7 +2833,7 @@ class AnnaQwen3_5TextEngine:
                             presence_penalty=config.presence_penalty,
                             repetition_penalty=config.repetition_penalty,
                         )
-                    token_id = int(next_token.item())
+                    token_id = self._token_id_from_tensor(next_token)
                     if first_token_at is None:
                         first_token_at = time.perf_counter()
 
@@ -2861,6 +2867,7 @@ class AnnaQwen3_5TextEngine:
                         history_tensor=repetition_history,
                         history_ids=repetition_history_ids,
                         next_token=next_token,
+                        token_id=token_id,
                     )
                     delta, hit_stop_string = text_assembler.feed_token(token_id)
 

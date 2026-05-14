@@ -387,7 +387,7 @@ class AnnaScheduler:
                 continue
             request.past_key_values = split_caches[row_idx]
             next_token = self._sample_next_token_from_outputs(outputs, row_idx=row_idx, request=request)
-            token_id = int(next_token.item())
+            token_id = self.engine._token_id_from_tensor(next_token)
             if request.first_token_at is None:
                 request.first_token_at = time.perf_counter()
             if token_id in stop_token_ids:
@@ -401,6 +401,7 @@ class AnnaScheduler:
                 history_tensor=request.repetition_history,
                 history_ids=request.repetition_history_ids,
                 next_token=next_token,
+                token_id=token_id,
             )
             delta, hit_stop = request.assembler.feed_token(token_id) if request.assembler is not None else ("", False)
             if delta:
@@ -476,7 +477,7 @@ class AnnaScheduler:
                 continue
             request.past_key_values = split_caches[row_idx]
             next_token = self._sample_next_token_from_outputs(outputs, row_idx=row_idx, request=request)
-            token_id = int(next_token.item())
+            token_id = self.engine._token_id_from_tensor(next_token)
             if request.first_token_at is None:
                 request.first_token_at = time.perf_counter()
             if token_id in stop_token_ids:
@@ -490,6 +491,7 @@ class AnnaScheduler:
                 history_tensor=request.repetition_history,
                 history_ids=request.repetition_history_ids,
                 next_token=next_token,
+                token_id=token_id,
             )
             delta, hit_stop = request.assembler.feed_token(token_id) if request.assembler is not None else ("", False)
             if delta:

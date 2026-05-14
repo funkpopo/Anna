@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -330,6 +332,16 @@ def test_flashqla_solve_wu_build_wrapper_raises_without_registered_op(monkeypatc
     kkt = torch.empty(1, 64, 2, 64)
     with pytest.raises(RuntimeError, match="does not fall back"):
         fused_ops.run_flashqla_solve_wu_build(key=key, value=value, beta=beta, g_cumsum=g_cumsum, kkt=kkt, chunk_size=64)
+
+
+def test_flashqla_gated_delta_prefill_uses_solve_wu_build_fusion() -> None:
+    source = Path("src/anna/model/custom_ops/gated_delta_fused_op.sycl").read_text(encoding="utf-8")
+    body = source.split("std::tuple<at::Tensor, at::Tensor> flashqla_gated_delta_prefill_xpu", 1)[1]
+    body = body.split("void launch_flashqla_chunk_local_cumsum_kernel", 1)[0]
+
+    assert "flashqla_solve_wu_build_xpu" in body
+    assert "flashqla_kkt_solve_xpu(kkt, chunk_size)" not in body
+    assert "flashqla_wu_build_xpu(normalized_key, value_in, beta_in, g_cumsum, a, chunk_size)" not in body
 
 
 def test_flashqla_chunk_gdr_fwd_wrapper_raises_without_registered_op(monkeypatch: pytest.MonkeyPatch) -> None:

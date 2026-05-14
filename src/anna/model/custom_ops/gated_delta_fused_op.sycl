@@ -4483,15 +4483,15 @@ std::tuple<at::Tensor, at::Tensor> flashqla_gated_delta_prefill_xpu(
   auto cumsum_kkt = flashqla_cumsum_kkt_build_xpu(normalized_key, beta_in, g_in, chunk_size);
   auto g_cumsum = std::get<0>(cumsum_kkt);
   auto kkt = std::get<1>(cumsum_kkt);
-  auto a = flashqla_kkt_solve_xpu(kkt, chunk_size);
-  auto wu = flashqla_wu_build_xpu(normalized_key, value_in, beta_in, g_cumsum, a, chunk_size);
+  auto solve_wu = flashqla_solve_wu_build_xpu(normalized_key, value_in, beta_in, g_cumsum, kkt, chunk_size);
+  auto a = std::get<0>(solve_wu);
   return flashqla_chunk_gdr_fwd_xpu(
       normalized_query,
       normalized_key,
       g_cumsum,
       a,
-      std::get<0>(wu),
-      std::get<1>(wu),
+      std::get<1>(solve_wu),
+      std::get<2>(solve_wu),
       state_in,
       chunk_size);
 }
