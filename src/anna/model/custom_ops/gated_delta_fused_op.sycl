@@ -4398,6 +4398,106 @@ void launch_gated_delta_decode_kernel(
   });
 }
 
+template <typename scalar_t>
+void launch_gated_delta_decode_tiled_kernel(
+    sycl::queue& queue,
+    const scalar_t* query_ptr,
+    const scalar_t* key_ptr,
+    const scalar_t* value_ptr,
+    const float* g_ptr,
+    const float* beta_ptr,
+    const float* state_read_ptr,
+    float* state_write_ptr,
+    scalar_t* output_ptr,
+    int64_t batch_size,
+    int64_t num_heads,
+    int64_t key_head_dim,
+    int64_t value_head_dim,
+    int64_t value_block,
+    int64_t local_size,
+    float l2_eps_f,
+    float query_scale_base) {
+  const int64_t value_block_count = (value_head_dim + value_block - 1) / value_block;
+  const size_t group_count = static_cast<size_t>(batch_size * num_heads * value_block_count);
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> normalized_query(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
+    sycl::local_accessor<float, 1> normalized_key(sycl::range<1>(static_cast<size_t>(key_head_dim)), cgh);
+    cgh.parallel_for(
+        sycl::nd_range<2>(
+            sycl::range<2>(group_count, static_cast<size_t>(local_size)),
+            sycl::range<2>(1, static_cast<size_t>(local_size))),
+        [=](sycl::nd_item<2> item) {
+          const int64_t group_idx = static_cast<int64_t>(item.get_group(0));
+          const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+          const int64_t value_block_idx = group_idx % value_block_count;
+          const int64_t bh = group_idx / value_block_count;
+          const int64_t b = bh / num_heads;
+          const int64_t h = bh % num_heads;
+          const int64_t scalar_index = (b * num_heads) + h;
+          const int64_t q_t_base = scalar_index * key_head_dim;
+          const int64_t k_t_base = scalar_index * key_head_dim;
+          const int64_t v_t_base = scalar_index * value_head_dim;
+          const int64_t state_base = ((b * num_heads) + h) * key_head_dim * value_head_dim;
+
+          float local_query_sum_sq = 0.0f;
+          float local_key_sum_sq = 0.0f;
+          for (int64_t k_idx = lane; k_idx < key_head_dim; k_idx += local_size) {
+            const float raw_query = load_as_float(query_ptr, q_t_base + k_idx);
+            const float raw_key = load_as_float(key_ptr, k_t_base + k_idx);
+            normalized_query[k_idx] = raw_query;
+            normalized_key[k_idx] = raw_key;
+            local_query_sum_sq += raw_query * raw_query;
+            local_key_sum_sq += raw_key * raw_key;
+          }
+
+          const float total_query_sum_sq =
+              sycl::reduce_over_group(item.get_group(), local_query_sum_sq, sycl::plus<float>());
+          const float total_key_sum_sq =
+              sycl::reduce_over_group(item.get_group(), local_key_sum_sq, sycl::plus<float>());
+          const float query_scale = sycl::rsqrt(total_query_sum_sq + l2_eps_f) * query_scale_base;
+          const float key_scale = sycl::rsqrt(total_key_sum_sq + l2_eps_f);
+          for (int64_t k_idx = lane; k_idx < key_head_dim; k_idx += local_size) {
+            normalized_query[k_idx] *= query_scale;
+            normalized_key[k_idx] *= key_scale;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          const float g_scale = sycl::exp(g_ptr[scalar_index]);
+          const float beta_value = beta_ptr[scalar_index];
+          const int64_t value_start = value_block_idx * value_block;
+          for (int64_t block_offset = 0; block_offset < value_block; ++block_offset) {
+            const int64_t v_idx = value_start + block_offset;
+            float local_kv_mem = 0.0f;
+            if (v_idx < value_head_dim) {
+              for (int64_t k_idx = lane; k_idx < key_head_dim; k_idx += local_size) {
+                const int64_t state_index = state_base + k_idx * value_head_dim + v_idx;
+                local_kv_mem += state_read_ptr[state_index] * g_scale * normalized_key[k_idx];
+              }
+            }
+            const float kv_mem = sycl::reduce_over_group(item.get_group(), local_kv_mem, sycl::plus<float>());
+
+            const float delta = (v_idx < value_head_dim)
+                ? gated_delta_compute_delta(value_ptr, v_t_base, v_idx, kv_mem, beta_value)
+                : 0.0f;
+            float local_out_value = 0.0f;
+            if (v_idx < value_head_dim) {
+              for (int64_t k_idx = lane; k_idx < key_head_dim; k_idx += local_size) {
+                const int64_t state_index = state_base + k_idx * value_head_dim + v_idx;
+                const float updated = state_read_ptr[state_index] * g_scale + normalized_key[k_idx] * delta;
+                state_write_ptr[state_index] = updated;
+                local_out_value += updated * normalized_query[k_idx];
+              }
+            }
+            const float out_value = sycl::reduce_over_group(item.get_group(), local_out_value, sycl::plus<float>());
+            if (lane == 0 && v_idx < value_head_dim) {
+              const int64_t out_index = ((b * num_heads) + h) * value_head_dim + v_idx;
+              gated_delta_store_output(output_ptr, out_index, out_value);
+            }
+          }
+        });
+  });
+}
+
 std::tuple<at::Tensor, at::Tensor> gated_delta_prefill_xpu(
     const at::Tensor& query_in,
     const at::Tensor& key_in,
@@ -4476,24 +4576,9 @@ std::tuple<at::Tensor, at::Tensor> flashqla_gated_delta_prefill_xpu(
   TORCH_CHECK(
       query_in.scalar_type() == at::kHalf || query_in.scalar_type() == at::kBFloat16,
       "flashqla_gated_delta_prefill supports float16 and bfloat16 query/key/value inputs");
-  const int64_t chunk_size = 64;
-  auto normalized_qk = flashqla_normalize_qk_xpu(query_in, key_in);
-  auto normalized_query = std::get<0>(normalized_qk);
-  auto normalized_key = std::get<1>(normalized_qk);
-  auto cumsum_kkt = flashqla_cumsum_kkt_build_xpu(normalized_key, beta_in, g_in, chunk_size);
-  auto g_cumsum = std::get<0>(cumsum_kkt);
-  auto kkt = std::get<1>(cumsum_kkt);
-  auto solve_wu = flashqla_solve_wu_build_xpu(normalized_key, value_in, beta_in, g_cumsum, kkt, chunk_size);
-  auto a = std::get<0>(solve_wu);
-  return flashqla_chunk_gdr_fwd_xpu(
-      normalized_query,
-      normalized_key,
-      g_cumsum,
-      a,
-      std::get<1>(solve_wu),
-      std::get<2>(solve_wu),
-      state_in,
-      chunk_size);
+  // The decomposed FlashQLA helpers remain registered for validation and experimentation, but
+  // Arc A770 profiling shows the single-kernel recurrent path is the fast public prefill entry.
+  return gated_delta_prefill_xpu(query_in, key_in, value_in, g_in, beta_in, state_in);
 }
 
 void launch_flashqla_chunk_local_cumsum_kernel(
@@ -5444,6 +5529,9 @@ at::Tensor gated_delta_decode_xpu(
   auto stream = c10::xpu::getCurrentXPUStream(query_in.device().index());
   const int64_t local_size = std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, value_head_dim)), 256);
   validate_gated_delta_local_memory_requirements(stream.queue().get_device(), key_head_dim, local_size);
+  const int64_t value_block = std::max<int64_t>(
+      1,
+      std::min<int64_t>(32, resolve_env_int64("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", 4)));
 
   const float* beta_ptr = beta_in.const_data_ptr<float>();
   const float* g_ptr = g_in.const_data_ptr<float>();
@@ -5462,7 +5550,7 @@ at::Tensor gated_delta_decode_xpu(
         const scalar_t* key_ptr = key_in.const_data_ptr<scalar_t>();
         const scalar_t* value_ptr = value_in.const_data_ptr<scalar_t>();
         scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
-        launch_gated_delta_decode_kernel(
+        launch_gated_delta_decode_tiled_kernel(
             stream.queue(),
             query_ptr,
             key_ptr,
@@ -5476,6 +5564,7 @@ at::Tensor gated_delta_decode_xpu(
             num_heads,
             key_head_dim,
             value_head_dim,
+            value_block,
             local_size,
             l2_eps_f,
             query_scale_base);

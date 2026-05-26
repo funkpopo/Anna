@@ -279,7 +279,7 @@ XPU 和服务运行参数：
 | `--xpu-device-index N` | 未设置 | 通过 `ONEAPI_DEVICE_SELECTOR=level_zero:N` 选择 Intel XPU。 |
 | `--no-xpu-env-defaults` | 关闭 | 不在 XPU 启动前设置 Anna 推荐的 Level Zero 环境默认值。 |
 | `--xpu-int4-matmul auto\|torch\|dequant` | 运行时默认 | XPU int4 dense linear 执行策略。 |
-| `--enable-flashqla-gdn-prefill` | 关闭 | 在 XPU 上启用 Intel FlashQLA-compatible GDN prefill 路径。不支持的 shape、设备或 dtype 会直接报错。 |
+| `--enable-flashqla-gdn-prefill` | 关闭 | 启用 XPU SYCL GDN prefill 路径。不支持的 shape、设备或 dtype 会直接报错。 |
 | `--no-inference-warmup` | 关闭 | 跳过模型加载后的 XPU 小预热；首次真实请求可能承担 lazy kernel 加载开销。 |
 | `--warmup-prefill-tokens N` | `2` | XPU 预热 prefill 使用的文本 token 数。 |
 | `--warmup-decode-steps N` | `1` | XPU 预热 decode 步数。 |

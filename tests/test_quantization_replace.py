@@ -176,7 +176,7 @@ def test_convert_module_linears_to_xpu_int4_supports_autoround_payloads() -> Non
     assert torch.allclose(actual.float(), reference.float(), atol=1e-4, rtol=1e-4)
 
 
-def test_xpu_int4_linear_cpu_fallback_matches_dense_linear_closely() -> None:
+def test_xpu_int4_linear_cpu_dequant_path_matches_dense_linear_closely() -> None:
     linear = nn.Linear(32, 16, bias=False)
     with torch.no_grad():
         linear.weight.copy_(torch.linspace(-1.0, 1.0, steps=16 * 32).reshape(16, 32))

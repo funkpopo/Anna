@@ -1103,7 +1103,7 @@ def main() -> None:
             current_ms, flashqla_ms, reference_ms, diff = flashqla_gdn_profile
             _append_benchmark_row(
                 benchmark_rows,
-                op="flashqla_gdn_prefill_current_vs_intel_flashqla",
+                op="xpu_gdn_prefill_current_vs_public_entry",
                 baseline_ms=current_ms,
                 fused_ms=flashqla_ms,
                 speedup=_format_speedup(current_ms, flashqla_ms),
@@ -1168,7 +1168,7 @@ def main() -> None:
         if flashqla_gdn_profile is not None:
             current_ms, flashqla_ms, reference_ms, diff = flashqla_gdn_profile
             print(
-                f"flashqla_gdn_prefill_current_vs_intel_flashqla,{current_ms:.4f},{flashqla_ms:.4f},"
+                f"xpu_gdn_prefill_current_vs_public_entry,{current_ms:.4f},{flashqla_ms:.4f},"
                 f"{_format_speedup(current_ms, flashqla_ms)},{diff:.6f}"
             )
             print(f"flashqla_gdn_prefill_reference,-,{reference_ms:.4f},-,-")
