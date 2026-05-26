@@ -8,7 +8,7 @@ import torch
 import anna.model.ops as model_ops
 from anna.model.quantization import AutoRoundGPTQLinear, XPUInt4Linear, replace_linear_modules
 from anna.model.qwen3_5_text_config import QuantizationConfig, Qwen3_5TextConfig, RopeParameters
-from anna.model.turboquant import TurboQuantKVRow
+from anna.model.turboquant import TurboQuantKVRow, dequantize_turboquant_values
 from anna.model.ops import (
     Qwen3Attention,
     Qwen3DynamicCache,
@@ -360,9 +360,11 @@ def test_turboquant_decode_attention_merged_cache_matches_split_reference_on_xpu
     output = row.decode_attention(query, scaling=16**-0.5, num_key_value_groups=2)
 
     grouped_query = query.reshape(2, 2, 1, 16)
-    quantized_keys, quantized_values = row._materialize_quantized_prefix()
+    quantized_keys = row._materialize_quantized_keys_for_decode()
+    quantized_value_state = row._active_quantized_values()
     assert quantized_keys is not None
-    assert quantized_values is not None
+    assert quantized_value_state is not None
+    quantized_values = dequantize_turboquant_values(quantized_value_state, device=torch.device("xpu"), dtype=query.dtype)
     assert row._residual_keys is not None
     assert row._residual_values is not None
     score_parts = [
@@ -378,13 +380,16 @@ def test_turboquant_decode_attention_merged_cache_matches_split_reference_on_xpu
 
     torch.xpu.synchronize()
     assert torch.allclose(output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)
-    assert row._decode_full_keys is not None
-    assert row._decode_full_values is not None
-    assert row._decode_full_length == row.length
+    assert row._decode_quantized_keys is not None
+    assert row._decode_quantized_values is None
+    assert row._decode_quantized_length == row.quantized_length
+    assert row._decode_full_keys is None
+    assert row._decode_full_values is None
+    assert row._decode_full_length == 0
 
 
 @pytest.mark.skipif(not hasattr(torch, "xpu") or not torch.xpu.is_available(), reason="XPU is required for TurboQuant decode cache tests")
-def test_turboquant_decode_full_cache_reuses_storage_across_appends_on_xpu() -> None:
+def test_turboquant_decode_quantized_key_cache_reuses_storage_across_appends_on_xpu() -> None:
     torch.manual_seed(18)
     row = TurboQuantKVRow(bits=2, residual_len=4)
     row.append(
@@ -393,12 +398,11 @@ def test_turboquant_decode_full_cache_reuses_storage_across_appends_on_xpu() -> 
     )
     query = torch.randn(4, 1, 16, device="xpu", dtype=torch.bfloat16)
     row.decode_attention(query, scaling=16**-0.5, num_key_value_groups=2)
-    assert row._decode_full_keys is not None
-    assert row._decode_full_values is not None
-    key_storage_ptr = row._decode_full_keys.untyped_storage().data_ptr()
-    value_storage_ptr = row._decode_full_values.untyped_storage().data_ptr()
-    capacity = row._decode_full_capacity
-    assert capacity >= row.length
+    assert row._decode_quantized_keys is not None
+    assert row._decode_quantized_values is None
+    key_storage_ptr = row._decode_quantized_keys.untyped_storage().data_ptr()
+    capacity = row._decode_quantized_capacity
+    assert capacity >= row.quantized_length
 
     for _ in range(3):
         row.append(
@@ -406,12 +410,13 @@ def test_turboquant_decode_full_cache_reuses_storage_across_appends_on_xpu() -> 
             torch.randn(2, 1, 16, device="xpu", dtype=torch.bfloat16),
         )
         row.decode_attention(query, scaling=16**-0.5, num_key_value_groups=2)
-        assert row._decode_full_keys is not None
-        assert row._decode_full_values is not None
-        assert row._decode_full_keys.untyped_storage().data_ptr() == key_storage_ptr
-        assert row._decode_full_values.untyped_storage().data_ptr() == value_storage_ptr
-        assert row._decode_full_capacity == capacity
-        assert row._decode_full_length == row.length
+        assert row._decode_quantized_keys is not None
+        assert row._decode_quantized_values is None
+        assert row._decode_quantized_keys.untyped_storage().data_ptr() == key_storage_ptr
+        assert row._decode_quantized_capacity == capacity
+        assert row._decode_quantized_length == row.quantized_length
+        assert row._decode_full_keys is None
+        assert row._decode_full_values is None
 
     materialized_key, materialized_value = row.materialize()
     full_key, full_value = row._materialize_decode_full_cache()

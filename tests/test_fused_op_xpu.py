@@ -20,6 +20,7 @@ from anna.model.ops import (
 )
 from anna.model.quantization import XPUInt4Linear
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
+from anna.model.turboquant import dequantize_turboquant_values, quantize_turboquant_values
 
 
 def _reference_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -586,6 +587,65 @@ def test_gqa_decode_splitkv_fused_out_xpu_reuses_workspace_and_accepts_strided_q
     torch.xpu.synchronize()
     assert returned.untyped_storage().data_ptr() == output.untyped_storage().data_ptr()
     assert torch.allclose(output.float().cpu(), reference.float().cpu(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("value_bits", [2, 3, 4])
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gqa_decode_splitkv_turboquant_fused_out_xpu_matches_dequantized_reference(value_bits: int) -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gqa_decode_splitkv_turboquant_fused_out"):
+        pytest.skip("Anna fused-op library is not built with gqa_decode_splitkv_turboquant_fused_out")
+
+    torch.manual_seed(24 + value_bits)
+    device = torch.device("xpu")
+    batch_size = 1
+    num_heads = 8
+    num_kv_heads = 2
+    head_dim = 64
+    quantized_len = 77
+    residual_len = 5
+    block_size = 64
+    total_len = quantized_len + residual_len
+    blocks = (total_len + block_size - 1) // block_size
+    query_storage = torch.empty(batch_size, num_heads, 1, head_dim * 2, device=device, dtype=torch.bfloat16)
+    query_storage.normal_()
+    query = query_storage[..., ::2]
+    quantized_key = torch.randn(batch_size, num_kv_heads, quantized_len, head_dim, device=device, dtype=torch.bfloat16)
+    dense_quantized_value = torch.randn(num_kv_heads, quantized_len, head_dim, device=device, dtype=torch.bfloat16)
+    value_state = quantize_turboquant_values(dense_quantized_value, bits=value_bits, group_size=16)
+    residual_key = torch.randn(batch_size, num_kv_heads, residual_len, head_dim, device=device, dtype=torch.bfloat16)
+    residual_value = torch.randn(batch_size, num_kv_heads, residual_len, head_dim, device=device, dtype=torch.bfloat16)
+    output = torch.empty_like(query)
+    partial_stats = torch.empty(batch_size, num_heads, blocks + 1, 2, device=device, dtype=torch.float32)
+    partial_values = torch.empty(batch_size, num_heads, blocks + 1, head_dim, device=device, dtype=torch.float32)
+    gate_3d = torch.randn(batch_size, 1, num_heads * head_dim, device=device, dtype=torch.bfloat16)
+    gate_4d = _decode_gate_query_layout(gate_3d, num_heads=num_heads, head_dim=head_dim)
+    scale = head_dim**-0.5
+
+    returned = torch.ops.anna.gqa_decode_splitkv_turboquant_fused_out(
+        query,
+        quantized_key,
+        value_state.data.unsqueeze(0),
+        value_state.scales.unsqueeze(0),
+        value_state.zeros.unsqueeze(0),
+        residual_key,
+        residual_value,
+        output,
+        partial_stats,
+        partial_values,
+        scale,
+        value_bits,
+        value_state.group_size,
+        block_size,
+        gate_4d,
+    )
+    dequantized_value = dequantize_turboquant_values(value_state, device=device, dtype=torch.bfloat16).unsqueeze(0)
+    reference_key = torch.cat((quantized_key, residual_key), dim=2)
+    reference_value = torch.cat((dequantized_value, residual_value), dim=2)
+    reference = grouped_query_attention(query, reference_key, reference_value, scaling=scale) * torch.sigmoid(gate_4d)
+
+    torch.xpu.synchronize()
+    assert returned.untyped_storage().data_ptr() == output.untyped_storage().data_ptr()
+    assert torch.allclose(output.float().cpu(), reference.float().cpu(), atol=4e-2, rtol=4e-2)
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")

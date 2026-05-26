@@ -175,6 +175,13 @@ def _gqa_decode_splitkv_out_op():
     return getattr(namespace, "gqa_decode_splitkv_fused_out", None)
 
 
+def _gqa_decode_splitkv_turboquant_out_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "gqa_decode_splitkv_turboquant_fused_out", None)
+
+
 def _paged_gqa_decode_op():
     namespace = getattr(torch.ops, "anna", None)
     if namespace is None:
@@ -290,6 +297,10 @@ def gqa_decode_splitkv_fused_is_available() -> bool:
 
 def gqa_decode_splitkv_fused_out_is_available() -> bool:
     return _gqa_decode_splitkv_out_op() is not None
+
+
+def gqa_decode_splitkv_turboquant_fused_out_is_available() -> bool:
+    return _gqa_decode_splitkv_turboquant_out_op() is not None
 
 
 def paged_gqa_decode_fused_is_available() -> bool:
@@ -492,6 +503,69 @@ def run_gqa_decode_splitkv_fused_out(
     if gate is None:
         return op(query, key, value, output, partial_stats, partial_values, float(scaling), int(block_size))
     return op(query, key, value, output, partial_stats, partial_values, float(scaling), int(block_size), gate)
+
+
+def run_gqa_decode_splitkv_turboquant_fused_out(
+    *,
+    query: torch.Tensor,
+    quantized_key: torch.Tensor,
+    value_data: torch.Tensor,
+    value_scales: torch.Tensor,
+    value_zeros: torch.Tensor,
+    residual_key: torch.Tensor,
+    residual_value: torch.Tensor,
+    output: torch.Tensor,
+    partial_stats: torch.Tensor,
+    partial_values: torch.Tensor,
+    scaling: float,
+    value_bits: int,
+    value_group_size: int,
+    block_size: int,
+    gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    op = _gqa_decode_splitkv_turboquant_out_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _gqa_decode_splitkv_turboquant_out_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna gqa_decode_splitkv_turboquant_fused_out op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    if gate is None:
+        return op(
+            query,
+            quantized_key,
+            value_data,
+            value_scales,
+            value_zeros,
+            residual_key,
+            residual_value,
+            output,
+            partial_stats,
+            partial_values,
+            float(scaling),
+            int(value_bits),
+            int(value_group_size),
+            int(block_size),
+        )
+    return op(
+        query,
+        quantized_key,
+        value_data,
+        value_scales,
+        value_zeros,
+        residual_key,
+        residual_value,
+        output,
+        partial_stats,
+        partial_values,
+        float(scaling),
+        int(value_bits),
+        int(value_group_size),
+        int(block_size),
+        gate,
+    )
 
 
 def run_paged_gqa_decode_fused(
