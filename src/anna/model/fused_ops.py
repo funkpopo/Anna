@@ -161,6 +161,20 @@ def _gqa_decode_op():
     return getattr(namespace, "gqa_decode_fused", None)
 
 
+def _gqa_decode_splitkv_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "gqa_decode_splitkv_fused", None)
+
+
+def _gqa_decode_splitkv_out_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "gqa_decode_splitkv_fused_out", None)
+
+
 def _paged_gqa_decode_op():
     namespace = getattr(torch.ops, "anna", None)
     if namespace is None:
@@ -268,6 +282,14 @@ def _causal_conv1d_decode_op():
 
 def gqa_decode_fused_is_available() -> bool:
     return _gqa_decode_op() is not None
+
+
+def gqa_decode_splitkv_fused_is_available() -> bool:
+    return _gqa_decode_splitkv_op() is not None
+
+
+def gqa_decode_splitkv_fused_out_is_available() -> bool:
+    return _gqa_decode_splitkv_out_op() is not None
 
 
 def paged_gqa_decode_fused_is_available() -> bool:
@@ -421,6 +443,55 @@ def run_gqa_decode_fused(
     if gate is None:
         return op(query, key, value, visible_lengths, float(scaling))
     return op(query, key, value, visible_lengths, float(scaling), gate)
+
+
+def run_gqa_decode_splitkv_fused(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scaling: float,
+    block_size: int,
+    gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    op = _gqa_decode_splitkv_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _gqa_decode_splitkv_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna gqa_decode_splitkv_fused op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    if gate is None:
+        return op(query, key, value, float(scaling), int(block_size))
+    return op(query, key, value, float(scaling), int(block_size), gate)
+
+
+def run_gqa_decode_splitkv_fused_out(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    partial_stats: torch.Tensor,
+    partial_values: torch.Tensor,
+    scaling: float,
+    block_size: int,
+    gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    op = _gqa_decode_splitkv_out_op()
+    if op is None:
+        maybe_load_gated_delta_library()
+        op = _gqa_decode_splitkv_out_op()
+    if op is None:
+        raise RuntimeError(
+            "Anna gqa_decode_splitkv_fused_out op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+        )
+    if gate is None:
+        return op(query, key, value, output, partial_stats, partial_values, float(scaling), int(block_size))
+    return op(query, key, value, output, partial_stats, partial_values, float(scaling), int(block_size), gate)
 
 
 def run_paged_gqa_decode_fused(
