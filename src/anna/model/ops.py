@@ -38,7 +38,6 @@ from anna.model.xpu_decode_profile import xpu_profile_region
 
 logger = logging.getLogger(__name__)
 _LOGGED_FLASHQLA_GDN_PREFILL = False
-_LOGGED_FLASHQLA_GDN_PREFILL_SHORT_SKIP = False
 
 
 def _compiler_disable(fn: Callable[..., object]) -> Callable[..., object]:
@@ -2282,7 +2281,6 @@ class Qwen3GatedDeltaNet(nn.Module):
                 "ANNA_XPU_FLASHQLA_GDN_PREFILL=1 requires prefill seq_len > 1; "
                 f"got seq_len={seq_len}. This path does not fall back."
             )
-        flashqla_min_seq_len = max(2, int(os.environ.get("ANNA_XPU_FLASHQLA_GDN_PREFILL_MIN_SEQ_LEN", "64")))
         if query.device.type == "xpu" and seq_len > 1:
             state = initial_state
             if state is None:
@@ -2292,28 +2290,10 @@ class Qwen3GatedDeltaNet(nn.Module):
                     dtype=torch.float32,
                 )
             if use_flashqla_prefill:
-                if seq_len < flashqla_min_seq_len:
-                    global _LOGGED_FLASHQLA_GDN_PREFILL_SHORT_SKIP
-                    if not _LOGGED_FLASHQLA_GDN_PREFILL_SHORT_SKIP:
-                        logger.info(
-                            "Skipping FlashQLA-compatible GDN prefill for short prefill: seq_len=%s min_seq_len=%s. "
-                            "Set ANNA_XPU_FLASHQLA_GDN_PREFILL_MIN_SEQ_LEN to tune this threshold.",
-                            seq_len,
-                            flashqla_min_seq_len,
-                        )
-                        _LOGGED_FLASHQLA_GDN_PREFILL_SHORT_SKIP = True
-                    return run_gated_delta_prefill_fused(
-                        query=query,
-                        key=key,
-                        value=value,
-                        g=g,
-                        beta=beta,
-                        state=state,
-                    )
                 global _LOGGED_FLASHQLA_GDN_PREFILL
                 if not _LOGGED_FLASHQLA_GDN_PREFILL:
                     logger.info(
-                        "Enabled Intel FlashQLA-compatible GDN prefill: chunk_size=64 supported_dtypes=(float16,bfloat16) "
+                        "Enabled XPU SYCL GDN prefill via ANNA_XPU_FLASHQLA_GDN_PREFILL: supported_dtypes=(float16,bfloat16) "
                         "head_k_dim=%s head_v_dim=%s num_heads=%s fused_libraries=%s",
                         self.head_k_dim,
                         self.head_v_dim,

@@ -676,19 +676,7 @@ class XPUInt4Linear(nn.Module):
             if strategy == "dequant":
                 output = self._forward_dequant(x_padded)
             else:
-                try:
-                    output = self._forward_torch_xpu_int4(x_padded)
-                except Exception:
-                    if strategy == "torch":
-                        raise
-                    logger.warning(
-                        "Falling back to dequantized XPU int4 linear: in_features=%s out_features=%s group_size=%s",
-                        self.in_features,
-                        self.out_features,
-                        self.group_size,
-                        exc_info=True,
-                    )
-                    output = self._forward_dequant(x_padded)
+                output = self._forward_torch_xpu_int4(x_padded)
         else:
             output = self._forward_dequant(x_padded)
         return output.reshape(*original_shape, self.out_features).to(dtype=x.dtype)

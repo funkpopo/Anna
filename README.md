@@ -279,7 +279,7 @@ XPU and server runtime options:
 | `--xpu-device-index N` | unset | Select an Intel XPU with `ONEAPI_DEVICE_SELECTOR=level_zero:N`. |
 | `--no-xpu-env-defaults` | off | Do not set Anna's recommended Level Zero environment defaults before XPU startup. |
 | `--xpu-int4-matmul auto\|torch\|dequant` | runtime default | XPU int4 dense linear execution strategy. |
-| `--enable-flashqla-gdn-prefill` | off | Enable the Intel FlashQLA-compatible GDN prefill path on XPU. Unsupported shapes/devices/dtypes raise immediately. |
+| `--enable-flashqla-gdn-prefill` | off | Enable the XPU SYCL GDN prefill path. Unsupported shapes/devices/dtypes raise immediately. |
 | `--no-inference-warmup` | off | Skip the small post-load XPU warmup. First client request may then pay lazy kernel load. |
 | `--warmup-prefill-tokens N` | `2` | Text token count used by post-load XPU warmup prefill. |
 | `--warmup-decode-steps N` | `1` | Decode steps used by post-load XPU warmup. |

@@ -356,6 +356,25 @@ def test_xpu_int4_linear_auto_strategy_does_not_use_gemv_by_default(monkeypatch:
     assert torch.allclose(output.cpu(), reference.cpu(), atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_xpu_int4_linear_auto_strategy_propagates_torch_int4pack_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(7)
+    dense = torch.nn.Linear(32, 32, bias=False, device="xpu", dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=32, compute_dtype=torch.bfloat16, device="xpu")
+    hidden_states = torch.randn(1, 32, device="xpu", dtype=torch.bfloat16)
+
+    def _raise_int4pack_error(_x_padded: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("int4pack failed")
+
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "auto")
+    monkeypatch.setattr(quantized, "_forward_torch_xpu_int4", _raise_int4pack_error)
+
+    with pytest.raises(RuntimeError, match="int4pack failed"):
+        quantized(hidden_states)
+
+
 def _pack_paged_kv(
     key: torch.Tensor,
     value: torch.Tensor,

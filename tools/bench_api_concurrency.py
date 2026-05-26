@@ -232,7 +232,7 @@ def _long_prompt() -> str:
         "Anna runtime 正在优化 Qwen3.5 在 Intel Arc XPU 上的推理服务。"
         "目标是让 prefill 阶段和 decode 阶段尽量分离，降低长 prompt 插入时对已在生成请求的影响。"
         "当前配置使用 bf16、PyTorch int4pack dense 权重、TurboQuant KV cache、scheduler decode batching、"
-        "FlashQLA-compatible GDN prefill、LM-head top-k fused，并通过 runtime profile 观察 attention、MoE、"
+        "XPU SYCL GDN prefill、LM-head top-k fused，并通过 runtime profile 观察 attention、MoE、"
         "gated delta、TurboQuant dequant 和 LM-head 的耗时。"
     )
     return "\n".join([paragraph for _ in range(24)])

@@ -78,7 +78,7 @@ def configure_flashqla_environment(args: argparse.Namespace) -> None:
         return
     os.environ["ANNA_XPU_FLASHQLA_GDN_PREFILL"] = "1"
     logger.info(
-        "Enabled Intel FlashQLA-compatible GDN prefill via CLI. "
+        "Enabled XPU SYCL GDN prefill via CLI. "
         "Unsupported devices, shapes, dtypes, or missing custom ops will raise without fallback."
     )
 
@@ -226,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable-flashqla-gdn-prefill",
         action="store_true",
-        help="Enable the Intel FlashQLA-compatible GDN prefill path on XPU. This path does not fall back: "
+        help="Enable the XPU SYCL GDN prefill path. This path does not fall back: "
         "unsupported shapes/dtypes/devices or missing custom ops raise immediately.",
     )
     parser.add_argument(
