@@ -176,6 +176,18 @@ inline int64_t int4_group_index(int64_t in_idx, int64_t group_count, int64_t gro
   return sycl::min<int64_t>(group_idx, group_count - 1);
 }
 
+inline int64_t turboquant_value_storage_bits(int64_t bits) {
+  return bits == 2 ? 2 : 4;
+}
+
+inline int64_t turboquant_values_per_pack(int64_t bits) {
+  return bits == 2 ? 4 : 2;
+}
+
+inline uint32_t turboquant_value_mask(int64_t bits) {
+  return bits == 2 ? 0x03u : 0x0Fu;
+}
+
 int64_t resolve_env_int64(const char* env_name, int64_t fallback) {
   const char* raw = std::getenv(env_name);
   if (raw == nullptr || raw[0] == '\0') {
@@ -276,6 +288,32 @@ inline float load_xpu_int4_linear_weight_for_topk(
   const int64_t scale_offset = scale_by_output ? out_idx * group_count + group_idx : group_idx * out_features + out_idx;
   const int32_t zero_point = static_cast<int32_t>(qzeros_ptr[scale_offset]);
   return (static_cast<float>(qvalue - zero_point)) * qscale_ptr[scale_offset];
+}
+
+template <typename scalar_t>
+inline float load_turboquant_packed_value(
+    const uint8_t* value_data_ptr,
+    const scalar_t* value_scales_ptr,
+    const scalar_t* value_zeros_ptr,
+    int64_t data_base,
+    int64_t data_stride_packed,
+    int64_t scale_base,
+    int64_t scale_stride_group,
+    int64_t zero_base,
+    int64_t zero_stride_group,
+    int64_t dim_idx,
+    int64_t value_bits,
+    int64_t value_group_size) {
+  const int64_t values_per_pack = turboquant_values_per_pack(value_bits);
+  const int64_t storage_bits = turboquant_value_storage_bits(value_bits);
+  const int64_t pack_idx = dim_idx / values_per_pack;
+  const int64_t pack_lane = dim_idx - pack_idx * values_per_pack;
+  const uint32_t packed = static_cast<uint32_t>(value_data_ptr[data_base + pack_idx * data_stride_packed]);
+  const uint32_t qvalue = (packed >> (pack_lane * storage_bits)) & turboquant_value_mask(value_bits);
+  const int64_t group_idx = dim_idx / value_group_size;
+  const float scale = load_as_float(value_scales_ptr, scale_base + group_idx * scale_stride_group);
+  const float zero = load_as_float(value_zeros_ptr, zero_base + group_idx * zero_stride_group);
+  return static_cast<float>(qvalue) * scale + zero;
 }
 
 template <typename scalar_t, typename VectorAccessor>
@@ -940,6 +978,117 @@ void validate_gqa_decode_splitkv_xpu_inputs(
   TORCH_CHECK(device.type() == c10::DeviceType::XPU, "query must be an XPU tensor");
   TORCH_CHECK(key.device() == device, "key must be on the same device as query");
   TORCH_CHECK(value.device() == device, "value must be on the same device as query");
+}
+
+void validate_gqa_decode_splitkv_turboquant_inputs(
+    const at::Tensor& query,
+    const at::Tensor& quantized_key,
+    const at::Tensor& value_data,
+    const at::Tensor& value_scales,
+    const at::Tensor& value_zeros,
+    const at::Tensor& residual_key,
+    const at::Tensor& residual_value,
+    int64_t value_bits,
+    int64_t value_group_size,
+    int64_t block_size) {
+  TORCH_CHECK(query.dim() == 4, "query must be [batch, heads, 1, head_dim]");
+  TORCH_CHECK(quantized_key.dim() == 4, "quantized_key must be [batch, kv_heads, quantized_len, head_dim]");
+  TORCH_CHECK(value_data.dim() == 4, "value_data must be [batch, kv_heads, quantized_len, packed_dim]");
+  TORCH_CHECK(value_scales.dim() == 4, "value_scales must be [batch, kv_heads, quantized_len, value_groups]");
+  TORCH_CHECK(value_zeros.dim() == 4, "value_zeros must be [batch, kv_heads, quantized_len, value_groups]");
+  TORCH_CHECK(residual_key.dim() == 4, "residual_key must be [batch, kv_heads, residual_len, head_dim]");
+  TORCH_CHECK(residual_value.dim() == 4, "residual_value must be [batch, kv_heads, residual_len, head_dim]");
+  TORCH_CHECK(query.size(2) == 1, "gqa_decode_splitkv_turboquant_fused only supports single-token query");
+  TORCH_CHECK(query.size(0) == quantized_key.size(0), "query/quantized_key batch size mismatch");
+  TORCH_CHECK(query.size(0) == residual_key.size(0), "query/residual_key batch size mismatch");
+  TORCH_CHECK(residual_key.sizes() == residual_value.sizes(), "residual_key and residual_value must share the same shape");
+  TORCH_CHECK(quantized_key.size(1) == residual_key.size(1), "quantized and residual KV head count mismatch");
+  TORCH_CHECK(query.size(1) % quantized_key.size(1) == 0, "query heads must be divisible by kv_heads");
+  TORCH_CHECK(query.size(3) == quantized_key.size(3), "query/quantized_key head_dim mismatch");
+  TORCH_CHECK(query.size(3) == residual_key.size(3), "query/residual_key head_dim mismatch");
+  TORCH_CHECK(quantized_key.size(2) >= 1, "gqa_decode_splitkv_turboquant_fused requires a non-empty quantized prefix");
+  TORCH_CHECK(residual_key.size(2) >= 0, "residual_len must be non-negative");
+  TORCH_CHECK(quantized_key.size(1) >= 1, "kv_heads must be positive");
+  TORCH_CHECK(value_data.size(0) == quantized_key.size(0), "value_data batch size mismatch");
+  TORCH_CHECK(value_data.size(1) == quantized_key.size(1), "value_data kv head count mismatch");
+  TORCH_CHECK(value_data.size(2) == quantized_key.size(2), "value_data quantized_len mismatch");
+  TORCH_CHECK(value_scales.size(0) == quantized_key.size(0), "value_scales batch size mismatch");
+  TORCH_CHECK(value_scales.size(1) == quantized_key.size(1), "value_scales kv head count mismatch");
+  TORCH_CHECK(value_scales.size(2) == quantized_key.size(2), "value_scales quantized_len mismatch");
+  TORCH_CHECK(value_zeros.sizes() == value_scales.sizes(), "value_zeros shape must match value_scales");
+  TORCH_CHECK(value_bits == 2 || value_bits == 3 || value_bits == 4, "TurboQuant value_bits must be 2, 3, or 4");
+  TORCH_CHECK(value_group_size > 0, "TurboQuant value_group_size must be positive");
+  TORCH_CHECK(query.size(3) % value_group_size == 0, "TurboQuant value_group_size must evenly divide head_dim");
+  TORCH_CHECK(value_scales.size(3) * value_group_size == query.size(3), "TurboQuant value group count/head_dim mismatch");
+  TORCH_CHECK(
+      value_data.size(3) * turboquant_values_per_pack(value_bits) >= query.size(3),
+      "TurboQuant packed value width is smaller than head_dim");
+  TORCH_CHECK(block_size >= 16, "gqa_decode_splitkv_turboquant_fused block_size must be at least 16");
+  TORCH_CHECK(value_data.scalar_type() == at::kByte, "TurboQuant value_data must be uint8");
+  TORCH_CHECK(
+      query.scalar_type() == quantized_key.scalar_type() && query.scalar_type() == residual_key.scalar_type() &&
+          query.scalar_type() == residual_value.scalar_type() && query.scalar_type() == value_scales.scalar_type() &&
+          query.scalar_type() == value_zeros.scalar_type(),
+      "query, keys, residual values, value_scales, and value_zeros must share the same dtype");
+  TORCH_CHECK(
+      query.scalar_type() == at::kHalf || query.scalar_type() == at::kBFloat16 ||
+          query.scalar_type() == at::kFloat,
+      "gqa_decode_splitkv_turboquant_fused XPU kernel supports float16, bfloat16, and float32 inputs");
+}
+
+void validate_gqa_decode_splitkv_turboquant_xpu_inputs(
+    const at::Tensor& query,
+    const at::Tensor& quantized_key,
+    const at::Tensor& value_data,
+    const at::Tensor& value_scales,
+    const at::Tensor& value_zeros,
+    const at::Tensor& residual_key,
+    const at::Tensor& residual_value) {
+  auto device = query.device();
+  TORCH_CHECK(device.type() == c10::DeviceType::XPU, "query must be an XPU tensor");
+  TORCH_CHECK(quantized_key.device() == device, "quantized_key must be on the same device as query");
+  TORCH_CHECK(value_data.device() == device, "value_data must be on the same device as query");
+  TORCH_CHECK(value_scales.device() == device, "value_scales must be on the same device as query");
+  TORCH_CHECK(value_zeros.device() == device, "value_zeros must be on the same device as query");
+  TORCH_CHECK(residual_key.device() == device, "residual_key must be on the same device as query");
+  TORCH_CHECK(residual_value.device() == device, "residual_value must be on the same device as query");
+}
+
+void validate_gqa_decode_splitkv_workspace_for_length(
+    const at::Tensor& query,
+    int64_t key_len,
+    int64_t block_size,
+    const at::Tensor& output,
+    const at::Tensor& partial_stats,
+    const at::Tensor& partial_values,
+    const char* op_name) {
+  TORCH_CHECK(key_len >= 1, op_name, " workspace requires key_len >= 1");
+  const int64_t batch_size = query.size(0);
+  const int64_t num_heads = query.size(1);
+  const int64_t head_dim = query.size(3);
+  const int64_t effective_block_size = std::min<int64_t>(std::max<int64_t>(block_size, 16), key_len);
+  const int64_t num_blocks = (key_len + effective_block_size - 1) / effective_block_size;
+  TORCH_CHECK(output.sizes() == query.sizes(), op_name, " output must match query shape");
+  TORCH_CHECK(output.scalar_type() == query.scalar_type(), op_name, " output dtype must match query");
+  TORCH_CHECK(output.device() == query.device(), op_name, " output must be on the same device as query");
+  TORCH_CHECK(partial_stats.dim() == 4, op_name, " partial_stats must be [batch, heads, blocks, 2]");
+  TORCH_CHECK(partial_values.dim() == 4, op_name, " partial_values must be [batch, heads, blocks, head_dim]");
+  TORCH_CHECK(partial_stats.scalar_type() == at::kFloat, op_name, " partial_stats must be float32");
+  TORCH_CHECK(partial_values.scalar_type() == at::kFloat, op_name, " partial_values must be float32");
+  TORCH_CHECK(partial_stats.device() == query.device(), op_name, " partial_stats must be on the same device as query");
+  TORCH_CHECK(partial_values.device() == query.device(), op_name, " partial_values must be on the same device as query");
+  TORCH_CHECK(
+      partial_stats.size(0) == batch_size && partial_stats.size(1) == num_heads &&
+          partial_stats.size(2) >= num_blocks && partial_stats.size(3) == 2,
+      op_name,
+      " partial_stats shape/capacity mismatch");
+  TORCH_CHECK(
+      partial_values.size(0) == batch_size && partial_values.size(1) == num_heads &&
+          partial_values.size(2) >= num_blocks && partial_values.size(3) == head_dim,
+      op_name,
+      " partial_values shape/capacity mismatch");
+  TORCH_CHECK(partial_stats.is_contiguous(), op_name, " partial_stats must be contiguous");
+  TORCH_CHECK(partial_values.is_contiguous(), op_name, " partial_values must be contiguous");
 }
 
 void validate_gqa_decode_splitkv_workspace(
@@ -4155,6 +4304,427 @@ at::Tensor gqa_decode_splitkv_fused_out_xpu(
   return output;
 }
 
+void launch_gqa_decode_splitkv_turboquant_fused_xpu(
+    const at::Tensor& query,
+    const at::Tensor& quantized_key,
+    const at::Tensor& value_data,
+    const at::Tensor& value_scales,
+    const at::Tensor& value_zeros,
+    const at::Tensor& residual_key,
+    const at::Tensor& residual_value,
+    at::Tensor output,
+    at::Tensor partial_stats,
+    at::Tensor partial_values,
+    double scaling,
+    int64_t value_bits,
+    int64_t value_group_size,
+    int64_t block_size,
+    const c10::optional<at::Tensor>& gate_opt) {
+  const auto batch_size = query.size(0);
+  const auto num_heads = query.size(1);
+  const auto num_kv_heads = quantized_key.size(1);
+  const auto quantized_len = quantized_key.size(2);
+  const auto residual_len = residual_key.size(2);
+  const auto key_len = quantized_len + residual_len;
+  const auto head_dim = query.size(3);
+  const int64_t q_stride_b = query.stride(0);
+  const int64_t q_stride_h = query.stride(1);
+  const int64_t q_stride_d = query.stride(3);
+  const int64_t qk_stride_b = quantized_key.stride(0);
+  const int64_t qk_stride_h = quantized_key.stride(1);
+  const int64_t qk_stride_t = quantized_key.stride(2);
+  const int64_t qk_stride_d = quantized_key.stride(3);
+  const int64_t vd_stride_b = value_data.stride(0);
+  const int64_t vd_stride_h = value_data.stride(1);
+  const int64_t vd_stride_t = value_data.stride(2);
+  const int64_t vd_stride_p = value_data.stride(3);
+  const int64_t vs_stride_b = value_scales.stride(0);
+  const int64_t vs_stride_h = value_scales.stride(1);
+  const int64_t vs_stride_t = value_scales.stride(2);
+  const int64_t vs_stride_g = value_scales.stride(3);
+  const int64_t vz_stride_b = value_zeros.stride(0);
+  const int64_t vz_stride_h = value_zeros.stride(1);
+  const int64_t vz_stride_t = value_zeros.stride(2);
+  const int64_t vz_stride_g = value_zeros.stride(3);
+  const int64_t rk_stride_b = residual_key.stride(0);
+  const int64_t rk_stride_h = residual_key.stride(1);
+  const int64_t rk_stride_t = residual_key.stride(2);
+  const int64_t rk_stride_d = residual_key.stride(3);
+  const int64_t rv_stride_b = residual_value.stride(0);
+  const int64_t rv_stride_h = residual_value.stride(1);
+  const int64_t rv_stride_t = residual_value.stride(2);
+  const int64_t rv_stride_d = residual_value.stride(3);
+  const int64_t o_stride_b = output.stride(0);
+  const int64_t o_stride_h = output.stride(1);
+  const int64_t o_stride_d = output.stride(3);
+  const int64_t ps_stride_b = partial_stats.stride(0);
+  const int64_t ps_stride_h = partial_stats.stride(1);
+  const int64_t ps_stride_block = partial_stats.stride(2);
+  const int64_t ps_stride_stat = partial_stats.stride(3);
+  const int64_t pv_stride_b = partial_values.stride(0);
+  const int64_t pv_stride_h = partial_values.stride(1);
+  const int64_t pv_stride_block = partial_values.stride(2);
+  const int64_t pv_stride_d = partial_values.stride(3);
+  const auto groups_per_kv_head = num_heads / num_kv_heads;
+  const int64_t effective_block_size = std::min<int64_t>(std::max<int64_t>(block_size, 16), key_len);
+  const int64_t num_blocks = (key_len + effective_block_size - 1) / effective_block_size;
+  const int64_t values_per_pack = turboquant_values_per_pack(value_bits);
+  const int64_t storage_bits = turboquant_value_storage_bits(value_bits);
+  const uint32_t value_mask = turboquant_value_mask(value_bits);
+  const int64_t packed_head_dim = (head_dim + values_per_pack - 1) / values_per_pack;
+  const int64_t local_size =
+      std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(packed_head_dim, 128))), 128);
+  constexpr int64_t kMaxAccumSlots = 8;
+  const int64_t lane_dim_span = local_size * values_per_pack;
+  const int64_t max_accum_slots = ((head_dim + lane_dim_span - 1) / lane_dim_span) * values_per_pack;
+  TORCH_CHECK(
+      max_accum_slots <= kMaxAccumSlots,
+      "gqa_decode_splitkv_turboquant_fused_xpu head_dim is too large for the current accumulator configuration");
+  const float scaling_f = static_cast<float>(scaling);
+
+  c10::optional<at::Tensor> gate_prepared;
+  bool gate_is_4d = false;
+  int64_t g_stride_batch = 0;
+  int64_t g_stride_h_or_inner = 1;
+  int64_t g_stride_d = 0;
+  if (gate_opt.has_value() && gate_opt->defined()) {
+    TORCH_CHECK(
+        gate_opt->device() == query.device(),
+        "gate must be on the same XPU device as query");
+    gate_prepared = prepare_gqa_decode_gate(
+        *gate_opt, num_heads, head_dim, gate_is_4d, g_stride_batch, g_stride_h_or_inner, g_stride_d);
+  }
+
+  auto stream = c10::xpu::getCurrentXPUStream(query.device().index());
+  validate_gqa_query_cache_local_memory(stream.queue().get_device(), head_dim);
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      query.scalar_type(),
+      "gqa_decode_splitkv_turboquant_fused_xpu",
+      [&] {
+        const scalar_t* query_ptr = query.const_data_ptr<scalar_t>();
+        const scalar_t* quantized_key_ptr = quantized_key.const_data_ptr<scalar_t>();
+        const uint8_t* value_data_ptr = value_data.const_data_ptr<uint8_t>();
+        const scalar_t* value_scales_ptr = value_scales.const_data_ptr<scalar_t>();
+        const scalar_t* value_zeros_ptr = value_zeros.const_data_ptr<scalar_t>();
+        const scalar_t* residual_key_ptr = residual_key.const_data_ptr<scalar_t>();
+        const scalar_t* residual_value_ptr = residual_value.const_data_ptr<scalar_t>();
+        float* partial_stats_ptr = partial_stats.mutable_data_ptr<float>();
+        float* partial_values_ptr = partial_values.mutable_data_ptr<float>();
+        scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
+        const scalar_t* gate_ptr =
+            (gate_prepared.has_value() && gate_prepared->defined()) ? gate_prepared->const_data_ptr<scalar_t>() : nullptr;
+        const size_t partial_group_count = static_cast<size_t>(batch_size * num_heads * num_blocks);
+
+        stream.queue().submit([&](sycl::handler& cgh) {
+          sycl::local_accessor<float, 1> query_slm(sycl::range<1>(static_cast<size_t>(head_dim)), cgh);
+          cgh.parallel_for(
+              sycl::nd_range<2>(
+                  sycl::range<2>(partial_group_count, static_cast<size_t>(local_size)),
+                  sycl::range<2>(1, static_cast<size_t>(local_size))),
+              [=](sycl::nd_item<2> item) {
+                const int64_t linear_group = static_cast<int64_t>(item.get_group(0));
+                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+                const int64_t block_idx = linear_group % num_blocks;
+                const int64_t bh = linear_group / num_blocks;
+                const int64_t batch_idx = bh / num_heads;
+                const int64_t head_idx = bh % num_heads;
+                const int64_t kv_head_idx = head_idx / groups_per_kv_head;
+                const int64_t query_base = batch_idx * q_stride_b + head_idx * q_stride_h;
+                const int64_t quantized_key_base = batch_idx * qk_stride_b + kv_head_idx * qk_stride_h;
+                const int64_t value_data_base = batch_idx * vd_stride_b + kv_head_idx * vd_stride_h;
+                const int64_t value_scales_base = batch_idx * vs_stride_b + kv_head_idx * vs_stride_h;
+                const int64_t value_zeros_base = batch_idx * vz_stride_b + kv_head_idx * vz_stride_h;
+                const int64_t residual_key_base = batch_idx * rk_stride_b + kv_head_idx * rk_stride_h;
+                const int64_t residual_value_base = batch_idx * rv_stride_b + kv_head_idx * rv_stride_h;
+                const int64_t token_start = block_idx * effective_block_size;
+                const int64_t token_end = sycl::min<int64_t>(token_start + effective_block_size, key_len);
+                const int64_t stats_base =
+                    batch_idx * ps_stride_b + head_idx * ps_stride_h + block_idx * ps_stride_block;
+                const int64_t partial_base =
+                    batch_idx * pv_stride_b + head_idx * pv_stride_h + block_idx * pv_stride_block;
+
+                for (int64_t dim_base = lane * values_per_pack; dim_base < head_dim;
+                     dim_base += local_size * values_per_pack) {
+                  for (int64_t pack_lane = 0; pack_lane < values_per_pack; ++pack_lane) {
+                    const int64_t dim_idx = dim_base + pack_lane;
+                    if (dim_idx < head_dim) {
+                      query_slm[dim_idx] = load_as_float(query_ptr, query_base + dim_idx * q_stride_d);
+                    }
+                  }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                float running_max = -std::numeric_limits<float>::infinity();
+                float denom = 0.0f;
+                float accumulators[kMaxAccumSlots];
+                for (int64_t slot = 0; slot < kMaxAccumSlots; ++slot) {
+                  accumulators[slot] = 0.0f;
+                }
+
+                for (int64_t key_idx = token_start; key_idx < token_end; ++key_idx) {
+                  const bool from_quantized = key_idx < quantized_len;
+                  const int64_t residual_idx = key_idx - quantized_len;
+                  float local_dot = 0.0f;
+                  for (int64_t dim_base = lane * values_per_pack; dim_base < head_dim;
+                       dim_base += local_size * values_per_pack) {
+                    for (int64_t pack_lane = 0; pack_lane < values_per_pack; ++pack_lane) {
+                      const int64_t dim_idx = dim_base + pack_lane;
+                      if (dim_idx < head_dim) {
+                        const float key_value = from_quantized
+                            ? load_as_float(
+                                  quantized_key_ptr,
+                                  quantized_key_base + key_idx * qk_stride_t + dim_idx * qk_stride_d)
+                            : load_as_float(
+                                  residual_key_ptr,
+                                  residual_key_base + residual_idx * rk_stride_t + dim_idx * rk_stride_d);
+                        local_dot += query_slm[dim_idx] * key_value;
+                      }
+                    }
+                  }
+                  const float dot_sum =
+                      sycl::reduce_over_group(item.get_group(), local_dot, sycl::plus<float>());
+                  const float score = dot_sum * scaling_f;
+                  const float new_max = sycl::fmax(running_max, score);
+                  const float old_scale = denom == 0.0f ? 0.0f : sycl::exp(running_max - new_max);
+                  const float score_scale = sycl::exp(score - new_max);
+                  int64_t slot = 0;
+                  for (int64_t dim_base = lane * values_per_pack; dim_base < head_dim;
+                       dim_base += local_size * values_per_pack) {
+                    const uint32_t packed = from_quantized
+                        ? static_cast<uint32_t>(
+                              value_data_ptr[value_data_base + key_idx * vd_stride_t +
+                                  (dim_base / values_per_pack) * vd_stride_p])
+                        : 0u;
+                    const int64_t pack_group_idx = dim_base / value_group_size;
+                    const bool pack_shares_group = from_quantized &&
+                        ((sycl::min<int64_t>(dim_base + values_per_pack - 1, head_dim - 1) / value_group_size) ==
+                         pack_group_idx);
+                    const float pack_scale = pack_shares_group
+                        ? load_as_float(
+                              value_scales_ptr,
+                              value_scales_base + key_idx * vs_stride_t + pack_group_idx * vs_stride_g)
+                        : 0.0f;
+                    const float pack_zero = pack_shares_group
+                        ? load_as_float(
+                              value_zeros_ptr,
+                              value_zeros_base + key_idx * vz_stride_t + pack_group_idx * vz_stride_g)
+                        : 0.0f;
+                    for (int64_t pack_lane = 0; pack_lane < values_per_pack; ++pack_lane, ++slot) {
+                      const int64_t dim_idx = dim_base + pack_lane;
+                      if (dim_idx < head_dim) {
+                        float value_item;
+                        if (from_quantized) {
+                          const uint32_t qvalue = (packed >> (pack_lane * storage_bits)) & value_mask;
+                          const int64_t group_idx = pack_shares_group ? pack_group_idx : dim_idx / value_group_size;
+                          const float scale = pack_shares_group
+                              ? pack_scale
+                              : load_as_float(
+                                    value_scales_ptr,
+                                    value_scales_base + key_idx * vs_stride_t + group_idx * vs_stride_g);
+                          const float zero = pack_shares_group
+                              ? pack_zero
+                              : load_as_float(
+                                    value_zeros_ptr,
+                                    value_zeros_base + key_idx * vz_stride_t + group_idx * vz_stride_g);
+                          value_item = static_cast<float>(qvalue) * scale + zero;
+                        } else {
+                          value_item = load_as_float(
+                              residual_value_ptr,
+                              residual_value_base + residual_idx * rv_stride_t + dim_idx * rv_stride_d);
+                        }
+                        accumulators[slot] = accumulators[slot] * old_scale + score_scale * value_item;
+                      }
+                    }
+                  }
+                  denom = denom * old_scale + score_scale;
+                  running_max = new_max;
+                }
+
+                if (lane == 0) {
+                  partial_stats_ptr[stats_base] = running_max;
+                  partial_stats_ptr[stats_base + ps_stride_stat] = denom;
+                }
+                int64_t slot = 0;
+                for (int64_t dim_base = lane * values_per_pack; dim_base < head_dim;
+                     dim_base += local_size * values_per_pack) {
+                  for (int64_t pack_lane = 0; pack_lane < values_per_pack; ++pack_lane, ++slot) {
+                    const int64_t dim_idx = dim_base + pack_lane;
+                    if (dim_idx < head_dim) {
+                      partial_values_ptr[partial_base + dim_idx * pv_stride_d] = accumulators[slot];
+                    }
+                  }
+                }
+              });
+        });
+
+        const size_t output_group_count = static_cast<size_t>(batch_size * num_heads);
+        stream.queue().submit([&](sycl::handler& cgh) {
+          cgh.parallel_for(
+              sycl::nd_range<2>(
+                  sycl::range<2>(output_group_count, static_cast<size_t>(local_size)),
+                  sycl::range<2>(1, static_cast<size_t>(local_size))),
+              [=](sycl::nd_item<2> item) {
+                const int64_t bh = static_cast<int64_t>(item.get_group(0));
+                const int64_t lane = static_cast<int64_t>(item.get_local_id(1));
+                const int64_t batch_idx = bh / num_heads;
+                const int64_t head_idx = bh % num_heads;
+                const int64_t stats_base = batch_idx * ps_stride_b + head_idx * ps_stride_h;
+                const int64_t partial_base = batch_idx * pv_stride_b + head_idx * pv_stride_h;
+                const int64_t output_base = batch_idx * o_stride_b + head_idx * o_stride_h;
+                const bool use_4d_gate = gate_is_4d;
+                const int64_t g_sb = g_stride_batch;
+                const int64_t g_sh = g_stride_h_or_inner;
+                const int64_t g_sd = g_stride_d;
+
+                float local_max = -std::numeric_limits<float>::infinity();
+                for (int64_t block_idx = lane; block_idx < num_blocks; block_idx += local_size) {
+                  local_max =
+                      sycl::fmax(local_max, partial_stats_ptr[stats_base + block_idx * ps_stride_block]);
+                }
+                const float global_max =
+                    sycl::reduce_over_group(item.get_group(), local_max, sycl::maximum<float>());
+
+                float local_denom = 0.0f;
+                for (int64_t block_idx = lane; block_idx < num_blocks; block_idx += local_size) {
+                  const int64_t block_stats_base = stats_base + block_idx * ps_stride_block;
+                  const float block_max = partial_stats_ptr[block_stats_base];
+                  const float block_denom = partial_stats_ptr[block_stats_base + ps_stride_stat];
+                  local_denom += block_denom * sycl::exp(block_max - global_max);
+                }
+                const float denom =
+                    sycl::reduce_over_group(item.get_group(), local_denom, sycl::plus<float>());
+
+                for (int64_t dim_base = lane * values_per_pack; dim_base < head_dim;
+                     dim_base += local_size * values_per_pack) {
+                  for (int64_t pack_lane = 0; pack_lane < values_per_pack; ++pack_lane) {
+                    const int64_t dim_idx = dim_base + pack_lane;
+                    if (dim_idx < head_dim) {
+                      float accum = 0.0f;
+                      for (int64_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
+                        const float block_max = partial_stats_ptr[stats_base + block_idx * ps_stride_block];
+                        const float coeff = sycl::exp(block_max - global_max);
+                        accum += coeff *
+                            partial_values_ptr[partial_base + block_idx * pv_stride_block + dim_idx * pv_stride_d];
+                      }
+                      float out_value = denom > 0.0f ? accum / denom : 0.0f;
+                      if (gate_ptr != nullptr) {
+                        int64_t gate_off;
+                        if (use_4d_gate) {
+                          gate_off = batch_idx * g_sb + head_idx * g_sh + dim_idx * g_sd;
+                        } else {
+                          gate_off = batch_idx * g_sb + (head_idx * head_dim + dim_idx) * g_sh;
+                        }
+                        const float gpre = load_as_float(gate_ptr, gate_off);
+                        out_value *= (1.0f / (1.0f + sycl::exp(-gpre)));
+                      }
+                      output_ptr[output_base + dim_idx * o_stride_d] = static_cast<scalar_t>(out_value);
+                    }
+                  }
+                }
+              });
+        });
+      });
+}
+
+at::Tensor gqa_decode_splitkv_turboquant_fused_out_meta(
+    const at::Tensor& query,
+    const at::Tensor& quantized_key,
+    const at::Tensor& value_data,
+    const at::Tensor& value_scales,
+    const at::Tensor& value_zeros,
+    const at::Tensor& residual_key,
+    const at::Tensor& residual_value,
+    const at::Tensor& output,
+    const at::Tensor& partial_stats,
+    const at::Tensor& partial_values,
+    double /*scaling*/,
+    int64_t value_bits,
+    int64_t value_group_size,
+    int64_t block_size,
+    const c10::optional<at::Tensor>& gate_opt) {
+  validate_gqa_decode_splitkv_turboquant_inputs(
+      query,
+      quantized_key,
+      value_data,
+      value_scales,
+      value_zeros,
+      residual_key,
+      residual_value,
+      value_bits,
+      value_group_size,
+      block_size);
+  validate_gqa_decode_optional_gate(query, gate_opt);
+  validate_gqa_decode_splitkv_workspace_for_length(
+      query,
+      quantized_key.size(2) + residual_key.size(2),
+      block_size,
+      output,
+      partial_stats,
+      partial_values,
+      "gqa_decode_splitkv_turboquant_fused_out");
+  return output;
+}
+
+at::Tensor gqa_decode_splitkv_turboquant_fused_out_xpu(
+    const at::Tensor& query,
+    const at::Tensor& quantized_key,
+    const at::Tensor& value_data,
+    const at::Tensor& value_scales,
+    const at::Tensor& value_zeros,
+    const at::Tensor& residual_key,
+    const at::Tensor& residual_value,
+    const at::Tensor& output,
+    const at::Tensor& partial_stats,
+    const at::Tensor& partial_values,
+    double scaling,
+    int64_t value_bits,
+    int64_t value_group_size,
+    int64_t block_size,
+    const c10::optional<at::Tensor>& gate_opt) {
+  validate_gqa_decode_splitkv_turboquant_inputs(
+      query,
+      quantized_key,
+      value_data,
+      value_scales,
+      value_zeros,
+      residual_key,
+      residual_value,
+      value_bits,
+      value_group_size,
+      block_size);
+  validate_gqa_decode_optional_gate(query, gate_opt);
+  validate_gqa_decode_splitkv_turboquant_xpu_inputs(
+      query, quantized_key, value_data, value_scales, value_zeros, residual_key, residual_value);
+  validate_gqa_decode_splitkv_workspace_for_length(
+      query,
+      quantized_key.size(2) + residual_key.size(2),
+      block_size,
+      output,
+      partial_stats,
+      partial_values,
+      "gqa_decode_splitkv_turboquant_fused_out");
+  launch_gqa_decode_splitkv_turboquant_fused_xpu(
+      query,
+      quantized_key,
+      value_data,
+      value_scales,
+      value_zeros,
+      residual_key,
+      residual_value,
+      output,
+      partial_stats,
+      partial_values,
+      scaling,
+      value_bits,
+      value_group_size,
+      block_size,
+      gate_opt);
+  return output;
+}
+
 at::Tensor paged_gqa_decode_fused_meta(
     const at::Tensor& query,
     const at::Tensor& key_pages,
@@ -5968,6 +6538,24 @@ TORCH_LIBRARY(anna, m) {
       "Tensor? gate=None"
       ") -> Tensor(a!)");
   m.def(
+      "gqa_decode_splitkv_turboquant_fused_out("
+      "Tensor query, "
+      "Tensor quantized_key, "
+      "Tensor value_data, "
+      "Tensor value_scales, "
+      "Tensor value_zeros, "
+      "Tensor residual_key, "
+      "Tensor residual_value, "
+      "Tensor(a!) output, "
+      "Tensor(b!) partial_stats, "
+      "Tensor(c!) partial_values, "
+      "float scaling, "
+      "int value_bits, "
+      "int value_group_size, "
+      "int block_size, "
+      "Tensor? gate=None"
+      ") -> Tensor(a!)");
+  m.def(
       "paged_gqa_decode_fused("
       "Tensor query, "
       "Tensor key_pages, "
@@ -6194,6 +6782,7 @@ TORCH_LIBRARY_IMPL(anna, Meta, m) {
   m.impl("gqa_decode_fused", anna::gqa_decode_fused_meta);
   m.impl("gqa_decode_splitkv_fused", anna::gqa_decode_splitkv_fused_meta);
   m.impl("gqa_decode_splitkv_fused_out", anna::gqa_decode_splitkv_fused_out_meta);
+  m.impl("gqa_decode_splitkv_turboquant_fused_out", anna::gqa_decode_splitkv_turboquant_fused_out_meta);
   m.impl("paged_gqa_decode_fused", anna::paged_gqa_decode_fused_meta);
   m.impl("moe_router_fused", anna::moe_router_fused_meta);
   m.impl("moe_dispatch_fused", anna::moe_dispatch_fused_meta);
@@ -6226,6 +6815,7 @@ TORCH_LIBRARY_IMPL(anna, XPU, m) {
   m.impl("gqa_decode_fused", anna::gqa_decode_fused_xpu);
   m.impl("gqa_decode_splitkv_fused", anna::gqa_decode_splitkv_fused_xpu);
   m.impl("gqa_decode_splitkv_fused_out", anna::gqa_decode_splitkv_fused_out_xpu);
+  m.impl("gqa_decode_splitkv_turboquant_fused_out", anna::gqa_decode_splitkv_turboquant_fused_out_xpu);
   m.impl("paged_gqa_decode_fused", anna::paged_gqa_decode_fused_xpu);
   m.impl("moe_router_fused", anna::moe_router_fused_xpu);
   m.impl("moe_dispatch_fused", anna::moe_dispatch_fused_xpu);

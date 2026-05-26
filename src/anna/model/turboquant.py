@@ -7,7 +7,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 
-from anna.model.fused_ops import run_gqa_decode_splitkv_fused_out
+from anna.model.fused_ops import run_gqa_decode_splitkv_fused_out, run_gqa_decode_splitkv_turboquant_fused_out
 from anna.model.xpu_decode_profile import xpu_profile_region
 
 _mse_quantizers: dict[tuple[int, int, str], Any] = {}
@@ -719,6 +719,26 @@ class TurboQuantKVRow:
         self._decode_quantized_values = new_values
         self._decode_quantized_capacity = new_capacity
 
+    def _ensure_decode_quantized_key_capacity(
+        self,
+        required_length: int,
+        *,
+        key_template: torch.Tensor,
+    ) -> None:
+        if required_length <= 0:
+            return
+        if self._decode_quantized_keys is not None and self._decode_quantized_capacity >= required_length:
+            return
+
+        new_capacity = self._next_decode_capacity(self._decode_quantized_capacity, required_length)
+        new_keys = key_template.new_empty((key_template.shape[0], new_capacity, key_template.shape[2]))
+        if self._decode_quantized_keys is not None and self._decode_quantized_length > 0:
+            copy_len = min(self._decode_quantized_length, self._decode_quantized_keys.shape[1], new_capacity)
+            new_keys[:, :copy_len, :].copy_(self._decode_quantized_keys[:, :copy_len, :])
+        self._decode_quantized_keys = new_keys
+        self._decode_quantized_values = None
+        self._decode_quantized_capacity = new_capacity
+
     def _append_decode_quantized_cache(
         self,
         *,
@@ -729,12 +749,9 @@ class TurboQuantKVRow:
         if not _KEEP_DECODE_CACHE:
             self._invalidate_decode_cache()
             return
-        if new_keys is None or new_values is None or new_keys.shape[1] <= 0:
+        if new_keys is None or new_keys.shape[1] <= 0:
             return
-        if (
-            self._decode_quantized_keys is None
-            or self._decode_quantized_values is None
-        ):
+        if self._decode_quantized_keys is None:
             if prior_quantized_length != 0:
                 self._invalidate_decode_cache()
                 return
@@ -744,16 +761,24 @@ class TurboQuantKVRow:
             return
 
         required_length = prior_quantized_length + int(new_keys.shape[1])
-        self._ensure_decode_quantized_capacity(
-            required_length,
-            key_template=new_keys,
-            value_template=new_values,
-        )
-        if self._decode_quantized_keys is None or self._decode_quantized_values is None:
+        if new_values is None:
+            self._ensure_decode_quantized_key_capacity(required_length, key_template=new_keys)
+            self._decode_quantized_values = None
+        else:
+            self._ensure_decode_quantized_capacity(
+                required_length,
+                key_template=new_keys,
+                value_template=new_values,
+            )
+            if self._decode_quantized_values is None:
+                self._invalidate_decode_cache()
+                return
+        if self._decode_quantized_keys is None:
             self._invalidate_decode_cache()
             return
         self._decode_quantized_keys[:, prior_quantized_length:required_length, :].copy_(new_keys)
-        self._decode_quantized_values[:, prior_quantized_length:required_length, :].copy_(new_values)
+        if new_values is not None and self._decode_quantized_values is not None:
+            self._decode_quantized_values[:, prior_quantized_length:required_length, :].copy_(new_values)
         self._decode_quantized_length = required_length
 
     def _ensure_decode_full_capacity(
@@ -958,6 +983,47 @@ class TurboQuantKVRow:
             )
         return quantized_keys, quantized_values
 
+    def _materialize_quantized_keys_for_decode(self) -> torch.Tensor | None:
+        quantized_len = self.quantized_length
+        quantized_key_state = self._active_quantized_keys()
+        if quantized_key_state is None or quantized_len <= 0:
+            self._decode_quantized_keys = None
+            self._decode_quantized_values = None
+            self._decode_quantized_length = 0
+            self._decode_quantized_capacity = 0
+            return None
+
+        if (
+            _KEEP_DECODE_CACHE
+            and self._decode_quantized_keys is not None
+            and self._decode_quantized_length == quantized_len
+        ):
+            return self._decode_quantized_keys[:, :quantized_len, :]
+
+        assert self.device is not None
+        assert self.dtype is not None
+        with xpu_profile_region("turboquant_dequant"):
+            quantized_keys = dequantize_turboquant_keys(
+                quantized_key_state,
+                bits=self.bits,
+                device=self.device,
+                dtype=self.dtype,
+            ).contiguous()
+        if _KEEP_DECODE_CACHE:
+            self._ensure_decode_quantized_key_capacity(quantized_len, key_template=quantized_keys)
+            if self._decode_quantized_keys is not None:
+                self._decode_quantized_keys[:, :quantized_len, :].copy_(quantized_keys)
+            self._decode_quantized_values = None
+            self._decode_quantized_length = quantized_len
+        else:
+            self._decode_quantized_keys = None
+            self._decode_quantized_values = None
+            self._decode_quantized_length = 0
+            self._decode_quantized_capacity = 0
+        if _KEEP_DECODE_CACHE and self._decode_quantized_keys is not None:
+            return self._decode_quantized_keys[:, :quantized_len, :]
+        return quantized_keys
+
     def append(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
         if key_states.ndim != 3 or value_states.ndim != 3:
             raise ValueError(
@@ -1043,11 +1109,14 @@ class TurboQuantKVRow:
                     device=self.device,
                     dtype=self.dtype,
                 ).contiguous()
-                new_decode_values = dequantize_turboquant_values(
-                    quantized_values,
-                    device=self.device,
-                    dtype=self.dtype,
-                ).contiguous()
+                if self.device.type == "xpu":
+                    new_decode_values = None
+                else:
+                    new_decode_values = dequantize_turboquant_values(
+                        quantized_values,
+                        device=self.device,
+                        dtype=self.dtype,
+                    ).contiguous()
         else:
             new_decode_keys = None
             new_decode_values = None
@@ -1064,8 +1133,11 @@ class TurboQuantKVRow:
             new_values=new_decode_values,
         )
         if _KEEP_DECODE_CACHE and self._decode_full_keys is not None and self._decode_full_values is not None:
-            self._copy_decode_full_range(start=prior_quant_len, keys=new_decode_keys, values=new_decode_values)
-            self._decode_full_length = self._length
+            if new_decode_values is None:
+                self._invalidate_decode_full_cache()
+            else:
+                self._copy_decode_full_range(start=prior_quant_len, keys=new_decode_keys, values=new_decode_values)
+                self._decode_full_length = self._length
 
     def materialize(
         self,
@@ -1136,28 +1208,71 @@ class TurboQuantKVRow:
             )
 
         if self.length > 0:
-            decode_keys, decode_values = self._materialize_decode_full_cache()
             if query.device.type == "xpu":
                 query_4d = query.unsqueeze(0)
-                key_4d = decode_keys.unsqueeze(0)
-                value_4d = decode_values.unsqueeze(0)
-                output, partial_stats, partial_values = self._ensure_decode_splitkv_workspace(
-                    query=query_4d,
-                    key_len=int(key_4d.shape[2]),
-                    block_size=_DECODE_SPLITKV_BLOCK_SIZE,
-                )
-                run_gqa_decode_splitkv_fused_out(
-                    query=query_4d,
-                    key=key_4d,
-                    value=value_4d,
-                    output=output,
-                    partial_stats=partial_stats,
-                    partial_values=partial_values,
-                    scaling=scaling,
-                    block_size=_DECODE_SPLITKV_BLOCK_SIZE,
-                    gate=None if gate is None else gate.unsqueeze(0),
-                )
-                return output.squeeze(0)
+                quantized_len = self.quantized_length
+                residual_len = self.residual_length
+                if quantized_len > 0:
+                    quantized_keys = self._materialize_quantized_keys_for_decode()
+                    quantized_value_state = self._active_quantized_values()
+                    if quantized_keys is None or quantized_value_state is None:
+                        raise RuntimeError("TurboQuant packed-value decode requires active quantized key/value state.")
+                    if self._residual_keys is None:
+                        residual_key = query.new_empty((self.num_heads, 0, self.head_dim))
+                    else:
+                        residual_key = self._residual_keys
+                    if self._residual_values is None:
+                        residual_value = query.new_empty((self.num_heads, 0, self.head_dim))
+                    else:
+                        residual_value = self._residual_values
+                    key_len = quantized_len + residual_len
+                    output, partial_stats, partial_values = self._ensure_decode_splitkv_workspace(
+                        query=query_4d,
+                        key_len=key_len,
+                        block_size=_DECODE_SPLITKV_BLOCK_SIZE,
+                    )
+                    run_gqa_decode_splitkv_turboquant_fused_out(
+                        query=query_4d,
+                        quantized_key=quantized_keys.unsqueeze(0),
+                        value_data=quantized_value_state.data.unsqueeze(0),
+                        value_scales=quantized_value_state.scales.unsqueeze(0),
+                        value_zeros=quantized_value_state.zeros.unsqueeze(0),
+                        residual_key=residual_key.unsqueeze(0),
+                        residual_value=residual_value.unsqueeze(0),
+                        output=output,
+                        partial_stats=partial_stats,
+                        partial_values=partial_values,
+                        scaling=scaling,
+                        value_bits=quantized_value_state.bits,
+                        value_group_size=quantized_value_state.group_size,
+                        block_size=_DECODE_SPLITKV_BLOCK_SIZE,
+                        gate=None if gate is None else gate.unsqueeze(0),
+                    )
+                    return output.squeeze(0)
+
+                if self._residual_keys is not None and self._residual_values is not None and residual_len > 0:
+                    key_4d = self._residual_keys.unsqueeze(0)
+                    value_4d = self._residual_values.unsqueeze(0)
+                    output, partial_stats, partial_values = self._ensure_decode_splitkv_workspace(
+                        query=query_4d,
+                        key_len=residual_len,
+                        block_size=_DECODE_SPLITKV_BLOCK_SIZE,
+                    )
+                    run_gqa_decode_splitkv_fused_out(
+                        query=query_4d,
+                        key=key_4d,
+                        value=value_4d,
+                        output=output,
+                        partial_stats=partial_stats,
+                        partial_values=partial_values,
+                        scaling=scaling,
+                        block_size=_DECODE_SPLITKV_BLOCK_SIZE,
+                        gate=None if gate is None else gate.unsqueeze(0),
+                    )
+                    return output.squeeze(0)
+                return query.new_zeros((int(query.shape[0]), 1, self.head_dim))
+
+            decode_keys, decode_values = self._materialize_decode_full_cache()
             # FP16/BF16 matmul on XPU/GPU is typically much faster than promoting everything to FP32; keep softmax in
             # FP32 for stability on long contexts.
             compute_dtype = (

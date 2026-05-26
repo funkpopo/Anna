@@ -390,6 +390,7 @@ def main() -> None:
         gqa_decode_fused_is_available,
         gqa_decode_splitkv_fused_is_available,
         gqa_decode_splitkv_fused_out_is_available,
+        gqa_decode_splitkv_turboquant_fused_out_is_available,
         maybe_load_gated_delta_library,
         moe_dispatch_fused_is_available,
         moe_grouped_int4_mlp_fused_is_available,
@@ -410,6 +411,7 @@ def main() -> None:
     print(f"gqa_decode_registered={gqa_decode_fused_is_available()}")
     print(f"gqa_decode_splitkv_registered={gqa_decode_splitkv_fused_is_available()}")
     print(f"gqa_decode_splitkv_out_registered={gqa_decode_splitkv_fused_out_is_available()}")
+    print(f"gqa_decode_splitkv_turboquant_out_registered={gqa_decode_splitkv_turboquant_fused_out_is_available()}")
     print(f"paged_gqa_decode_registered={paged_gqa_decode_fused_is_available()}")
     print(f"moe_router_registered={moe_router_fused_is_available()}")
     print(f"moe_dispatch_registered={moe_dispatch_fused_is_available()}")

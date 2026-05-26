@@ -19,6 +19,7 @@ from anna.mm.prepared_inputs import PreparedInputs
 from anna.mm.qwen3_5_text_processor import Qwen3_5TextMultimodalProcessor
 from anna.model.fused_ops import (
     gqa_decode_splitkv_fused_out_is_available,
+    gqa_decode_splitkv_turboquant_fused_out_is_available,
     maybe_load_gated_delta_library,
     paged_gqa_decode_fused_is_available,
 )
@@ -97,11 +98,11 @@ def _qwen3_paged_full_attention_decode_enabled(*, device_type: str, kv_cache_qua
     use_paged_full_attention_decode = False
     if device_type == "xpu" and turboquant_kv_enabled:
         maybe_load_gated_delta_library()
-        if not gqa_decode_splitkv_fused_out_is_available():
+        if not gqa_decode_splitkv_fused_out_is_available() or not gqa_decode_splitkv_turboquant_fused_out_is_available():
             raise RuntimeError(
                 "Anna Qwen3.5 TurboQuant decode on Intel XPU requires the native fused-op library with "
-                "gqa_decode_splitkv_fused_out. Build anna_gated_delta_fused (see tools/build_gated_delta_fused_op.py) "
-                "or set ANNA_GATED_DELTA_OP_LIB."
+                "gqa_decode_splitkv_fused_out and gqa_decode_splitkv_turboquant_fused_out. "
+                "Build anna_gated_delta_fused (see tools/build_gated_delta_fused_op.py) or set ANNA_GATED_DELTA_OP_LIB."
             )
     if device_type == "xpu" and not turboquant_kv_enabled:
         maybe_load_gated_delta_library()
