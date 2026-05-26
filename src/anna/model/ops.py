@@ -1028,12 +1028,17 @@ class Qwen3DynamicCache:
         *,
         scaling: float,
         num_key_value_groups: int,
+        gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not self.uses_turboquant_for_layer(layer_idx):
             raise ValueError(f"Layer {layer_idx} does not use TurboQuant-backed KV storage.")
         if query_states.ndim != 4 or query_states.shape[2] != 1:
             raise ValueError(
                 "TurboQuant decode attention expects query_states shaped [batch, query_heads, 1, head_dim]."
+            )
+        if gate is not None and gate.shape != query_states.shape:
+            raise ValueError(
+                f"TurboQuant decode gate expects query layout {tuple(query_states.shape)}, got {tuple(gate.shape)}."
             )
         batch = int(query_states.shape[0])
         if batch == 1:
@@ -1044,6 +1049,7 @@ class Qwen3DynamicCache:
                 query_states[0],
                 scaling=scaling,
                 num_key_value_groups=num_key_value_groups,
+                gate=None if gate is None else gate[0],
             ).unsqueeze(0)
         n_head = int(query_states.shape[1])
         head_dim = int(query_states.shape[3])
@@ -1058,6 +1064,7 @@ class Qwen3DynamicCache:
                     query_states[batch_idx],
                     scaling=scaling,
                     num_key_value_groups=num_key_value_groups,
+                    gate=None if gate is None else gate[batch_idx],
                 )
             )
         return out
@@ -1837,14 +1844,19 @@ class Qwen3Attention(nn.Module):
             visible_mask = None
             key_padding_mask = None
             if use_turboquant_cache and attention_mask is None and seq_len == 1 and past_key_values is not None:
+                gate_fused = _reshape_decode_gate_to_query_layout(
+                    gate,
+                    num_heads=query_states.size(1),
+                    head_dim=self.head_dim,
+                )
                 attn_output = past_key_values.turboquant_single_token_decode_attention(
                     self.layer_idx,
                     query_states,
                     scaling=self.scaling,
                     num_key_value_groups=self.num_key_value_groups,
+                    gate=gate_fused,
                 )
                 attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
-                attn_output = attn_output * torch.sigmoid(gate)
                 return self.o_proj(attn_output)
             if prefer_paged_decode and past_key_values is not None:
                 visible_lengths = past_lengths + seq_len

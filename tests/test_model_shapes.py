@@ -346,6 +346,171 @@ def test_dynamic_cache_can_store_full_attention_rows_with_turboquant() -> None:
     assert ((second_value[:, :, :3, :] - value_a).float() ** 2).mean().item() < 1.0
 
 
+@pytest.mark.skipif(not hasattr(torch, "xpu") or not torch.xpu.is_available(), reason="XPU is required for TurboQuant decode cache tests")
+def test_turboquant_decode_attention_merged_cache_matches_split_reference_on_xpu() -> None:
+    torch.manual_seed(17)
+    row = TurboQuantKVRow(bits=2, residual_len=4)
+    key = torch.randn(2, 9, 16, device="xpu", dtype=torch.bfloat16)
+    value = torch.randn(2, 9, 16, device="xpu", dtype=torch.bfloat16)
+    row.append(key, value)
+    assert row.quantized_length == 5
+    assert row.residual_length == 4
+
+    query = torch.randn(4, 1, 16, device="xpu", dtype=torch.bfloat16)
+    output = row.decode_attention(query, scaling=16**-0.5, num_key_value_groups=2)
+
+    grouped_query = query.reshape(2, 2, 1, 16)
+    quantized_keys, quantized_values = row._materialize_quantized_prefix()
+    assert quantized_keys is not None
+    assert quantized_values is not None
+    assert row._residual_keys is not None
+    assert row._residual_values is not None
+    score_parts = [
+        torch.matmul(grouped_query, quantized_keys.unsqueeze(1).transpose(-1, -2)) * (16**-0.5),
+        torch.matmul(grouped_query, row._residual_keys.unsqueeze(1).transpose(-1, -2)) * (16**-0.5),
+    ]
+    attn_scores = torch.cat(score_parts, dim=-1)
+    attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query.dtype)
+    quantized_len = row.quantized_length
+    reference = torch.matmul(attn_probs[..., :quantized_len], quantized_values.unsqueeze(1))
+    reference = reference + torch.matmul(attn_probs[..., quantized_len:], row._residual_values.unsqueeze(1))
+    reference = reference.reshape(4, 1, 16)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(output.float().cpu(), reference.float().cpu(), atol=2e-2, rtol=2e-2)
+    assert row._decode_full_keys is not None
+    assert row._decode_full_values is not None
+    assert row._decode_full_length == row.length
+
+
+@pytest.mark.skipif(not hasattr(torch, "xpu") or not torch.xpu.is_available(), reason="XPU is required for TurboQuant decode cache tests")
+def test_turboquant_decode_full_cache_reuses_storage_across_appends_on_xpu() -> None:
+    torch.manual_seed(18)
+    row = TurboQuantKVRow(bits=2, residual_len=4)
+    row.append(
+        torch.randn(2, 8, 16, device="xpu", dtype=torch.bfloat16),
+        torch.randn(2, 8, 16, device="xpu", dtype=torch.bfloat16),
+    )
+    query = torch.randn(4, 1, 16, device="xpu", dtype=torch.bfloat16)
+    row.decode_attention(query, scaling=16**-0.5, num_key_value_groups=2)
+    assert row._decode_full_keys is not None
+    assert row._decode_full_values is not None
+    key_storage_ptr = row._decode_full_keys.untyped_storage().data_ptr()
+    value_storage_ptr = row._decode_full_values.untyped_storage().data_ptr()
+    capacity = row._decode_full_capacity
+    assert capacity >= row.length
+
+    for _ in range(3):
+        row.append(
+            torch.randn(2, 1, 16, device="xpu", dtype=torch.bfloat16),
+            torch.randn(2, 1, 16, device="xpu", dtype=torch.bfloat16),
+        )
+        row.decode_attention(query, scaling=16**-0.5, num_key_value_groups=2)
+        assert row._decode_full_keys is not None
+        assert row._decode_full_values is not None
+        assert row._decode_full_keys.untyped_storage().data_ptr() == key_storage_ptr
+        assert row._decode_full_values.untyped_storage().data_ptr() == value_storage_ptr
+        assert row._decode_full_capacity == capacity
+        assert row._decode_full_length == row.length
+
+    materialized_key, materialized_value = row.materialize()
+    full_key, full_value = row._materialize_decode_full_cache()
+    torch.xpu.synchronize()
+    assert torch.equal(full_key, materialized_key)
+    assert torch.equal(full_value, materialized_value)
+
+
+@pytest.mark.skipif(not hasattr(torch, "xpu") or not torch.xpu.is_available(), reason="XPU is required for TurboQuant decode cache tests")
+def test_turboquant_splitkv_workspace_reuses_storage_across_decode_steps_on_xpu() -> None:
+    torch.manual_seed(23)
+    row = TurboQuantKVRow(bits=2, residual_len=4)
+    row.append(
+        torch.randn(2, 8, 16, device="xpu", dtype=torch.bfloat16),
+        torch.randn(2, 8, 16, device="xpu", dtype=torch.bfloat16),
+    )
+    query = torch.randn(4, 1, 16, device="xpu", dtype=torch.bfloat16)
+    row.decode_attention(query, scaling=16**-0.5, num_key_value_groups=2)
+    assert row._decode_splitkv_output is not None
+    assert row._decode_splitkv_partial_stats is not None
+    assert row._decode_splitkv_partial_values is not None
+    output_ptr = row._decode_splitkv_output.untyped_storage().data_ptr()
+    stats_ptr = row._decode_splitkv_partial_stats.untyped_storage().data_ptr()
+    values_ptr = row._decode_splitkv_partial_values.untyped_storage().data_ptr()
+    blocks_capacity = row._decode_splitkv_blocks_capacity
+
+    for _ in range(3):
+        row.decode_attention(query, scaling=16**-0.5, num_key_value_groups=2)
+        assert row._decode_splitkv_output is not None
+        assert row._decode_splitkv_partial_stats is not None
+        assert row._decode_splitkv_partial_values is not None
+        assert row._decode_splitkv_output.untyped_storage().data_ptr() == output_ptr
+        assert row._decode_splitkv_partial_stats.untyped_storage().data_ptr() == stats_ptr
+        assert row._decode_splitkv_partial_values.untyped_storage().data_ptr() == values_ptr
+        assert row._decode_splitkv_blocks_capacity == blocks_capacity
+
+    for _ in range(3):
+        row.append(
+            torch.randn(2, 1, 16, device="xpu", dtype=torch.bfloat16),
+            torch.randn(2, 1, 16, device="xpu", dtype=torch.bfloat16),
+        )
+        row.decode_attention(query, scaling=16**-0.5, num_key_value_groups=2)
+        assert row._decode_splitkv_output is not None
+        assert row._decode_splitkv_partial_stats is not None
+        assert row._decode_splitkv_partial_values is not None
+        assert row._decode_splitkv_output.untyped_storage().data_ptr() == output_ptr
+        assert row._decode_splitkv_partial_stats.untyped_storage().data_ptr() == stats_ptr
+        assert row._decode_splitkv_partial_values.untyped_storage().data_ptr() == values_ptr
+        assert row._decode_splitkv_blocks_capacity == blocks_capacity
+
+
+@pytest.mark.skipif(not hasattr(torch, "xpu") or not torch.xpu.is_available(), reason="XPU is required for TurboQuant decode cache tests")
+def test_turboquant_quantized_state_reuses_storage_across_appends_on_xpu() -> None:
+    torch.manual_seed(21)
+    row = TurboQuantKVRow(bits=2, residual_len=4)
+    row.append(
+        torch.randn(2, 12, 16, device="xpu", dtype=torch.bfloat16),
+        torch.randn(2, 12, 16, device="xpu", dtype=torch.bfloat16),
+    )
+    assert row.quantized_length == 8
+    assert row._quantized_keys is not None
+    assert row._quantized_values is not None
+    assert row._quantized_capacity >= row.quantized_length + row.residual_len
+    mse_ptr = row._quantized_keys.mse_indices.untyped_storage().data_ptr()
+    data_ptr = row._quantized_values.data.untyped_storage().data_ptr()
+    capacity = row._quantized_capacity
+
+    row.append(
+        torch.randn(2, 1, 16, device="xpu", dtype=torch.bfloat16),
+        torch.randn(2, 1, 16, device="xpu", dtype=torch.bfloat16),
+    )
+    assert row.quantized_length == 9
+    assert row._quantized_keys is not None
+    assert row._quantized_values is not None
+    assert row._quantized_keys.mse_indices.untyped_storage().data_ptr() == mse_ptr
+    assert row._quantized_values.data.untyped_storage().data_ptr() == data_ptr
+    assert row._quantized_capacity == capacity
+
+    for _ in range(3):
+        row.append(
+            torch.randn(2, 1, 16, device="xpu", dtype=torch.bfloat16),
+            torch.randn(2, 1, 16, device="xpu", dtype=torch.bfloat16),
+        )
+        assert row._quantized_keys is not None
+        assert row._quantized_values is not None
+        assert row._quantized_keys.mse_indices.untyped_storage().data_ptr() == mse_ptr
+        assert row._quantized_values.data.untyped_storage().data_ptr() == data_ptr
+        assert row._quantized_capacity == capacity
+
+    cloned = row.clone()
+    assert cloned.quantized_length == row.quantized_length
+    assert cloned._quantized_capacity == row.quantized_length
+    materialized_key, materialized_value = row.materialize()
+    cloned_key, cloned_value = cloned.materialize()
+    torch.xpu.synchronize()
+    assert torch.equal(cloned_key, materialized_key)
+    assert torch.equal(cloned_value, materialized_value)
+
+
 def test_dynamic_cache_stack_and_split_round_trips_turboquant_batches() -> None:
     config = _tiny_config()
     allocator = Qwen3PageAllocator(config)

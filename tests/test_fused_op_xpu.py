@@ -486,6 +486,109 @@ def test_gqa_decode_fused_xpu_long_qwen35_shape_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gqa_decode_splitkv_fused_xpu_long_qwen35_shape_matches_reference() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gqa_decode_splitkv_fused"):
+        pytest.skip("Anna fused-op library is not built with gqa_decode_splitkv_fused")
+
+    torch.manual_seed(19)
+    device = "xpu"
+    head_dim = 256
+    key_len = 4096
+    query = torch.randn(1, 16, 1, head_dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(1, 4, key_len, head_dim, device=device, dtype=torch.bfloat16)
+    value = torch.randn(1, 4, key_len, head_dim, device=device, dtype=torch.bfloat16)
+
+    fused_output = torch.ops.anna.gqa_decode_splitkv_fused(query, key, value, head_dim**-0.5, 256)
+    reference = grouped_query_attention(query, key, value, scaling=head_dim**-0.5)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(fused_output.float().cpu(), reference.float().cpu(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gqa_decode_splitkv_fused_xpu_accepts_strided_kv_and_fuses_gate() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gqa_decode_splitkv_fused"):
+        pytest.skip("Anna fused-op library is not built with gqa_decode_splitkv_fused")
+
+    torch.manual_seed(20)
+    device = "xpu"
+    batch_size = 1
+    num_heads = 8
+    num_kv_heads = 2
+    head_dim = 64
+    key_len = 257
+    capacity = 512
+    query = torch.randn(batch_size, num_heads, 1, head_dim, device=device, dtype=torch.bfloat16)
+    key_storage = torch.empty(batch_size, num_kv_heads, capacity, head_dim, device=device, dtype=torch.bfloat16)
+    value_storage = torch.empty_like(key_storage)
+    key_storage[:, :, :key_len, :].normal_()
+    value_storage[:, :, :key_len, :].normal_()
+    key = key_storage[:, :, :key_len, :]
+    value = value_storage[:, :, :key_len, :]
+    gate_3d = torch.randn(batch_size, 1, num_heads * head_dim, device=device, dtype=torch.bfloat16)
+    gate_4d = _decode_gate_query_layout(gate_3d, num_heads=num_heads, head_dim=head_dim)
+    scale = head_dim**-0.5
+
+    assert not key.is_contiguous()
+    assert not value.is_contiguous()
+    fused = torch.ops.anna.gqa_decode_splitkv_fused(query, key, value, scale, 64, gate_4d)
+    reference = grouped_query_attention(query, key, value, scaling=scale) * torch.sigmoid(gate_4d)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(fused.float().cpu(), reference.float().cpu(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gqa_decode_splitkv_fused_out_xpu_reuses_workspace_and_accepts_strided_query() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gqa_decode_splitkv_fused_out"):
+        pytest.skip("Anna fused-op library is not built with gqa_decode_splitkv_fused_out")
+
+    torch.manual_seed(22)
+    device = "xpu"
+    batch_size = 1
+    num_heads = 8
+    num_kv_heads = 2
+    head_dim = 64
+    key_len = 193
+    block_size = 64
+    blocks = (key_len + block_size - 1) // block_size
+    query_storage = torch.empty(batch_size, num_heads, 1, head_dim * 2, device=device, dtype=torch.bfloat16)
+    query_storage.normal_()
+    query = query_storage[..., ::2]
+    key_storage = torch.empty(batch_size, num_kv_heads, 256, head_dim, device=device, dtype=torch.bfloat16)
+    value_storage = torch.empty_like(key_storage)
+    key_storage[:, :, :key_len, :].normal_()
+    value_storage[:, :, :key_len, :].normal_()
+    key = key_storage[:, :, :key_len, :]
+    value = value_storage[:, :, :key_len, :]
+    output = torch.empty_like(query)
+    partial_stats = torch.empty(batch_size, num_heads, blocks + 2, 2, device=device, dtype=torch.float32)
+    partial_values = torch.empty(batch_size, num_heads, blocks + 2, head_dim, device=device, dtype=torch.float32)
+    gate_3d = torch.randn(batch_size, 1, num_heads * head_dim, device=device, dtype=torch.bfloat16)
+    gate_4d = _decode_gate_query_layout(gate_3d, num_heads=num_heads, head_dim=head_dim)
+    scale = head_dim**-0.5
+
+    assert not query.is_contiguous()
+    assert not key.is_contiguous()
+    returned = torch.ops.anna.gqa_decode_splitkv_fused_out(
+        query,
+        key,
+        value,
+        output,
+        partial_stats,
+        partial_values,
+        scale,
+        block_size,
+        gate_4d,
+    )
+    reference = grouped_query_attention(query, key, value, scaling=scale) * torch.sigmoid(gate_4d)
+
+    torch.xpu.synchronize()
+    assert returned.untyped_storage().data_ptr() == output.untyped_storage().data_ptr()
+    assert torch.allclose(output.float().cpu(), reference.float().cpu(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
 def test_gqa_decode_fused_xpu_with_gate_matches_sigmoid_fusion() -> None:
     if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gqa_decode_fused"):
         pytest.skip("Anna fused-op library is not built")
