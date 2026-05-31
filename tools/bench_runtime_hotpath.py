@@ -15,7 +15,9 @@ from anna.core.hotpath_events import hotpath_event_recorder
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.runtime.hotpath_guard import scan_hotpath_files, unexpected_findings
+from anna.runtime.paged_kv import PagedKVManager
 from anna.runtime.service_metrics import AnnaServiceMetrics
+from anna.runtime.slot_scheduler import SlotScheduler
 from anna.sampling.sampler import sample_next_token, sample_next_token_from_candidates
 
 
@@ -101,6 +103,57 @@ def _bench_cache_stack_split(
     }
 
 
+def _bench_slot_decode_plan(
+    *,
+    batch_size: int,
+    seq_len: int,
+    block_size: int,
+    max_blocks_per_seq: int,
+    iters: int,
+) -> dict[str, Any]:
+    required_blocks = 0 if seq_len <= 0 else (seq_len + block_size - 1) // block_size
+    resolved_max_blocks = max(max_blocks_per_seq, required_blocks + 1, 1)
+    manager = PagedKVManager(
+        max_slots=batch_size,
+        total_blocks=batch_size * resolved_max_blocks,
+        block_size=block_size,
+        max_blocks_per_seq=resolved_max_blocks,
+        device="cpu",
+    )
+    scheduler = SlotScheduler(manager, max_batch_size=batch_size)
+    request_ids = tuple(f"bench-{idx}" for idx in range(batch_size))
+    for idx, request_id in enumerate(request_ids):
+        scheduler.admit(
+            request_id,
+            prompt_length=seq_len,
+            max_new_tokens=4,
+            sampling_params={
+                "temperature": 0.0 if idx % 2 == 0 else 0.7,
+                "top_p": 1.0 if idx % 2 == 0 else 0.8,
+                "top_k": 1 if idx % 2 == 0 else 32,
+                "min_p": 0.0,
+                "presence_penalty": 0.0,
+                "repetition_penalty": 1.0,
+            },
+        )
+        scheduler.mark_prefilled(request_id, next_input_id=idx + 1)
+
+    plan = scheduler.build_decode_plan(request_ids=request_ids)
+    assert plan.block_tables.shape == (batch_size, resolved_max_blocks)
+    assert plan.sampling_batch_params.batch_size == batch_size
+
+    plan_ms = _time_ms(lambda: scheduler.build_decode_plan(request_ids=request_ids), iters=iters)
+    return {
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+        "block_size": block_size,
+        "max_blocks_per_seq": resolved_max_blocks,
+        "plan_ms": plan_ms,
+        "block_table_rows": int(plan.block_tables.shape[0]),
+        "block_table_cols": int(plan.block_tables.shape[1]),
+    }
+
+
 def _bench_sampler(*, vocab_size: int, candidates: int, iters: int) -> dict[str, Any]:
     logits = torch.randn(vocab_size)
     history = torch.arange(0, min(64, vocab_size), dtype=torch.long)
@@ -162,6 +215,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--heads", type=int, default=2)
     parser.add_argument("--head-dim", type=int, default=16)
     parser.add_argument("--block-size", type=int, default=32)
+    parser.add_argument(
+        "--max-blocks-per-seq",
+        type=int,
+        default=0,
+        help="Max block-table entries per sequence for the slot decode plan benchmark. Set 0 to derive from seq len.",
+    )
     parser.add_argument("--vocab-size", type=int, default=4096)
     parser.add_argument("--candidates", type=int, default=64)
     parser.add_argument("--json", action="store_true")
@@ -179,6 +238,13 @@ def main() -> int:
             heads=args.heads,
             head_dim=args.head_dim,
             block_size=args.block_size,
+            iters=args.iters,
+        ),
+        "slot_decode_plan": _bench_slot_decode_plan(
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            block_size=args.block_size,
+            max_blocks_per_seq=args.max_blocks_per_seq,
             iters=args.iters,
         ),
         "sampler": _bench_sampler(

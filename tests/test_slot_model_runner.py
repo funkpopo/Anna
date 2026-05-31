@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig, Qwen3_5TextModelConfig
@@ -72,8 +73,18 @@ def test_slot_model_runner_builds_decode_model_inputs_without_cache_objects() ->
         max_batch_size=2,
     )
 
-    slot_a = runner.admit_prefill("req-a", prompt_length=3, max_new_tokens=4, sampling_params={"top_k": 1})
-    slot_b = runner.admit_prefill("req-b", prompt_length=5, max_new_tokens=4, sampling_params={"top_k": 2})
+    slot_a = runner.admit_prefill(
+        "req-a",
+        prompt_length=3,
+        max_new_tokens=4,
+        sampling_params={"temperature": 0.0, "top_k": 1},
+    )
+    slot_b = runner.admit_prefill(
+        "req-b",
+        prompt_length=5,
+        max_new_tokens=4,
+        sampling_params={"temperature": 0.8, "top_k": 2},
+    )
     runner.mark_prefilled("req-a", next_input_id=11)
     runner.mark_prefilled("req-b", next_input_id=22)
 
@@ -86,7 +97,12 @@ def test_slot_model_runner_builds_decode_model_inputs_without_cache_objects() ->
     assert model_inputs.positions.tolist() == [3, 5]
     assert model_inputs.seq_lens.tolist() == [3, 5]
     assert model_inputs.block_tables.shape == (2, 4)
-    assert model_inputs.sampling_params == ({"top_k": 1}, {"top_k": 2})
+    assert model_inputs.sampling_params == (
+        {"temperature": 0.0, "top_k": 1},
+        {"temperature": 0.8, "top_k": 2},
+    )
+    assert model_inputs.sampling_batch_params.temperature.tolist() == pytest.approx([0.0, 0.8])
+    assert model_inputs.sampling_batch_params.top_k.tolist() == [1, 2]
     assert not hasattr(model_inputs, "past_key_values")
 
     runner.advance_decode("req-a", next_input_id=12)

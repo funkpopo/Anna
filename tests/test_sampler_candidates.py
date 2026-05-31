@@ -1,12 +1,70 @@
-import pytest
 import torch
+import pytest
 
 from anna.sampling.sampler import (
     apply_min_p,
     apply_presence_penalty,
+    apply_repetition_penalty,
+    sample_next_token_batch,
     sample_next_token_batch_from_candidates,
+    sample_next_token_batch_from_candidates_with_params,
+    sample_next_token_batch_with_params,
     sample_next_token_from_candidates,
 )
+from anna.sampling.params import SamplingBatchParams
+from anna.core.hotpath_events import hotpath_event_recorder
+from anna.runtime.service_metrics import AnnaServiceMetrics
+
+
+def _reference_filtered_logits(
+    logits: torch.Tensor,
+    *,
+    generated_ids_batch: tuple[torch.Tensor | None, ...] | None = None,
+    temperature: float = 0.7,
+    top_k: int = 20,
+    top_p: float = 0.8,
+    min_p: float = 0.0,
+    presence_penalty: float = 1.5,
+    repetition_penalty: float = 1.0,
+) -> torch.Tensor:
+    if logits.ndim == 1:
+        flat = logits.unsqueeze(0)
+        output_shape = logits.shape
+    else:
+        flat = logits.reshape(-1, logits.shape[-1])
+        output_shape = logits.shape
+
+    rows: list[torch.Tensor] = []
+    histories = generated_ids_batch or (None,) * int(flat.shape[0])
+    for row, generated_ids in zip(flat.unbind(0), histories, strict=True):
+        adjusted = apply_repetition_penalty(row, generated_ids, repetition_penalty)
+        adjusted = apply_presence_penalty(adjusted, generated_ids, presence_penalty)
+        rows.append(adjusted)
+    filtered = torch.stack(rows, dim=0)
+
+    if temperature <= 0.0:
+        return filtered.reshape(output_shape)
+    filtered = filtered / temperature
+    if 0 < top_k < filtered.shape[-1]:
+        kth = torch.topk(filtered, k=top_k, dim=-1).values[..., -1, None]
+        filtered = torch.where(filtered < kth, torch.full_like(filtered, float("-inf")), filtered)
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(filtered, descending=True)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        cutoff = cumulative_probs > top_p
+        cutoff[..., 1:] = cutoff[..., :-1].clone()
+        cutoff[..., 0] = False
+        sorted_logits = sorted_logits.masked_fill(cutoff, float("-inf"))
+        next_filtered = torch.full_like(filtered, float("-inf"))
+        next_filtered.scatter_(dim=-1, index=sorted_indices, src=sorted_logits)
+        filtered = next_filtered
+    if min_p > 0.0:
+        probs = torch.softmax(filtered, dim=-1)
+        max_prob = torch.max(probs, dim=-1, keepdim=True).values
+        keep = probs >= max_prob * min_p
+        filtered = torch.where(keep, filtered, torch.full_like(filtered, float("-inf")))
+    return filtered.reshape(output_shape)
 
 
 def test_sample_next_token_from_candidates_greedy_maps_back_to_token_id() -> None:
@@ -52,3 +110,227 @@ def test_apply_min_p_keeps_tokens_above_scaled_max_probability() -> None:
     assert torch.isfinite(filtered[0])
     assert torch.isfinite(filtered[1])
     assert torch.isneginf(filtered[2])
+
+
+def test_top_k_sampling_avoids_full_vocab_top_p_sort_metric() -> None:
+    metrics = AnnaServiceMetrics()
+    logits = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
+
+    with hotpath_event_recorder(metrics):
+        token = sample_next_token_batch(logits, temperature=1.0, top_k=2, top_p=0.9, min_p=0.0)
+
+    assert int(token.item()) in {0, 1}
+    assert metrics.snapshot().sampler_full_vocab_sort_count == 0
+
+
+def test_top_p_without_top_k_records_full_vocab_sort_metric() -> None:
+    metrics = AnnaServiceMetrics()
+    logits = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
+
+    with hotpath_event_recorder(metrics):
+        sample_next_token_batch(logits, temperature=1.0, top_k=0, top_p=0.9, min_p=0.0)
+
+    assert metrics.snapshot().sampler_full_vocab_sort_count == 1
+
+
+def test_sample_next_token_batch_greedy_matches_reference_with_penalties() -> None:
+    logits = torch.tensor(
+        [
+            [2.0, 9.0, 7.0, 1.0],
+            [8.0, 6.0, 4.0, 3.0],
+        ]
+    )
+    histories = (torch.tensor([1, 2]), torch.tensor([0]))
+
+    next_tokens = sample_next_token_batch(
+        logits,
+        generated_ids_batch=histories,
+        temperature=0.0,
+        top_k=2,
+        top_p=0.75,
+        min_p=0.1,
+        presence_penalty=1.5,
+        repetition_penalty=2.0,
+    )
+    reference = torch.argmax(
+        _reference_filtered_logits(
+            logits,
+            generated_ids_batch=histories,
+            temperature=0.0,
+            top_k=2,
+            top_p=0.75,
+            min_p=0.1,
+            presence_penalty=1.5,
+            repetition_penalty=2.0,
+        ),
+        dim=-1,
+    )
+
+    assert torch.equal(next_tokens, reference)
+
+
+def test_top_k_candidate_sampler_support_matches_full_vocab_reference() -> None:
+    logits = torch.tensor(
+        [
+            [5.0, 4.0, 3.0, 2.0, 1.0],
+            [1.0, 5.0, 4.0, 3.0, 2.0],
+        ]
+    )
+    reference = _reference_filtered_logits(
+        logits,
+        temperature=1.0,
+        top_k=3,
+        top_p=0.72,
+        min_p=0.05,
+        presence_penalty=0.0,
+        repetition_penalty=1.0,
+    )
+    allowed = torch.isfinite(reference)
+
+    for seed in range(20):
+        torch.manual_seed(seed)
+        sampled = sample_next_token_batch(
+            logits,
+            temperature=1.0,
+            top_k=3,
+            top_p=0.72,
+            min_p=0.05,
+            presence_penalty=0.0,
+            repetition_penalty=1.0,
+        )
+
+        assert allowed[0, int(sampled[0].item())]
+        assert allowed[1, int(sampled[1].item())]
+
+
+def test_full_vocab_sampler_support_matches_reference_with_top_p_min_p_and_penalties() -> None:
+    logits = torch.tensor(
+        [
+            [5.0, 4.5, 2.0, 1.0, -1.0],
+            [1.0, 3.0, 4.0, 2.5, 0.5],
+        ]
+    )
+    histories = (torch.tensor([0, 1]), torch.tensor([2, 3, 3]))
+    reference = _reference_filtered_logits(
+        logits,
+        generated_ids_batch=histories,
+        temperature=0.8,
+        top_k=0,
+        top_p=0.82,
+        min_p=0.08,
+        presence_penalty=0.4,
+        repetition_penalty=1.2,
+    )
+    allowed = torch.isfinite(reference)
+
+    for seed in range(20):
+        torch.manual_seed(seed)
+        sampled = sample_next_token_batch(
+            logits,
+            generated_ids_batch=histories,
+            temperature=0.8,
+            top_k=0,
+            top_p=0.82,
+            min_p=0.08,
+            presence_penalty=0.4,
+            repetition_penalty=1.2,
+        )
+
+        assert allowed[0, int(sampled[0].item())]
+        assert allowed[1, int(sampled[1].item())]
+
+
+def test_sample_next_token_batch_with_params_supports_per_row_sampling_config() -> None:
+    logits = torch.tensor(
+        [
+            [5.0, 4.0, 3.0, 2.0, 1.0],
+            [1.0, 4.0, 5.0, 2.0, 0.5],
+        ]
+    )
+    histories = (torch.tensor([0, 1]), torch.tensor([2]))
+    params = SamplingBatchParams.from_sampling_params(
+        (
+            {
+                "temperature": 0.0,
+                "top_k": 2,
+                "top_p": 0.7,
+                "min_p": 0.1,
+                "presence_penalty": 0.3,
+                "repetition_penalty": 1.1,
+            },
+            {
+                "temperature": 0.9,
+                "top_k": 0,
+                "top_p": 0.82,
+                "min_p": 0.05,
+                "presence_penalty": 0.2,
+                "repetition_penalty": 1.3,
+            },
+        ),
+        device="cpu",
+    )
+    first_reference = torch.argmax(
+        _reference_filtered_logits(
+            logits[0],
+            generated_ids_batch=(histories[0],),
+            temperature=0.0,
+            top_k=2,
+            top_p=0.7,
+            min_p=0.1,
+            presence_penalty=0.3,
+            repetition_penalty=1.1,
+        )
+    )
+    second_allowed = torch.isfinite(
+        _reference_filtered_logits(
+            logits[1],
+            generated_ids_batch=(histories[1],),
+            temperature=0.9,
+            top_k=0,
+            top_p=0.82,
+            min_p=0.05,
+            presence_penalty=0.2,
+            repetition_penalty=1.3,
+        )
+    )
+
+    for seed in range(20):
+        torch.manual_seed(seed)
+        sampled = sample_next_token_batch_with_params(
+            logits,
+            params,
+            generated_ids_batch=histories,
+        )
+
+        assert sampled[0] == first_reference
+        assert second_allowed[int(sampled[1].item())]
+
+
+def test_candidate_sampler_with_params_supports_per_row_sampling_config() -> None:
+    logits = torch.tensor([[5.0, 4.0, 3.0], [1.0, 5.0, 4.0]])
+    token_ids = torch.tensor([[10, 11, 12], [20, 21, 22]])
+    params = SamplingBatchParams.from_sampling_params(
+        (
+            {"temperature": 0.0, "top_p": 1.0, "min_p": 0.0},
+            {"temperature": 0.8, "top_p": 0.7, "min_p": 0.0},
+        ),
+        device="cpu",
+    )
+    second_allowed = torch.isfinite(
+        _reference_filtered_logits(
+            logits[1],
+            temperature=0.8,
+            top_k=0,
+            top_p=0.7,
+            min_p=0.0,
+            presence_penalty=0.0,
+            repetition_penalty=1.0,
+        )
+    )
+
+    for seed in range(20):
+        torch.manual_seed(seed)
+        sampled = sample_next_token_batch_from_candidates_with_params(logits, token_ids, params)
+
+        assert sampled[0] == 10
+        assert second_allowed[int((token_ids[1] == sampled[1]).nonzero(as_tuple=True)[0].item())]

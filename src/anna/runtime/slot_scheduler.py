@@ -6,6 +6,7 @@ from typing import Any, Sequence
 
 import torch
 
+from anna.sampling.params import SamplingBatchParams
 from anna.runtime.paged_kv import KVSlotHandle, PagedKVDecodePlan, PagedKVManager
 
 
@@ -23,6 +24,7 @@ class SequenceSlot:
     prompt_length: int
     max_new_tokens: int
     seq_len: int
+    prefilled_tokens: int = 0
     status: SlotState = SlotState.WAITING_PREFILL
     generated_tokens: int = 0
     next_input_id: int | None = None
@@ -53,6 +55,7 @@ class DecodeBatchPlan:
     seq_lens: torch.Tensor
     block_tables: torch.Tensor
     sampling_params: tuple[Any | None, ...]
+    sampling_batch_params: SamplingBatchParams
 
     @classmethod
     def from_kv_plan(
@@ -71,6 +74,10 @@ class DecodeBatchPlan:
             seq_lens=kv_plan.seq_lens,
             block_tables=kv_plan.block_tables,
             sampling_params=tuple(slot.sampling_params for slot in slots),
+            sampling_batch_params=SamplingBatchParams.from_sampling_params(
+                tuple(slot.sampling_params for slot in slots),
+                device=input_ids.device,
+            ),
         )
 
 
@@ -115,7 +122,7 @@ class SlotScheduler:
 
         handle = self.kv_manager.allocate_slot()
         try:
-            self.kv_manager.set_seq_len(handle.slot_id, handle.epoch, prompt_length)
+            self.kv_manager.set_seq_len(handle.slot_id, handle.epoch, 0)
         except Exception:
             self.kv_manager.release_slot(handle.slot_id, handle.epoch)
             raise
@@ -125,7 +132,7 @@ class SlotScheduler:
             handle=handle,
             prompt_length=int(prompt_length),
             max_new_tokens=int(max_new_tokens),
-            seq_len=int(prompt_length),
+            seq_len=0,
             sampling_params=sampling_params,
             admission_index=self._next_admission_index,
         )
@@ -134,10 +141,30 @@ class SlotScheduler:
         self._active_by_slot[slot.slot_id] = slot
         return slot
 
+    def advance_prefill(self, request_id: str, *, token_count: int) -> SequenceSlot:
+        slot = self._require_active(request_id)
+        if slot.status is not SlotState.WAITING_PREFILL:
+            raise ValueError(f"Request {request_id!r} is not waiting for prefill.")
+        if token_count < 0:
+            raise ValueError("token_count must be non-negative.")
+
+        next_prefilled = slot.prefilled_tokens + int(token_count)
+        if next_prefilled > slot.prompt_length:
+            raise ValueError(
+                f"Request {request_id!r} prefilled {next_prefilled} tokens, "
+                f"but prompt_length={slot.prompt_length}."
+            )
+        slot.prefilled_tokens = next_prefilled
+        slot.seq_len = next_prefilled
+        self.kv_manager.set_seq_len(slot.slot_id, slot.epoch, next_prefilled)
+        return slot
+
     def mark_prefilled(self, request_id: str, *, next_input_id: int) -> SequenceSlot:
         slot = self._require_active(request_id)
         if slot.status is not SlotState.WAITING_PREFILL:
             raise ValueError(f"Request {request_id!r} is not waiting for prefill.")
+        if slot.prefilled_tokens < slot.prompt_length:
+            self.advance_prefill(request_id, token_count=slot.prompt_length - slot.prefilled_tokens)
         slot.next_input_id = int(next_input_id)
         slot.status = SlotState.DECODING
         return slot

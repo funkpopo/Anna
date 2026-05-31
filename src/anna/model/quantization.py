@@ -67,6 +67,10 @@ def _int4_shifts(*, device: torch.device | str | None = None) -> torch.Tensor:
     return torch.arange(0, 32, 4, device=device, dtype=torch.int32)
 
 
+def xpu_int4pack_mm_is_available() -> bool:
+    return getattr(torch.ops.aten, "_weight_int4pack_mm_with_scales_and_zeros", None) is not None
+
+
 def _dtype_cache_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
@@ -692,6 +696,55 @@ class XPUInt4Linear(nn.Module):
         else:
             output = self._forward_dequant(x_padded)
         return output.reshape(*original_shape, self.out_features).to(dtype=x.dtype)
+
+
+@dataclass(frozen=True, slots=True)
+class XPUInt4HotPathReport:
+    module_count: int
+    matmul_strategy: str
+    int4pack_available: bool
+    backend: str
+
+
+def validate_xpu_int4_hotpath(module: nn.Module, *, device: torch.device | str) -> XPUInt4HotPathReport:
+    """Validate that XPU int4 linears have a non-CPU hot path before serving."""
+    resolved_device = torch.device(device)
+    int4_modules = tuple(
+        module_name
+        for module_name, child in module.named_modules()
+        if module_name and isinstance(child, XPUInt4Linear)
+    )
+    strategy = XPUInt4Linear._matmul_strategy()
+    int4pack_available = xpu_int4pack_mm_is_available()
+    if resolved_device.type != "xpu" or not int4_modules:
+        return XPUInt4HotPathReport(
+            module_count=len(int4_modules),
+            matmul_strategy=strategy,
+            int4pack_available=int4pack_available,
+            backend="inactive",
+        )
+    if strategy == "dequant":
+        raise RuntimeError(
+            "XPUInt4Linear dequant matmul strategy is not allowed for XPU serving hot path. "
+            "Use ANNA_XPU_INT4_MATMUL=auto or torch with a working "
+            "aten._weight_int4pack_mm_with_scales_and_zeros op; reserve "
+            f"{_XPU_INT4_ALLOW_XPU_DEQUANT_ENV}=1 and ANNA_XPU_INT4_MATMUL=dequant for isolated debugging."
+        )
+    if not int4pack_available:
+        sample = ", ".join(int4_modules[:5])
+        if len(int4_modules) > 5:
+            sample += ", ..."
+        raise RuntimeError(
+            "XPUInt4Linear modules are present, but aten._weight_int4pack_mm_with_scales_and_zeros "
+            f"is unavailable for the XPU hot path. Affected modules: {sample}. "
+            "Install a torch XPU build with int4pack support or disable XPU int4 quantization."
+        )
+    return XPUInt4HotPathReport(
+        module_count=len(int4_modules),
+        matmul_strategy=strategy,
+        int4pack_available=True,
+        backend="aten._weight_int4pack_mm_with_scales_and_zeros",
+    )
 
 
 @dataclass(slots=True)

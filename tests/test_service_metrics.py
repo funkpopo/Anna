@@ -15,6 +15,7 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     metrics.record_decode_step(0.125)
     metrics.record_cache_stack(0.03125)
     metrics.record_cache_split(0.0625)
+    metrics.record_slot_decode_plan(0.015625)
     metrics.record_cpu_sync(reason="token_id_cpu_staging", count=2)
     metrics.record_attention_fallback(reason="grouped_attention")
     metrics.record_paged_cache_materialization(reason="gather_layer_cache")
@@ -55,6 +56,9 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     assert snapshot.cache_split_count == 1
     assert snapshot.cache_split_seconds_total == 0.0625
     assert snapshot.cache_split_seconds_max == 0.0625
+    assert snapshot.slot_decode_plan_count == 1
+    assert snapshot.slot_decode_plan_seconds_total == 0.015625
+    assert snapshot.slot_decode_plan_seconds_max == 0.015625
     assert snapshot.cpu_sync_count == 2
     assert snapshot.attention_fallback_count == 1
     assert snapshot.paged_cache_materialize_count == 1
@@ -98,6 +102,9 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
         cache_split_seconds_total=0.08,
         cache_split_count=4,
         cache_split_seconds_max=0.04,
+        slot_decode_plan_seconds_total=0.02,
+        slot_decode_plan_count=2,
+        slot_decode_plan_seconds_max=0.015,
         cpu_sync_count=3,
         attention_fallback_count=4,
         paged_cache_materialize_count=5,
@@ -117,6 +124,7 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
     assert "Decode step p50/p95/p99: 20.0/50.0/50.0 ms" in line
     assert "Cache stack avg/max: 20.0/30.0 ms" in line
     assert "Cache split avg/max: 20.0/40.0 ms" in line
+    assert "Slot decode plan avg/max: 10.0/15.0 ms" in line
     assert "Hot path events: cpu_sync=3, attention_fallback=4, paged_cache_materialize=5, sampler_full_vocab_sort=6, moe_host_offset=7" in line
     assert "Waiting: 1 reqs" in line
     assert "GPU KV cache usage: 50.0% (6/12 pages)" in line

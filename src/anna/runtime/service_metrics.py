@@ -52,6 +52,9 @@ class ServiceMetricsSnapshot:
     cache_split_seconds_total: float = 0.0
     cache_split_count: int = 0
     cache_split_seconds_max: float = 0.0
+    slot_decode_plan_seconds_total: float = 0.0
+    slot_decode_plan_count: int = 0
+    slot_decode_plan_seconds_max: float = 0.0
     cpu_sync_count: int = 0
     attention_fallback_count: int = 0
     paged_cache_materialize_count: int = 0
@@ -95,6 +98,9 @@ class AnnaServiceMetrics:
         self._cache_split_seconds_total = 0.0
         self._cache_split_count = 0
         self._cache_split_seconds_max = 0.0
+        self._slot_decode_plan_seconds_total = 0.0
+        self._slot_decode_plan_count = 0
+        self._slot_decode_plan_seconds_max = 0.0
         self._cpu_sync_count = 0
         self._attention_fallback_count = 0
         self._paged_cache_materialize_count = 0
@@ -159,6 +165,14 @@ class AnnaServiceMetrics:
             self._cache_split_seconds_total += normalized
             self._cache_split_count += 1
             self._cache_split_seconds_max = max(self._cache_split_seconds_max, normalized)
+        self._activity_event.set()
+
+    def record_slot_decode_plan(self, seconds: float) -> None:
+        normalized = max(0.0, float(seconds))
+        with self._lock:
+            self._slot_decode_plan_seconds_total += normalized
+            self._slot_decode_plan_count += 1
+            self._slot_decode_plan_seconds_max = max(self._slot_decode_plan_seconds_max, normalized)
         self._activity_event.set()
 
     @staticmethod
@@ -276,6 +290,9 @@ class AnnaServiceMetrics:
                 cache_split_seconds_total=self._cache_split_seconds_total,
                 cache_split_count=self._cache_split_count,
                 cache_split_seconds_max=self._cache_split_seconds_max,
+                slot_decode_plan_seconds_total=self._slot_decode_plan_seconds_total,
+                slot_decode_plan_count=self._slot_decode_plan_count,
+                slot_decode_plan_seconds_max=self._slot_decode_plan_seconds_max,
                 cpu_sync_count=self._cpu_sync_count,
                 attention_fallback_count=self._attention_fallback_count,
                 paged_cache_materialize_count=self._paged_cache_materialize_count,
@@ -332,6 +349,11 @@ class AnnaServiceMetricsLogger:
         cache_stack_count = max(0, current.cache_stack_count - previous.cache_stack_count)
         cache_split_total = max(0.0, current.cache_split_seconds_total - previous.cache_split_seconds_total)
         cache_split_count = max(0, current.cache_split_count - previous.cache_split_count)
+        slot_decode_plan_total = max(
+            0.0,
+            current.slot_decode_plan_seconds_total - previous.slot_decode_plan_seconds_total,
+        )
+        slot_decode_plan_count = max(0, current.slot_decode_plan_count - previous.slot_decode_plan_count)
         cpu_sync_count = max(0, current.cpu_sync_count - previous.cpu_sync_count)
         attention_fallback_count = max(0, current.attention_fallback_count - previous.attention_fallback_count)
         paged_cache_materialize_count = max(0, current.paged_cache_materialize_count - previous.paged_cache_materialize_count)
@@ -346,6 +368,9 @@ class AnnaServiceMetricsLogger:
         decode_step_avg_ms = 0.0 if decode_step_count <= 0 else (decode_step_total / decode_step_count) * 1000.0
         cache_stack_avg_ms = 0.0 if cache_stack_count <= 0 else (cache_stack_total / cache_stack_count) * 1000.0
         cache_split_avg_ms = 0.0 if cache_split_count <= 0 else (cache_split_total / cache_split_count) * 1000.0
+        slot_decode_plan_avg_ms = (
+            0.0 if slot_decode_plan_count <= 0 else (slot_decode_plan_total / slot_decode_plan_count) * 1000.0
+        )
         prefill_recent = current.prefill_step_recent_seconds
         decode_recent = current.decode_step_recent_seconds
         prefill_p50_ms = _quantile(prefill_recent, 0.50) * 1000.0
@@ -365,6 +390,8 @@ class AnnaServiceMetricsLogger:
             f"Decode step p50/p95/p99: {decode_p50_ms:.1f}/{decode_p95_ms:.1f}/{decode_p99_ms:.1f} ms, "
             f"Cache stack avg/max: {cache_stack_avg_ms:.1f}/{current.cache_stack_seconds_max * 1000.0:.1f} ms, "
             f"Cache split avg/max: {cache_split_avg_ms:.1f}/{current.cache_split_seconds_max * 1000.0:.1f} ms, "
+            f"Slot decode plan avg/max: {slot_decode_plan_avg_ms:.1f}/"
+            f"{current.slot_decode_plan_seconds_max * 1000.0:.1f} ms, "
             f"Hot path events: cpu_sync={cpu_sync_count}, attention_fallback={attention_fallback_count}, "
             f"paged_cache_materialize={paged_cache_materialize_count}, "
             f"sampler_full_vocab_sort={sampler_full_vocab_sort_count}, moe_host_offset={moe_host_offset_count}, "
@@ -393,6 +420,7 @@ class AnnaServiceMetricsLogger:
             current.decode_step_count - previous.decode_step_count,
             current.cache_stack_count - previous.cache_stack_count,
             current.cache_split_count - previous.cache_split_count,
+            current.slot_decode_plan_count - previous.slot_decode_plan_count,
             current.cpu_sync_count - previous.cpu_sync_count,
             current.attention_fallback_count - previous.attention_fallback_count,
             current.paged_cache_materialize_count - previous.paged_cache_materialize_count,

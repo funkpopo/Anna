@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from collections import OrderedDict
 from types import MethodType, SimpleNamespace
 
@@ -12,7 +13,7 @@ from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, GenerationConfig, GenerationPerfStats, ThinkingStreamParser
 from anna.runtime.qwen3_5_text_engine import EngineOptimizationConfig, StreamEvent, TextGenerationResult
-from anna.runtime.streaming import IncrementalTextAssembler
+from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
 
 
 class _PassThroughToolCallStreamParser:
@@ -1042,3 +1043,111 @@ def test_incremental_text_assembler_holds_back_multibyte_stop_boundary() -> None
 
     assert stopped is True
     assert "".join(outputs) == "开始"
+
+
+def test_incremental_text_assembler_matches_one_shot_decode_with_unicode_and_stop() -> None:
+    class DummyTokenizer:
+        mapping = {
+            (1,): "你",
+            (2,): "好",
+            (3,): "\ufffd",
+            (3, 4): "🌞",
+            (5,): "e",
+            (6,): "\u0301",
+            (7,): "かな",
+            (8,): "停",
+            (9,): "止",
+            (10,): "后",
+            (11,): "\ufffd",
+            (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11): "你好🌞e\u0301かな停止后\ufffd",
+        }
+
+        def decode(self, token_ids: list[int], *, skip_special_tokens: bool = False) -> str:
+            return self.mapping[tuple(token_ids)]
+
+    token_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    stop_strings = ["停止"]
+    tokenizer = DummyTokenizer()
+    assembler = IncrementalTextAssembler(tokenizer=tokenizer, stop_strings=stop_strings)
+    outputs: list[str] = []
+
+    for token_id in token_ids:
+        delta, stopped = assembler.feed_token(token_id)
+        if delta:
+            outputs.append(delta)
+        if stopped:
+            break
+
+    tail, stopped = assembler.flush()
+    if tail:
+        outputs.append(tail)
+
+    one_shot = strip_unstable_replacement_suffix(tokenizer.decode(token_ids, skip_special_tokens=False))
+    for stop_string in stop_strings:
+        stop_index = one_shot.find(stop_string)
+        if stop_index != -1:
+            one_shot = one_shot[:stop_index]
+            break
+
+    streamed = "".join(outputs)
+    assert stopped is True
+    assert streamed == one_shot
+    assert "\ufffd" not in streamed
+
+
+def test_incremental_text_assembler_random_token_splits_do_not_emit_replacement_suffix() -> None:
+    class DummyTokenizer:
+        pieces = {
+            1: "你",
+            2: "好",
+            5: "e",
+            6: "\u0301",
+            7: "かな",
+            8: "停",
+            9: "止",
+            10: "。",
+        }
+
+        def decode(self, token_ids: list[int], *, skip_special_tokens: bool = False) -> str:
+            parts: list[str] = []
+            idx = 0
+            while idx < len(token_ids):
+                token_id = token_ids[idx]
+                if token_id == 3:
+                    if idx + 1 < len(token_ids) and token_ids[idx + 1] == 4:
+                        parts.append("🌞")
+                        idx += 2
+                        continue
+                    parts.append("\ufffd")
+                    idx += 1
+                    continue
+                parts.append(self.pieces[token_id])
+                idx += 1
+            return "".join(parts)
+
+    rng = random.Random(20260531)
+    groups = ([1], [2], [3, 4], [5], [6], [7], [8], [9], [10])
+    token_ids: list[int] = []
+    for _ in range(128):
+        token_ids.extend(rng.choice(groups))
+    token_ids.append(3)
+
+    tokenizer = DummyTokenizer()
+    assembler = IncrementalTextAssembler(tokenizer=tokenizer, stop_strings=[])
+    outputs: list[str] = []
+    for token_id in token_ids:
+        delta, stopped = assembler.feed_token(token_id)
+        assert stopped is False
+        if delta:
+            outputs.append(delta)
+            assert "\ufffd" not in delta
+
+    tail, stopped = assembler.flush()
+    assert stopped is False
+    if tail:
+        outputs.append(tail)
+
+    streamed = "".join(outputs)
+    one_shot = strip_unstable_replacement_suffix(tokenizer.decode(token_ids, skip_special_tokens=False))
+    assert streamed == one_shot
+    assert "\ufffd" not in streamed

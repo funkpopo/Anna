@@ -6,6 +6,7 @@ from typing import Any, Sequence
 import torch
 
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
+from anna.sampling.params import SamplingBatchParams
 from anna.runtime.paged_kv import PagedKVManager
 from anna.runtime.slot_scheduler import DecodeBatchPlan, SequenceSlot, SlotScheduler
 
@@ -32,6 +33,7 @@ class SlotDecodeModelInputs:
     seq_lens: torch.Tensor
     block_tables: torch.Tensor
     sampling_params: tuple[Any | None, ...]
+    sampling_batch_params: SamplingBatchParams
 
     @classmethod
     def from_plan(cls, plan: DecodeBatchPlan) -> "SlotDecodeModelInputs":
@@ -44,6 +46,7 @@ class SlotDecodeModelInputs:
             seq_lens=plan.seq_lens,
             block_tables=plan.block_tables,
             sampling_params=plan.sampling_params,
+            sampling_batch_params=plan.sampling_batch_params,
         )
 
 
@@ -138,6 +141,9 @@ class SlotModelRunner:
             max_new_tokens=max_new_tokens,
             sampling_params=sampling_params,
         )
+
+    def advance_prefill(self, request_id: str, *, token_count: int) -> SequenceSlot:
+        return self.scheduler.advance_prefill(request_id, token_count=token_count)
 
     def mark_prefilled(self, request_id: str, *, next_input_id: int) -> SequenceSlot:
         return self.scheduler.mark_prefilled(request_id, next_input_id=next_input_id)

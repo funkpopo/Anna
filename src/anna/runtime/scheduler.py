@@ -12,7 +12,13 @@ import torch
 from anna.mm.prepared_inputs import PreparedInputsLike
 from anna.runtime.streaming import IncrementalTextAssembler
 from anna.runtime.token_staging import stage_token_ids_to_host
-from anna.sampling.sampler import sample_next_token, sample_next_token_batch_from_candidates, sample_next_token_from_candidates
+from anna.sampling.params import SamplingBatchParams
+from anna.sampling.sampler import (
+    sample_next_token,
+    sample_next_token_batch_from_candidates_with_params,
+    sample_next_token_batch_with_params,
+    sample_next_token_from_candidates,
+)
 
 if TYPE_CHECKING:
     from anna.runtime.qwen3_5_text_engine import (
@@ -32,6 +38,8 @@ class SchedulerRequest:
     prepared: PreparedInputsLike
     config: "GenerationConfig"
     stream: bool
+    request_id: str = ""
+    slot_request_id: str | None = None
     prompt_ids: list[int] = field(default_factory=list)
     prompt_length: int = 0
     completion_ids: list[int] = field(default_factory=list)
@@ -74,6 +82,8 @@ class AnnaScheduler:
         self.batch_wait_seconds = max(0.0, batch_wait_ms) / 1000.0
         self.prefill_interval_steps = max(1, int(prefill_interval_steps))
         self._decode_steps_since_prefill = 0
+        self._next_request_index = 0
+        self._last_slot_decode_inputs = None
         self._pending: deque[SchedulerRequest] = deque()
         self._condition = threading.Condition()
         self._stop = False
@@ -135,6 +145,8 @@ class AnnaScheduler:
         if metrics is not None:
             metrics.record_request_submitted(waiting=True)
         with self._condition:
+            request.request_id = f"scheduler-{self._next_request_index}"
+            self._next_request_index += 1
             self._pending.append(request)
             self._condition.notify()
         return request
@@ -261,6 +273,7 @@ class AnnaScheduler:
                 tokenizer=self.engine.tokenizer,
                 stop_strings=request.config.stop_strings,
             )
+            self._admit_request_slot(request)
 
         active: list[SchedulerRequest] = []
         groups: dict[int, list[SchedulerRequest]] = defaultdict(list)
@@ -359,6 +372,7 @@ class AnnaScheduler:
         if metrics is not None:
             metrics.record_prefill_step(time.perf_counter() - started_at)
         group.past_key_values = outputs.past_key_values
+        self._advance_request_slots_after_prefill_chunk(requests, token_count=end_idx - start_idx)
         if metrics is not None:
             chunk_tokens = max(0, end_idx - start_idx) * len(requests)
             if chunk_tokens > 0:
@@ -371,7 +385,9 @@ class AnnaScheduler:
         total_prompt_tokens = sum(request.prompt_length for request in requests)
         if metrics is not None and group.prompt_tokens_recorded < total_prompt_tokens:
             metrics.record_prompt_tokens(total_prompt_tokens - group.prompt_tokens_recorded)
-        if outputs.past_key_values is not None:
+        if outputs.past_key_values is not None and len(requests) == 1:
+            split_caches = [outputs.past_key_values]
+        elif outputs.past_key_values is not None:
             split_started_at = time.perf_counter()
             split_caches = outputs.past_key_values.split_batch()
             if metrics is not None:
@@ -421,6 +437,7 @@ class AnnaScheduler:
                 self._finish_request(request, finish_reason="length")
                 continue
 
+            self._mark_request_slot_prefilled(request, next_input_id=token_id)
             request.input_ids = next_token.view(1, 1)
             active.append(request)
         return active
@@ -433,19 +450,23 @@ class AnnaScheduler:
         if not requests:
             return []
         input_ids = torch.cat([request.input_ids for request in requests if request.input_ids is not None], dim=0)
+        self._build_slot_decode_inputs(requests)
         caches = [request.past_key_values for request in requests if request.past_key_values is not None]
         if not caches:
             raise RuntimeError("Scheduler decode batch is missing cache state.")
-        cache_type = type(caches[0])
-        stack = getattr(cache_type, "stack", None)
-        if not callable(stack):
-            raise RuntimeError(f"Cache type {cache_type.__name__} does not support scheduler batching.")
         metrics = getattr(self.engine, "metrics", None)
-        stack_started_at = time.perf_counter()
-        stack_kwargs = {"clone_turboquant_rows": False} if cache_type.__name__ == "Qwen3DynamicCache" else {}
-        batch_cache = stack(caches, self.engine.config.text_config, **stack_kwargs)
-        if metrics is not None:
-            metrics.record_cache_stack(time.perf_counter() - stack_started_at)
+        if len(caches) == 1:
+            batch_cache = caches[0]
+        else:
+            cache_type = type(caches[0])
+            stack = getattr(cache_type, "stack", None)
+            if not callable(stack):
+                raise RuntimeError(f"Cache type {cache_type.__name__} does not support scheduler batching.")
+            stack_started_at = time.perf_counter()
+            stack_kwargs = {"clone_turboquant_rows": False} if cache_type.__name__ == "Qwen3DynamicCache" else {}
+            batch_cache = stack(caches, self.engine.config.text_config, **stack_kwargs)
+            if metrics is not None:
+                metrics.record_cache_stack(time.perf_counter() - stack_started_at)
 
         try:
             started_at = time.perf_counter()
@@ -462,7 +483,9 @@ class AnnaScheduler:
         if metrics is not None:
             metrics.record_decode_step(time.perf_counter() - started_at)
 
-        if outputs.past_key_values is not None:
+        if outputs.past_key_values is not None and len(requests) == 1:
+            split_caches = [outputs.past_key_values]
+        elif outputs.past_key_values is not None:
             split_started_at = time.perf_counter()
             split_kwargs = (
                 {"clone_turboquant_rows": False}
@@ -494,6 +517,7 @@ class AnnaScheduler:
             if request.first_token_at is None:
                 request.first_token_at = time.perf_counter()
             if token_id in stop_token_ids:
+                self._advance_request_slot_after_decode(request, finished=True)
                 self._finish_request(request, finish_reason="stop")
                 continue
 
@@ -510,13 +534,16 @@ class AnnaScheduler:
             if delta:
                 self._emit_text(request, delta)
             if hit_stop:
+                self._advance_request_slot_after_decode(request, finished=True)
                 self._finish_request(request, finish_reason="stop")
                 continue
 
             if len(request.completion_ids) >= request.config.max_new_tokens:
+                self._advance_request_slot_after_decode(request, finished=True)
                 self._finish_request(request, finish_reason="length")
                 continue
 
+            self._advance_request_slot_after_decode(request, next_input_id=token_id)
             request.input_ids = next_token.view(1, 1)
             next_active.append(request)
         return next_active
@@ -587,43 +614,23 @@ class AnnaScheduler:
         )
 
     def _sample_next_tokens_from_outputs(self, outputs, *, requests: list[SchedulerRequest]) -> list[torch.Tensor]:
-        if (
-            hasattr(outputs, "candidate_logits")
-            and hasattr(outputs, "candidate_token_ids")
-            and self._shared_candidate_sampling_params(requests) is not None
-        ):
-            temperature, top_p, min_p = self._shared_candidate_sampling_params(requests)
-            tokens = sample_next_token_batch_from_candidates(
+        sampling_params = SamplingBatchParams.from_sampling_params(
+            tuple(request.config for request in requests),
+            device=self.engine.device_context.device,
+        )
+        if hasattr(outputs, "candidate_logits") and hasattr(outputs, "candidate_token_ids"):
+            tokens = sample_next_token_batch_from_candidates_with_params(
                 outputs.candidate_logits[: len(requests), -1],
                 outputs.candidate_token_ids[: len(requests), -1],
-                temperature=temperature,
-                top_p=top_p,
-                min_p=min_p,
+                sampling_params,
             ).reshape(-1)
             return [tokens[row_idx] for row_idx in range(len(requests))]
-        return [
-            self._sample_next_token_from_outputs(outputs, row_idx=row_idx, request=request)
-            for row_idx, request in enumerate(requests)
-        ]
-
-    @staticmethod
-    def _shared_candidate_sampling_params(requests: list[SchedulerRequest]) -> tuple[float, float, float] | None:
-        if not requests:
-            return None
-        first = (
-            float(requests[0].config.temperature),
-            float(requests[0].config.top_p),
-            float(requests[0].config.min_p),
+        tokens = sample_next_token_batch_with_params(
+            outputs.logits[: len(requests), -1],
+            sampling_params,
+            generated_ids_batch=tuple(request.repetition_history for request in requests),
         )
-        for request in requests[1:]:
-            candidate = (
-                float(request.config.temperature),
-                float(request.config.top_p),
-                float(request.config.min_p),
-            )
-            if candidate != first:
-                return None
-        return first
+        return [tokens.reshape(-1)[row_idx] for row_idx in range(len(requests))]
 
     def _batch_text_inputs(self, requests: list[SchedulerRequest]) -> PreparedInputsLike:
         max_prompt_length = max(request.prompt_length for request in requests)
@@ -704,9 +711,7 @@ class AnnaScheduler:
             tail, _ = request.assembler.flush()
             if tail:
                 self._emit_text(request, tail)
-        if request.past_key_values is not None:
-            request.past_key_values.release()
-            request.past_key_values = None
+        self._release_request_cache(request, finish_slot=True)
 
         perf = self._build_perf_stats(request)
         if request.stream:
@@ -742,10 +747,97 @@ class AnnaScheduler:
             metrics.record_request_finished(success=True)
         self.engine._trim_runtime_cache_if_idle()
 
-    def _release_request_cache(self, request: SchedulerRequest) -> None:
+    def _release_request_cache(self, request: SchedulerRequest, *, finish_slot: bool = False) -> None:
         if request.past_key_values is not None:
             request.past_key_values.release()
             request.past_key_values = None
+        if finish_slot:
+            self._finish_request_slot(request)
+        else:
+            self._release_request_slot(request)
+
+    def _slot_model_runner(self):
+        return getattr(self.engine, "slot_model_runner", None)
+
+    def _admit_request_slot(self, request: SchedulerRequest) -> None:
+        runner = self._slot_model_runner()
+        if runner is None or request.slot_request_id is not None:
+            return
+        slot_request_id = request.request_id or f"scheduler-request-{id(request)}"
+        runner.admit_prefill(
+            slot_request_id,
+            prompt_length=request.prompt_length,
+            max_new_tokens=request.config.max_new_tokens,
+            sampling_params=request.config,
+        )
+        request.slot_request_id = slot_request_id
+
+    def _mark_request_slot_prefilled(self, request: SchedulerRequest, *, next_input_id: int) -> None:
+        runner = self._slot_model_runner()
+        if runner is None or request.slot_request_id is None:
+            return
+        runner.mark_prefilled(request.slot_request_id, next_input_id=next_input_id)
+
+    def _advance_request_slots_after_prefill_chunk(
+        self,
+        requests: list[SchedulerRequest],
+        *,
+        token_count: int,
+    ) -> None:
+        runner = self._slot_model_runner()
+        if runner is None or token_count <= 0:
+            return
+        for request in requests:
+            if request.slot_request_id is None:
+                continue
+            runner.advance_prefill(request.slot_request_id, token_count=token_count)
+
+    def _build_slot_decode_inputs(self, requests: list[SchedulerRequest]) -> None:
+        runner = self._slot_model_runner()
+        if runner is None:
+            return
+        request_ids = [request.slot_request_id for request in requests]
+        if any(request_id is None for request_id in request_ids):
+            raise RuntimeError("Experimental slot runner is missing slot ids for a decode batch.")
+        started_at = time.perf_counter()
+        self._last_slot_decode_inputs = runner.build_decode_inputs(request_ids=[str(request_id) for request_id in request_ids])
+        metrics = getattr(self.engine, "metrics", None)
+        if metrics is not None:
+            metrics.record_slot_decode_plan(time.perf_counter() - started_at)
+
+    def _advance_request_slot_after_decode(
+        self,
+        request: SchedulerRequest,
+        *,
+        next_input_id: int | None = None,
+        finished: bool = False,
+    ) -> None:
+        runner = self._slot_model_runner()
+        if runner is None or request.slot_request_id is None:
+            return
+        runner.advance_decode(request.slot_request_id, next_input_id=next_input_id, finished=finished)
+        if finished:
+            request.slot_request_id = None
+
+    def _release_request_slot(self, request: SchedulerRequest) -> None:
+        runner = self._slot_model_runner()
+        if runner is None or request.slot_request_id is None:
+            return
+        try:
+            runner.cancel(request.slot_request_id)
+        except (KeyError, ValueError):
+            pass
+        request.slot_request_id = None
+
+    def _finish_request_slot(self, request: SchedulerRequest) -> None:
+        runner = self._slot_model_runner()
+        if runner is None or request.slot_request_id is None:
+            return
+        try:
+            runner.finish(request.slot_request_id)
+        except (KeyError, ValueError):
+            pass
+        request.slot_request_id = None
 
     def _drop_cancelled_request(self, request: SchedulerRequest) -> bool:
         if not self._is_request_cancelled(request):

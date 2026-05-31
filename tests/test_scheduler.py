@@ -274,6 +274,55 @@ def test_scheduler_batches_same_length_requests() -> None:
         scheduler.shutdown()
 
 
+def test_scheduler_single_request_decode_avoids_cache_stack_split_metrics() -> None:
+    config = Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            vocab_size=16,
+            eos_token_id=9,
+            pad_token_id=0,
+            cache_block_size=2,
+            layer_types=["full_attention"],
+        )
+    )
+    fake_model = _FakeModel(config)
+    engine = AnnaQwen3_5TextEngine(
+        model=fake_model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="fake",
+        device_context=_FakeDeviceContext(),
+    )
+    scheduler = AnnaScheduler(engine, max_batch_size=4, batch_wait_ms=0.0)
+    engine.set_scheduler(scheduler)
+
+    try:
+        request = scheduler._submit(
+            _prepared([4, 5]),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            stream=False,
+        )
+
+        assert request.done.wait(timeout=2.0)
+        assert request.error is None
+        assert fake_model.text_prefill_batch_sizes == [1]
+        assert fake_model.text_decode_batch_sizes == [1]
+        snapshot = engine.service_metrics_snapshot()
+        assert snapshot.cache_stack_count == 0
+        assert snapshot.cache_split_count == 0
+    finally:
+        scheduler.shutdown()
+
+
 def test_scheduler_chunks_long_same_length_prefills() -> None:
     config = Qwen3_5TextModelConfig(
         text_config=Qwen3_5TextConfig(
@@ -325,6 +374,88 @@ def test_scheduler_chunks_long_same_length_prefills() -> None:
         assert fake_model.text_prefill_batch_sizes == [2, 2]
         assert fake_model.text_prefill_chunk_lengths == [2, 2]
         assert fake_model.text_decode_batch_sizes == [2]
+    finally:
+        scheduler.shutdown()
+
+
+def test_scheduler_advances_slot_metadata_for_chunked_prefill() -> None:
+    config = Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            vocab_size=16,
+            eos_token_id=9,
+            pad_token_id=0,
+            max_position_embeddings=16,
+            cache_block_size=2,
+            layer_types=["full_attention"],
+        )
+    )
+    fake_model = _FakeModel(config)
+    engine = AnnaQwen3_5TextEngine(
+        model=fake_model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="fake",
+        device_context=_FakeDeviceContext(),
+        optimization_config=EngineOptimizationConfig(
+            prefill_chunk_size=2,
+            slot_runner_enabled=True,
+            slot_runner_max_slots=2,
+            slot_runner_total_blocks=8,
+            slot_runner_max_blocks_per_seq=4,
+            slot_runner_max_batch_size=2,
+        ),
+    )
+    scheduler = AnnaScheduler(engine, max_batch_size=2, batch_wait_ms=20.0)
+    engine.set_scheduler(scheduler)
+
+    assert engine.slot_model_runner is not None
+    original_advance_prefill = engine.slot_model_runner.advance_prefill
+    prefill_updates: list[tuple[str, int, int, int, tuple[int, ...]]] = []
+
+    def _record_advance_prefill(request_id: str, *, token_count: int):
+        slot = original_advance_prefill(request_id, token_count=token_count)
+        assert engine.slot_model_runner is not None
+        blocks = engine.slot_model_runner.kv_manager.slot_blocks(slot.slot_id, slot.epoch)
+        prefill_updates.append((request_id, token_count, slot.prefilled_tokens, slot.seq_len, blocks))
+        return slot
+
+    engine.slot_model_runner.advance_prefill = _record_advance_prefill
+
+    try:
+        request_a = scheduler._submit(
+            _prepared([4, 5, 6, 7]),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            stream=False,
+        )
+        request_b = scheduler._submit(
+            _prepared([8, 10, 11, 12]),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            stream=False,
+        )
+
+        assert request_a.done.wait(timeout=2.0)
+        assert request_b.done.wait(timeout=2.0)
+        assert request_a.error is None
+        assert request_b.error is None
+
+        assert [(request_id, token_count, prefilled, seq_len) for request_id, token_count, prefilled, seq_len, _ in prefill_updates] == [
+            ("scheduler-0", 2, 2, 2),
+            ("scheduler-1", 2, 2, 2),
+            ("scheduler-0", 2, 4, 4),
+            ("scheduler-1", 2, 4, 4),
+        ]
+        assert [len(blocks) for *_, blocks in prefill_updates] == [1, 1, 2, 2]
+        assert fake_model.text_prefill_chunk_lengths == [2, 2]
     finally:
         scheduler.shutdown()
 
@@ -444,6 +575,80 @@ def test_scheduler_uses_topk_forward_for_eligible_batches() -> None:
         assert fake_model.text_decode_topk_batch_sizes == [2]
         assert fake_model.text_prefill_batch_sizes == []
         assert fake_model.text_decode_batch_sizes == []
+    finally:
+        scheduler.shutdown()
+
+
+def test_scheduler_populates_experimental_slot_decode_inputs() -> None:
+    config = Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            vocab_size=16,
+            eos_token_id=9,
+            pad_token_id=0,
+            max_position_embeddings=16,
+            cache_block_size=2,
+            layer_types=["full_attention"],
+        )
+    )
+    fake_model = _FakeModel(config)
+    engine = AnnaQwen3_5TextEngine(
+        model=fake_model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="fake",
+        device_context=_FakeDeviceContext(),
+        optimization_config=EngineOptimizationConfig(
+            slot_runner_enabled=True,
+            slot_runner_max_slots=2,
+            slot_runner_total_blocks=8,
+            slot_runner_max_blocks_per_seq=4,
+            slot_runner_max_batch_size=2,
+        ),
+    )
+    scheduler = AnnaScheduler(engine, max_batch_size=2, batch_wait_ms=20.0)
+    engine.set_scheduler(scheduler)
+
+    try:
+        request_a = scheduler._submit(
+            _prepared([4, 5]),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            stream=False,
+        )
+        request_b = scheduler._submit(
+            _prepared([6, 7]),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            stream=False,
+        )
+
+        assert request_a.done.wait(timeout=2.0)
+        assert request_b.done.wait(timeout=2.0)
+        assert request_a.error is None
+        assert request_b.error is None
+
+        slot_inputs = scheduler._last_slot_decode_inputs
+        assert slot_inputs is not None
+        assert slot_inputs.request_ids == ("scheduler-0", "scheduler-1")
+        assert slot_inputs.input_ids.tolist() == [[1], [2]]
+        assert slot_inputs.positions.tolist() == [2, 2]
+        assert slot_inputs.seq_lens.tolist() == [2, 2]
+        assert slot_inputs.block_tables.shape == (2, 4)
+
+        snapshot = engine.service_metrics_snapshot()
+        assert snapshot.slot_decode_plan_count == 1
+        assert snapshot.slot_decode_plan_seconds_total >= 0.0
+        assert engine.slot_model_runner is not None
+        assert engine.slot_model_runner.active_count == 0
+        assert engine.slot_model_runner.kv_manager.free_slot_count == 2
     finally:
         scheduler.shutdown()
 
