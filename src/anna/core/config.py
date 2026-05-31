@@ -36,6 +36,11 @@ class ServeSettings:
     kv_cache_quantization: str = "none"
     kv_cache_quant_bits: int = 4
     kv_cache_residual_len: int = 128
+    slot_runner_enabled: bool = False
+    slot_runner_max_slots: int = 0
+    slot_runner_total_blocks: int = 0
+    slot_runner_max_blocks_per_seq: int = 0
+    slot_runner_max_batch_size: int = 0
     default_max_completion_tokens: int | None = None
     default_temperature: float | None = None
     default_top_p: float | None = None

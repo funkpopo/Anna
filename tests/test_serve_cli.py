@@ -86,6 +86,15 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "4",
             "--scheduler-prefill-interval-steps",
             "3",
+            "--experimental-slot-runner",
+            "--slot-runner-max-slots",
+            "8",
+            "--slot-runner-total-blocks",
+            "256",
+            "--slot-runner-max-blocks-per-seq",
+            "64",
+            "--slot-runner-max-batch-size",
+            "4",
             "--metrics-log-interval-seconds",
             "3.5",
         ]
@@ -115,6 +124,11 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.warmup_decode_steps == 8
     assert args.warmup_batch_size == 4
     assert args.scheduler_prefill_interval_steps == 3
+    assert args.slot_runner_enabled is True
+    assert args.slot_runner_max_slots == 8
+    assert args.slot_runner_total_blocks == 256
+    assert args.slot_runner_max_blocks_per_seq == 64
+    assert args.slot_runner_max_batch_size == 4
     assert args.metrics_log_interval_seconds == 3.5
 
 
@@ -174,6 +188,11 @@ def test_serve_parser_defaults_to_direct_generation() -> None:
 
     assert args.scheduler_max_batch_size == 1
     assert args.scheduler_prefill_interval_steps == 1
+    assert args.slot_runner_enabled is False
+    assert args.slot_runner_max_slots == 0
+    assert args.slot_runner_total_blocks == 0
+    assert args.slot_runner_max_blocks_per_seq == 0
+    assert args.slot_runner_max_batch_size == 0
     assert args.metrics_log_interval_seconds == 10.0
 
 

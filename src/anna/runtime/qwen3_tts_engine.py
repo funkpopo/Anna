@@ -86,6 +86,14 @@ class AnnaQwen3TTSEngine:
         prompt_cache_size: int = 0,
         prompt_cache_max_tokens: int = 0,
         profile_runtime: bool = False,
+        kv_cache_quantization: str = "none",
+        kv_cache_quant_bits: int = 4,
+        kv_cache_residual_len: int = 128,
+        slot_runner_enabled: bool = False,
+        slot_runner_max_slots: int = 0,
+        slot_runner_total_blocks: int = 0,
+        slot_runner_max_blocks_per_seq: int = 0,
+        slot_runner_max_batch_size: int = 0,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
         default_temperature: float | None = None,
@@ -140,6 +148,22 @@ class AnnaQwen3TTSEngine:
             ignored_options.append(f"prompt_cache_max_tokens={prompt_cache_max_tokens}")
         if profile_runtime:
             ignored_options.append("profile_runtime=True")
+        if kv_cache_quantization != "none":
+            ignored_options.append(f"kv_cache_quantization={kv_cache_quantization}")
+        if kv_cache_quant_bits != 4:
+            ignored_options.append(f"kv_cache_quant_bits={kv_cache_quant_bits}")
+        if kv_cache_residual_len != 128:
+            ignored_options.append(f"kv_cache_residual_len={kv_cache_residual_len}")
+        if slot_runner_enabled:
+            ignored_options.append("slot_runner_enabled=True")
+        if slot_runner_max_slots:
+            ignored_options.append(f"slot_runner_max_slots={slot_runner_max_slots}")
+        if slot_runner_total_blocks:
+            ignored_options.append(f"slot_runner_total_blocks={slot_runner_total_blocks}")
+        if slot_runner_max_blocks_per_seq:
+            ignored_options.append(f"slot_runner_max_blocks_per_seq={slot_runner_max_blocks_per_seq}")
+        if slot_runner_max_batch_size:
+            ignored_options.append(f"slot_runner_max_batch_size={slot_runner_max_batch_size}")
         if offload_mode != "auto":
             ignored_options.append(f"offload_mode={offload_mode}")
         if offload_vision:

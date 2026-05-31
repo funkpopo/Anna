@@ -168,6 +168,11 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         kv_cache_quantization: str = "none",
         kv_cache_quant_bits: int = 4,
         kv_cache_residual_len: int = 128,
+        slot_runner_enabled: bool = False,
+        slot_runner_max_slots: int = 0,
+        slot_runner_total_blocks: int = 0,
+        slot_runner_max_blocks_per_seq: int = 0,
+        slot_runner_max_batch_size: int = 0,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
         default_temperature: float | None = None,
@@ -198,6 +203,22 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             raise ValueError("Gemma4 text runtime does not use resident expert layers.")
         if cached_experts_per_layer not in {None, 0}:
             raise ValueError("Gemma4 text runtime does not use expert caching.")
+        ignored_slot_runner_options: list[str] = []
+        if slot_runner_enabled:
+            ignored_slot_runner_options.append("slot_runner_enabled=True")
+        if slot_runner_max_slots:
+            ignored_slot_runner_options.append(f"slot_runner_max_slots={slot_runner_max_slots}")
+        if slot_runner_total_blocks:
+            ignored_slot_runner_options.append(f"slot_runner_total_blocks={slot_runner_total_blocks}")
+        if slot_runner_max_blocks_per_seq:
+            ignored_slot_runner_options.append(f"slot_runner_max_blocks_per_seq={slot_runner_max_blocks_per_seq}")
+        if slot_runner_max_batch_size:
+            ignored_slot_runner_options.append(f"slot_runner_max_batch_size={slot_runner_max_batch_size}")
+        if ignored_slot_runner_options:
+            logger.info(
+                "Ignoring Qwen3.5 slot-runner options for Gemma4 model load: %s",
+                ", ".join(ignored_slot_runner_options),
+            )
 
         model_path = Path(model_dir)
         config = load_gemma4_text_model_config(model_path)

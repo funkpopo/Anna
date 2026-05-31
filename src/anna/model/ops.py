@@ -35,9 +35,37 @@ from anna.model.fused_ops import (
 )
 from anna.model.quantization import AWQLinear, AutoRoundGPTQLinear, XPUInt4Linear, convert_module_linears_to_xpu_int4
 from anna.model.xpu_decode_profile import xpu_profile_region
+from anna.core.hotpath_events import (
+    record_attention_fallback,
+    record_moe_host_offset,
+    record_paged_cache_materialization,
+)
 
 logger = logging.getLogger(__name__)
 _LOGGED_FLASHQLA_GDN_PREFILL = False
+_XPU_PAGED_KV_ALLOW_MATERIALIZE_ENV = "ANNA_XPU_PAGED_KV_ALLOW_MATERIALIZE_FALLBACK"
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _xpu_paged_kv_materialize_fallback_allowed() -> bool:
+    return _env_flag_enabled(_XPU_PAGED_KV_ALLOW_MATERIALIZE_ENV)
+
+
+def _raise_if_xpu_paged_kv_materialization_disallowed(
+    device_type: str | None,
+    *,
+    reason: str,
+) -> None:
+    if device_type != "xpu" or _xpu_paged_kv_materialize_fallback_allowed():
+        return
+    raise RuntimeError(
+        "XPU paged KV materialization fallback is disabled by default because it turns the decode hot path "
+        "back into dense KV cache processing. Use the paged/TurboQuant decode attention path, or set "
+        f"{_XPU_PAGED_KV_ALLOW_MATERIALIZE_ENV}=1 only for debug validation. Reason: {reason}."
+    )
 
 
 def _compiler_disable(fn: Callable[..., object]) -> Callable[..., object]:
@@ -439,6 +467,27 @@ class Qwen3DynamicCache:
             return False
         return self.allocator.uses_contiguous_full_attention_mirror(layer_idx)
 
+    def _xpu_materialization_device_type(self, layer_idx: int) -> str | None:
+        if self.uses_turboquant_for_layer(layer_idx):
+            for row in self.turboquant_rows[layer_idx]:
+                device = None if row is None else row.device
+                if device is not None:
+                    return device.type
+            return None
+
+        layer = self.allocator.layers[layer_idx]
+        if layer.key_pages is not None:
+            return layer.key_pages.device.type
+        if layer.value_pages is not None:
+            return layer.value_pages.device.type
+        return None
+
+    def _raise_if_xpu_materialization_disallowed(self, layer_idx: int, *, reason: str) -> None:
+        _raise_if_xpu_paged_kv_materialization_disallowed(
+            self._xpu_materialization_device_type(layer_idx),
+            reason=reason,
+        )
+
     @staticmethod
     def _pad_cache_rows(rows: list[torch.Tensor], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if not rows:
@@ -636,10 +685,14 @@ class Qwen3DynamicCache:
                     bits=self.kv_cache_quant_bits,
                     residual_len=self.kv_cache_residual_len,
                 )
-                self.turboquant_rows[layer_idx][batch_idx] = row
+            self.turboquant_rows[layer_idx][batch_idx] = row
             row.append(key_states[batch_idx], value_states[batch_idx])
             self.layer_lengths[layer_idx][batch_idx] = row.length
             if require_dense_cache:
+                self._raise_if_xpu_materialization_disallowed(
+                    layer_idx,
+                    reason="turboquant_update_require_dense_cache",
+                )
                 row_key, row_value = row.materialize(
                     device=key_states.device,
                     dtype=key_states.dtype,
@@ -929,6 +982,7 @@ class Qwen3DynamicCache:
         return layer.key_pages, layer.value_pages, page_table, visible_lengths
 
     def _gather_layer_cache(self, layer_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+        record_paged_cache_materialization("qwen3_dynamic_cache_gather_layer_cache")
         if self.uses_turboquant_for_layer(layer_idx):
             batch_size = self.get_batch_size()
             if batch_size == 0:
@@ -938,6 +992,10 @@ class Qwen3DynamicCache:
             max_length = max(self.layer_lengths[layer_idx], default=0)
             if max_length <= 0:
                 return None, None, visible_lengths
+            self._raise_if_xpu_materialization_disallowed(
+                layer_idx,
+                reason="turboquant_gather_layer_cache",
+            )
             materialized_keys: list[torch.Tensor] = []
             materialized_values: list[torch.Tensor] = []
             key_device: torch.device | None = None
@@ -986,6 +1044,10 @@ class Qwen3DynamicCache:
         if layer.key_pages is None or layer.value_pages is None:
             return None, None, visible_lengths
 
+        self._raise_if_xpu_materialization_disallowed(
+            layer_idx,
+            reason="paged_gather_layer_cache",
+        )
         key_batch = layer.key_pages.new_zeros(
             (batch_size, layer.key_pages.shape[1], max_length, layer.key_pages.shape[3])
         )
@@ -1533,6 +1595,59 @@ def paged_kv_single_token_decode_attention(
     )
 
 
+def paged_kv_slot_batch_decode_attention(
+    query_states: torch.Tensor,
+    key_pages: torch.Tensor,
+    value_pages: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    scaling: float,
+    slot_ids: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Paged GQA decode entry point for slot-based scheduler metadata.
+
+    ``block_tables`` and ``seq_lens`` may be either already selected for the
+    decode batch or global slot-indexed tensors. When global tensors are passed,
+    ``slot_ids`` selects the active batch rows before invoking the existing
+    paged fused op wrapper.
+    """
+    if query_states.ndim != 4 or query_states.shape[2] != 1:
+        raise RuntimeError("slot-based paged GQA decode expects query shape [batch, heads, 1, head_dim].")
+    if block_tables.ndim != 2:
+        raise RuntimeError("slot-based paged GQA decode expects block_tables shape [slots_or_batch, max_blocks].")
+    if seq_lens.ndim != 1:
+        raise RuntimeError("slot-based paged GQA decode expects seq_lens shape [slots_or_batch].")
+
+    batch_size = query_states.shape[0]
+    selected_block_tables = block_tables
+    selected_seq_lens = seq_lens
+    if block_tables.shape[0] != batch_size or seq_lens.shape[0] != batch_size:
+        if slot_ids is None:
+            raise RuntimeError("slot_ids are required when block_tables or seq_lens are global tensors.")
+        if slot_ids.ndim != 1 or slot_ids.shape[0] != batch_size:
+            raise RuntimeError("slot_ids must be a 1D tensor with one entry per decode batch row.")
+        index = slot_ids.to(device=block_tables.device, dtype=torch.long)
+        selected_block_tables = block_tables.index_select(0, index)
+        selected_seq_lens = seq_lens.index_select(0, index.to(device=seq_lens.device))
+
+    if selected_block_tables.shape[0] != batch_size:
+        raise RuntimeError("selected block table row count must match decode batch size.")
+    if selected_seq_lens.shape[0] != batch_size:
+        raise RuntimeError("selected seq_lens length must match decode batch size.")
+
+    return paged_kv_single_token_decode_attention(
+        query_states,
+        key_pages,
+        value_pages,
+        selected_block_tables,
+        scaling=scaling,
+        visible_lengths=selected_seq_lens,
+        gate=gate,
+    )
+
+
 def _reshape_decode_gate_to_query_layout(
     gate: torch.Tensor,
     *,
@@ -1903,6 +2018,7 @@ class Qwen3Attention(nn.Module):
                 return self.o_proj(attn_output)
             # Multi-token decode and masked full-attention stay on the explicit grouped path.
             if not (batch_size == 1 and seq_len == 1 and attention_mask is None and past_key_values is not None):
+                record_attention_fallback("qwen3_grouped_attention_path")
                 visible_lengths = past_lengths + seq_len
 
                 causal_mask = self._causal_mask(seq_len, key_states.shape[-2], past_lengths, hidden_states.device)
@@ -3433,6 +3549,8 @@ class Qwen3SparseMoeBlock(nn.Module):
             )
             compact_outputs = hidden_states.new_empty((compact_hidden_states.shape[0], hidden_dim))
             expert_offsets_host = expert_offsets.to(device="cpu") if expert_offsets.device.type == "xpu" else expert_offsets
+            if expert_offsets.device.type == "xpu":
+                record_moe_host_offset("qwen3_moe_expert_offsets_cpu")
             if self.offload_experts and hit_expert_list:
                 self._execute_offloaded_experts(
                     hit_experts=hit_expert_list,
@@ -3445,6 +3563,8 @@ class Qwen3SparseMoeBlock(nn.Module):
                     hidden_dtype=hidden_states.dtype,
                 )
             else:
+                if expert_offsets_host.device.type == "cpu":
+                    record_moe_host_offset("qwen3_moe_expert_offsets_numpy")
                 offsets_np = expert_offsets_host.detach().numpy()
                 for expert_idx in hit_expert_list:
                     start_idx = int(offsets_np[expert_idx])

@@ -267,6 +267,7 @@ def test_scheduler_batches_same_length_requests() -> None:
         assert snapshot.requests_failed_total == 0
         assert snapshot.prompt_tokens_total == 4
         assert snapshot.generation_tokens_total == 2
+        assert snapshot.cpu_sync_count == 2
         assert snapshot.running_requests == 0
         assert snapshot.waiting_requests == 0
     finally:
@@ -385,6 +386,7 @@ def test_scheduler_batches_mixed_length_requests_during_decode() -> None:
         assert snapshot.requests_failed_total == 0
         assert snapshot.prompt_tokens_total == 5
         assert snapshot.generation_tokens_total == 2
+        assert snapshot.cpu_sync_count == 3
         assert snapshot.running_requests == 0
         assert snapshot.waiting_requests == 0
     finally:

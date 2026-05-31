@@ -1,6 +1,12 @@
+import pytest
 import torch
 
-from anna.sampling.sampler import apply_min_p, apply_presence_penalty, sample_next_token_from_candidates
+from anna.sampling.sampler import (
+    apply_min_p,
+    apply_presence_penalty,
+    sample_next_token_batch_from_candidates,
+    sample_next_token_from_candidates,
+)
 
 
 def test_sample_next_token_from_candidates_greedy_maps_back_to_token_id() -> None:
@@ -10,6 +16,23 @@ def test_sample_next_token_from_candidates_greedy_maps_back_to_token_id() -> Non
     next_token = sample_next_token_from_candidates(logits, token_ids, temperature=0.0, top_p=1.0)
 
     assert next_token.item() == 20
+
+
+def test_sample_next_token_batch_from_candidates_greedy_maps_each_row_back_to_token_id() -> None:
+    logits = torch.tensor([[1.0, 3.0, 2.0], [5.0, 4.0, 6.0]])
+    token_ids = torch.tensor([[10, 20, 30], [40, 50, 60]])
+
+    next_tokens = sample_next_token_batch_from_candidates(logits, token_ids, temperature=0.0, top_p=1.0)
+
+    assert torch.equal(next_tokens, torch.tensor([20, 60]))
+
+
+def test_sample_next_token_batch_from_candidates_validates_shapes() -> None:
+    logits = torch.tensor([[1.0, 3.0, 2.0]])
+    token_ids = torch.tensor([[10, 20]])
+
+    with pytest.raises(ValueError, match="same shape"):
+        sample_next_token_batch_from_candidates(logits, token_ids)
 
 
 def test_apply_presence_penalty_subtracts_from_seen_tokens() -> None:

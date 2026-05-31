@@ -35,3 +35,19 @@ def test_default_library_candidates_include_project_root_env(
     candidates = fused_ops._default_library_candidates()
 
     assert str(library) in candidates
+
+
+def test_fused_op_health_report_exposes_key_kernel_availability(monkeypatch) -> None:
+    monkeypatch.setattr(fused_ops, "_paged_gqa_decode_op", lambda: object())
+    monkeypatch.setattr(fused_ops, "_lm_head_int4_topk_op", lambda: object())
+    monkeypatch.setattr(fused_ops, "_moe_grouped_int4_mlp_op", lambda: object())
+    monkeypatch.setenv("ANNA_GATED_DELTA_OP_LIB", "D:/fake/anna_gated_delta_fused.pyd")
+
+    report = fused_ops.fused_op_health_report()
+
+    assert report["env"]["ANNA_GATED_DELTA_OP_LIB"] == "D:/fake/anna_gated_delta_fused.pyd"
+    assert report["available"]["paged_gqa_decode_fused"] is True
+    assert report["available"]["lm_head_int4_topk_fused"] is True
+    assert report["available"]["moe_grouped_int4_mlp_fused"] is True
+    assert "rmsnorm_fused" in report["available"]
+    assert "qk_norm_rotary_fused" in report["available"]

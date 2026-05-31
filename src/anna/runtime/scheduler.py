@@ -11,7 +11,8 @@ import torch
 
 from anna.mm.prepared_inputs import PreparedInputsLike
 from anna.runtime.streaming import IncrementalTextAssembler
-from anna.sampling.sampler import sample_next_token, sample_next_token_from_candidates
+from anna.runtime.token_staging import stage_token_ids_to_host
+from anna.sampling.sampler import sample_next_token, sample_next_token_batch_from_candidates, sample_next_token_from_candidates
 
 if TYPE_CHECKING:
     from anna.runtime.qwen3_5_text_engine import (
@@ -379,6 +380,12 @@ class AnnaScheduler:
             split_caches = [None] * len(requests)
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
         active: list[SchedulerRequest | SchedulerPrefillGroup] = []
+        next_tokens = self._sample_next_tokens_from_outputs(outputs, requests=requests)
+        token_ids = stage_token_ids_to_host(
+            torch.cat([next_token.reshape(1) for next_token in next_tokens], dim=0),
+            metrics=metrics,
+            reason="scheduler_batch_token_id_staging",
+        )
         for row_idx, request in enumerate(requests):
             if self._is_request_cancelled(request):
                 if split_caches[row_idx] is not None:
@@ -386,8 +393,8 @@ class AnnaScheduler:
                 self._drop_cancelled_request(request)
                 continue
             request.past_key_values = split_caches[row_idx]
-            next_token = self._sample_next_token_from_outputs(outputs, row_idx=row_idx, request=request)
-            token_id = self.engine._token_id_from_tensor(next_token)
+            next_token = next_tokens[row_idx]
+            token_id = token_ids[row_idx]
             if request.first_token_at is None:
                 request.first_token_at = time.perf_counter()
             if token_id in stop_token_ids:
@@ -469,6 +476,12 @@ class AnnaScheduler:
             split_caches = [None] * len(requests)
         next_active: list[SchedulerRequest] = []
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
+        next_tokens = self._sample_next_tokens_from_outputs(outputs, requests=requests)
+        token_ids = stage_token_ids_to_host(
+            torch.cat([next_token.reshape(1) for next_token in next_tokens], dim=0),
+            metrics=metrics,
+            reason="scheduler_batch_token_id_staging",
+        )
         for row_idx, request in enumerate(requests):
             if self._is_request_cancelled(request):
                 if split_caches[row_idx] is not None:
@@ -476,8 +489,8 @@ class AnnaScheduler:
                 self._drop_cancelled_request(request)
                 continue
             request.past_key_values = split_caches[row_idx]
-            next_token = self._sample_next_token_from_outputs(outputs, row_idx=row_idx, request=request)
-            token_id = self.engine._token_id_from_tensor(next_token)
+            next_token = next_tokens[row_idx]
+            token_id = token_ids[row_idx]
             if request.first_token_at is None:
                 request.first_token_at = time.perf_counter()
             if token_id in stop_token_ids:
@@ -572,6 +585,45 @@ class AnnaScheduler:
             presence_penalty=request.config.presence_penalty,
             repetition_penalty=request.config.repetition_penalty,
         )
+
+    def _sample_next_tokens_from_outputs(self, outputs, *, requests: list[SchedulerRequest]) -> list[torch.Tensor]:
+        if (
+            hasattr(outputs, "candidate_logits")
+            and hasattr(outputs, "candidate_token_ids")
+            and self._shared_candidate_sampling_params(requests) is not None
+        ):
+            temperature, top_p, min_p = self._shared_candidate_sampling_params(requests)
+            tokens = sample_next_token_batch_from_candidates(
+                outputs.candidate_logits[: len(requests), -1],
+                outputs.candidate_token_ids[: len(requests), -1],
+                temperature=temperature,
+                top_p=top_p,
+                min_p=min_p,
+            ).reshape(-1)
+            return [tokens[row_idx] for row_idx in range(len(requests))]
+        return [
+            self._sample_next_token_from_outputs(outputs, row_idx=row_idx, request=request)
+            for row_idx, request in enumerate(requests)
+        ]
+
+    @staticmethod
+    def _shared_candidate_sampling_params(requests: list[SchedulerRequest]) -> tuple[float, float, float] | None:
+        if not requests:
+            return None
+        first = (
+            float(requests[0].config.temperature),
+            float(requests[0].config.top_p),
+            float(requests[0].config.min_p),
+        )
+        for request in requests[1:]:
+            candidate = (
+                float(request.config.temperature),
+                float(request.config.top_p),
+                float(request.config.min_p),
+            )
+            if candidate != first:
+                return None
+        return first
 
     def _batch_text_inputs(self, requests: list[SchedulerRequest]) -> PreparedInputsLike:
         max_prompt_length = max(request.prompt_length for request in requests)

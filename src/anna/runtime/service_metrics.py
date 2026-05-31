@@ -52,6 +52,11 @@ class ServiceMetricsSnapshot:
     cache_split_seconds_total: float = 0.0
     cache_split_count: int = 0
     cache_split_seconds_max: float = 0.0
+    cpu_sync_count: int = 0
+    attention_fallback_count: int = 0
+    paged_cache_materialize_count: int = 0
+    sampler_full_vocab_sort_count: int = 0
+    moe_host_offset_count: int = 0
 
     @property
     def kv_cache_usage_ratio(self) -> float:
@@ -90,6 +95,11 @@ class AnnaServiceMetrics:
         self._cache_split_seconds_total = 0.0
         self._cache_split_count = 0
         self._cache_split_seconds_max = 0.0
+        self._cpu_sync_count = 0
+        self._attention_fallback_count = 0
+        self._paged_cache_materialize_count = 0
+        self._sampler_full_vocab_sort_count = 0
+        self._moe_host_offset_count = 0
 
     def record_request_submitted(self, *, waiting: bool) -> None:
         with self._lock:
@@ -149,6 +159,55 @@ class AnnaServiceMetrics:
             self._cache_split_seconds_total += normalized
             self._cache_split_count += 1
             self._cache_split_seconds_max = max(self._cache_split_seconds_max, normalized)
+        self._activity_event.set()
+
+    @staticmethod
+    def _normalize_count(count: int) -> int:
+        return max(0, int(count))
+
+    def record_cpu_sync(self, *, reason: str = "", count: int = 1) -> None:
+        del reason
+        normalized = self._normalize_count(count)
+        if normalized <= 0:
+            return
+        with self._lock:
+            self._cpu_sync_count += normalized
+        self._activity_event.set()
+
+    def record_attention_fallback(self, *, reason: str = "", count: int = 1) -> None:
+        del reason
+        normalized = self._normalize_count(count)
+        if normalized <= 0:
+            return
+        with self._lock:
+            self._attention_fallback_count += normalized
+        self._activity_event.set()
+
+    def record_paged_cache_materialization(self, *, reason: str = "", count: int = 1) -> None:
+        del reason
+        normalized = self._normalize_count(count)
+        if normalized <= 0:
+            return
+        with self._lock:
+            self._paged_cache_materialize_count += normalized
+        self._activity_event.set()
+
+    def record_sampler_full_vocab_sort(self, *, reason: str = "", count: int = 1) -> None:
+        del reason
+        normalized = self._normalize_count(count)
+        if normalized <= 0:
+            return
+        with self._lock:
+            self._sampler_full_vocab_sort_count += normalized
+        self._activity_event.set()
+
+    def record_moe_host_offset(self, *, reason: str = "", count: int = 1) -> None:
+        del reason
+        normalized = self._normalize_count(count)
+        if normalized <= 0:
+            return
+        with self._lock:
+            self._moe_host_offset_count += normalized
         self._activity_event.set()
 
     def record_request_finished(self, *, success: bool) -> None:
@@ -217,6 +276,11 @@ class AnnaServiceMetrics:
                 cache_split_seconds_total=self._cache_split_seconds_total,
                 cache_split_count=self._cache_split_count,
                 cache_split_seconds_max=self._cache_split_seconds_max,
+                cpu_sync_count=self._cpu_sync_count,
+                attention_fallback_count=self._attention_fallback_count,
+                paged_cache_materialize_count=self._paged_cache_materialize_count,
+                sampler_full_vocab_sort_count=self._sampler_full_vocab_sort_count,
+                moe_host_offset_count=self._moe_host_offset_count,
             )
 
 
@@ -268,6 +332,11 @@ class AnnaServiceMetricsLogger:
         cache_stack_count = max(0, current.cache_stack_count - previous.cache_stack_count)
         cache_split_total = max(0.0, current.cache_split_seconds_total - previous.cache_split_seconds_total)
         cache_split_count = max(0, current.cache_split_count - previous.cache_split_count)
+        cpu_sync_count = max(0, current.cpu_sync_count - previous.cpu_sync_count)
+        attention_fallback_count = max(0, current.attention_fallback_count - previous.attention_fallback_count)
+        paged_cache_materialize_count = max(0, current.paged_cache_materialize_count - previous.paged_cache_materialize_count)
+        sampler_full_vocab_sort_count = max(0, current.sampler_full_vocab_sort_count - previous.sampler_full_vocab_sort_count)
+        moe_host_offset_count = max(0, current.moe_host_offset_count - previous.moe_host_offset_count)
         prompt_tokens_per_second = prompt_tokens / elapsed
         generation_tokens_per_second = generation_tokens / elapsed
         prompt_cache_hit_rate = 0.0 if cache_queries <= 0 else (cache_hits / cache_queries) * 100.0
@@ -296,6 +365,9 @@ class AnnaServiceMetricsLogger:
             f"Decode step p50/p95/p99: {decode_p50_ms:.1f}/{decode_p95_ms:.1f}/{decode_p99_ms:.1f} ms, "
             f"Cache stack avg/max: {cache_stack_avg_ms:.1f}/{current.cache_stack_seconds_max * 1000.0:.1f} ms, "
             f"Cache split avg/max: {cache_split_avg_ms:.1f}/{current.cache_split_seconds_max * 1000.0:.1f} ms, "
+            f"Hot path events: cpu_sync={cpu_sync_count}, attention_fallback={attention_fallback_count}, "
+            f"paged_cache_materialize={paged_cache_materialize_count}, "
+            f"sampler_full_vocab_sort={sampler_full_vocab_sort_count}, moe_host_offset={moe_host_offset_count}, "
             f"Waiting: {current.waiting_requests} reqs, GPU KV cache usage: {kv_cache_usage:.1f}% "
             f"({current.kv_cache_used_pages}/{current.kv_cache_total_pages} pages), "
             f"Prompt cache hit rate: {prompt_cache_hit_rate:.1f}%"
@@ -321,6 +393,11 @@ class AnnaServiceMetricsLogger:
             current.decode_step_count - previous.decode_step_count,
             current.cache_stack_count - previous.cache_stack_count,
             current.cache_split_count - previous.cache_split_count,
+            current.cpu_sync_count - previous.cpu_sync_count,
+            current.attention_fallback_count - previous.attention_fallback_count,
+            current.paged_cache_materialize_count - previous.paged_cache_materialize_count,
+            current.sampler_full_vocab_sort_count - previous.sampler_full_vocab_sort_count,
+            current.moe_host_offset_count - previous.moe_host_offset_count,
         )
         return any(delta != 0 for delta in deltas)
 

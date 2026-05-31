@@ -18,6 +18,7 @@ from anna.core.gguf_model import has_gguf_model
 from anna.mm.prepared_inputs import PreparedInputs
 from anna.mm.qwen3_5_text_processor import Qwen3_5TextMultimodalProcessor
 from anna.model.fused_ops import (
+    fused_op_health_report,
     gqa_decode_splitkv_fused_out_is_available,
     gqa_decode_splitkv_turboquant_fused_out_is_available,
     maybe_load_gated_delta_library,
@@ -29,9 +30,12 @@ from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoe
 from anna.model.turboquant import VALID_KV_CACHE_QUANT_BITS, turboquant_is_available
 from anna.model.xpu_decode_profile import record_steady_decode_step_if_applicable, steady_decode_accumulation
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
+from anna.core.hotpath_events import hotpath_event_recorder
 from anna.runtime.memory_release import release_conversion_artifacts
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
+from anna.runtime.slot_model_runner import SlotModelRunner
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
+from anna.runtime.token_staging import stage_single_token_id_to_host
 from anna.sampling.sampler import sample_next_token, sample_next_token_from_candidates
 from anna.weights.qwen3_5_text_weight_loader import build_qwen3_5_text_model, estimate_qwen3_5_text_model_weight_bytes, load_qwen3_5_text_model_config, load_qwen3_5_text_model_weights
 from anna.weights.qwen3_5_text_tokenizer import Qwen3_5TextTokenizer
@@ -137,6 +141,11 @@ class EngineOptimizationConfig:
     kv_cache_quantization: str = "none"
     kv_cache_quant_bits: int = 4
     kv_cache_residual_len: int = 128
+    slot_runner_enabled: bool = False
+    slot_runner_max_slots: int = 0
+    slot_runner_total_blocks: int = 0
+    slot_runner_max_blocks_per_seq: int = 0
+    slot_runner_max_batch_size: int = 0
 
 
 @dataclass(slots=True)
@@ -296,6 +305,7 @@ class AnnaQwen3_5TextEngine:
         self._attach_cache_allocator()
         self.execution_lock = threading.Lock()
         self.scheduler = None
+        self.slot_model_runner = self._build_slot_model_runner()
         self._compiled_text_forward = None
         self._prompt_cache: OrderedDict[tuple[int, ...], PromptCacheEntry] = OrderedDict()
         self.metrics = AnnaServiceMetrics()
@@ -321,7 +331,26 @@ class AnnaQwen3_5TextEngine:
             kv_cache_quantization=normalize_kv_cache_quantization(config.kv_cache_quantization),
             kv_cache_quant_bits=kv_cache_quant_bits,
             kv_cache_residual_len=max(1, int(config.kv_cache_residual_len)),
+            slot_runner_enabled=bool(config.slot_runner_enabled),
+            slot_runner_max_slots=max(0, int(config.slot_runner_max_slots)),
+            slot_runner_total_blocks=max(0, int(config.slot_runner_total_blocks)),
+            slot_runner_max_blocks_per_seq=max(0, int(config.slot_runner_max_blocks_per_seq)),
+            slot_runner_max_batch_size=max(0, int(config.slot_runner_max_batch_size)),
         )
+
+    def _build_slot_model_runner(self) -> SlotModelRunner | None:
+        if not self.optimization_config.slot_runner_enabled:
+            return None
+        runner = SlotModelRunner.from_text_config(
+            self.config.text_config,
+            device=self.device_context.device,
+            max_slots=self.optimization_config.slot_runner_max_slots,
+            total_blocks=self.optimization_config.slot_runner_total_blocks,
+            max_blocks_per_seq=self.optimization_config.slot_runner_max_blocks_per_seq,
+            max_batch_size=self.optimization_config.slot_runner_max_batch_size,
+        )
+        logger.info("Enabled experimental slot model runner metadata path: %s", runner.health())
+        return runner
 
     def _resolve_prefill_chunk_size(self, requested_chunk_size: int) -> int:
         if requested_chunk_size > 0:
@@ -400,7 +429,27 @@ class AnnaQwen3_5TextEngine:
                 mlp = getattr(layer, "mlp", None)
                 if isinstance(mlp, Qwen3SparseMoeBlock):
                     mlp.profile_runtime = self.optimization_config.profile_runtime
+        self._log_fused_op_health()
         self._maybe_compile_text_model()
+
+    @staticmethod
+    def _log_fused_op_health() -> None:
+        report = fused_op_health_report()
+        available = report.get("available", {})
+        if not isinstance(available, dict):
+            return
+        logger.info(
+            "Fused op health: paged_gqa_decode=%s turboquant_decode=%s lm_head_topk=%s "
+            "lm_head_int4_topk=%s moe_grouped_int4=%s rmsnorm=%s qk_norm_rotary=%s loaded_libraries=%s",
+            bool(available.get("paged_gqa_decode_fused")),
+            bool(available.get("gqa_decode_splitkv_turboquant_fused_out")),
+            bool(available.get("lm_head_topk_fused")),
+            bool(available.get("lm_head_int4_topk_fused")),
+            bool(available.get("moe_grouped_int4_mlp_fused")),
+            bool(available.get("rmsnorm_fused")),
+            bool(available.get("qk_norm_rotary_fused")),
+            report.get("loaded_libraries", ()),
+        )
 
     def _maybe_compile_text_model(self) -> None:
         self._compiled_text_forward = None
@@ -463,6 +512,11 @@ class AnnaQwen3_5TextEngine:
         kv_cache_quantization: str = "none",
         kv_cache_quant_bits: int = 4,
         kv_cache_residual_len: int = 128,
+        slot_runner_enabled: bool = False,
+        slot_runner_max_slots: int = 0,
+        slot_runner_total_blocks: int = 0,
+        slot_runner_max_blocks_per_seq: int = 0,
+        slot_runner_max_batch_size: int = 0,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
         default_temperature: float | None = None,
@@ -794,6 +848,11 @@ class AnnaQwen3_5TextEngine:
                 kv_cache_quantization=resolved_kv_cache_quantization,
                 kv_cache_quant_bits=kv_cache_quant_bits,
                 kv_cache_residual_len=kv_cache_residual_len,
+                slot_runner_enabled=slot_runner_enabled,
+                slot_runner_max_slots=slot_runner_max_slots,
+                slot_runner_total_blocks=slot_runner_total_blocks,
+                slot_runner_max_blocks_per_seq=slot_runner_max_blocks_per_seq,
+                slot_runner_max_batch_size=slot_runner_max_batch_size,
             ),
         )
         kv_cache_info = engine._kv_cache_runtime_info()
@@ -1366,6 +1425,7 @@ class AnnaQwen3_5TextEngine:
         memory_info = self.device_context.get_memory_info()
         service_metrics = self.service_metrics_snapshot()
         kv_cache_runtime_info = self._kv_cache_runtime_info()
+        slot_model_runner = getattr(self, "slot_model_runner", None)
         return {
             "status": "ok",
             "model": self.default_model_id,
@@ -1405,6 +1465,11 @@ class AnnaQwen3_5TextEngine:
                 "kv_cache_quantization": self.optimization_config.kv_cache_quantization,
                 "kv_cache_quant_bits": self.optimization_config.kv_cache_quant_bits,
                 "kv_cache_residual_len": self.optimization_config.kv_cache_residual_len,
+                "slot_runner": (
+                    {"enabled": False}
+                    if slot_model_runner is None
+                    else slot_model_runner.health()
+                ),
                 "xpu_int4_kernels": {
                     "matmul_strategy": os.getenv("ANNA_XPU_INT4_MATMUL", "auto"),
                     "lm_head_local_size": os.getenv("ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE"),
@@ -1415,6 +1480,7 @@ class AnnaQwen3_5TextEngine:
                     "lm_head_int4_topk_disabled": os.getenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK"),
                     "moe_grouped_int4_disabled": os.getenv("ANNA_XPU_DISABLE_MOE_GROUPED_INT4"),
                 },
+                "fused_ops": fused_op_health_report(),
             },
             "vision_enabled": self.config.vision_config is not None,
             "cache_device": str(self.device_context.migration_policy.execution_device),
@@ -1447,6 +1513,11 @@ class AnnaQwen3_5TextEngine:
                 "waiting_requests": service_metrics.waiting_requests,
                 "kv_cache_used_pages": service_metrics.kv_cache_used_pages,
                 "kv_cache_total_pages": service_metrics.kv_cache_total_pages,
+                "cpu_sync_count": service_metrics.cpu_sync_count,
+                "attention_fallback_count": service_metrics.attention_fallback_count,
+                "paged_cache_materialize_count": service_metrics.paged_cache_materialize_count,
+                "sampler_full_vocab_sort_count": service_metrics.sampler_full_vocab_sort_count,
+                "moe_host_offset_count": service_metrics.moe_host_offset_count,
             },
         }
 
@@ -1958,27 +2029,28 @@ class AnnaQwen3_5TextEngine:
             model_kwargs.get(key) is not None
             for key in self._forward_multimodal_input_keys()
         )
-        if not has_multimodal_inputs:
-            forward_fn = getattr(self, "_compiled_text_forward", None)
-            if forward_fn is None:
-                if not hasattr(self.model, "forward_text_only"):
-                    raise RuntimeError("Text-only generation requires Qwen3_5TextForConditionalGeneration.forward_text_only")
-                forward_fn = self.model.forward_text_only
-            return forward_fn(
+        with hotpath_event_recorder(getattr(self, "metrics", None)):
+            if not has_multimodal_inputs:
+                forward_fn = getattr(self, "_compiled_text_forward", None)
+                if forward_fn is None:
+                    if not hasattr(self.model, "forward_text_only"):
+                        raise RuntimeError("Text-only generation requires Qwen3_5TextForConditionalGeneration.forward_text_only")
+                    forward_fn = self.model.forward_text_only
+                return forward_fn(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    logits_to_keep=logits_to_keep,
+                )
+            return self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 logits_to_keep=logits_to_keep,
+                **model_kwargs,
             )
-        return self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            logits_to_keep=logits_to_keep,
-            **model_kwargs,
-        )
 
     def _fused_lm_head_candidate_count(self, config: GenerationConfig) -> int | None:
         if config.repetition_penalty != 1.0:
@@ -2008,8 +2080,20 @@ class AnnaQwen3_5TextEngine:
             model_kwargs.get(key) is not None
             for key in self._forward_multimodal_input_keys()
         )
-        if not has_multimodal_inputs:
-            forward_fn = getattr(self.model, "forward_text_only_topk", None)
+        with hotpath_event_recorder(getattr(self, "metrics", None)):
+            if not has_multimodal_inputs:
+                forward_fn = getattr(self.model, "forward_text_only_topk", None)
+                if forward_fn is None:
+                    return None
+                return forward_fn(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    logits_to_keep=logits_to_keep,
+                    top_k=top_k,
+                )
+            forward_fn = getattr(self.model, "forward_topk", None)
             if forward_fn is None:
                 return None
             return forward_fn(
@@ -2019,19 +2103,8 @@ class AnnaQwen3_5TextEngine:
                 use_cache=use_cache,
                 logits_to_keep=logits_to_keep,
                 top_k=top_k,
+                **model_kwargs,
             )
-        forward_fn = getattr(self.model, "forward_topk", None)
-        if forward_fn is None:
-            return None
-        return forward_fn(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            logits_to_keep=logits_to_keep,
-            top_k=top_k,
-            **model_kwargs,
-        )
 
     def warmup_inference_kernels(
         self,
@@ -2591,9 +2664,8 @@ class AnnaQwen3_5TextEngine:
             return appended, history_ids
         return torch.cat([history_tensor, appended]), history_ids
 
-    @staticmethod
-    def _token_id_from_tensor(next_token: torch.Tensor) -> int:
-        return int(next_token.detach().reshape(-1).to(device="cpu")[0])
+    def _token_id_from_tensor(self, next_token: torch.Tensor) -> int:
+        return stage_single_token_id_to_host(next_token, metrics=getattr(self, "metrics", None))
 
     def _raise_if_generation_cancelled(self, config: GenerationConfig) -> None:
         if config.cancellation_event is not None and config.cancellation_event.is_set():

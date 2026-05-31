@@ -398,6 +398,37 @@ def build_parser() -> argparse.ArgumentParser:
         "inter-token latency for active decodes.",
     )
     parser.add_argument(
+        "--experimental-slot-runner",
+        dest="slot_runner_enabled",
+        action="store_true",
+        help="Enable the experimental Qwen3.5 slot-based metadata runner. This currently exposes slot/block "
+        "decode plans for migration work and does not replace the production scheduler yet.",
+    )
+    parser.add_argument(
+        "--slot-runner-max-slots",
+        type=_non_negative_int,
+        default=0,
+        help="Max sequence slots for the experimental slot runner. Set 0 to derive from the slot runner batch size.",
+    )
+    parser.add_argument(
+        "--slot-runner-total-blocks",
+        type=_non_negative_int,
+        default=0,
+        help="Total KV metadata blocks for the experimental slot runner. Set 0 to derive from slots and context length.",
+    )
+    parser.add_argument(
+        "--slot-runner-max-blocks-per-seq",
+        type=_non_negative_int,
+        default=0,
+        help="Max block-table entries per slot for the experimental slot runner. Set 0 to derive from model context length.",
+    )
+    parser.add_argument(
+        "--slot-runner-max-batch-size",
+        type=_non_negative_int,
+        default=0,
+        help="Max decode batch size for the experimental slot runner. Set 0 to use the slot count.",
+    )
+    parser.add_argument(
         "--metrics-log-interval-seconds",
         type=_non_negative_float,
         default=10.0,
@@ -435,6 +466,11 @@ def main() -> None:
         kv_cache_quantization=args.kv_cache_quantization,
         kv_cache_quant_bits=args.kv_cache_quant_bits,
         kv_cache_residual_len=args.kv_cache_residual_len,
+        slot_runner_enabled=args.slot_runner_enabled,
+        slot_runner_max_slots=args.slot_runner_max_slots,
+        slot_runner_total_blocks=args.slot_runner_total_blocks,
+        slot_runner_max_blocks_per_seq=args.slot_runner_max_blocks_per_seq,
+        slot_runner_max_batch_size=args.slot_runner_max_batch_size,
         default_max_completion_tokens=args.max_completion_tokens,
         default_temperature=args.temperature,
         default_top_p=args.top_p,
@@ -481,6 +517,11 @@ def main() -> None:
         kv_cache_quantization=settings.kv_cache_quantization,
         kv_cache_quant_bits=settings.kv_cache_quant_bits,
         kv_cache_residual_len=settings.kv_cache_residual_len,
+        slot_runner_enabled=settings.slot_runner_enabled,
+        slot_runner_max_slots=settings.slot_runner_max_slots,
+        slot_runner_total_blocks=settings.slot_runner_total_blocks,
+        slot_runner_max_blocks_per_seq=settings.slot_runner_max_blocks_per_seq,
+        slot_runner_max_batch_size=settings.slot_runner_max_batch_size,
         safety_policy=_build_safety_policy(settings),
         default_max_completion_tokens=settings.default_max_completion_tokens,
         default_temperature=settings.default_temperature,

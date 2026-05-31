@@ -207,6 +207,19 @@ def test_xpu_int4_linear_strategy_env_parsing(monkeypatch: pytest.MonkeyPatch) -
     assert XPUInt4Linear._matmul_strategy() == "auto"
 
 
+def test_xpu_int4_linear_rejects_xpu_dequant_fallback_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANNA_XPU_INT4_ALLOW_DEQUANT_FALLBACK", raising=False)
+
+    with pytest.raises(RuntimeError, match="CPU dequant fallback is disabled"):
+        XPUInt4Linear._raise_if_xpu_dequant_fallback_disallowed(torch.device("xpu"))
+
+
+def test_xpu_int4_linear_allows_xpu_dequant_fallback_only_for_debug(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANNA_XPU_INT4_ALLOW_DEQUANT_FALLBACK", "1")
+
+    XPUInt4Linear._raise_if_xpu_dequant_fallback_disallowed(torch.device("xpu"))
+
+
 def test_convert_module_linears_to_xpu_int4_ignores_persistent_layout_cache(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

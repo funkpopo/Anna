@@ -986,3 +986,59 @@ def test_incremental_text_assembler_uses_suffix_window_for_stop_strings() -> Non
 
     assert stopped is True
     assert "".join(outputs) == "AB"
+
+
+def test_incremental_text_assembler_handles_multilingual_unicode_boundaries() -> None:
+    class DummyTokenizer:
+        mapping = {
+            (1,): "你",
+            (2,): "好",
+            (3,): "\ufffd",
+            (3, 4): "🌞",
+            (5,): "e",
+            (6,): "\u0301",
+            (7,): "かな",
+        }
+
+        def decode(self, token_ids: list[int], *, skip_special_tokens: bool = False) -> str:
+            return self.mapping[tuple(token_ids)]
+
+    assembler = IncrementalTextAssembler(tokenizer=DummyTokenizer(), stop_strings=[])
+    outputs: list[str] = []
+    for token_id in [1, 2, 3, 4, 5, 6, 7]:
+        delta, stopped = assembler.feed_token(token_id)
+        assert stopped is False
+        if delta:
+            outputs.append(delta)
+    tail, stopped = assembler.flush()
+    assert stopped is False
+    if tail:
+        outputs.append(tail)
+
+    text = "".join(outputs)
+    assert text == "你好🌞e\u0301かな"
+    assert "\ufffd" not in text
+
+
+def test_incremental_text_assembler_holds_back_multibyte_stop_boundary() -> None:
+    class DummyTokenizer:
+        mapping = {
+            (1,): "开始停",
+            (2,): "止后面",
+        }
+
+        def decode(self, token_ids: list[int], *, skip_special_tokens: bool = False) -> str:
+            return self.mapping[tuple(token_ids)]
+
+    assembler = IncrementalTextAssembler(tokenizer=DummyTokenizer(), stop_strings=["停止"])
+    outputs: list[str] = []
+    stopped = False
+    for token_id in [1, 2]:
+        delta, stopped = assembler.feed_token(token_id)
+        if delta:
+            outputs.append(delta)
+        if stopped:
+            break
+
+    assert stopped is True
+    assert "".join(outputs) == "开始"

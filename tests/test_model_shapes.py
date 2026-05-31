@@ -83,6 +83,7 @@ def _stub_run_gated_delta_fused(
 
 @pytest.fixture(autouse=True)
 def _stub_gated_delta_fused(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("ANNA_XPU_FLASHQLA_GDN_PREFILL", raising=False)
     monkeypatch.setattr(model_ops, "run_gated_delta_fused", _stub_run_gated_delta_fused, raising=False)
 
 
@@ -671,6 +672,40 @@ def test_dynamic_cache_update_can_skip_dense_full_attention_materialization() ->
     assert tuple(int(length) for length in visible_lengths.tolist()) == (5,)
     assert torch.equal(cache.visible_key_cache(1), key)
     assert torch.equal(cache.visible_value_cache(1), value)
+
+
+def test_xpu_paged_kv_materialization_guard_blocks_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANNA_XPU_PAGED_KV_ALLOW_MATERIALIZE_FALLBACK", raising=False)
+
+    with pytest.raises(RuntimeError, match="ANNA_XPU_PAGED_KV_ALLOW_MATERIALIZE_FALLBACK"):
+        model_ops._raise_if_xpu_paged_kv_materialization_disallowed(
+            "xpu",
+            reason="unit_test",
+        )
+
+
+def test_xpu_paged_kv_materialization_guard_allows_cpu_and_debug(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANNA_XPU_PAGED_KV_ALLOW_MATERIALIZE_FALLBACK", raising=False)
+    model_ops._raise_if_xpu_paged_kv_materialization_disallowed("cpu", reason="unit_test")
+    model_ops._raise_if_xpu_paged_kv_materialization_disallowed(None, reason="unit_test")
+
+    monkeypatch.setenv("ANNA_XPU_PAGED_KV_ALLOW_MATERIALIZE_FALLBACK", "1")
+    model_ops._raise_if_xpu_paged_kv_materialization_disallowed("xpu", reason="unit_test")
+
+
+def test_dynamic_cache_turboquant_xpu_materialization_uses_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeTurboQuantRow:
+        device = torch.device("xpu")
+        length = 1
+
+    config = _tiny_config()
+    cache = Qwen3DynamicCache(config, kv_cache_quantization="turboquant", batch_size=1)
+    cache.turboquant_rows[1][0] = _FakeTurboQuantRow()  # type: ignore[assignment]
+    cache.layer_lengths[1][0] = 1
+    monkeypatch.delenv("ANNA_XPU_PAGED_KV_ALLOW_MATERIALIZE_FALLBACK", raising=False)
+
+    with pytest.raises(RuntimeError, match="turboquant_gather_layer_cache"):
+        cache._gather_layer_cache(1)
 
 
 def test_page_allocator_trim_releases_idle_page_storage() -> None:

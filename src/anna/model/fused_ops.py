@@ -395,6 +395,47 @@ def qk_norm_rotary_fused_ex_is_available() -> bool:
     return _qk_norm_rotary_ex_op() is not None
 
 
+def fused_op_health_report() -> dict[str, object]:
+    """Return current custom-op availability without running model kernels."""
+    return {
+        "loaded_libraries": loaded_fused_library_paths(),
+        "library_candidates": tuple(_default_library_candidates()),
+        "env": {
+            "ANNA_GATED_DELTA_OP_LIB": os.getenv("ANNA_GATED_DELTA_OP_LIB"),
+            "ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK": os.getenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK"),
+            "ANNA_XPU_DISABLE_MOE_GROUPED_INT4": os.getenv("ANNA_XPU_DISABLE_MOE_GROUPED_INT4"),
+        },
+        "available": {
+            "gqa_decode_fused": gqa_decode_fused_is_available(),
+            "gqa_decode_splitkv_fused": gqa_decode_splitkv_fused_is_available(),
+            "gqa_decode_splitkv_fused_out": gqa_decode_splitkv_fused_out_is_available(),
+            "gqa_decode_splitkv_turboquant_fused_out": gqa_decode_splitkv_turboquant_fused_out_is_available(),
+            "paged_gqa_decode_fused": paged_gqa_decode_fused_is_available(),
+            "moe_router_fused": moe_router_fused_is_available(),
+            "moe_dispatch_fused": moe_dispatch_fused_is_available(),
+            "moe_scatter_fused": moe_scatter_fused_is_available(),
+            "moe_grouped_int4_mlp_fused": moe_grouped_int4_mlp_fused_is_available(),
+            "lm_head_topk_fused": lm_head_topk_fused_is_available(),
+            "lm_head_int4_topk_fused": lm_head_int4_topk_fused_is_available(),
+            "rmsnorm_fused": rmsnorm_fused_is_available(),
+            "rmsnorm_fused_ex": rmsnorm_fused_ex_is_available(),
+            "rmsnorm_gated_fused": rmsnorm_gated_fused_is_available(),
+            "qk_norm_rotary_fused": qk_norm_rotary_fused_is_available(),
+            "qk_norm_rotary_fused_ex": qk_norm_rotary_fused_ex_is_available(),
+            "causal_conv1d_fused": causal_conv1d_fused_is_available(),
+            "gated_delta_fused": gated_delta_fused_is_available(),
+            "flashqla_gated_delta_fused": flashqla_gated_delta_fused_is_available(),
+            "flashqla_chunk_local_cumsum": flashqla_chunk_local_cumsum_is_available(),
+            "flashqla_kkt_build": flashqla_kkt_build_is_available(),
+            "flashqla_cumsum_kkt_build": flashqla_cumsum_kkt_build_is_available(),
+            "flashqla_kkt_solve": flashqla_kkt_solve_is_available(),
+            "flashqla_wu_build": flashqla_wu_build_is_available(),
+            "flashqla_solve_wu_build": flashqla_solve_wu_build_is_available(),
+            "flashqla_chunk_gdr_fwd": flashqla_chunk_gdr_fwd_is_available(),
+        },
+    }
+
+
 def maybe_load_gated_delta_library(path: str | os.PathLike[str] | None = None) -> bool:
     candidates: list[str] = []
     if path is not None:

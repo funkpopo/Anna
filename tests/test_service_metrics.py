@@ -15,6 +15,11 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     metrics.record_decode_step(0.125)
     metrics.record_cache_stack(0.03125)
     metrics.record_cache_split(0.0625)
+    metrics.record_cpu_sync(reason="token_id_cpu_staging", count=2)
+    metrics.record_attention_fallback(reason="grouped_attention")
+    metrics.record_paged_cache_materialization(reason="gather_layer_cache")
+    metrics.record_sampler_full_vocab_sort(reason="top_p_full_logits_sort")
+    metrics.record_moe_host_offset(reason="expert_offsets_cpu")
     metrics.record_prompt_tokens(12)
     metrics.record_generation_tokens(5)
     metrics.record_prompt_cache_lookup(hit=True)
@@ -50,6 +55,11 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     assert snapshot.cache_split_count == 1
     assert snapshot.cache_split_seconds_total == 0.0625
     assert snapshot.cache_split_seconds_max == 0.0625
+    assert snapshot.cpu_sync_count == 2
+    assert snapshot.attention_fallback_count == 1
+    assert snapshot.paged_cache_materialize_count == 1
+    assert snapshot.sampler_full_vocab_sort_count == 1
+    assert snapshot.moe_host_offset_count == 1
     assert metrics.activity_event.is_set() is True
 
 
@@ -88,6 +98,11 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
         cache_split_seconds_total=0.08,
         cache_split_count=4,
         cache_split_seconds_max=0.04,
+        cpu_sync_count=3,
+        attention_fallback_count=4,
+        paged_cache_materialize_count=5,
+        sampler_full_vocab_sort_count=6,
+        moe_host_offset_count=7,
     )
 
     line = AnnaServiceMetricsLogger.format_interval(previous, current)
@@ -102,6 +117,7 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
     assert "Decode step p50/p95/p99: 20.0/50.0/50.0 ms" in line
     assert "Cache stack avg/max: 20.0/30.0 ms" in line
     assert "Cache split avg/max: 20.0/40.0 ms" in line
+    assert "Hot path events: cpu_sync=3, attention_fallback=4, paged_cache_materialize=5, sampler_full_vocab_sort=6, moe_host_offset=7" in line
     assert "Waiting: 1 reqs" in line
     assert "GPU KV cache usage: 50.0% (6/12 pages)" in line
     assert "Prompt cache hit rate: 75.0%" in line
@@ -122,6 +138,7 @@ def test_service_metrics_logger_logs_idle_interval_after_completed_work() -> Non
         requests_completed_total=1,
         prompt_tokens_total=32,
         generation_tokens_total=8,
+        cpu_sync_count=1,
         kv_cache_total_pages=128,
     )
 

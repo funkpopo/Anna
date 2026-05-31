@@ -23,6 +23,7 @@ _AUTO_ROUND_PACKING_FORMATS = frozenset({"auto_round:auto_gptq"})
 _FLOAT_OVERRIDE_DATA_TYPES = frozenset({"fp", "float", "float16", "fp16", "bfloat16", "bf16"})
 _REGEX_META_CHARS = frozenset("\\[](){}?*+^$|")
 _XPU_INT4_MATMUL_STRATEGIES = frozenset({"auto", "torch", "dequant"})
+_XPU_INT4_ALLOW_XPU_DEQUANT_ENV = "ANNA_XPU_INT4_ALLOW_DEQUANT_FALLBACK"
 _XPU_INT4_LAYOUT_CACHE_VERSION = 2
 _XPU_INT4_LAYOUT_NAME = "anna_xpu_int4_linear_v1"
 _XPU_INT4_LM_HEAD_CACHE_TILE = 4
@@ -635,7 +636,18 @@ class XPUInt4Linear(nn.Module):
             return "auto"
         return strategy
 
+    @staticmethod
+    def _raise_if_xpu_dequant_fallback_disallowed(device: object) -> None:
+        device_type = getattr(device, "type", str(device))
+        if device_type == "xpu" and os.getenv(_XPU_INT4_ALLOW_XPU_DEQUANT_ENV, "0") != "1":
+            raise RuntimeError(
+                "XPUInt4Linear CPU dequant fallback is disabled for XPU serving because it copies int4 weights "
+                f"through CPU in the hot path. Use ANNA_XPU_INT4_MATMUL=torch/auto with a working XPU int4 op, "
+                f"or set {_XPU_INT4_ALLOW_XPU_DEQUANT_ENV}=1 only for debugging."
+            )
+
     def _forward_dequant(self, x_padded: torch.Tensor) -> torch.Tensor:
+        self._raise_if_xpu_dequant_fallback_disallowed(x_padded.device)
         weight = self._dequantize_weight().to(device=x_padded.device, dtype=self.compute_dtype)
         bias = None if self.bias is None else self.bias.to(device=x_padded.device, dtype=self.compute_dtype)
         return F.linear(x_padded, weight, bias)
