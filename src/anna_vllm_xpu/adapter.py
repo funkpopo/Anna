@@ -17,6 +17,7 @@ from anna.runtime.slot_model_runner import (
     SlotModelRunnerConfig,
     resolve_slot_model_runner_config,
 )
+from anna.sampling.capabilities import sampler_capability_report
 from anna.sampling.params import SamplingBatchParams
 from anna.vllm_compat.outputs import RequestOutput, request_output_from_result
 from anna.vllm_compat.sampling import SamplingParams, sampling_params_to_generation_config
@@ -650,6 +651,7 @@ class AnnaVLLMXPURuntimeAdapter:
             "execute_model_batch_adapter": True,
             "kv_cache_connector": self.slot_model_runner is not None,
             "attention_backend_registry": True,
+            "sampler": sampler_capability_report(),
             "model": self.model_id,
             "platform": capabilities,
             "slot_model_runner_enabled": self.slot_model_runner is not None,

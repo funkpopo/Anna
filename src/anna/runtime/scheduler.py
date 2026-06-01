@@ -3,7 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterator
 
@@ -84,6 +84,8 @@ class AnnaScheduler:
         self._decode_steps_since_prefill = 0
         self._next_request_index = 0
         self._last_slot_decode_inputs = None
+        self._sampling_batch_params_cache: OrderedDict[tuple[object, ...], SamplingBatchParams] = OrderedDict()
+        self._sampling_batch_params_cache_size = 64
         self._pending: deque[SchedulerRequest] = deque()
         self._condition = threading.Condition()
         self._stop = False
@@ -729,10 +731,7 @@ class AnnaScheduler:
         )
 
     def _sample_next_tokens_from_outputs(self, outputs, *, requests: list[SchedulerRequest]) -> torch.Tensor:
-        sampling_params = SamplingBatchParams.from_sampling_params(
-            tuple(request.config for request in requests),
-            device=self.engine.device_context.device,
-        )
+        sampling_params = self._sampling_batch_params_for_requests(requests)
         if hasattr(outputs, "candidate_logits") and hasattr(outputs, "candidate_token_ids"):
             return sample_next_token_batch_from_candidates_with_params(
                 outputs.candidate_logits[: len(requests), -1],
@@ -746,6 +745,35 @@ class AnnaScheduler:
             sampling_params,
             generated_ids_batch=tuple(request.repetition_history for request in requests),
         ).reshape(-1)
+
+    def _sampling_batch_params_for_requests(self, requests: list[SchedulerRequest]) -> SamplingBatchParams:
+        device = torch.device(self.engine.device_context.device)
+        rows = tuple(
+            (
+                float(request.config.temperature),
+                float(request.config.top_p),
+                int(request.config.top_k),
+                float(request.config.min_p),
+                float(request.config.presence_penalty),
+                float(request.config.repetition_penalty),
+            )
+            for request in requests
+        )
+        cache_key: tuple[object, ...] = (str(device), rows)
+        cached = self._sampling_batch_params_cache.get(cache_key)
+        if cached is not None:
+            self._sampling_batch_params_cache.move_to_end(cache_key)
+            return cached
+
+        sampling_params = SamplingBatchParams.from_sampling_params(
+            tuple(request.config for request in requests),
+            device=device,
+        )
+        self._sampling_batch_params_cache[cache_key] = sampling_params
+        self._sampling_batch_params_cache.move_to_end(cache_key)
+        while len(self._sampling_batch_params_cache) > self._sampling_batch_params_cache_size:
+            self._sampling_batch_params_cache.popitem(last=False)
+        return sampling_params
 
     def _batch_text_inputs(self, requests: list[SchedulerRequest]) -> PreparedInputsLike:
         max_prompt_length = max(request.prompt_length for request in requests)

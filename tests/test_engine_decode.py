@@ -1077,6 +1077,67 @@ def test_prefill_generation_uses_topk_candidates_for_direct_monotonic_penalties(
     assert result.candidate_token_ids.tolist() == [11, 12, 13]
 
 
+def test_prefill_generation_keeps_full_logits_when_penalties_can_boost_seen_tokens() -> None:
+    class _FakeModel:
+        def __init__(self) -> None:
+            self.full_calls = 0
+            self.topk_calls = 0
+
+        def forward_text_only(self, **_kwargs):
+            self.full_calls += 1
+            return SimpleNamespace(
+                logits=torch.tensor([[[1.0, 2.0, 3.0]]]),
+                past_key_values=SimpleNamespace(release=lambda: None),
+            )
+
+        def forward_text_only_topk(self, **_kwargs):
+            self.topk_calls += 1
+            return SimpleNamespace(
+                candidate_logits=torch.tensor([[[3.0]]]),
+                candidate_token_ids=torch.tensor([[[2]]]),
+                past_key_values=SimpleNamespace(release=lambda: None),
+            )
+
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.optimization_config = EngineOptimizationConfig()
+    engine._prompt_cache = OrderedDict()
+    engine._compiled_text_forward = None
+    engine.model = _FakeModel()
+    engine.config = SimpleNamespace(text_config=SimpleNamespace(vocab_size=16))
+
+    history = RepetitionPenaltyHistory(
+        [4, 5],
+        buffer=torch.tensor([4, 5], dtype=torch.long),
+        length=2,
+    )
+    prepared = PreparedInputs(
+        prompt="candidate prefill",
+        input_ids=torch.tensor([[4, 5]], dtype=torch.long),
+        attention_mask=torch.ones((1, 2), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 2), dtype=torch.int32),
+        prompt_token_ids=[4, 5],
+    )
+
+    result = engine._prefill_generation_prompt(
+        prepared,
+        config=GenerationConfig(
+            max_new_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=1,
+            presence_penalty=-0.5,
+            repetition_penalty=0.9,
+        ),
+        repetition_history_ids=history,
+    )
+
+    assert engine.model.full_calls == 1
+    assert engine.model.topk_calls == 0
+    assert result.logits is not None
+    assert result.candidate_logits is None
+    assert result.candidate_token_ids is None
+
+
 def test_generate_token_ids_uses_prefill_candidates_for_first_token_penalty_sampling() -> None:
     class _FakeModel:
         def __init__(self) -> None:

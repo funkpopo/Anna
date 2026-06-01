@@ -120,6 +120,20 @@ def test_adapter_converts_sampling_and_outputs_without_vllm_dependency() -> None
     assert health["integrated_vllm_worker"] is False
     assert health["slot_model_runner_enabled"] is False
     assert health["platform_plugin_entry_point"] == "anna_xpu = anna_vllm_xpu:register_platform"
+    assert health["sampler"] == {
+        "backend": "torch_tensor_fallback",
+        "custom_xpu_kernel": False,
+        "batch_params": True,
+        "candidate_sampler": True,
+        "candidate_penalty_overfetch": True,
+        "candidate_penalty_overfetch_requires": {
+            "top_k_gt": 0,
+            "presence_penalty_gte": 0.0,
+            "repetition_penalty_gte": 1.0,
+        },
+        "direct_prefill_candidates": True,
+        "full_vocab_fallback_metric": "sampler_full_vocab_sort_count",
+    }
 
 
 def test_vllm_plugin_spec_is_discoverable_without_integrated_worker() -> None:

@@ -45,6 +45,7 @@ from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnaps
 from anna.runtime.slot_model_runner import SlotModelRunner
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
 from anna.runtime.token_staging import stage_single_token_id_to_host
+from anna.sampling.capabilities import sampler_capability_report
 from anna.sampling.sampler import sample_next_token, sample_next_token_from_candidates
 from anna.weights.qwen3_5_text_weight_loader import build_qwen3_5_text_model, estimate_qwen3_5_text_model_weight_bytes, load_qwen3_5_text_model_config, load_qwen3_5_text_model_weights
 from anna.weights.qwen3_5_text_tokenizer import Qwen3_5TextTokenizer
@@ -1585,6 +1586,7 @@ class AnnaQwen3_5TextEngine:
                     if slot_model_runner is None
                     else slot_model_runner.health()
                 ),
+                "sampler": sampler_capability_report(),
                 "xpu_int4_kernels": {
                     "module_count": self.xpu_int4_hotpath.module_count,
                     "backend": self.xpu_int4_hotpath.backend,

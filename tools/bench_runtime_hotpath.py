@@ -431,6 +431,7 @@ def _bench_sampler(*, vocab_size: int, candidates: int, iters: int) -> dict[str,
     history = torch.arange(0, min(64, vocab_size), dtype=torch.long)
     candidate_logits = torch.randn(candidates)
     candidate_token_ids = torch.arange(candidates, dtype=torch.long)
+    candidate_history = torch.arange(0, max(1, candidates // 2), dtype=torch.long)
     metrics = AnnaServiceMetrics()
 
     def full_vocab() -> torch.Tensor:
@@ -455,14 +456,29 @@ def _bench_sampler(*, vocab_size: int, candidates: int, iters: int) -> dict[str,
             min_p=0.0,
         )
 
+    def candidate_penalty() -> torch.Tensor:
+        return sample_next_token_from_candidates(
+            candidate_logits,
+            candidate_token_ids,
+            temperature=0.7,
+            top_p=0.8,
+            top_k=max(1, min(4, candidates)),
+            min_p=0.0,
+            generated_ids=candidate_history,
+            presence_penalty=0.1,
+            repetition_penalty=1.05,
+        )
+
     full_vocab_ms = _time_ms(full_vocab, iters=iters)
     candidate_ms = _time_ms(candidate, iters=iters)
+    candidate_penalty_ms = _time_ms(candidate_penalty, iters=iters)
     snapshot = metrics.snapshot()
     return {
         "vocab_size": vocab_size,
         "candidates": candidates,
         "full_vocab_ms": full_vocab_ms,
         "candidate_ms": candidate_ms,
+        "candidate_penalty_ms": candidate_penalty_ms,
         "sampler_full_vocab_sort_count": snapshot.sampler_full_vocab_sort_count,
     }
 

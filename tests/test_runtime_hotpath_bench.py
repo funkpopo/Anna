@@ -106,6 +106,7 @@ def test_runtime_hotpath_bench_sampler_reports_candidate_and_full_vocab() -> Non
     assert result["candidates"] == 8
     assert result["full_vocab_ms"] >= 0.0
     assert result["candidate_ms"] >= 0.0
+    assert result["candidate_penalty_ms"] >= 0.0
     assert result["sampler_full_vocab_sort_count"] == 1
 
 

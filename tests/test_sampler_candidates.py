@@ -11,9 +11,27 @@ from anna.sampling.sampler import (
     sample_next_token_batch_with_params,
     sample_next_token_from_candidates,
 )
+from anna.sampling.capabilities import sampler_capability_report
 from anna.sampling.params import SamplingBatchParams
 from anna.core.hotpath_events import hotpath_event_recorder
 from anna.runtime.service_metrics import AnnaServiceMetrics
+
+
+def test_sampler_capability_report_exposes_current_backend_boundary() -> None:
+    assert sampler_capability_report() == {
+        "backend": "torch_tensor_fallback",
+        "custom_xpu_kernel": False,
+        "batch_params": True,
+        "candidate_sampler": True,
+        "candidate_penalty_overfetch": True,
+        "candidate_penalty_overfetch_requires": {
+            "top_k_gt": 0,
+            "presence_penalty_gte": 0.0,
+            "repetition_penalty_gte": 1.0,
+        },
+        "direct_prefill_candidates": True,
+        "full_vocab_fallback_metric": "sampler_full_vocab_sort_count",
+    }
 
 
 def _reference_filtered_logits(
