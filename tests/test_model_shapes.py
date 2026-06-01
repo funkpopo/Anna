@@ -6,6 +6,8 @@ import pytest
 import torch
 
 import anna.model.ops as model_ops
+from anna.core.hotpath_events import hotpath_event_recorder
+from anna.model.moe_host_planning import plan_moe_host_fallback
 from anna.model.quantization import AutoRoundGPTQLinear, XPUInt4Linear, replace_linear_modules
 from anna.model.qwen3_5_text_config import QuantizationConfig, Qwen3_5TextConfig, RopeParameters
 from anna.model.turboquant import TurboQuantKVRow, dequantize_turboquant_values
@@ -16,6 +18,7 @@ from anna.model.ops import (
     Qwen3SparseMoeBlock,
     Qwen3TextRotaryEmbedding,
     grouped_query_attention,
+    materialized_kv_single_token_decode_attention,
     repeat_kv,
     torch_causal_conv1d_update,
     torch_chunk_gated_delta_rule,
@@ -23,6 +26,7 @@ from anna.model.ops import (
 )
 from anna.model.qwen3_5_text_model import Qwen3_5TextForCausalLM
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine
+from anna.runtime.service_metrics import AnnaServiceMetrics
 
 
 @contextmanager
@@ -261,6 +265,22 @@ def test_dynamic_cache_appends_without_reallocating_visible_prefix() -> None:
     assert torch.equal(combined_key_b[:, :, 3:, :], key_b)
     assert torch.equal(combined_value_b[:, :, 3:, :], value_b)
     assert cache.get_seq_length() == 5
+
+
+def test_dynamic_cache_prompt_token_ids_accepts_control_plane_sequence() -> None:
+    cache = Qwen3DynamicCache(_tiny_config())
+
+    cache.set_prompt_token_ids((11, 12, 13))
+
+    assert cache._prompt_token_ids == [11, 12, 13]
+
+
+def test_dynamic_cache_prompt_token_ids_accepts_cpu_input_ids_without_tolist() -> None:
+    cache = Qwen3DynamicCache(_tiny_config())
+
+    cache.set_prompt_token_ids(torch.tensor([[21, 22, 23]], dtype=torch.long))
+
+    assert cache._prompt_token_ids == [21, 22, 23]
 
 
 def test_dynamic_cache_stack_and_split_round_trips_batches() -> None:
@@ -645,6 +665,89 @@ def test_dynamic_cache_stack_and_split_can_reuse_turboquant_rows_for_decode() ->
     assert split[1].turboquant_rows[1][0] is row_b
 
 
+def test_dynamic_cache_turboquant_metadata_tracks_lifecycle() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config)
+    cache_a = Qwen3DynamicCache(
+        config,
+        allocator=allocator,
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+    cache_b = Qwen3DynamicCache(
+        config,
+        allocator=allocator,
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+
+    assert Qwen3DynamicCache(config).turboquant_metadata(1) is None
+    cache_a.update(torch.randn(1, 2, 3, 16), torch.randn(1, 2, 3, 16), layer_idx=1, require_dense_cache=False)
+    cache_b.update(torch.randn(1, 2, 4, 16), torch.randn(1, 2, 4, 16), layer_idx=1, require_dense_cache=False)
+
+    metadata_a = cache_a.turboquant_metadata(1)
+    metadata_b = cache_b.turboquant_metadata(1)
+    assert metadata_a is not None
+    assert metadata_b is not None
+    assert torch.equal(metadata_a[0], torch.tensor([3], dtype=torch.long))
+    assert torch.equal(metadata_a[1], torch.tensor([True], dtype=torch.bool))
+    assert torch.equal(metadata_b[0], torch.tensor([4], dtype=torch.long))
+    assert torch.equal(metadata_b[1], torch.tensor([True], dtype=torch.bool))
+
+    batch_view = Qwen3DynamicCache.batch_view([cache_a, cache_b], config, clone_turboquant_rows=False)
+    view_lengths, view_active = batch_view.turboquant_metadata(1) or (None, None)
+    assert torch.equal(view_lengths, torch.tensor([3, 4], dtype=torch.long))
+    assert torch.equal(view_active, torch.tensor([True, True], dtype=torch.bool))
+
+    batch_view.update(torch.randn(2, 2, 1, 16), torch.randn(2, 2, 1, 16), layer_idx=1, require_dense_cache=False)
+    updated_lengths, updated_active = batch_view.turboquant_metadata(1) or (None, None)
+    assert torch.equal(updated_lengths, torch.tensor([4, 5], dtype=torch.long))
+    assert torch.equal(updated_active, torch.tensor([True, True], dtype=torch.bool))
+
+    batch_view.sync_batch_view_rows()
+    metadata_a = cache_a.turboquant_metadata(1)
+    metadata_b = cache_b.turboquant_metadata(1)
+    assert metadata_a is not None
+    assert metadata_b is not None
+    assert torch.equal(metadata_a[0], torch.tensor([4], dtype=torch.long))
+    assert torch.equal(metadata_b[0], torch.tensor([5], dtype=torch.long))
+
+    row_a, row_b = batch_view.row_views()
+    row_a_metadata = row_a.turboquant_metadata(1)
+    row_b_metadata = row_b.turboquant_metadata(1)
+    assert row_a_metadata is not None
+    assert row_b_metadata is not None
+    assert torch.equal(row_a_metadata[0], torch.tensor([4], dtype=torch.long))
+    assert torch.equal(row_b_metadata[0], torch.tensor([5], dtype=torch.long))
+
+    stacked = Qwen3DynamicCache.stack([cache_a, cache_b], config, clone_turboquant_rows=False)
+    stacked_metadata = stacked.turboquant_metadata(1)
+    assert stacked_metadata is not None
+    assert torch.equal(stacked_metadata[0], torch.tensor([4, 5], dtype=torch.long))
+    assert torch.equal(stacked_metadata[1], torch.tensor([True, True], dtype=torch.bool))
+
+    split_a, split_b = stacked.split_batch(clone_turboquant_rows=False)
+    split_a_metadata = split_a.turboquant_metadata(1)
+    split_b_metadata = split_b.turboquant_metadata(1)
+    assert split_a_metadata is not None
+    assert split_b_metadata is not None
+    assert torch.equal(split_a_metadata[0], torch.tensor([4], dtype=torch.long))
+    assert torch.equal(split_b_metadata[0], torch.tensor([5], dtype=torch.long))
+
+    cloned_metadata = stacked.clone().turboquant_metadata(1)
+    assert cloned_metadata is not None
+    assert torch.equal(cloned_metadata[0], torch.tensor([4, 5], dtype=torch.long))
+    assert torch.equal(cloned_metadata[1], torch.tensor([True, True], dtype=torch.bool))
+
+    cache_a.release()
+    released_metadata = cache_a.turboquant_metadata(1)
+    assert released_metadata is not None
+    assert torch.equal(released_metadata[0], torch.tensor([0], dtype=torch.long))
+    assert torch.equal(released_metadata[1], torch.tensor([False], dtype=torch.bool))
+
+
 def test_dynamic_cache_clone_preserves_contents_with_distinct_page_tables() -> None:
     config = _tiny_config()
     allocator = Qwen3PageAllocator(config)
@@ -735,6 +838,78 @@ def test_dynamic_cache_update_can_skip_dense_full_attention_materialization() ->
     assert torch.equal(cache.visible_value_cache(1), value)
 
 
+def test_dynamic_cache_reuses_synced_page_table_tensor_for_paged_attention_state() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config, maintain_full_attention_mirror=False)
+    cache = Qwen3DynamicCache(config, allocator=allocator)
+    key = torch.randn(1, 2, 5, 16)
+    value = torch.randn(1, 2, 5, 16)
+
+    cache.update(key, value, layer_idx=1, require_dense_cache=False)
+    cached_table = cache.page_table_caches[1]
+    assert cached_table is not None
+    assert cache.page_table_valid_blocks[1] == 1
+
+    paged_state = cache.paged_attention_state(1)
+
+    assert paged_state is not None
+    _, _, page_table, _ = paged_state
+    assert page_table.data_ptr() == cached_table.data_ptr()
+    assert page_table.shape == (1, 1)
+    assert cache.page_table_valid_blocks[1] == 1
+
+
+def test_dynamic_cache_reuses_page_table_tensor_for_decode_appends_within_block() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config, maintain_full_attention_mirror=False)
+    cache = Qwen3DynamicCache(config, allocator=allocator)
+    key = torch.randn(1, 2, 5, 16)
+    value = torch.randn(1, 2, 5, 16)
+    append_key = torch.randn(1, 2, 1, 16)
+    append_value = torch.randn(1, 2, 1, 16)
+
+    cache.update(key, value, layer_idx=1, require_dense_cache=False)
+    cached_table = cache.page_table_caches[1]
+    assert cached_table is not None
+    cached_ptr = cached_table.data_ptr()
+
+    cache.update(append_key, append_value, layer_idx=1, require_dense_cache=False)
+    paged_state = cache.paged_attention_state(1)
+
+    assert paged_state is not None
+    _, _, page_table, visible_lengths = paged_state
+    assert page_table.data_ptr() == cached_ptr
+    assert page_table.shape == (1, 1)
+    assert tuple(int(length) for length in visible_lengths.tolist()) == (6,)
+
+
+def test_dynamic_cache_refreshes_page_table_tensor_when_decode_crosses_block() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config, maintain_full_attention_mirror=False)
+    cache = Qwen3DynamicCache(config, allocator=allocator)
+    initial_length = config.cache_block_size
+    key = torch.randn(1, 2, initial_length, 16)
+    value = torch.randn(1, 2, initial_length, 16)
+    append_key = torch.randn(1, 2, 1, 16)
+    append_value = torch.randn(1, 2, 1, 16)
+
+    cache.update(key, value, layer_idx=1, require_dense_cache=False)
+    first_state = cache.paged_attention_state(1)
+    assert first_state is not None
+    _, _, first_page_table, _ = first_state
+    first_page_ids = first_page_table.clone()
+
+    cache.update(append_key, append_value, layer_idx=1, require_dense_cache=False)
+    paged_state = cache.paged_attention_state(1)
+
+    assert paged_state is not None
+    _, _, page_table, visible_lengths = paged_state
+    assert page_table.shape == (1, 2)
+    assert torch.equal(page_table[:, :1], first_page_ids)
+    assert page_table[0, 1].item() != first_page_ids[0, 0].item()
+    assert tuple(int(length) for length in visible_lengths.tolist()) == (initial_length + 1,)
+
+
 def test_xpu_paged_kv_materialization_guard_blocks_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ANNA_XPU_PAGED_KV_ALLOW_MATERIALIZE_FALLBACK", raising=False)
 
@@ -752,6 +927,25 @@ def test_xpu_paged_kv_materialization_guard_allows_cpu_and_debug(monkeypatch: py
 
     monkeypatch.setenv("ANNA_XPU_PAGED_KV_ALLOW_MATERIALIZE_FALLBACK", "1")
     model_ops._raise_if_xpu_paged_kv_materialization_disallowed("xpu", reason="unit_test")
+
+
+def test_xpu_moe_host_planning_guard_blocks_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANNA_XPU_MOE_ALLOW_HOST_PLANNING_FALLBACK", raising=False)
+
+    with pytest.raises(RuntimeError, match="ANNA_XPU_MOE_ALLOW_HOST_PLANNING_FALLBACK"):
+        model_ops._raise_if_xpu_moe_host_planning_disallowed(
+            "xpu",
+            reason="unit_test",
+        )
+
+
+def test_xpu_moe_host_planning_guard_allows_cpu_and_debug(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANNA_XPU_MOE_ALLOW_HOST_PLANNING_FALLBACK", raising=False)
+    model_ops._raise_if_xpu_moe_host_planning_disallowed("cpu", reason="unit_test")
+    model_ops._raise_if_xpu_moe_host_planning_disallowed(None, reason="unit_test")
+
+    monkeypatch.setenv("ANNA_XPU_MOE_ALLOW_HOST_PLANNING_FALLBACK", "1")
+    model_ops._raise_if_xpu_moe_host_planning_disallowed("xpu", reason="unit_test")
 
 
 def test_dynamic_cache_turboquant_xpu_materialization_uses_guard(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -919,6 +1113,35 @@ def test_grouped_query_attention_matches_materialized_kv_reference() -> None:
     assert torch.allclose(grouped_output, expected, atol=1e-5, rtol=1e-4)
 
 
+def test_materialized_single_token_decode_attention_masks_padding_without_host_sync() -> None:
+    with _temporary_torch_seed(0):
+        query_states = torch.randn(2, 4, 1, 16)
+        key_states = torch.randn(2, 2, 5, 16)
+        value_states = torch.randn(2, 2, 5, 16)
+
+    visible_lengths = torch.tensor([5, 3], dtype=torch.long)
+    output = materialized_kv_single_token_decode_attention(
+        query_states,
+        key_states,
+        value_states,
+        scaling=16**-0.5,
+        num_key_value_groups=2,
+        visible_lengths=visible_lengths,
+    )
+
+    visible_mask = torch.arange(5).view(1, -1) < visible_lengths[:, None]
+    masked_key = key_states.masked_fill(~visible_mask[:, None, :, None], 0)
+    masked_value = value_states.masked_fill(~visible_mask[:, None, :, None], 0)
+    repeated_key = repeat_kv(masked_key, 2)
+    repeated_value = repeat_kv(masked_value, 2)
+    attn_scores = torch.matmul(query_states, repeated_key.transpose(-1, -2)) * (16**-0.5)
+    attn_scores = attn_scores.masked_fill(~visible_mask[:, None, None, :], float("-inf"))
+    attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
+    expected = torch.matmul(attn_probs, repeated_value)
+
+    assert torch.allclose(output, expected, atol=1e-5, rtol=1e-4)
+
+
 def test_qwen3_attention_incremental_cache_matches_full_forward_without_repeat_kv_materialization() -> None:
     with _temporary_torch_seed(0):
         config = _tiny_config()
@@ -943,6 +1166,27 @@ def test_qwen3_attention_incremental_cache_matches_full_forward_without_repeat_k
         append_output = attention(append_states, append_embeddings, past_key_values=cache)
 
     assert torch.allclose(append_output, full_output[:, -append_states.shape[1] :], atol=1e-5, rtol=1e-4)
+
+
+def test_qwen3_attention_grouped_fallback_records_hotpath_metric() -> None:
+    with _temporary_torch_seed(0):
+        config = _tiny_config()
+        attention = Qwen3Attention(config, layer_idx=1).eval()
+        rotary = Qwen3TextRotaryEmbedding(config)
+        hidden_states = torch.randn(1, 4, config.hidden_size)
+        position_ids = torch.arange(hidden_states.shape[1]).view(1, -1)
+        attention_mask = torch.ones((1, hidden_states.shape[1]), dtype=torch.long)
+
+    metrics = AnnaServiceMetrics()
+    with torch.no_grad(), hotpath_event_recorder(metrics):
+        output = attention(
+            hidden_states,
+            rotary(hidden_states, position_ids),
+            attention_mask=attention_mask,
+        )
+
+    assert output.shape == hidden_states.shape
+    assert metrics.snapshot().attention_fallback_count == 1
 
 
 def test_sparse_moe_routing_assignments_match_reference_without_expert_mask_materialization() -> None:
@@ -1009,6 +1253,76 @@ def test_sparse_moe_compacted_execution_matches_reference() -> None:
 
     assert torch.allclose(compacted_hidden_states, reference_hidden_states.reshape_as(hidden_states), atol=1e-5, rtol=1e-4)
     assert torch.allclose(compacted_router_logits, router_logits, atol=1e-5, rtol=1e-4)
+
+
+def test_sparse_moe_host_planning_helper_is_cpu_debug_only() -> None:
+    usage = torch.tensor([0, 2, 0, 3], dtype=torch.long)
+    expert_offsets = torch.tensor([0, 0, 2, 2, 5], dtype=torch.long)
+    metrics = AnnaServiceMetrics()
+
+    with hotpath_event_recorder(metrics):
+        hit_experts, expert_offsets_host = plan_moe_host_fallback(
+            usage=usage,
+            expert_offsets=expert_offsets,
+        )
+
+    assert hit_experts == [1, 3]
+    assert expert_offsets_host is expert_offsets
+    snapshot = metrics.snapshot()
+    assert snapshot.moe_host_offset_count == 0
+    assert snapshot.moe_cpu_sync_count == 0
+
+
+def test_sparse_moe_resident_grouped_int4_path_skips_host_offset_planning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block = Qwen3SparseMoeBlock(_tiny_moe_config()).eval()
+    hidden_states = torch.randn(2, 3, block._config.hidden_size)
+    bank = model_ops._GroupedInt4ExpertBank(
+        capacity=block.num_experts,
+        hidden_dim=block._config.hidden_size,
+        intermediate_dim=block._config.moe_intermediate_size,
+        group_size=128,
+        gate_qweight=torch.empty((block.num_experts, 1, 1), dtype=torch.int32),
+        gate_qscale=torch.empty((block.num_experts, 1, 1), dtype=torch.float32),
+        gate_qzeros=torch.empty((block.num_experts, 1, 1), dtype=torch.int8),
+        up_qweight=torch.empty((block.num_experts, 1, 1), dtype=torch.int32),
+        up_qscale=torch.empty((block.num_experts, 1, 1), dtype=torch.float32),
+        up_qzeros=torch.empty((block.num_experts, 1, 1), dtype=torch.int8),
+        down_qweight=torch.empty((block.num_experts, 1, 1), dtype=torch.int32),
+        down_qscale=torch.empty((block.num_experts, 1, 1), dtype=torch.float32),
+        down_qzeros=torch.empty((block.num_experts, 1, 1), dtype=torch.int8),
+        slot_to_expert=list(range(block.num_experts)),
+        expert_to_slot={expert_idx: expert_idx for expert_idx in range(block.num_experts)},
+        resident_active_experts=torch.arange(block.num_experts, dtype=torch.long),
+        resident_active_slots=torch.arange(block.num_experts, dtype=torch.long),
+    )
+    calls = 0
+
+    def _fake_grouped_int4_mlp_fused(**kwargs: torch.Tensor | int) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        compact_outputs = kwargs["compact_outputs"]
+        compact_outputs.copy_(
+            kwargs["compact_hidden_states"]
+            * kwargs["compact_routing_weights"].to(dtype=kwargs["compact_hidden_states"].dtype)
+        )
+        return compact_outputs
+
+    block.resident_experts = True
+    block.execution_device = torch.device("xpu")
+    monkeypatch.setattr(block, "_should_use_xpu_int4", lambda: True)
+    monkeypatch.setattr(block, "_prepare_resident_grouped_int4_bank", lambda: bank)
+    monkeypatch.setattr(model_ops, "run_moe_grouped_int4_mlp_fused", _fake_grouped_int4_mlp_fused)
+    metrics = AnnaServiceMetrics()
+
+    with hotpath_event_recorder(metrics):
+        output, router_logits = block(hidden_states)
+
+    assert output.shape == hidden_states.shape
+    assert router_logits.shape == (hidden_states.numel() // hidden_states.shape[-1], block.num_experts)
+    assert calls == 1
+    assert metrics.snapshot().moe_host_offset_count == 0
 
 
 def test_qwen3_allows_out_of_range_padding_idx_for_tiny_configs() -> None:

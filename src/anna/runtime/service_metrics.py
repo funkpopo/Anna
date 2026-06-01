@@ -60,6 +60,24 @@ class ServiceMetricsSnapshot:
     paged_cache_materialize_count: int = 0
     sampler_full_vocab_sort_count: int = 0
     moe_host_offset_count: int = 0
+    moe_router_seconds_total: float = 0.0
+    moe_router_count: int = 0
+    moe_router_seconds_max: float = 0.0
+    moe_dispatch_seconds_total: float = 0.0
+    moe_dispatch_count: int = 0
+    moe_dispatch_seconds_max: float = 0.0
+    moe_expert_gemm_seconds_total: float = 0.0
+    moe_expert_gemm_count: int = 0
+    moe_expert_gemm_seconds_max: float = 0.0
+    moe_scatter_seconds_total: float = 0.0
+    moe_scatter_count: int = 0
+    moe_scatter_seconds_max: float = 0.0
+    moe_staging_seconds_total: float = 0.0
+    moe_staging_count: int = 0
+    moe_staging_seconds_max: float = 0.0
+    moe_cpu_sync_seconds_total: float = 0.0
+    moe_cpu_sync_count: int = 0
+    moe_cpu_sync_seconds_max: float = 0.0
 
     @property
     def kv_cache_usage_ratio(self) -> float:
@@ -106,6 +124,24 @@ class AnnaServiceMetrics:
         self._paged_cache_materialize_count = 0
         self._sampler_full_vocab_sort_count = 0
         self._moe_host_offset_count = 0
+        self._moe_router_seconds_total = 0.0
+        self._moe_router_count = 0
+        self._moe_router_seconds_max = 0.0
+        self._moe_dispatch_seconds_total = 0.0
+        self._moe_dispatch_count = 0
+        self._moe_dispatch_seconds_max = 0.0
+        self._moe_expert_gemm_seconds_total = 0.0
+        self._moe_expert_gemm_count = 0
+        self._moe_expert_gemm_seconds_max = 0.0
+        self._moe_scatter_seconds_total = 0.0
+        self._moe_scatter_count = 0
+        self._moe_scatter_seconds_max = 0.0
+        self._moe_staging_seconds_total = 0.0
+        self._moe_staging_count = 0
+        self._moe_staging_seconds_max = 0.0
+        self._moe_cpu_sync_seconds_total = 0.0
+        self._moe_cpu_sync_count = 0
+        self._moe_cpu_sync_seconds_max = 0.0
 
     def record_request_submitted(self, *, waiting: bool) -> None:
         with self._lock:
@@ -224,9 +260,57 @@ class AnnaServiceMetrics:
             self._moe_host_offset_count += normalized
         self._activity_event.set()
 
-    def record_request_finished(self, *, success: bool) -> None:
+    def record_moe_stage(self, *, stage: str, seconds: float) -> None:
+        normalized = max(0.0, float(seconds))
+        stage_name = str(stage).strip().lower()
+        mapping = {
+            "router": (
+                "_moe_router_seconds_total",
+                "_moe_router_count",
+                "_moe_router_seconds_max",
+            ),
+            "dispatch": (
+                "_moe_dispatch_seconds_total",
+                "_moe_dispatch_count",
+                "_moe_dispatch_seconds_max",
+            ),
+            "expert_gemm": (
+                "_moe_expert_gemm_seconds_total",
+                "_moe_expert_gemm_count",
+                "_moe_expert_gemm_seconds_max",
+            ),
+            "scatter": (
+                "_moe_scatter_seconds_total",
+                "_moe_scatter_count",
+                "_moe_scatter_seconds_max",
+            ),
+            "staging": (
+                "_moe_staging_seconds_total",
+                "_moe_staging_count",
+                "_moe_staging_seconds_max",
+            ),
+            "cpu_sync": (
+                "_moe_cpu_sync_seconds_total",
+                "_moe_cpu_sync_count",
+                "_moe_cpu_sync_seconds_max",
+            ),
+        }
+        fields = mapping.get(stage_name)
+        if fields is None:
+            return
+        total_name, count_name, max_name = fields
         with self._lock:
-            self._running_requests = max(0, self._running_requests - 1)
+            setattr(self, total_name, getattr(self, total_name) + normalized)
+            setattr(self, count_name, getattr(self, count_name) + 1)
+            setattr(self, max_name, max(getattr(self, max_name), normalized))
+        self._activity_event.set()
+
+    def record_request_finished(self, *, success: bool, from_waiting: bool = False) -> None:
+        with self._lock:
+            if from_waiting:
+                self._waiting_requests = max(0, self._waiting_requests - 1)
+            else:
+                self._running_requests = max(0, self._running_requests - 1)
             if success:
                 self._requests_completed_total += 1
             else:
@@ -298,6 +382,24 @@ class AnnaServiceMetrics:
                 paged_cache_materialize_count=self._paged_cache_materialize_count,
                 sampler_full_vocab_sort_count=self._sampler_full_vocab_sort_count,
                 moe_host_offset_count=self._moe_host_offset_count,
+                moe_router_seconds_total=self._moe_router_seconds_total,
+                moe_router_count=self._moe_router_count,
+                moe_router_seconds_max=self._moe_router_seconds_max,
+                moe_dispatch_seconds_total=self._moe_dispatch_seconds_total,
+                moe_dispatch_count=self._moe_dispatch_count,
+                moe_dispatch_seconds_max=self._moe_dispatch_seconds_max,
+                moe_expert_gemm_seconds_total=self._moe_expert_gemm_seconds_total,
+                moe_expert_gemm_count=self._moe_expert_gemm_count,
+                moe_expert_gemm_seconds_max=self._moe_expert_gemm_seconds_max,
+                moe_scatter_seconds_total=self._moe_scatter_seconds_total,
+                moe_scatter_count=self._moe_scatter_count,
+                moe_scatter_seconds_max=self._moe_scatter_seconds_max,
+                moe_staging_seconds_total=self._moe_staging_seconds_total,
+                moe_staging_count=self._moe_staging_count,
+                moe_staging_seconds_max=self._moe_staging_seconds_max,
+                moe_cpu_sync_seconds_total=self._moe_cpu_sync_seconds_total,
+                moe_cpu_sync_count=self._moe_cpu_sync_count,
+                moe_cpu_sync_seconds_max=self._moe_cpu_sync_seconds_max,
             )
 
 
@@ -359,6 +461,18 @@ class AnnaServiceMetricsLogger:
         paged_cache_materialize_count = max(0, current.paged_cache_materialize_count - previous.paged_cache_materialize_count)
         sampler_full_vocab_sort_count = max(0, current.sampler_full_vocab_sort_count - previous.sampler_full_vocab_sort_count)
         moe_host_offset_count = max(0, current.moe_host_offset_count - previous.moe_host_offset_count)
+        moe_router_total = max(0.0, current.moe_router_seconds_total - previous.moe_router_seconds_total)
+        moe_router_count = max(0, current.moe_router_count - previous.moe_router_count)
+        moe_dispatch_total = max(0.0, current.moe_dispatch_seconds_total - previous.moe_dispatch_seconds_total)
+        moe_dispatch_count = max(0, current.moe_dispatch_count - previous.moe_dispatch_count)
+        moe_expert_gemm_total = max(0.0, current.moe_expert_gemm_seconds_total - previous.moe_expert_gemm_seconds_total)
+        moe_expert_gemm_count = max(0, current.moe_expert_gemm_count - previous.moe_expert_gemm_count)
+        moe_scatter_total = max(0.0, current.moe_scatter_seconds_total - previous.moe_scatter_seconds_total)
+        moe_scatter_count = max(0, current.moe_scatter_count - previous.moe_scatter_count)
+        moe_staging_total = max(0.0, current.moe_staging_seconds_total - previous.moe_staging_seconds_total)
+        moe_staging_count = max(0, current.moe_staging_count - previous.moe_staging_count)
+        moe_cpu_sync_total = max(0.0, current.moe_cpu_sync_seconds_total - previous.moe_cpu_sync_seconds_total)
+        moe_cpu_sync_count = max(0, current.moe_cpu_sync_count - previous.moe_cpu_sync_count)
         prompt_tokens_per_second = prompt_tokens / elapsed
         generation_tokens_per_second = generation_tokens / elapsed
         prompt_cache_hit_rate = 0.0 if cache_queries <= 0 else (cache_hits / cache_queries) * 100.0
@@ -371,6 +485,14 @@ class AnnaServiceMetricsLogger:
         slot_decode_plan_avg_ms = (
             0.0 if slot_decode_plan_count <= 0 else (slot_decode_plan_total / slot_decode_plan_count) * 1000.0
         )
+        moe_router_avg_ms = 0.0 if moe_router_count <= 0 else (moe_router_total / moe_router_count) * 1000.0
+        moe_dispatch_avg_ms = 0.0 if moe_dispatch_count <= 0 else (moe_dispatch_total / moe_dispatch_count) * 1000.0
+        moe_expert_gemm_avg_ms = (
+            0.0 if moe_expert_gemm_count <= 0 else (moe_expert_gemm_total / moe_expert_gemm_count) * 1000.0
+        )
+        moe_scatter_avg_ms = 0.0 if moe_scatter_count <= 0 else (moe_scatter_total / moe_scatter_count) * 1000.0
+        moe_staging_avg_ms = 0.0 if moe_staging_count <= 0 else (moe_staging_total / moe_staging_count) * 1000.0
+        moe_cpu_sync_avg_ms = 0.0 if moe_cpu_sync_count <= 0 else (moe_cpu_sync_total / moe_cpu_sync_count) * 1000.0
         prefill_recent = current.prefill_step_recent_seconds
         decode_recent = current.decode_step_recent_seconds
         prefill_p50_ms = _quantile(prefill_recent, 0.50) * 1000.0
@@ -395,6 +517,13 @@ class AnnaServiceMetricsLogger:
             f"Hot path events: cpu_sync={cpu_sync_count}, attention_fallback={attention_fallback_count}, "
             f"paged_cache_materialize={paged_cache_materialize_count}, "
             f"sampler_full_vocab_sort={sampler_full_vocab_sort_count}, moe_host_offset={moe_host_offset_count}, "
+            f"MoE stage avg/max ms: router={moe_router_avg_ms:.3f}/"
+            f"{current.moe_router_seconds_max * 1000.0:.3f}, dispatch={moe_dispatch_avg_ms:.3f}/"
+            f"{current.moe_dispatch_seconds_max * 1000.0:.3f}, expert_gemm={moe_expert_gemm_avg_ms:.3f}/"
+            f"{current.moe_expert_gemm_seconds_max * 1000.0:.3f}, scatter={moe_scatter_avg_ms:.3f}/"
+            f"{current.moe_scatter_seconds_max * 1000.0:.3f}, staging={moe_staging_avg_ms:.3f}/"
+            f"{current.moe_staging_seconds_max * 1000.0:.3f}, cpu_sync={moe_cpu_sync_avg_ms:.3f}/"
+            f"{current.moe_cpu_sync_seconds_max * 1000.0:.3f}, "
             f"Waiting: {current.waiting_requests} reqs, GPU KV cache usage: {kv_cache_usage:.1f}% "
             f"({current.kv_cache_used_pages}/{current.kv_cache_total_pages} pages), "
             f"Prompt cache hit rate: {prompt_cache_hit_rate:.1f}%"
@@ -426,6 +555,12 @@ class AnnaServiceMetricsLogger:
             current.paged_cache_materialize_count - previous.paged_cache_materialize_count,
             current.sampler_full_vocab_sort_count - previous.sampler_full_vocab_sort_count,
             current.moe_host_offset_count - previous.moe_host_offset_count,
+            current.moe_router_count - previous.moe_router_count,
+            current.moe_dispatch_count - previous.moe_dispatch_count,
+            current.moe_expert_gemm_count - previous.moe_expert_gemm_count,
+            current.moe_scatter_count - previous.moe_scatter_count,
+            current.moe_staging_count - previous.moe_staging_count,
+            current.moe_cpu_sync_count - previous.moe_cpu_sync_count,
         )
         return any(delta != 0 for delta in deltas)
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Protocol, TypeVar, runtime_checkable
 
 import torch
@@ -12,6 +12,7 @@ class PreparedInputs:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     mm_token_type_ids: torch.Tensor
+    prompt_token_ids: list[int] = field(default_factory=list)
     pixel_values: torch.Tensor | None = None
     image_position_ids: torch.Tensor | None = None
     image_grid_thw: torch.Tensor | None = None
@@ -28,6 +29,7 @@ class PreparedInputsLike(Protocol):
     input_ids: torch.Tensor
     attention_mask: torch.Tensor | None
     mm_token_type_ids: torch.Tensor | None
+    prompt_token_ids: list[int]
     pixel_values: torch.Tensor | None
     image_position_ids: torch.Tensor | None
     image_grid_thw: torch.Tensor | None

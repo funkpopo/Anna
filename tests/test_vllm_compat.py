@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
 from anna.runtime.qwen3_5_text_engine import GenerationConfig, TextGenerationResult
 from anna.vllm_compat import AnnaLLM, CompletionOutput, RequestOutput, SamplingParams, sampling_params_to_generation_config
+from anna.vllm_compat.outputs import request_output_from_result
 
 
 def test_sampling_params_maps_to_generation_config() -> None:
@@ -58,6 +60,8 @@ class _FakeEngine:
             finish_reason="stop",
             prompt_tokens=len(prompt),
             completion_tokens=1,
+            prompt_token_ids=[ord(prompt[0])] if prompt else [],
+            completion_token_ids=[100 + len(prompt)],
         )
 
 
@@ -73,6 +77,32 @@ def test_anna_llm_generate_returns_vllm_like_request_outputs() -> None:
     assert [output.prompt for output in outputs] == ["a", "bb"]
     assert [output.outputs[0].text for output in outputs] == ["out:a", "out:bb"]
     assert [output.outputs[0].finish_reason for output in outputs] == ["stop", "stop"]
+    assert [output.prompt_token_ids for output in outputs] == [[97], [98]]
+    assert [output.outputs[0].token_ids for output in outputs] == [[101], [102]]
     assert outputs[0].request_id.startswith("req-0-")
     assert engine.calls is not None
     assert [call[1].max_new_tokens for call in engine.calls] == [3, 3]
+
+
+def test_request_output_from_result_maps_optional_token_ids_and_logprobs() -> None:
+    result = SimpleNamespace(
+        text="decoded",
+        finish_reason="length",
+        prompt_ids=[4, 5],
+        completion_ids=[6, 7],
+        cumulative_logprob=-1.25,
+        logprobs=[{"6": -0.5}, {"7": -0.75}],
+        perf={"decode_ms": 3.0},
+    )
+
+    output = request_output_from_result("prompt", result, request_id="req-rich")
+
+    assert output.request_id == "req-rich"
+    assert output.prompt_token_ids == [4, 5]
+    assert output.outputs[0].token_ids == [6, 7]
+    assert output.outputs[0].cumulative_logprob == -1.25
+    assert output.outputs[0].logprobs == [{"6": -0.5}, {"7": -0.75}]
+    assert output.outputs[0].finish_reason == "length"
+    assert output.outputs[0].stop_reason == "length"
+    assert output.finished is True
+    assert output.metrics == {"decode_ms": 3.0}

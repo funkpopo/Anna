@@ -5,10 +5,9 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -35,15 +34,17 @@ from anna.model.fused_ops import (
 )
 from anna.model.quantization import AWQLinear, AutoRoundGPTQLinear, XPUInt4Linear, convert_module_linears_to_xpu_int4
 from anna.model.xpu_decode_profile import xpu_profile_region
+from anna.model.moe_host_planning import plan_moe_host_fallback
 from anna.core.hotpath_events import (
     record_attention_fallback,
-    record_moe_host_offset,
+    record_moe_stage,
     record_paged_cache_materialization,
 )
 
 logger = logging.getLogger(__name__)
 _LOGGED_FLASHQLA_GDN_PREFILL = False
 _XPU_PAGED_KV_ALLOW_MATERIALIZE_ENV = "ANNA_XPU_PAGED_KV_ALLOW_MATERIALIZE_FALLBACK"
+_XPU_MOE_ALLOW_HOST_PLANNING_ENV = "ANNA_XPU_MOE_ALLOW_HOST_PLANNING_FALLBACK"
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -52,6 +53,10 @@ def _env_flag_enabled(name: str) -> bool:
 
 def _xpu_paged_kv_materialize_fallback_allowed() -> bool:
     return _env_flag_enabled(_XPU_PAGED_KV_ALLOW_MATERIALIZE_ENV)
+
+
+def _xpu_moe_host_planning_fallback_allowed() -> bool:
+    return _env_flag_enabled(_XPU_MOE_ALLOW_HOST_PLANNING_ENV)
 
 
 def _raise_if_xpu_paged_kv_materialization_disallowed(
@@ -65,6 +70,21 @@ def _raise_if_xpu_paged_kv_materialization_disallowed(
         "XPU paged KV materialization fallback is disabled by default because it turns the decode hot path "
         "back into dense KV cache processing. Use the paged/TurboQuant decode attention path, or set "
         f"{_XPU_PAGED_KV_ALLOW_MATERIALIZE_ENV}=1 only for debug validation. Reason: {reason}."
+    )
+
+
+def _raise_if_xpu_moe_host_planning_disallowed(
+    device_type: str | None,
+    *,
+    reason: str,
+) -> None:
+    if device_type != "xpu" or _xpu_moe_host_planning_fallback_allowed():
+        return
+    raise RuntimeError(
+        "XPU MoE host planning fallback is disabled by default because it pulls active expert metadata "
+        "and expert offsets back to CPU in the model forward hot path. Use resident grouped-int4 MoE "
+        "or a GPU expert wave plan, or set "
+        f"{_XPU_MOE_ALLOW_HOST_PLANNING_ENV}=1 only for debug/offload validation. Reason: {reason}."
     )
 
 
@@ -115,6 +135,8 @@ class _GroupedInt4ExpertBank:
     down_qzeros: torch.Tensor
     slot_to_expert: list[int | None]
     expert_to_slot: dict[int, int]
+    resident_active_experts: torch.Tensor | None = None
+    resident_active_slots: torch.Tensor | None = None
 
 
 class Qwen3PagedLayerAllocator:
@@ -410,11 +432,20 @@ class Qwen3DynamicCache:
             [None for _ in range(batch_size)]
             for _ in range(config.num_hidden_layers)
         ]
+        self.turboquant_row_lengths: list[torch.Tensor] = [
+            torch.zeros((batch_size,), dtype=torch.long)
+            for _ in range(config.num_hidden_layers)
+        ]
+        self.turboquant_row_active: list[torch.Tensor] = [
+            torch.zeros((batch_size,), dtype=torch.bool)
+            for _ in range(config.num_hidden_layers)
+        ]
         self.visible_key_caches: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
         self.visible_value_caches: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
         self.visible_cache_capacities: list[int] = [0 for _ in range(config.num_hidden_layers)]
         self.page_table_caches: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
         self.page_table_capacities: list[int] = [0 for _ in range(config.num_hidden_layers)]
+        self.page_table_valid_blocks: list[int] = [0 for _ in range(config.num_hidden_layers)]
         self.seen_tokens = 0
         self.rope_deltas: torch.Tensor | None = None
         self.reserved_seq_capacity = 0
@@ -429,19 +460,20 @@ class Qwen3DynamicCache:
     def detach_prefill_input_ids(self) -> None:
         self._prefill_input_ids = None
 
-    def set_prompt_token_ids(self, input_ids: torch.LongTensor | None) -> None:
-        if input_ids is None or not self._prefix_kv_share:
+    def set_prompt_token_ids(self, token_ids: Sequence[int] | torch.Tensor | None) -> None:
+        if token_ids is None or not self._prefix_kv_share:
             return
         if self._prompt_token_ids is not None:
             return
-        if int(input_ids.shape[0]) != 1:
+        if torch.is_tensor(token_ids):
+            if token_ids.device.type != "cpu" or token_ids.ndim != 2 or int(token_ids.shape[0]) != 1:
+                return
+            prompt_tokens = [int(token_ids[0, idx]) for idx in range(int(token_ids.shape[1]))]
+        else:
+            prompt_tokens = [int(token_id) for token_id in token_ids]
+        if self.get_seq_length() != 0 or not prompt_tokens:
             return
-        if self.get_seq_length() != 0:
-            return
-        seq = int(input_ids.shape[1])
-        if seq <= 0:
-            return
-        self._prompt_token_ids = [int(t) for t in input_ids[0].tolist()]
+        self._prompt_token_ids = prompt_tokens
 
     def reserve_sequence_capacity(self, seq_length: int) -> None:
         self.reserved_seq_capacity = max(0, int(seq_length))
@@ -455,9 +487,84 @@ class Qwen3DynamicCache:
             self.layer_lengths = [[0 for _ in range(batch_size)] for _ in range(self.config.num_hidden_layers)]
             self.page_tables = [[[] for _ in range(batch_size)] for _ in range(self.config.num_hidden_layers)]
             self.turboquant_rows = [[None for _ in range(batch_size)] for _ in range(self.config.num_hidden_layers)]
+            self.turboquant_row_lengths = [
+                torch.zeros((batch_size,), dtype=torch.long)
+                for _ in range(self.config.num_hidden_layers)
+            ]
+            self.turboquant_row_active = [
+                torch.zeros((batch_size,), dtype=torch.bool)
+                for _ in range(self.config.num_hidden_layers)
+            ]
+            self.page_table_caches = [None for _ in range(self.config.num_hidden_layers)]
+            self.page_table_capacities = [0 for _ in range(self.config.num_hidden_layers)]
+            self.page_table_valid_blocks = [0 for _ in range(self.config.num_hidden_layers)]
             return
         if len(self.layer_lengths[0]) != batch_size:
             raise ValueError(f"Cache batch size mismatch: expected {len(self.layer_lengths[0])}, got {batch_size}")
+        for layer_idx in range(self.config.num_hidden_layers):
+            self._ensure_turboquant_metadata_layer(layer_idx, batch_size)
+
+    def _rebuild_turboquant_metadata_layer(
+        self,
+        layer_idx: int,
+        *,
+        device: torch.device | str | None = None,
+    ) -> None:
+        if device is None:
+            device = self.turboquant_row_lengths[layer_idx].device
+        resolved_device = torch.device(device)
+        rows = self.turboquant_rows[layer_idx]
+        self.turboquant_row_lengths[layer_idx] = torch.tensor(
+            [0 if row is None else int(row.length) for row in rows],
+            dtype=torch.long,
+            device=resolved_device,
+        )
+        self.turboquant_row_active[layer_idx] = torch.tensor(
+            [row is not None and int(row.length) > 0 for row in rows],
+            dtype=torch.bool,
+            device=resolved_device,
+        )
+
+    def _ensure_turboquant_metadata_layer(
+        self,
+        layer_idx: int,
+        batch_size: int,
+        *,
+        device: torch.device | str | None = None,
+    ) -> None:
+        resolved_device = None if device is None else torch.device(device)
+        lengths = self.turboquant_row_lengths[layer_idx]
+        active = self.turboquant_row_active[layer_idx]
+        if (
+            lengths.shape == (batch_size,)
+            and active.shape == (batch_size,)
+            and (resolved_device is None or lengths.device == resolved_device)
+            and (resolved_device is None or active.device == resolved_device)
+        ):
+            return
+        self._rebuild_turboquant_metadata_layer(
+            layer_idx,
+            device=lengths.device if resolved_device is None else resolved_device,
+        )
+
+    def _set_turboquant_row_metadata(
+        self,
+        layer_idx: int,
+        batch_idx: int,
+        row: TurboQuantKVRow | None,
+        *,
+        device: torch.device | str | None = None,
+    ) -> None:
+        self._ensure_turboquant_metadata_layer(layer_idx, len(self.turboquant_rows[layer_idx]), device=device)
+        length = 0 if row is None else int(row.length)
+        self.turboquant_row_lengths[layer_idx][batch_idx] = length
+        self.turboquant_row_active[layer_idx][batch_idx] = length > 0
+
+    def turboquant_metadata(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not self.uses_turboquant_for_layer(layer_idx):
+            return None
+        self._ensure_turboquant_metadata_layer(layer_idx, self.get_batch_size())
+        return self.turboquant_row_lengths[layer_idx], self.turboquant_row_active[layer_idx]
 
     def uses_turboquant_for_layer(self, layer_idx: int) -> bool:
         return layer_idx in self._turboquant_layer_index_set
@@ -515,6 +622,16 @@ class Qwen3DynamicCache:
             return current_capacity
         growth_target = max(1, current_capacity * 2)
         return max(required_blocks, growth_target)
+
+    def _invalidate_page_table_layer_buffer(self, layer_idx: int, *, release_storage: bool = False) -> None:
+        if release_storage:
+            self.page_table_caches[layer_idx] = None
+            self.page_table_capacities[layer_idx] = 0
+        self.page_table_valid_blocks[layer_idx] = 0
+
+    def _invalidate_all_page_table_buffers(self, *, release_storage: bool = False) -> None:
+        for layer_idx in range(self.config.num_hidden_layers):
+            self._invalidate_page_table_layer_buffer(layer_idx, release_storage=release_storage)
 
     def _ensure_visible_layer_buffers(
         self,
@@ -619,9 +736,18 @@ class Qwen3DynamicCache:
     ) -> torch.Tensor | None:
         required_blocks = max((len(page_ids) for page_ids in self.page_tables[layer_idx]), default=0)
         if required_blocks <= 0:
-            self.page_table_caches[layer_idx] = None
-            self.page_table_capacities[layer_idx] = 0
+            self._invalidate_page_table_layer_buffer(layer_idx, release_storage=True)
             return None
+
+        cached_page_table = self.page_table_caches[layer_idx]
+        if (
+            cached_page_table is not None
+            and cached_page_table.shape[0] == batch_size
+            and cached_page_table.device == device
+            and cached_page_table.shape[1] >= required_blocks
+            and self.page_table_valid_blocks[layer_idx] == required_blocks
+        ):
+            return cached_page_table[:, :required_blocks]
 
         page_table_buffer = self._ensure_page_table_layer_buffer(
             layer_idx,
@@ -629,11 +755,13 @@ class Qwen3DynamicCache:
             required_blocks=required_blocks,
             device=device,
         )
+        page_table_buffer[:, :required_blocks].fill_(-1)
         for batch_idx, page_ids in enumerate(self.page_tables[layer_idx]):
             if not page_ids:
                 continue
             page_ids_tensor = torch.tensor(page_ids, device=device, dtype=page_table_buffer.dtype)
             page_table_buffer[batch_idx, : page_ids_tensor.shape[0]].copy_(page_ids_tensor)
+        self.page_table_valid_blocks[layer_idx] = required_blocks
         return page_table_buffer[:, :required_blocks]
 
     def _update_visible_layer_cache(
@@ -642,11 +770,12 @@ class Qwen3DynamicCache:
         *,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
-        past_lengths: torch.Tensor,
+        past_lengths_host: list[int] | tuple[int, ...],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         visible_lengths = self.layer_lengths[layer_idx]
         max_length = max(visible_lengths, default=0)
-        previous_max_length = int(past_lengths.max().item()) if past_lengths.numel() > 0 else 0
+        previous_lengths = tuple(int(length) for length in past_lengths_host)
+        previous_max_length = max(previous_lengths, default=0)
         key_buffer, value_buffer = self._ensure_visible_layer_buffers(
             layer_idx,
             key_states=key_states,
@@ -656,7 +785,7 @@ class Qwen3DynamicCache:
             previous_max_length=previous_max_length,
         )
 
-        for batch_idx, start_position in enumerate(past_lengths.tolist()):
+        for batch_idx, start_position in enumerate(previous_lengths):
             append_length = key_states.shape[2]
             end_position = start_position + append_length
             key_buffer[batch_idx, :, start_position:end_position, :].copy_(key_states[batch_idx])
@@ -674,7 +803,8 @@ class Qwen3DynamicCache:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
         batch_size = int(key_states.shape[0])
         self._ensure_batch_size(batch_size)
-        past_lengths = torch.tensor(self.layer_lengths[layer_idx], device=key_states.device, dtype=torch.long)
+        past_lengths_host = list(self.layer_lengths[layer_idx])
+        past_lengths = torch.tensor(past_lengths_host, device=key_states.device, dtype=torch.long)
         materialized_keys: list[torch.Tensor] = []
         materialized_values: list[torch.Tensor] = []
 
@@ -688,6 +818,7 @@ class Qwen3DynamicCache:
             self.turboquant_rows[layer_idx][batch_idx] = row
             row.append(key_states[batch_idx], value_states[batch_idx])
             self.layer_lengths[layer_idx][batch_idx] = row.length
+            self._set_turboquant_row_metadata(layer_idx, batch_idx, row, device=key_states.device)
             if require_dense_cache:
                 self._raise_if_xpu_materialization_disallowed(
                     layer_idx,
@@ -703,9 +834,8 @@ class Qwen3DynamicCache:
         self.visible_key_caches[layer_idx] = None
         self.visible_value_caches[layer_idx] = None
         self.visible_cache_capacities[layer_idx] = 0
-        self.page_table_caches[layer_idx] = None
-        self.page_table_capacities[layer_idx] = 0
-        self.seen_tokens = max(self.get_seq_lengths().tolist(), default=0)
+        self._invalidate_page_table_layer_buffer(layer_idx, release_storage=True)
+        self.seen_tokens = self.get_seq_length()
         if not require_dense_cache:
             return None, None, past_lengths
         padded_key = self._pad_cache_rows(materialized_keys, device=key_states.device, dtype=key_states.dtype)
@@ -730,7 +860,8 @@ class Qwen3DynamicCache:
             )
         batch_size, _, append_length, _ = key_states.shape
         self._ensure_batch_size(batch_size)
-        past_lengths = torch.tensor(self.layer_lengths[layer_idx], device=key_states.device, dtype=torch.long)
+        past_lengths_host = list(self.layer_lengths[layer_idx])
+        past_lengths = torch.tensor(past_lengths_host, device=key_states.device, dtype=torch.long)
         reserved_length = max(append_length, self.reserved_seq_capacity)
         required_blocks_hint = (reserved_length + self.block_size - 1) // self.block_size
         if required_blocks_hint > 0:
@@ -746,8 +877,10 @@ class Qwen3DynamicCache:
             and batch_size == 1
             and self._prompt_token_ids is not None
         )
+        page_table_changed = False
         for batch_idx in range(batch_size):
             if use_prefix_share:
+                previous_blocks = len(self.page_tables[layer_idx][batch_idx])
                 self._update_paged_row_with_prefix_sharing(
                     key_states,
                     value_states,
@@ -755,6 +888,7 @@ class Qwen3DynamicCache:
                     batch_idx,
                     append_length,
                 )
+                page_table_changed = page_table_changed or len(self.page_tables[layer_idx][batch_idx]) != previous_blocks
                 continue
 
             current_length = self.layer_lengths[layer_idx][batch_idx]
@@ -771,6 +905,7 @@ class Qwen3DynamicCache:
                         value_template=value_states,
                     )
                 )
+                page_table_changed = True
 
             self._write_pages(
                 layer_idx=layer_idx,
@@ -781,14 +916,16 @@ class Qwen3DynamicCache:
             )
             self.layer_lengths[layer_idx][batch_idx] = required_length
 
-        self.seen_tokens = max(self.get_seq_lengths().tolist(), default=0)
+        self.seen_tokens = self.get_seq_length()
+        if page_table_changed:
+            self._invalidate_page_table_layer_buffer(layer_idx)
         self._sync_page_table_layer_buffer(layer_idx, batch_size=batch_size, device=key_states.device)
         if self._uses_contiguous_full_attention_mirror(layer_idx):
             mirrored_key, mirrored_value = self._update_visible_layer_cache(
                 layer_idx,
                 key_states=key_states,
                 value_states=value_states,
-                past_lengths=past_lengths,
+                past_lengths_host=past_lengths_host,
             )
             if require_dense_cache:
                 return mirrored_key, mirrored_value, past_lengths
@@ -1163,7 +1300,7 @@ class Qwen3DynamicCache:
         )
         for layer_idx in range(config.num_hidden_layers):
             stacked.layer_lengths[layer_idx] = [row.layer_lengths[layer_idx][0] for row in rows]
-        stacked.seen_tokens = max(stacked.get_seq_lengths().tolist(), default=0)
+        stacked.seen_tokens = stacked.get_seq_length()
         stacked.rope_deltas = None if rows[0].rope_deltas is None else torch.cat([row.rope_deltas for row in rows], dim=0)
         stacked.reserved_seq_capacity = max((row.reserved_seq_capacity for row in rows), default=0)
 
@@ -1177,6 +1314,10 @@ class Qwen3DynamicCache:
                         stacked.turboquant_rows[layer_idx][batch_idx] = turboquant_row.clone()
                     else:
                         stacked.turboquant_rows[layer_idx][batch_idx] = turboquant_row
+                stacked._rebuild_turboquant_metadata_layer(
+                    layer_idx,
+                    device=prototype.turboquant_row_lengths[layer_idx].device,
+                )
                 continue
             stacked.page_tables[layer_idx] = [list(row.page_tables[layer_idx][0]) for row in rows]
 
@@ -1277,6 +1418,10 @@ class Qwen3DynamicCache:
                         view.turboquant_rows[layer_idx][batch_idx] = turboquant_row.clone()
                     else:
                         view.turboquant_rows[layer_idx][batch_idx] = turboquant_row
+                view._rebuild_turboquant_metadata_layer(
+                    layer_idx,
+                    device=prototype.turboquant_row_lengths[layer_idx].device,
+                )
                 continue
             view.page_tables[layer_idx] = [row.page_tables[layer_idx][0] for row in caches]
 
@@ -1340,7 +1485,14 @@ class Qwen3DynamicCache:
             for layer_idx in range(self.config.num_hidden_layers):
                 row.layer_lengths[layer_idx][0] = self.layer_lengths[layer_idx][batch_idx]
                 if self.uses_turboquant_for_layer(layer_idx):
-                    row.turboquant_rows[layer_idx][0] = self.turboquant_rows[layer_idx][batch_idx]
+                    turboquant_row = self.turboquant_rows[layer_idx][batch_idx]
+                    row.turboquant_rows[layer_idx][0] = turboquant_row
+                    row._set_turboquant_row_metadata(
+                        layer_idx,
+                        0,
+                        turboquant_row,
+                        device=self.turboquant_row_lengths[layer_idx].device,
+                    )
                 if self.conv_states[layer_idx] is not None:
                     row.conv_states[layer_idx] = self.conv_states[layer_idx][batch_idx : batch_idx + 1].contiguous()
                 if self.recurrent_states[layer_idx] is not None:
@@ -1380,11 +1532,17 @@ class Qwen3DynamicCache:
             for layer_idx in range(self.config.num_hidden_layers):
                 row.layer_lengths[layer_idx][0] = self.layer_lengths[layer_idx][batch_idx]
                 row.visible_cache_capacities[layer_idx] = self.visible_cache_capacities[layer_idx]
-                row.page_table_capacities[layer_idx] = 0
-                row.page_table_caches[layer_idx] = None
+                row._invalidate_page_table_layer_buffer(layer_idx, release_storage=True)
 
                 if self.uses_turboquant_for_layer(layer_idx):
-                    row.turboquant_rows[layer_idx][0] = self.turboquant_rows[layer_idx][batch_idx]
+                    turboquant_row = self.turboquant_rows[layer_idx][batch_idx]
+                    row.turboquant_rows[layer_idx][0] = turboquant_row
+                    row._set_turboquant_row_metadata(
+                        layer_idx,
+                        0,
+                        turboquant_row,
+                        device=self.turboquant_row_lengths[layer_idx].device,
+                    )
                 else:
                     row.page_tables[layer_idx][0] = self.page_tables[layer_idx][batch_idx]
 
@@ -1437,6 +1595,12 @@ class Qwen3DynamicCache:
                     outputs[idx].turboquant_rows[layer_idx][0] = (
                         turboquant_row.clone() if clone_turboquant_rows else turboquant_row
                     )
+                outputs[idx]._set_turboquant_row_metadata(
+                    layer_idx,
+                    0,
+                    outputs[idx].turboquant_rows[layer_idx][0],
+                    device=self.turboquant_row_lengths[layer_idx].device,
+                )
             if self.conv_states[layer_idx] is not None:
                 for idx, chunk in enumerate(self.conv_states[layer_idx].split(1, dim=0)):
                     outputs[idx].conv_states[layer_idx] = chunk.clone()
@@ -1483,6 +1647,10 @@ class Qwen3DynamicCache:
                     cloned.turboquant_rows[layer_idx][batch_idx] = row.clone()
 
             if self.uses_turboquant_for_layer(layer_idx):
+                cloned._rebuild_turboquant_metadata_layer(
+                    layer_idx,
+                    device=self.turboquant_row_lengths[layer_idx].device,
+                )
                 continue
 
             layer = self.allocator.layers[layer_idx]
@@ -1520,6 +1688,8 @@ class Qwen3DynamicCache:
             if self.uses_turboquant_for_layer(layer_idx):
                 for batch_idx in range(len(self.turboquant_rows[layer_idx])):
                     self.turboquant_rows[layer_idx][batch_idx] = None
+                self.turboquant_row_lengths[layer_idx].zero_()
+                self.turboquant_row_active[layer_idx].zero_()
             else:
                 for page_ids in self.page_tables[layer_idx]:
                     self.allocator.release_pages(layer_idx, page_ids)
@@ -1531,8 +1701,7 @@ class Qwen3DynamicCache:
             self.visible_key_caches[layer_idx] = None
             self.visible_value_caches[layer_idx] = None
             self.visible_cache_capacities[layer_idx] = 0
-            self.page_table_caches[layer_idx] = None
-            self.page_table_capacities[layer_idx] = 0
+            self._invalidate_page_table_layer_buffer(layer_idx, release_storage=True)
 
         self.seen_tokens = 0
         self.rope_deltas = None
@@ -1561,6 +1730,9 @@ class Qwen3DynamicCache:
         self.visible_value_caches = [_move_tensor(tensor) for tensor in self.visible_value_caches]
         self.page_table_caches = [_move_tensor(tensor) for tensor in self.page_table_caches]
         self.rope_deltas = _move_tensor(self.rope_deltas)
+        if device is not None:
+            self.turboquant_row_lengths = [tensor.to(device=device) for tensor in self.turboquant_row_lengths]
+            self.turboquant_row_active = [tensor.to(device=device) for tensor in self.turboquant_row_active]
         for layer_idx in range(self.config.num_hidden_layers):
             for batch_idx, row in enumerate(self.turboquant_rows[layer_idx]):
                 if row is not None:
@@ -1733,9 +1905,8 @@ def materialized_kv_single_token_decode_attention(
 
     key_positions = torch.arange(key_states.shape[-2], device=query_states.device)[None, :]
     visible_mask = key_positions < visible_lengths[:, None]
-    if not bool(torch.all(visible_mask).item()):
-        key_states = key_states.masked_fill(~visible_mask[:, None, :, None], 0)
-        value_states = value_states.masked_fill(~visible_mask[:, None, :, None], 0)
+    key_states = key_states.masked_fill(~visible_mask[:, None, :, None], 0)
+    value_states = value_states.masked_fill(~visible_mask[:, None, :, None], 0)
 
     repeated_key_states = repeat_kv(key_states, num_key_value_groups)
     repeated_value_states = repeat_kv(value_states, num_key_value_groups)
@@ -1775,6 +1946,8 @@ def paged_kv_slot_batch_decode_attention(
     *,
     scaling: float,
     slot_ids: torch.Tensor | None = None,
+    block_tables_are_global: bool = False,
+    seq_lens_are_global: bool = False,
     gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Paged GQA decode entry point for slot-based scheduler metadata.
@@ -1794,13 +1967,19 @@ def paged_kv_slot_batch_decode_attention(
     batch_size = query_states.shape[0]
     selected_block_tables = block_tables
     selected_seq_lens = seq_lens
-    if block_tables.shape[0] != batch_size or seq_lens.shape[0] != batch_size:
+    if block_tables_are_global or block_tables.shape[0] != batch_size:
         if slot_ids is None:
-            raise RuntimeError("slot_ids are required when block_tables or seq_lens are global tensors.")
+            raise RuntimeError("slot_ids are required when block_tables are global tensors.")
         if slot_ids.ndim != 1 or slot_ids.shape[0] != batch_size:
             raise RuntimeError("slot_ids must be a 1D tensor with one entry per decode batch row.")
         index = slot_ids.to(device=block_tables.device, dtype=torch.long)
         selected_block_tables = block_tables.index_select(0, index)
+    if seq_lens_are_global or seq_lens.shape[0] != batch_size:
+        if slot_ids is None:
+            raise RuntimeError("slot_ids are required when seq_lens are global tensors.")
+        if slot_ids.ndim != 1 or slot_ids.shape[0] != batch_size:
+            raise RuntimeError("slot_ids must be a 1D tensor with one entry per decode batch row.")
+        index = slot_ids.to(device=seq_lens.device, dtype=torch.long)
         selected_seq_lens = seq_lens.index_select(0, index.to(device=seq_lens.device))
 
     if selected_block_tables.shape[0] != batch_size:
@@ -1817,6 +1996,44 @@ def paged_kv_slot_batch_decode_attention(
         visible_lengths=selected_seq_lens,
         gate=gate,
     )
+
+
+def _require_slot_decode_physical_pages(
+    past_key_values: Qwen3DynamicCache,
+    layer_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    layer = past_key_values.allocator.layers[layer_idx]
+    if layer.key_pages is None or layer.value_pages is None:
+        record_attention_fallback("qwen3_slot_paged_decode_pages_missing")
+        raise RuntimeError(
+            "slot_decode_inputs.physical_block_tables=True requires initialized physical KV pages; "
+            "refusing to fall back to legacy Qwen3DynamicCache.page_tables for slot-owned decode."
+        )
+    return layer.key_pages, layer.value_pages
+
+
+def _slot_decode_visible_seq_lens(
+    slot_decode_inputs: object,
+    *,
+    seq_lens: torch.Tensor,
+    decode_token_count: int,
+) -> torch.Tensor:
+    batch_visible_seq_lens = getattr(slot_decode_inputs, "batch_visible_seq_lens", None)
+    if torch.is_tensor(batch_visible_seq_lens):
+        return batch_visible_seq_lens
+    visible_seq_lens = getattr(slot_decode_inputs, "visible_seq_lens", None)
+    if torch.is_tensor(visible_seq_lens):
+        return visible_seq_lens
+    batch_seq_lens = getattr(slot_decode_inputs, "batch_seq_lens", None)
+    if torch.is_tensor(batch_seq_lens):
+        return batch_seq_lens + int(decode_token_count)
+    if bool(getattr(slot_decode_inputs, "seq_lens_are_global", False)):
+        slot_ids = getattr(slot_decode_inputs, "slot_ids", None)
+        if not torch.is_tensor(slot_ids):
+            raise RuntimeError("slot_decode_inputs.slot_ids are required when seq_lens are global tensors.")
+        index = slot_ids.to(device=seq_lens.device, dtype=torch.long)
+        seq_lens = seq_lens.index_select(0, index)
+    return seq_lens + int(decode_token_count)
 
 
 def _reshape_decode_gate_to_query_layout(
@@ -2121,6 +2338,8 @@ class Qwen3Attention(nn.Module):
             )
 
         if past_key_values is None and attention_mask is None:
+            if hidden_states.device.type == "xpu" and seq_len > 1:
+                record_attention_fallback("qwen3_xpu_sdpa_prefill_attention")
             attn_output = F.scaled_dot_product_attention(
                 query_states,
                 key_states,
@@ -2154,26 +2373,32 @@ class Qwen3Attention(nn.Module):
                 slot_seq_lens = getattr(slot_decode_inputs, "seq_lens", None)
                 if not torch.is_tensor(slot_block_tables) or not torch.is_tensor(slot_seq_lens):
                     raise RuntimeError("slot_decode_inputs must provide tensor block_tables and seq_lens.")
-                layer = past_key_values.allocator.layers[self.layer_idx]
-                if layer.key_pages is not None and layer.value_pages is not None:
-                    gate_fused = _reshape_decode_gate_to_query_layout(
-                        gate,
-                        num_heads=query_states.size(1),
-                        head_dim=self.head_dim,
-                    )
-                    slot_ids = getattr(slot_decode_inputs, "slot_ids", None)
-                    attn_output = paged_kv_slot_batch_decode_attention(
-                        query_states,
-                        layer.key_pages,
-                        layer.value_pages,
-                        slot_block_tables.to(device=layer.key_pages.device, dtype=torch.int32),
-                        slot_seq_lens.to(device=layer.key_pages.device, dtype=torch.long) + seq_len,
-                        scaling=self.scaling,
-                        slot_ids=slot_ids if torch.is_tensor(slot_ids) else None,
-                        gate=gate_fused,
-                    )
-                    attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
-                    return self.o_proj(attn_output)
+                key_pages, value_pages = _require_slot_decode_physical_pages(past_key_values, self.layer_idx)
+                gate_fused = _reshape_decode_gate_to_query_layout(
+                    gate,
+                    num_heads=query_states.size(1),
+                    head_dim=self.head_dim,
+                )
+                slot_ids = getattr(slot_decode_inputs, "slot_ids", None)
+                visible_seq_lens = _slot_decode_visible_seq_lens(
+                    slot_decode_inputs,
+                    seq_lens=slot_seq_lens,
+                    decode_token_count=seq_len,
+                )
+                attn_output = paged_kv_slot_batch_decode_attention(
+                    query_states,
+                    key_pages,
+                    value_pages,
+                    slot_block_tables.to(device=key_pages.device, dtype=torch.int32),
+                    visible_seq_lens.to(device=key_pages.device, dtype=torch.long),
+                    scaling=self.scaling,
+                    slot_ids=slot_ids if torch.is_tensor(slot_ids) else None,
+                    block_tables_are_global=bool(getattr(slot_decode_inputs, "block_tables_are_global", False)),
+                    seq_lens_are_global=False,
+                    gate=gate_fused,
+                )
+                attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
+                return self.o_proj(attn_output)
             if prefer_paged_decode and past_key_values is not None:
                 visible_lengths = past_lengths + seq_len
                 paged_state = past_key_values.paged_attention_state(self.layer_idx)
@@ -2195,7 +2420,9 @@ class Qwen3Attention(nn.Module):
                     )
                     attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
                     return self.o_proj(attn_output)
+                record_attention_fallback("qwen3_paged_decode_state_missing")
             if attention_mask is None and past_key_values is not None and seq_len == 1 and hidden_states.device.type == "xpu":
+                record_attention_fallback("qwen3_materialized_single_token_decode_attention")
                 if key_states is None or value_states is None:
                     key_states, value_states, _ = past_key_values._gather_layer_cache(self.layer_idx)
                     if key_states is None or value_states is None:
@@ -2849,12 +3076,14 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.host_prepacked_experts_pinned = False
 
         if resident_experts and self._should_use_xpu_int4():
+            self.cached_experts_per_layer = self.num_experts
             for expert in self.experts:
                 convert_module_linears_to_xpu_int4(
                     expert,
                     group_size=self.expert_quant_group_size,
                     device=execution_device,
                 )
+            self._prepare_resident_grouped_int4_bank()
         else:
             expert_device = execution_device if resident_experts or not offload_experts else torch.device("cpu")
             for expert in self.experts:
@@ -3017,6 +3246,8 @@ class Qwen3SparseMoeBlock(nn.Module):
                 f"Grouped int4 expert bank bookkeeping mismatch for slot {slot}: expected {expert_idx}, found {mapped_expert}."
             )
         bank.slot_to_expert[slot] = None
+        bank.resident_active_experts = None
+        bank.resident_active_slots = None
 
     def _copy_grouped_int4_expert_to_bank_slot_(
         self,
@@ -3066,6 +3297,8 @@ class Qwen3SparseMoeBlock(nn.Module):
         )
         bank.slot_to_expert[slot] = int(expert_idx)
         bank.expert_to_slot[int(expert_idx)] = slot
+        bank.resident_active_experts = None
+        bank.resident_active_slots = None
         self._grouped_int4_lru[int(expert_idx)] = None
 
     def _ensure_grouped_int4_bank_slot(self, expert_idx: int, expert_layer: Qwen3MLP) -> int:
@@ -3101,6 +3334,40 @@ class Qwen3SparseMoeBlock(nn.Module):
                 raise RuntimeError(f"Grouped int4 expert GEMM expected expert {expert_idx} to be prepared on XPU.")
             slots.append(self._ensure_grouped_int4_bank_slot(expert_idx, expert_layer))
         return slots
+
+    def _prepare_resident_grouped_int4_bank(self) -> _GroupedInt4ExpertBank:
+        if not (self.resident_experts and self._should_use_xpu_int4()):
+            raise RuntimeError("Resident grouped int4 MoE bank requires resident XPU int4 experts.")
+        if self.cached_experts_per_layer < self.num_experts:
+            raise RuntimeError(
+                "Resident grouped int4 MoE bank requires enough slots for all experts: "
+                f"capacity={self.cached_experts_per_layer} experts={self.num_experts}."
+            )
+        bank = self._grouped_int4_bank
+        if bank is not None and all(bank.expert_to_slot.get(expert_idx) is not None for expert_idx in range(self.num_experts)):
+            self._ensure_resident_grouped_int4_active_tensors(bank)
+            return bank
+        prepared = {expert_idx: expert for expert_idx, expert in enumerate(self.experts)}
+        self._ensure_grouped_int4_bank_slots(
+            prepared=prepared,
+            expert_indices=list(range(self.num_experts)),
+        )
+        bank = self._grouped_int4_bank
+        if bank is None:
+            raise RuntimeError("Resident grouped int4 MoE bank was not initialized.")
+        self._ensure_resident_grouped_int4_active_tensors(bank)
+        return bank
+
+    def _ensure_resident_grouped_int4_active_tensors(self, bank: _GroupedInt4ExpertBank) -> None:
+        if bank.resident_active_experts is not None and bank.resident_active_slots is not None:
+            return
+        expert_indices = tuple(range(self.num_experts))
+        slots = tuple(bank.expert_to_slot.get(expert_idx) for expert_idx in expert_indices)
+        if any(slot is None for slot in slots):
+            raise RuntimeError("Resident grouped int4 MoE bank is missing one or more expert slots.")
+        device = bank.gate_qweight.device
+        bank.resident_active_experts = torch.tensor(expert_indices, device=device, dtype=torch.long)
+        bank.resident_active_slots = torch.tensor(tuple(int(slot) for slot in slots), device=device, dtype=torch.long)
 
     def _prepare_grouped_int4_bank_slots(self, required_expert_indices: list[int]) -> list[int]:
         if self.execution_device is None or self.execution_device.type != "xpu":
@@ -3621,7 +3888,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         *,
         wave_indices: list[int],
         wave_slots: list[int],
-        offsets_np: np.ndarray,
+        expert_offsets_host: torch.Tensor,
         expert_offsets_device: torch.Tensor,
         compact_hidden_states: torch.Tensor,
         compact_routing_weights: torch.Tensor,
@@ -3642,8 +3909,7 @@ class Qwen3SparseMoeBlock(nn.Module):
                 raise RuntimeError(
                     f"Grouped int4 expert GEMM slot mapping mismatch for expert {expert_idx}: expected {mapped_slot}, got {slot}."
                 )
-            start_idx = int(offsets_np[expert_idx])
-            end_idx = int(offsets_np[expert_idx + 1])
+            start_idx, end_idx = self._expert_offset_range(expert_offsets_host, expert_idx)
             max_routes_per_expert = max(max_routes_per_expert, end_idx - start_idx)
         if max_routes_per_expert <= 0:
             raise RuntimeError("Grouped int4 expert GEMM received an empty expert wave.")
@@ -3670,6 +3936,56 @@ class Qwen3SparseMoeBlock(nn.Module):
             max_routes_per_expert=max_routes_per_expert,
         )
 
+    @staticmethod
+    def _expert_offset_range(expert_offsets_host: torch.Tensor, expert_idx: int) -> tuple[int, int]:
+        if expert_offsets_host.device.type != "cpu":
+            raise RuntimeError("MoE expert offset planning requires a CPU offsets mirror.")
+        if expert_idx < 0 or expert_idx + 1 >= int(expert_offsets_host.numel()):
+            raise RuntimeError(f"MoE expert offset index is out of range: {expert_idx}")
+        return int(expert_offsets_host[expert_idx]), int(expert_offsets_host[expert_idx + 1])
+
+    def _execute_resident_grouped_int4_experts(
+        self,
+        *,
+        expert_offsets: torch.Tensor,
+        compact_hidden_states: torch.Tensor,
+        compact_routing_weights: torch.Tensor,
+        compact_outputs: torch.Tensor,
+    ) -> bool:
+        if not (self.resident_experts and self._should_use_xpu_int4()):
+            return False
+
+        stage_started_at = time.perf_counter()
+        bank = self._prepare_resident_grouped_int4_bank()
+        record_moe_stage("staging", time.perf_counter() - stage_started_at)
+        active_experts = bank.resident_active_experts
+        active_slots = bank.resident_active_slots
+        if active_experts is None or active_slots is None:
+            raise RuntimeError("Resident grouped int4 MoE bank active tensors were not initialized.")
+        max_routes_per_expert = max(1, int(compact_hidden_states.shape[0]))
+        stage_started_at = time.perf_counter()
+        run_moe_grouped_int4_mlp_fused(
+            compact_hidden_states=compact_hidden_states,
+            compact_routing_weights=compact_routing_weights,
+            compact_outputs=compact_outputs,
+            expert_offsets=expert_offsets,
+            active_experts=active_experts,
+            active_slots=active_slots,
+            gate_qweight=bank.gate_qweight,
+            gate_qscale=bank.gate_qscale,
+            gate_qzeros=bank.gate_qzeros,
+            up_qweight=bank.up_qweight,
+            up_qscale=bank.up_qscale,
+            up_qzeros=bank.up_qzeros,
+            down_qweight=bank.down_qweight,
+            down_qscale=bank.down_qscale,
+            down_qzeros=bank.down_qzeros,
+            group_size=bank.group_size,
+            max_routes_per_expert=max_routes_per_expert,
+        )
+        record_moe_stage("expert_gemm", time.perf_counter() - stage_started_at)
+        return True
+
     def _execute_offloaded_experts(
         self,
         *,
@@ -3691,32 +4007,37 @@ class Qwen3SparseMoeBlock(nn.Module):
         if wave_capacity <= 0:
             return
 
-        offsets_np = expert_offsets_host.detach().numpy()
         for wave_start in range(0, len(hit_experts), wave_capacity):
             wave_indices = hit_experts[wave_start : wave_start + wave_capacity]
             if self._should_use_xpu_int4():
+                stage_started_at = time.perf_counter()
                 wave_slots = self._prepare_grouped_int4_bank_slots(wave_indices)
+                record_moe_stage("staging", time.perf_counter() - stage_started_at)
+                stage_started_at = time.perf_counter()
                 self._execute_grouped_int4_experts(
                     wave_indices=wave_indices,
                     wave_slots=wave_slots,
-                    offsets_np=offsets_np,
+                    expert_offsets_host=expert_offsets_host,
                     expert_offsets_device=expert_offsets,
                     compact_hidden_states=compact_hidden_states,
                     compact_routing_weights=compact_routing_weights,
                     compact_outputs=compact_outputs,
                 )
+                record_moe_stage("expert_gemm", time.perf_counter() - stage_started_at)
                 continue
 
+            stage_started_at = time.perf_counter()
             prepared = self._prepare_cached_experts(wave_indices)
+            record_moe_stage("staging", time.perf_counter() - stage_started_at)
             missing = [expert_idx for expert_idx in wave_indices if expert_idx not in prepared]
             if missing:
                 raise RuntimeError(
                     "Failed to stage all requested MoE experts onto the execution device: "
                     f"missing={missing} cache_capacity={self.cached_experts_per_layer}"
-                )
+            )
+            stage_started_at = time.perf_counter()
             for expert_idx in wave_indices:
-                start_idx = int(offsets_np[expert_idx])
-                end_idx = int(offsets_np[expert_idx + 1])
+                start_idx, end_idx = self._expert_offset_range(expert_offsets_host, expert_idx)
                 self._execute_expert(
                     expert_layer=prepared[expert_idx],
                     start_idx=start_idx,
@@ -3727,6 +4048,7 @@ class Qwen3SparseMoeBlock(nn.Module):
                     execution_device=execution_device,
                     hidden_dtype=hidden_dtype,
                 )
+            record_moe_stage("expert_gemm", time.perf_counter() - stage_started_at)
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         execution_device = hidden_states.device
@@ -3735,23 +4057,48 @@ class Qwen3SparseMoeBlock(nn.Module):
         router_logits = self.gate(hidden_states)
 
         def _moe_body() -> tuple[torch.Tensor, torch.Tensor]:
+            stage_started_at = time.perf_counter()
             routing_weights, selected_experts, usage = self._route_tokens(router_logits, hidden_dtype=hidden_states.dtype)
+            record_moe_stage("router", time.perf_counter() - stage_started_at)
 
             num_tokens = batch_size * sequence_length
             usage = usage.to(device=selected_experts.device)
-            hit_experts = usage.nonzero(as_tuple=False).flatten()
-            hit_expert_list = [int(expert_idx) for expert_idx in hit_experts.tolist()]
-
+            stage_started_at = time.perf_counter()
             sorted_token_idx, expert_offsets, compact_hidden_states, compact_routing_weights = self._dispatch_routing_inputs(
                 hidden_states,
                 routing_weights,
                 selected_experts,
                 usage,
             )
+            record_moe_stage("dispatch", time.perf_counter() - stage_started_at)
             compact_outputs = hidden_states.new_empty((compact_hidden_states.shape[0], hidden_dim))
-            expert_offsets_host = expert_offsets.to(device="cpu") if expert_offsets.device.type == "xpu" else expert_offsets
-            if expert_offsets.device.type == "xpu":
-                record_moe_host_offset("qwen3_moe_expert_offsets_cpu")
+            used_resident_grouped_int4 = self._execute_resident_grouped_int4_experts(
+                expert_offsets=expert_offsets,
+                compact_hidden_states=compact_hidden_states,
+                compact_routing_weights=compact_routing_weights,
+                compact_outputs=compact_outputs,
+            )
+            if not used_resident_grouped_int4:
+                planning_device_type = (
+                    "xpu"
+                    if execution_device.type == "xpu"
+                    or usage.device.type == "xpu"
+                    or expert_offsets.device.type == "xpu"
+                    else execution_device.type
+                )
+                _raise_if_xpu_moe_host_planning_disallowed(
+                    planning_device_type,
+                    reason="qwen3_sparse_moe_forward",
+                )
+                hit_expert_list, expert_offsets_host = plan_moe_host_fallback(
+                    usage=usage,
+                    expert_offsets=expert_offsets,
+                )
+            elif self.offload_experts:
+                raise RuntimeError("Resident grouped int4 MoE execution cannot be combined with expert offload.")
+            else:
+                hit_expert_list = []
+                expert_offsets_host = expert_offsets
             if self.offload_experts and hit_expert_list:
                 self._execute_offloaded_experts(
                     hit_experts=hit_expert_list,
@@ -3763,13 +4110,10 @@ class Qwen3SparseMoeBlock(nn.Module):
                     execution_device=execution_device,
                     hidden_dtype=hidden_states.dtype,
                 )
-            else:
-                if expert_offsets_host.device.type == "cpu":
-                    record_moe_host_offset("qwen3_moe_expert_offsets_numpy")
-                offsets_np = expert_offsets_host.detach().numpy()
+            elif not used_resident_grouped_int4:
+                stage_started_at = time.perf_counter()
                 for expert_idx in hit_expert_list:
-                    start_idx = int(offsets_np[expert_idx])
-                    end_idx = int(offsets_np[expert_idx + 1])
+                    start_idx, end_idx = self._expert_offset_range(expert_offsets_host, expert_idx)
                     self._execute_expert(
                         expert_layer=self.experts[expert_idx],
                         start_idx=start_idx,
@@ -3780,22 +4124,27 @@ class Qwen3SparseMoeBlock(nn.Module):
                         execution_device=execution_device,
                         hidden_dtype=hidden_states.dtype,
                     )
+                record_moe_stage("expert_gemm", time.perf_counter() - stage_started_at)
 
+            stage_started_at = time.perf_counter()
             final_hidden_states = self._scatter_compact_outputs(
                 compact_outputs,
                 sorted_token_idx,
                 num_tokens=num_tokens,
                 hidden_dim=hidden_dim,
             )
+            record_moe_stage("scatter", time.perf_counter() - stage_started_at)
 
             shared_expert_device = _module_device(self.shared_expert)
             shared_gate_device = _module_device(self.shared_expert_gate)
             shared_input = hidden_states if hidden_states.device == shared_expert_device else hidden_states.to(device=shared_expert_device)
             gate_input = hidden_states if hidden_states.device == shared_gate_device else hidden_states.to(device=shared_gate_device)
+            stage_started_at = time.perf_counter()
             shared_expert_output = self.shared_expert(shared_input)
             shared_expert_output = torch.sigmoid(self.shared_expert_gate(gate_input).to(device=shared_expert_output.device)) * shared_expert_output
             if shared_expert_output.device != execution_device:
                 shared_expert_output = shared_expert_output.to(device=execution_device, dtype=hidden_states.dtype)
+            record_moe_stage("expert_gemm", time.perf_counter() - stage_started_at)
             final_hidden_states = final_hidden_states + shared_expert_output
             return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim), router_logits
 

@@ -123,6 +123,21 @@ def test_top_k_sampling_avoids_full_vocab_top_p_sort_metric() -> None:
     assert metrics.snapshot().sampler_full_vocab_sort_count == 0
 
 
+def test_top_k_one_sampling_is_deterministic_without_rng_or_full_vocab_sort() -> None:
+    metrics = AnnaServiceMetrics()
+    logits = torch.tensor([[1.0, 4.0, 3.0, 2.0], [5.0, 2.0, 4.0, 3.0]])
+
+    torch.manual_seed(0)
+    with hotpath_event_recorder(metrics):
+        first = sample_next_token_batch(logits, temperature=0.9, top_k=1, top_p=0.3, min_p=0.9)
+    torch.manual_seed(1234)
+    second = sample_next_token_batch(logits, temperature=0.9, top_k=1, top_p=0.3, min_p=0.9)
+
+    assert torch.equal(first, torch.tensor([1, 0]))
+    assert torch.equal(second, first)
+    assert metrics.snapshot().sampler_full_vocab_sort_count == 0
+
+
 def test_top_p_without_top_k_records_full_vocab_sort_metric() -> None:
     metrics = AnnaServiceMetrics()
     logits = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
@@ -269,6 +284,19 @@ def test_sample_next_token_batch_with_params_supports_per_row_sampling_config() 
         ),
         device="cpu",
     )
+    assert params.greedy_rows == (0,)
+    assert params.sample_rows == (1,)
+    assert params.top_p_rows == (1,)
+    assert params.top1_rows == ()
+    assert params.topk_rows == ()
+    assert params.penalty_rows == (0, 1)
+    assert params.topk_plain_rows == ()
+    assert params.topk_top_p_rows == ()
+    assert params.full_plain_rows == ()
+    assert params.full_top_p_rows == (1,)
+    assert params.candidate_plain_rows == ()
+    assert params.candidate_top_p_rows == (1,)
+    assert params.penalty_indices.tolist() == [0, 1]
     first_reference = torch.argmax(
         _reference_filtered_logits(
             logits[0],
@@ -306,6 +334,90 @@ def test_sample_next_token_batch_with_params_supports_per_row_sampling_config() 
         assert second_allowed[int(sampled[1].item())]
 
 
+def test_sample_next_token_batch_with_params_treats_top_k_one_sample_rows_as_top1() -> None:
+    metrics = AnnaServiceMetrics()
+    logits = torch.tensor(
+        [
+            [1.0, 6.0, 5.0, 4.0],
+            [3.0, 2.0, 7.0, 1.0],
+            [4.0, 3.0, 2.0, 1.0],
+        ]
+    )
+    params = SamplingBatchParams.from_sampling_params(
+        (
+            {"temperature": 0.8, "top_k": 1, "top_p": 0.2, "min_p": 0.9},
+            {"temperature": 0.7, "top_k": 2, "top_p": 1.0, "min_p": 0.0},
+            {"temperature": 0.0, "top_k": 0, "top_p": 1.0, "min_p": 0.0},
+        ),
+        device="cpu",
+    )
+    assert params.greedy_rows == (2,)
+    assert params.sample_rows == (0, 1)
+    assert params.top_p_rows == (0,)
+    assert params.top1_rows == (0,)
+    assert params.topk_rows == (1,)
+    assert params.penalty_rows == (0, 1, 2)
+    assert params.topk_plain_rows == (1,)
+    assert params.topk_top_p_rows == ()
+    assert params.full_plain_rows == ()
+    assert params.full_top_p_rows == ()
+    assert params.candidate_plain_rows == (1,)
+    assert params.candidate_top_p_rows == ()
+    assert params.greedy_indices.tolist() == [2]
+    assert params.top1_indices.tolist() == [0]
+    assert params.topk_plain_indices.tolist() == [1]
+    assert params.topk_top_p_indices.tolist() == []
+    assert params.full_plain_indices.tolist() == []
+    assert params.full_top_p_indices.tolist() == []
+    assert params.candidate_plain_indices.tolist() == [1]
+    assert params.candidate_top_p_indices.tolist() == []
+    assert params.penalty_indices.tolist() == [0, 1, 2]
+
+    torch.manual_seed(1)
+    with hotpath_event_recorder(metrics):
+        sampled = sample_next_token_batch_with_params(logits, params)
+
+    assert sampled[0] == 1
+    assert sampled[1] in (0, 2)
+    assert sampled[2] == 0
+    assert metrics.snapshot().sampler_full_vocab_sort_count == 0
+
+
+def test_sample_next_token_batch_with_params_counts_only_full_vocab_top_p_rows() -> None:
+    metrics = AnnaServiceMetrics()
+    logits = torch.tensor(
+        [
+            [5.0, 4.0, 3.0, 2.0],
+            [1.0, 5.0, 4.0, 3.0],
+            [4.0, 1.0, 3.0, 2.0],
+        ]
+    )
+    params = SamplingBatchParams.from_sampling_params(
+        (
+            {"temperature": 0.8, "top_k": 0, "top_p": 1.0, "min_p": 0.0},
+            {"temperature": 0.9, "top_k": 0, "top_p": 0.7, "min_p": 0.0},
+            {"temperature": 0.7, "top_k": 0, "top_p": 1.0, "min_p": 0.0},
+        ),
+        device="cpu",
+    )
+    assert params.full_plain_rows == (0, 2)
+    assert params.full_top_p_rows == (1,)
+    assert params.candidate_plain_rows == (0, 2)
+    assert params.candidate_top_p_rows == (1,)
+    assert params.penalty_rows == (0, 1, 2)
+    assert params.full_plain_indices.tolist() == [0, 2]
+    assert params.full_top_p_indices.tolist() == [1]
+    assert params.candidate_plain_indices.tolist() == [0, 2]
+    assert params.candidate_top_p_indices.tolist() == [1]
+
+    torch.manual_seed(2)
+    with hotpath_event_recorder(metrics):
+        sampled = sample_next_token_batch_with_params(logits, params)
+
+    assert sampled.shape == (3,)
+    assert metrics.snapshot().sampler_full_vocab_sort_count == 1
+
+
 def test_candidate_sampler_with_params_supports_per_row_sampling_config() -> None:
     logits = torch.tensor([[5.0, 4.0, 3.0], [1.0, 5.0, 4.0]])
     token_ids = torch.tensor([[10, 11, 12], [20, 21, 22]])
@@ -316,6 +428,17 @@ def test_candidate_sampler_with_params_supports_per_row_sampling_config() -> Non
         ),
         device="cpu",
     )
+    assert params.greedy_rows == (0,)
+    assert params.sample_rows == (1,)
+    assert params.top_p_rows == (1,)
+    assert params.top1_rows == ()
+    assert params.topk_rows == (1,)
+    assert params.penalty_rows == (0, 1)
+    assert params.topk_plain_rows == ()
+    assert params.topk_top_p_rows == (1,)
+    assert params.candidate_plain_rows == ()
+    assert params.candidate_top_p_rows == (1,)
+    assert params.penalty_indices.tolist() == [0, 1]
     second_allowed = torch.isfinite(
         _reference_filtered_logits(
             logits[1],
@@ -334,3 +457,57 @@ def test_candidate_sampler_with_params_supports_per_row_sampling_config() -> Non
 
         assert sampled[0] == 10
         assert second_allowed[int((token_ids[1] == sampled[1]).nonzero(as_tuple=True)[0].item())]
+
+
+def test_candidate_sampler_with_params_respects_per_row_top_k_on_wide_candidates() -> None:
+    logits = torch.tensor(
+        [
+            [1.0, 6.0, 5.0],
+            [10.0, 9.0, -10.0],
+        ]
+    )
+    token_ids = torch.tensor(
+        [
+            [10, 11, 12],
+            [20, 21, 22],
+        ]
+    )
+    params = SamplingBatchParams.from_sampling_params(
+        (
+            {"temperature": 0.8, "top_k": 1, "top_p": 0.2, "min_p": 0.9},
+            {"temperature": 0.8, "top_k": 2, "top_p": 1.0, "min_p": 0.0},
+        ),
+        device="cpu",
+    )
+
+    for seed in range(20):
+        torch.manual_seed(seed)
+        sampled = sample_next_token_batch_from_candidates_with_params(
+            logits,
+            token_ids,
+            params,
+            candidates_are_sorted=False,
+        )
+
+        assert sampled[0] == 11
+        assert int(sampled[1].item()) in {20, 21}
+
+
+def test_candidate_sampler_top1_returns_only_candidate_without_sampling() -> None:
+    logits = torch.tensor([[2.0], [9.0]])
+    token_ids = torch.tensor([[42], [77]])
+    params = SamplingBatchParams.from_sampling_params(
+        (
+            {"temperature": 0.8, "top_p": 0.1, "min_p": 1.0},
+            {"temperature": 0.6, "top_p": 0.2, "min_p": 0.9},
+        ),
+        device="cpu",
+    )
+
+    torch.manual_seed(0)
+    first = sample_next_token_batch_from_candidates_with_params(logits, token_ids, params)
+    torch.manual_seed(123)
+    second = sample_next_token_batch_from_candidates_with_params(logits, token_ids, params)
+
+    assert torch.equal(first, torch.tensor([42, 77]))
+    assert torch.equal(second, first)

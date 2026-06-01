@@ -5,11 +5,20 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import torch
+import torch.nn.functional as F
 
+from anna.core.hotpath_events import record_attention_fallback
 from anna.model.fused_ops import fused_op_health_report
+from anna.model import ops as model_ops
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, GenerationConfig, TextGenerationResult
-from anna.runtime.slot_model_runner import SlotModelRunner, SlotModelRunnerConfig, resolve_slot_model_runner_config
-from anna.vllm_compat.outputs import CompletionOutput, RequestOutput
+from anna.runtime.slot_model_runner import (
+    SlotDecodeModelInputs,
+    SlotModelRunner,
+    SlotModelRunnerConfig,
+    resolve_slot_model_runner_config,
+)
+from anna.sampling.params import SamplingBatchParams
+from anna.vllm_compat.outputs import RequestOutput, request_output_from_result
 from anna.vllm_compat.sampling import SamplingParams, sampling_params_to_generation_config
 
 
@@ -40,12 +49,286 @@ class AnnaXPUPlatformCapabilities:
         default_factory=lambda: AnnaXPUAttentionBackend(
             name="anna.paged_gqa",
             paged_decode=False,
-            prefill="torch",
+            prefill="torch_scaled_dot_product_attention",
             fallback="missing_fused_ops",
         )
     )
     fused_ops: Mapping[str, bool] = field(default_factory=dict)
     kv_cache: AnnaXPUKVCacheConfig | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AnnaVLLMPluginSpec:
+    """vLLM plugin discovery metadata without importing vLLM."""
+
+    name: str = "anna_xpu"
+    platform_entry_point_group: str = "vllm.platform_plugins"
+    platform_entry_point: str = "anna_xpu = anna_vllm_xpu:register_platform"
+    platform_class: str | None = None
+    worker_class: str | None = None
+    attention_backend_registry_class: str = "anna_vllm_xpu.adapter.AnnaXPUAttentionBackendRegistry"
+    runtime_adapter_class: str = "anna_vllm_xpu.adapter.AnnaVLLMXPURuntimeAdapter"
+    kv_cache_connector_class: str = "anna_vllm_xpu.adapter.AnnaXPUKVCacheConnector"
+    integrated_vllm_worker: bool = False
+
+
+def build_vllm_plugin_spec() -> AnnaVLLMPluginSpec:
+    return AnnaVLLMPluginSpec()
+
+
+def register_platform() -> str | None:
+    """vLLM ``vllm.platform_plugins`` entry point.
+
+    The current package exposes the discovery hook but intentionally returns
+    ``None`` until an integrated vLLM Platform/Worker pair is implemented.
+    Returning ``None`` keeps vLLM discovery harmless in environments where Anna
+    is installed next to vLLM before the full worker plugin is enabled.
+    """
+
+    return build_vllm_plugin_spec().platform_class
+
+
+class AnnaXPUAttentionBackendRegistry:
+    """No-dependency attention backend boundary for a future vLLM plugin."""
+
+    name = "anna.paged_gqa"
+    paged_decode_entrypoint = "anna.model.ops.paged_kv_slot_batch_decode_attention"
+    prefill_entrypoint = "torch.nn.functional.scaled_dot_product_attention"
+
+    def __init__(
+        self,
+        capabilities: AnnaXPUPlatformCapabilities | None = None,
+        *,
+        allow_cpu_tensors_for_tests: bool = False,
+    ) -> None:
+        self.capabilities = capabilities
+        self.allow_cpu_tensors_for_tests = bool(allow_cpu_tensors_for_tests)
+
+    @property
+    def paged_decode_supported(self) -> bool:
+        if self.capabilities is None:
+            return True
+        return bool(self.capabilities.attention_backend.paged_decode)
+
+    @property
+    def prefill_backend(self) -> str:
+        if self.capabilities is None:
+            return "torch_scaled_dot_product_attention"
+        return self.capabilities.attention_backend.prefill
+
+    def paged_decode(
+        self,
+        *,
+        query_states: torch.Tensor,
+        key_pages: torch.Tensor,
+        value_pages: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        scaling: float,
+        slot_ids: torch.Tensor | None = None,
+        gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.paged_decode_supported:
+            fallback = None if self.capabilities is None else self.capabilities.attention_backend.fallback
+            detail = f" ({fallback})" if fallback else ""
+            raise RuntimeError(
+                "Anna XPU paged decode attention backend is not available; "
+                f"build/load the native paged_gqa_decode_fused op before using this vLLM path{detail}."
+            )
+        self._require_xpu_tensors(
+            query_states=query_states,
+            key_pages=key_pages,
+            value_pages=value_pages,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+        )
+        optional_tensors = {}
+        if slot_ids is not None:
+            optional_tensors["slot_ids"] = slot_ids
+        if gate is not None:
+            optional_tensors["gate"] = gate
+        self._require_xpu_tensors(**optional_tensors)
+        return model_ops.paged_kv_slot_batch_decode_attention(
+            query_states,
+            key_pages,
+            value_pages,
+            block_tables,
+            seq_lens,
+            scaling=scaling,
+            slot_ids=slot_ids,
+            gate=gate,
+        )
+
+    def prefill(
+        self,
+        *,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        causal: bool = True,
+        dropout_p: float = 0.0,
+    ) -> torch.Tensor:
+        self._require_xpu_tensors(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+        )
+        if self.prefill_backend != "anna.prefill_attention":
+            record_attention_fallback("anna_vllm_xpu_torch_sdpa_prefill_attention")
+        enable_gqa = query_states.shape[1] != key_states.shape[1]
+        try:
+            return F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                dropout_p=float(dropout_p),
+                is_causal=bool(causal),
+                enable_gqa=enable_gqa,
+            )
+        except TypeError:
+            if enable_gqa:
+                groups = query_states.shape[1] // key_states.shape[1]
+                key_states = model_ops.repeat_kv(key_states, groups)
+                value_states = model_ops.repeat_kv(value_states, groups)
+            return F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                dropout_p=float(dropout_p),
+                is_causal=bool(causal),
+            )
+
+    def _require_xpu_tensors(self, **named_tensors: torch.Tensor) -> None:
+        if self.allow_cpu_tensors_for_tests:
+            return
+        for name, tensor in named_tensors.items():
+            if tensor.device.type != "xpu":
+                raise RuntimeError(
+                    "Anna XPU attention backend expects XPU tensors; "
+                    f"{name} is on {tensor.device}. Refusing to run this vLLM backend path on CPU."
+                )
+
+
+class AnnaXPUKVCacheConnector:
+    """No-dependency KV metadata bridge for vLLM-style block tables.
+
+    vLLM owns its KV allocator in a real plugin. This connector mirrors the
+    external slot/block-table tensors into Anna's metadata tensors and returns
+    the same ``SlotDecodeModelInputs`` shape that Anna's slot runner emits.
+    """
+
+    def __init__(self, runner: SlotModelRunner) -> None:
+        self.runner = runner
+
+    @property
+    def device(self) -> torch.device:
+        return self.runner.config.device
+
+    def import_decode_batch(
+        self,
+        *,
+        request_ids: Sequence[str] | None = None,
+        input_ids: torch.Tensor | Sequence[int] | Sequence[Sequence[int]],
+        slot_ids: torch.Tensor | Sequence[int],
+        block_tables: torch.Tensor | Sequence[Sequence[int]],
+        seq_lens: torch.Tensor | Sequence[int],
+        epochs: torch.Tensor | Sequence[int] | None = None,
+        positions: torch.Tensor | Sequence[int] | None = None,
+        sampling_params: Sequence[Any | None] | None = None,
+        physical_block_tables: bool = True,
+    ) -> SlotDecodeModelInputs:
+        slot_ids_tensor = torch.as_tensor(slot_ids, dtype=torch.long, device=self.device).reshape(-1)
+        batch_size = int(slot_ids_tensor.numel())
+        if batch_size <= 0:
+            raise ValueError("external KV decode batch must contain at least one slot.")
+        if batch_size > self.runner.config.max_batch_size:
+            raise ValueError(
+                f"external KV decode batch size {batch_size} exceeds "
+                f"runner max_batch_size={self.runner.config.max_batch_size}."
+            )
+
+        input_ids_tensor = torch.as_tensor(input_ids, dtype=torch.long, device=self.device)
+        if input_ids_tensor.ndim == 1:
+            if input_ids_tensor.numel() != batch_size:
+                raise ValueError("1D input_ids must contain one token id per slot.")
+            input_ids_tensor = input_ids_tensor.view(batch_size, 1)
+        if input_ids_tensor.ndim != 2 or input_ids_tensor.shape[0] != batch_size:
+            raise ValueError("input_ids must be [batch] or [batch, tokens] with one row per slot.")
+        if input_ids_tensor.shape[1] <= 0:
+            raise ValueError("input_ids must include at least one token per slot.")
+        if self.device.type == "cpu" and bool(torch.any(input_ids_tensor < 0)):
+            raise ValueError("input_ids must be non-negative.")
+
+        seq_lens_tensor = torch.as_tensor(seq_lens, dtype=torch.long, device=self.device).reshape(-1)
+        if seq_lens_tensor.numel() != batch_size:
+            raise ValueError("seq_lens must contain one value per slot.")
+        if positions is None:
+            positions_tensor = seq_lens_tensor.clone()
+        else:
+            positions_tensor = torch.as_tensor(positions, dtype=torch.long, device=self.device).reshape(-1)
+            if positions_tensor.numel() != batch_size:
+                raise ValueError("positions must contain one value per slot.")
+            if self.device.type == "cpu" and bool(torch.any(positions_tensor < 0)):
+                raise ValueError("positions must be non-negative.")
+        if epochs is None:
+            epochs_tensor = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
+        else:
+            epochs_tensor = torch.as_tensor(epochs, dtype=torch.long, device=self.device).reshape(-1)
+            if epochs_tensor.numel() != batch_size:
+                raise ValueError("epochs must contain one value per slot.")
+            if self.device.type == "cpu" and bool(torch.any(epochs_tensor < 0)):
+                raise ValueError("epochs must be non-negative.")
+
+        block_tables_tensor = torch.as_tensor(block_tables, dtype=torch.int32, device=self.device)
+        if block_tables_tensor.ndim != 2 or block_tables_tensor.shape[0] != batch_size:
+            raise ValueError("block_tables must be [batch, max_blocks] with one row per slot.")
+
+        if request_ids is None:
+            resolved_request_ids = tuple(f"external-row-{row_idx}" for row_idx in range(batch_size))
+        elif isinstance(request_ids, str):
+            resolved_request_ids = (request_ids,)
+        else:
+            resolved_request_ids = tuple(str(request_id) for request_id in request_ids)
+        if len(resolved_request_ids) != batch_size:
+            raise ValueError("request_ids must contain one value per slot.")
+        if any(not request_id for request_id in resolved_request_ids):
+            raise ValueError("request_ids must be non-empty.")
+        if len(set(resolved_request_ids)) != len(resolved_request_ids):
+            raise ValueError("request_ids must be unique within an external decode batch.")
+
+        resolved_sampling_params = (
+            tuple(sampling_params)
+            if sampling_params is not None
+            else tuple(None for _ in range(batch_size))
+        )
+        if len(resolved_sampling_params) != batch_size:
+            raise ValueError("sampling_params must contain one value per slot.")
+
+        self.runner.kv_manager.mirror_external_slot_tensors(
+            slot_ids=slot_ids_tensor,
+            block_tables=block_tables_tensor,
+            seq_lens=seq_lens_tensor,
+            epochs=epochs_tensor,
+            append_tokens=int(input_ids_tensor.shape[1]),
+        )
+        return SlotDecodeModelInputs(
+            request_ids=resolved_request_ids,
+            input_ids=input_ids_tensor,
+            slot_ids=slot_ids_tensor.to(dtype=torch.int32),
+            epochs=epochs_tensor,
+            positions=positions_tensor,
+            positions_are_global=False,
+            seq_lens=seq_lens_tensor,
+            seq_lens_are_global=False,
+            block_tables=block_tables_tensor,
+            block_tables_are_global=False,
+            physical_block_tables=bool(physical_block_tables),
+            sampling_params=resolved_sampling_params,
+            sampling_batch_params=SamplingBatchParams.from_sampling_params(
+                resolved_sampling_params,
+                device=self.device,
+            ),
+        )
 
 
 def _dtype_name(dtype: torch.dtype | str) -> str:
@@ -57,7 +340,7 @@ def _attention_backend_from_health(health_report: Mapping[str, object]) -> AnnaX
     if not isinstance(available, Mapping):
         available = {}
     paged_decode = bool(available.get("paged_gqa_decode_fused"))
-    prefill = "anna.prefill_attention" if bool(available.get("flashqla_gated_delta_fused")) else "torch"
+    prefill = "torch_scaled_dot_product_attention"
     fallback = None if paged_decode else "missing_paged_gqa_decode_fused"
     return AnnaXPUAttentionBackend(
         name="anna.paged_gqa",
@@ -81,6 +364,16 @@ def _coerce_request_ids(value: object) -> tuple[str, ...]:
     if isinstance(value, Sequence):
         return tuple(str(item) for item in value)
     return ()
+
+
+def _coerce_sampling_params(value: object) -> tuple[object | None, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return (value,)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(value)
+    return (value,)
 
 
 def extract_execute_model_request_ids(execute_model_request: object) -> tuple[str, ...]:
@@ -109,6 +402,41 @@ def extract_execute_model_request_ids(execute_model_request: object) -> tuple[st
             continue
         request_ids.append(str(request_id))
     return tuple(request_ids)
+
+
+def extract_execute_model_sampling_params(execute_model_request: object) -> tuple[object | None, ...] | None:
+    """Extract per-row sampling params from vLLM-like execute_model inputs."""
+
+    direct = _coerce_sampling_params(
+        extract_execute_model_field(execute_model_request, "sampling_params", "sampling_params_list")
+    )
+    if direct is not None:
+        return direct
+
+    seq_groups = _get_field(execute_model_request, "seq_group_metadata_list")
+    if seq_groups is None:
+        seq_groups = _get_field(execute_model_request, "seq_groups")
+    if seq_groups is None or isinstance(seq_groups, str) or not isinstance(seq_groups, Sequence):
+        return None
+
+    params: list[object | None] = []
+    found_any = False
+    for seq_group in seq_groups:
+        value = _get_field(seq_group, "sampling_params")
+        if value is not None:
+            found_any = True
+        params.append(value)
+    return tuple(params) if found_any else None
+
+
+def extract_execute_model_field(execute_model_request: object, *names: str) -> object | None:
+    """Return the first present field from a vLLM-like execute_model input."""
+
+    for name in names:
+        value = _get_field(execute_model_request, name)
+        if value is not None:
+            return value
+    return None
 
 
 def build_platform_capabilities(
@@ -196,6 +524,40 @@ class AnnaVLLMXPURuntimeAdapter:
             quant_bits=self.engine.optimization_config.kv_cache_quant_bits,
         )
 
+    def kv_cache_connector(self) -> AnnaXPUKVCacheConnector:
+        runner = self.slot_model_runner
+        if runner is None:
+            raise RuntimeError("Anna slot model runner is not enabled; KV cache connector cannot be created.")
+        return AnnaXPUKVCacheConnector(runner)
+
+    def attention_backend_registry(self) -> AnnaXPUAttentionBackendRegistry:
+        return AnnaXPUAttentionBackendRegistry(self.platform_capabilities())
+
+    def import_external_kv_decode_batch(
+        self,
+        *,
+        request_ids: Sequence[str] | None = None,
+        input_ids: torch.Tensor | Sequence[int] | Sequence[Sequence[int]],
+        slot_ids: torch.Tensor | Sequence[int],
+        block_tables: torch.Tensor | Sequence[Sequence[int]],
+        seq_lens: torch.Tensor | Sequence[int],
+        epochs: torch.Tensor | Sequence[int] | None = None,
+        positions: torch.Tensor | Sequence[int] | None = None,
+        sampling_params: Sequence[Any | None] | None = None,
+        physical_block_tables: bool = True,
+    ) -> SlotDecodeModelInputs:
+        return self.kv_cache_connector().import_decode_batch(
+            request_ids=request_ids,
+            input_ids=input_ids,
+            slot_ids=slot_ids,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            epochs=epochs,
+            positions=positions,
+            sampling_params=sampling_params,
+            physical_block_tables=physical_block_tables,
+        )
+
     def build_model_runner_inputs(
         self,
         *,
@@ -211,7 +573,52 @@ class AnnaVLLMXPURuntimeAdapter:
         request_ids = extract_execute_model_request_ids(execute_model_request)
         if not request_ids:
             raise ValueError("vLLM execute_model request did not expose any request ids.")
+        if any(not request_id for request_id in request_ids):
+            raise ValueError("vLLM execute_model request ids must be non-empty.")
         return self.build_model_runner_inputs(request_ids=request_ids)
+
+    def import_external_kv_decode_batch_from_execute_model(
+        self,
+        execute_model_request: object,
+        *,
+        sampling_params: Sequence[Any | None] | None = None,
+        physical_block_tables: bool = True,
+    ) -> SlotDecodeModelInputs:
+        input_ids = extract_execute_model_field(execute_model_request, "input_ids", "token_ids")
+        slot_ids = extract_execute_model_field(execute_model_request, "slot_ids", "slots")
+        block_tables = extract_execute_model_field(execute_model_request, "block_tables", "block_table")
+        seq_lens = extract_execute_model_field(execute_model_request, "seq_lens", "sequence_lengths")
+        epochs = extract_execute_model_field(execute_model_request, "epochs", "slot_epochs")
+        positions = extract_execute_model_field(execute_model_request, "positions")
+        missing = [
+            name
+            for name, value in (
+                ("input_ids", input_ids),
+                ("slot_ids", slot_ids),
+                ("block_tables", block_tables),
+                ("seq_lens", seq_lens),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "vLLM execute_model request is missing external KV decode fields: "
+                + ", ".join(missing)
+            )
+        if sampling_params is None:
+            sampling_params = extract_execute_model_sampling_params(execute_model_request)
+        request_ids = extract_execute_model_request_ids(execute_model_request)
+        return self.import_external_kv_decode_batch(
+            request_ids=request_ids or None,
+            input_ids=input_ids,  # type: ignore[arg-type]
+            slot_ids=slot_ids,  # type: ignore[arg-type]
+            block_tables=block_tables,  # type: ignore[arg-type]
+            seq_lens=seq_lens,  # type: ignore[arg-type]
+            epochs=epochs,  # type: ignore[arg-type]
+            positions=positions,  # type: ignore[arg-type]
+            sampling_params=sampling_params,
+            physical_block_tables=physical_block_tables,
+        )
 
     @staticmethod
     def sampling_params_to_generation_config(params: SamplingParams | None) -> GenerationConfig:
@@ -230,30 +637,19 @@ class AnnaVLLMXPURuntimeAdapter:
 
     @staticmethod
     def request_output_from_result(prompt: str, result: TextGenerationResult, *, request_id: str) -> RequestOutput:
-        return RequestOutput(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_token_ids=[],
-            outputs=[
-                CompletionOutput(
-                    index=0,
-                    text=result.text,
-                    token_ids=[],
-                    finish_reason=result.finish_reason,
-                    stop_reason=result.finish_reason,
-                )
-            ],
-            finished=True,
-            metrics=result.perf,
-        )
+        return request_output_from_result(prompt, result, request_id=request_id)
 
     def health(self) -> dict[str, object]:
         capabilities = self.platform_capabilities()
+        plugin_spec = build_vllm_plugin_spec()
         return {
             "runtime_adapter": "anna_vllm_xpu",
             "level": 3,
             "integrated_vllm_worker": False,
+            "platform_plugin_entry_point": plugin_spec.platform_entry_point,
             "execute_model_batch_adapter": True,
+            "kv_cache_connector": self.slot_model_runner is not None,
+            "attention_backend_registry": True,
             "model": self.model_id,
             "platform": capabilities,
             "slot_model_runner_enabled": self.slot_model_runner is not None,

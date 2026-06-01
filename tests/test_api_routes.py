@@ -122,6 +122,88 @@ def test_list_app_routes_includes_openapi_and_completion_endpoints() -> None:
     assert ("/v1/completions", "POST") in routes
     assert ("/v1/audio/speech", "POST") in routes
 
+
+def test_list_models_returns_openai_compatible_payload() -> None:
+    client = TestClient(create_app(_CapturingEngine()))
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["object"] == "list"
+    assert payload["data"] == [
+        {
+            "id": "fake-model",
+            "object": "model",
+            "created": payload["data"][0]["created"],
+            "owned_by": "anna",
+        }
+    ]
+    assert isinstance(payload["data"][0]["created"], int)
+
+
+def test_non_streaming_chat_completion_returns_openai_compatible_payload() -> None:
+    client = TestClient(create_app(_CapturingEngine()))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"].startswith("chatcmpl-")
+    assert payload["object"] == "chat.completion"
+    assert isinstance(payload["created"], int)
+    assert payload["model"] == "fake-model"
+    assert payload["choices"] == [
+        {
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop",
+        }
+    ]
+    assert payload["usage"] == {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+
+
+def test_non_streaming_completion_returns_openai_compatible_payload() -> None:
+    client = TestClient(create_app(_CapturingEngine()))
+
+    response = client.post(
+        "/v1/completions",
+        json={
+            "model": "fake-model",
+            "prompt": "hello",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"].startswith("cmpl-")
+    assert payload["object"] == "text_completion"
+    assert isinstance(payload["created"], int)
+    assert payload["model"] == "fake-model"
+    assert payload["choices"] == [
+        {
+            "index": 0,
+            "text": "ok",
+            "finish_reason": "stop",
+        }
+    ]
+    assert payload["usage"] == {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+
+
 def test_streaming_chat_returns_sse_error_frame_for_engine_failures() -> None:
     client = TestClient(create_app(_FailingStreamEngine()))
 

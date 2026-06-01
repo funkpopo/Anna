@@ -11,7 +11,13 @@ from anna.core.function_calling import ParsedToolCall
 from anna.mm.qwen3_5_text_processor import PreparedInputs
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
-from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, GenerationConfig, GenerationPerfStats, ThinkingStreamParser
+from anna.runtime.qwen3_5_text_engine import (
+    AnnaQwen3_5TextEngine,
+    GenerationConfig,
+    GenerationPerfStats,
+    RepetitionPenaltyHistory,
+    ThinkingStreamParser,
+)
 from anna.runtime.qwen3_5_text_engine import EngineOptimizationConfig, StreamEvent, TextGenerationResult
 from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
 
@@ -187,6 +193,8 @@ def test_generate_without_streaming_overhead_decodes_once() -> None:
     assert result.finish_reason == "stop"
     assert result.prompt_tokens == 7
     assert result.completion_tokens == 3
+    assert result.prompt_token_ids == []
+    assert result.completion_token_ids == [3, 4, 5]
 
 
 def test_stop_token_ids_include_model_config_eos_token_id() -> None:
@@ -195,6 +203,69 @@ def test_stop_token_ids_include_model_config_eos_token_id() -> None:
     engine.config = SimpleNamespace(text_config=SimpleNamespace(eos_token_id=22))
 
     assert engine._stop_token_ids() == {11, 22}
+
+
+def test_repetition_penalty_history_appends_into_preallocated_device_buffer() -> None:
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.device_context = SimpleNamespace(
+        device=torch.device("cpu"),
+        move_token_ids=lambda token_ids: token_ids,
+    )
+
+    history_tensor, history = engine._init_repetition_penalty_state(
+        [1, 2, 1],
+        penalty=1.1,
+        max_new_tokens=2,
+    )
+
+    assert isinstance(history, RepetitionPenaltyHistory)
+    assert history_tensor is not None
+    assert history.length == 2
+    assert history.buffer.shape == (4,)
+    assert history_tensor.tolist() == [1, 2]
+    original_ptr = history.buffer.data_ptr()
+
+    history_tensor, history = engine._append_repetition_penalty_token(
+        history_tensor=history_tensor,
+        history_ids=history,
+        next_token=torch.tensor(3),
+        token_id=3,
+    )
+    history_tensor, history = engine._append_repetition_penalty_token(
+        history_tensor=history_tensor,
+        history_ids=history,
+        next_token=torch.tensor(4),
+        token_id=4,
+    )
+
+    assert history.buffer.data_ptr() == original_ptr
+    assert history.length == 4
+    assert history_tensor is not None
+    assert history_tensor.tolist() == [1, 2, 3, 4]
+
+    history_tensor, history = engine._append_repetition_penalty_token(
+        history_tensor=history_tensor,
+        history_ids=history,
+        next_token=torch.tensor(3),
+        token_id=3,
+    )
+
+    assert history.buffer.data_ptr() == original_ptr
+    assert history.length == 4
+    assert history_tensor is not None
+    assert history_tensor.tolist() == [1, 2, 3, 4]
+
+
+def test_repetition_penalty_append_rejects_legacy_set_history() -> None:
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+
+    with pytest.raises(TypeError, match="preallocated device buffer"):
+        engine._append_repetition_penalty_token(
+            history_tensor=torch.tensor([1], dtype=torch.long),
+            history_ids={1},
+            next_token=torch.tensor(2, dtype=torch.long),
+            token_id=2,
+        )
 
 
 def test_generate_text_prepares_prompt_on_preprocess_device() -> None:
@@ -229,6 +300,101 @@ def test_generate_text_prepares_prompt_on_preprocess_device() -> None:
 
     assert result.text == "ok"
     assert engine.processor.tensor_device == torch.device("cpu")
+
+
+def test_text_generation_uses_scheduler_when_available() -> None:
+    class DummyProcessor:
+        def encode_text(self, prompt: str, *, tensor_device=None):
+            return PreparedInputs(
+                prompt=prompt,
+                input_ids=torch.tensor([[4, 5]], dtype=torch.long, device=tensor_device),
+                attention_mask=torch.ones((1, 2), dtype=torch.long, device=tensor_device),
+                mm_token_type_ids=torch.zeros((1, 2), dtype=torch.int32, device=tensor_device),
+            )
+
+    class DummyScheduler:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def generate(self, prepared, *, config):
+            self.calls.append((prepared, config))
+            return TextGenerationResult(
+                text="queued",
+                finish_reason="stop",
+                prompt_tokens=2,
+                completion_tokens=1,
+                prompt_token_ids=[4, 5],
+                completion_token_ids=[6],
+            )
+
+    def _fail_direct(self, prepared, *, config):  # pragma: no cover - should never be called
+        del prepared, config
+        raise AssertionError("text-only generation should be submitted to the scheduler")
+
+    scheduler = DummyScheduler()
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.processor = DummyProcessor()
+    engine.scheduler = scheduler
+    engine.device_context = SimpleNamespace(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        migration_policy=SimpleNamespace(preprocess_device=torch.device("cpu")),
+    )
+    engine._generate_direct = MethodType(_fail_direct, engine)
+
+    result = engine.generate_text("hello", config=GenerationConfig())
+
+    assert result.text == "queued"
+    assert result.prompt_token_ids == [4, 5]
+    assert result.completion_token_ids == [6]
+    assert len(scheduler.calls) == 1
+    prepared, config = scheduler.calls[0]
+    assert prepared.prompt == "hello"
+    assert isinstance(config, GenerationConfig)
+
+
+def test_text_streaming_uses_scheduler_when_available() -> None:
+    class DummyProcessor:
+        def encode_text(self, prompt: str, *, tensor_device=None):
+            return PreparedInputs(
+                prompt=prompt,
+                input_ids=torch.tensor([[4, 5]], dtype=torch.long, device=tensor_device),
+                attention_mask=torch.ones((1, 2), dtype=torch.long, device=tensor_device),
+                mm_token_type_ids=torch.zeros((1, 2), dtype=torch.int32, device=tensor_device),
+            )
+
+    class DummyScheduler:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def stream(self, prepared, *, config):
+            self.calls.append((prepared, config))
+            yield StreamEvent(text="queued", finish_reason=None)
+            yield StreamEvent(text="", finish_reason="stop", prompt_tokens=2, completion_tokens=1)
+
+    def _fail_stream_direct(self, prepared, *, config):  # pragma: no cover - should never be called
+        del prepared, config
+        raise AssertionError("text-only streaming should be submitted to the scheduler")
+
+    scheduler = DummyScheduler()
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.processor = DummyProcessor()
+    engine.scheduler = scheduler
+    engine.device_context = SimpleNamespace(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        migration_policy=SimpleNamespace(preprocess_device=torch.device("cpu")),
+    )
+    engine._stream_direct = MethodType(_fail_stream_direct, engine)
+
+    events = list(engine.stream_text("hello", config=GenerationConfig()))
+
+    assert [event.text for event in events] == ["queued", ""]
+    assert events[-1].finish_reason == "stop"
+    assert len(scheduler.calls) == 1
+    prepared, config = scheduler.calls[0]
+    assert prepared.prompt == "hello"
+    assert isinstance(config, GenerationConfig)
 
 
 def test_prepare_messages_uses_preprocess_device_before_xpu_transfer() -> None:
@@ -900,6 +1066,32 @@ def test_prefill_generation_reuses_prompt_cache_for_exact_prompt_matches() -> No
     assert second.logits.item() == 11.0
     cached_entry = engine._prompt_cache[tuple(int(token) for token in prepared.input_ids[0].tolist())]
     assert second.logits.data_ptr() == cached_entry.logits.data_ptr()
+
+
+def test_prompt_cache_key_prefers_prepared_prompt_token_ids() -> None:
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.optimization_config = EngineOptimizationConfig(prompt_cache_size=4)
+
+    prepared = PreparedInputs(
+        prompt="cache me",
+        input_ids=torch.tensor([[99, 98]], dtype=torch.long),
+        attention_mask=torch.ones((1, 2), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 2), dtype=torch.int32),
+        prompt_token_ids=[11, 12, 13],
+    )
+
+    assert engine._prompt_cache_key(prepared) == (11, 12, 13)
+
+
+def test_prepared_prompt_token_ids_can_fallback_to_cpu_input_ids() -> None:
+    prepared = PreparedInputs(
+        prompt="cache me",
+        input_ids=torch.tensor([[21, 22, 23]], dtype=torch.long),
+        attention_mask=torch.ones((1, 3), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 3), dtype=torch.int32),
+    )
+
+    assert AnnaQwen3_5TextEngine._prepared_prompt_token_ids(prepared) == [21, 22, 23]
 
 
 def test_prefill_generation_skips_prompt_cache_when_prompt_is_over_token_threshold() -> None:

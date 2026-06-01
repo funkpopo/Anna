@@ -1,17 +1,31 @@
 from anna_vllm_xpu.adapter import (
     AnnaVLLMXPURuntimeAdapter,
     AnnaXPUAttentionBackend,
+    AnnaXPUAttentionBackendRegistry,
+    AnnaXPUKVCacheConnector,
     AnnaXPUKVCacheConfig,
     AnnaXPUPlatformCapabilities,
+    AnnaVLLMPluginSpec,
     build_platform_capabilities,
+    build_vllm_plugin_spec,
+    extract_execute_model_field,
     extract_execute_model_request_ids,
+    extract_execute_model_sampling_params,
+    register_platform,
 )
 
 __all__ = [
     "AnnaVLLMXPURuntimeAdapter",
     "AnnaXPUAttentionBackend",
+    "AnnaXPUAttentionBackendRegistry",
+    "AnnaXPUKVCacheConnector",
     "AnnaXPUKVCacheConfig",
     "AnnaXPUPlatformCapabilities",
+    "AnnaVLLMPluginSpec",
     "build_platform_capabilities",
+    "build_vllm_plugin_spec",
+    "extract_execute_model_field",
     "extract_execute_model_request_ids",
+    "extract_execute_model_sampling_params",
+    "register_platform",
 ]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -129,7 +130,21 @@ def _slot_decode_position_ids(
 ) -> torch.Tensor | None:
     if slot_decode_inputs is None:
         return None
-    positions = getattr(slot_decode_inputs, "positions", None)
+
+    positions = getattr(slot_decode_inputs, "batch_positions", None)
+    if not torch.is_tensor(positions):
+        positions = getattr(slot_decode_inputs, "positions", None)
+        if torch.is_tensor(positions) and bool(getattr(slot_decode_inputs, "positions_are_global", False)):
+            slot_ids = getattr(slot_decode_inputs, "slot_ids", None)
+            if not torch.is_tensor(slot_ids):
+                raise RuntimeError("slot_decode_inputs.slot_ids are required when positions are global tensors.")
+            if slot_ids.ndim != 1 or int(slot_ids.shape[0]) != batch_size:
+                raise RuntimeError(
+                    "slot_decode_inputs.slot_ids must be a 1D tensor with one entry per decode batch row; "
+                    f"got shape={tuple(slot_ids.shape)} batch_size={batch_size}."
+                )
+            index = slot_ids.to(device=positions.device, dtype=torch.long)
+            positions = positions.index_select(0, index)
     if not torch.is_tensor(positions):
         return None
     if positions.ndim != 1 or int(positions.shape[0]) != batch_size:
@@ -219,6 +234,7 @@ class Qwen3TextModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
         slot_decode_inputs: object | None = None,
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> TextModelOutput:
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds.")
@@ -237,7 +253,9 @@ class Qwen3TextModel(nn.Module):
                 kv_cache_quant_bits=self.kv_cache_quant_bits,
                 kv_cache_residual_len=self.kv_cache_residual_len,
             )
-            if input_ids is not None:
+            if prompt_token_ids is not None:
+                past_key_values.set_prompt_token_ids(prompt_token_ids)
+            elif input_ids is not None:
                 past_key_values.set_prompt_token_ids(input_ids)
 
         execution_device = self.execution_device or _module_device(self.norm)
@@ -776,6 +794,7 @@ class Qwen3Model(nn.Module):
         mm_token_type_ids: torch.IntTensor | None = None,
         use_cache: bool | None = None,
         slot_decode_inputs: object | None = None,
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> MultimodalModelOutput:
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
@@ -788,7 +807,9 @@ class Qwen3Model(nn.Module):
                 kv_cache_quant_bits=self.language_model.kv_cache_quant_bits,
                 kv_cache_residual_len=self.language_model.kv_cache_residual_len,
             )
-            if input_ids is not None:
+            if prompt_token_ids is not None:
+                past_key_values.set_prompt_token_ids(prompt_token_ids)
+            elif input_ids is not None:
                 past_key_values.set_prompt_token_ids(input_ids)
 
         if inputs_embeds is None:
@@ -829,6 +850,7 @@ class Qwen3Model(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            prompt_token_ids=prompt_token_ids,
         )
         return MultimodalModelOutput(
             last_hidden_state=outputs.last_hidden_state,
@@ -889,6 +911,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
         slot_decode_inputs: object | None = None,
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> CausalLMOutput:
         outputs = self.model(
             input_ids=input_ids,
@@ -898,6 +921,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            prompt_token_ids=prompt_token_ids,
         )
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
@@ -920,6 +944,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
         logits_to_keep: int | None = None,
         top_k: int = 1,
         slot_decode_inputs: object | None = None,
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> CausalLMTopKOutput:
         outputs = self.model(
             input_ids=input_ids,
@@ -929,6 +954,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            prompt_token_ids=prompt_token_ids,
         )
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
@@ -992,6 +1018,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
         slot_decode_inputs: object | None = None,
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> CausalLMOutput:
         outputs = self.model.language_model(
             input_ids=input_ids,
@@ -1001,6 +1028,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            prompt_token_ids=prompt_token_ids,
         )
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
@@ -1024,6 +1052,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         logits_to_keep: int | None = None,
         top_k: int = 1,
         slot_decode_inputs: object | None = None,
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> CausalLMTopKOutput:
         outputs = self.model.language_model(
             input_ids=input_ids,
@@ -1033,6 +1062,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            prompt_token_ids=prompt_token_ids,
         )
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
@@ -1055,6 +1085,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
         slot_decode_inputs: object | None = None,
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> CausalLMOutput:
         outputs = self.model(
             input_ids=input_ids,
@@ -1069,6 +1100,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             mm_token_type_ids=mm_token_type_ids,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            prompt_token_ids=prompt_token_ids,
         )
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
@@ -1096,6 +1128,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         logits_to_keep: int | None = None,
         top_k: int = 1,
         slot_decode_inputs: object | None = None,
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> CausalLMTopKOutput:
         outputs = self.model(
             input_ids=input_ids,
@@ -1110,6 +1143,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             mm_token_type_ids=mm_token_type_ids,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            prompt_token_ids=prompt_token_ids,
         )
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:

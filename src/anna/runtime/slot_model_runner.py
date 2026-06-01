@@ -23,18 +23,63 @@ class SlotModelRunnerConfig:
 
 @dataclass(frozen=True, slots=True)
 class SlotDecodeModelInputs:
-    """Tensor view passed from a slot scheduler to the future model runner."""
+    """Tensor view passed from a slot scheduler to the future model runner.
+
+    ``seq_lens`` and ``positions`` describe lengths before the current
+    ``input_ids`` are appended. Attention paths that read KV after writing the
+    current decode tokens should use ``visible_seq_lens``.
+
+    Internal Anna slot decode plans pass ``seq_lens``, ``positions``, and
+    ``block_tables`` as live global slot tensors and set the corresponding
+    ``*_are_global`` flags so model code can select active rows with ``slot_ids``
+    without rebuilding per-batch metadata.
+    """
 
     request_ids: tuple[str, ...]
     input_ids: torch.Tensor
     slot_ids: torch.Tensor
     epochs: torch.Tensor
     positions: torch.Tensor
+    positions_are_global: bool
     seq_lens: torch.Tensor
+    seq_lens_are_global: bool
     block_tables: torch.Tensor
+    block_tables_are_global: bool
     physical_block_tables: bool
     sampling_params: tuple[Any | None, ...]
     sampling_batch_params: SamplingBatchParams
+
+    @property
+    def decode_token_count(self) -> int:
+        if self.input_ids.ndim <= 1:
+            return 1
+        return int(self.input_ids.shape[1])
+
+    def _select_batch_rows(self, tensor: torch.Tensor, *, is_global: bool) -> torch.Tensor:
+        if not is_global:
+            return tensor
+        index = self.slot_ids.to(device=tensor.device, dtype=torch.long)
+        return tensor.index_select(0, index)
+
+    @property
+    def batch_positions(self) -> torch.Tensor:
+        return self._select_batch_rows(self.positions, is_global=self.positions_are_global)
+
+    @property
+    def batch_seq_lens(self) -> torch.Tensor:
+        return self._select_batch_rows(self.seq_lens, is_global=self.seq_lens_are_global)
+
+    @property
+    def batch_block_tables(self) -> torch.Tensor:
+        return self._select_batch_rows(self.block_tables, is_global=self.block_tables_are_global)
+
+    @property
+    def visible_seq_lens(self) -> torch.Tensor:
+        return self.batch_visible_seq_lens
+
+    @property
+    def batch_visible_seq_lens(self) -> torch.Tensor:
+        return self.batch_seq_lens + self.decode_token_count
 
     @classmethod
     def from_plan(cls, plan: DecodeBatchPlan) -> "SlotDecodeModelInputs":
@@ -44,8 +89,11 @@ class SlotDecodeModelInputs:
             slot_ids=plan.slot_ids,
             epochs=plan.epochs,
             positions=plan.positions,
+            positions_are_global=plan.positions_are_global,
             seq_lens=plan.seq_lens,
+            seq_lens_are_global=plan.seq_lens_are_global,
             block_tables=plan.block_tables,
+            block_tables_are_global=plan.block_tables_are_global,
             physical_block_tables=plan.physical_block_tables,
             sampling_params=plan.sampling_params,
             sampling_batch_params=plan.sampling_batch_params,
@@ -147,8 +195,31 @@ class SlotModelRunner:
     def advance_prefill(self, request_id: str, *, token_count: int) -> SequenceSlot:
         return self.scheduler.advance_prefill(request_id, token_count=token_count)
 
-    def mark_prefilled(self, request_id: str, *, next_input_id: int) -> SequenceSlot:
-        return self.scheduler.mark_prefilled(request_id, next_input_id=next_input_id)
+    def mark_prefilled(
+        self,
+        request_id: str,
+        *,
+        next_input_id: int | torch.Tensor,
+        next_input_host_id: int | None = None,
+    ) -> SequenceSlot:
+        return self.scheduler.mark_prefilled(
+            request_id,
+            next_input_id=next_input_id,
+            next_input_host_id=next_input_host_id,
+        )
+
+    def mark_prefilled_batch(
+        self,
+        *,
+        request_ids: Sequence[str],
+        next_input_ids: torch.Tensor | Sequence[int | torch.Tensor],
+        next_input_host_ids: Sequence[int | None] | None = None,
+    ) -> tuple[SequenceSlot, ...]:
+        return self.scheduler.mark_prefilled_batch(
+            request_ids=request_ids,
+            next_input_ids=next_input_ids,
+            next_input_host_ids=next_input_host_ids,
+        )
 
     def build_decode_inputs(
         self,
@@ -164,12 +235,29 @@ class SlotModelRunner:
         self,
         request_id: str,
         *,
-        next_input_id: int | None = None,
+        next_input_id: int | torch.Tensor | None = None,
+        next_input_host_id: int | None = None,
         finished: bool = False,
     ) -> SequenceSlot:
         return self.scheduler.advance_decode(
             request_id,
             next_input_id=next_input_id,
+            next_input_host_id=next_input_host_id,
+            finished=finished,
+        )
+
+    def advance_decode_batch(
+        self,
+        *,
+        request_ids: Sequence[str],
+        next_input_ids: torch.Tensor | Sequence[int | torch.Tensor | None] | None = None,
+        next_input_host_ids: Sequence[int | None] | None = None,
+        finished: Sequence[bool] | None = None,
+    ) -> tuple[SequenceSlot, ...]:
+        return self.scheduler.advance_decode_batch(
+            request_ids=request_ids,
+            next_input_ids=next_input_ids,
+            next_input_host_ids=next_input_host_ids,
             finished=finished,
         )
 

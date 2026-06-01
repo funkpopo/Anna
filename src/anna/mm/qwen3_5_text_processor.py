@@ -136,7 +136,8 @@ class Qwen3_5TextMultimodalProcessor:
     ) -> PreparedInputs:
         resolved_device = self._resolve_tensor_device(tensor_device)
         tensor_kwargs = {} if resolved_device is None else {"device": resolved_device}
-        input_ids = torch.tensor([self.tokenizer.encode(prompt)], dtype=torch.long, **tensor_kwargs)
+        prompt_token_ids = [int(token_id) for token_id in self.tokenizer.encode(prompt)]
+        input_ids = torch.tensor([prompt_token_ids], dtype=torch.long, **tensor_kwargs)
         attention_mask = torch.ones_like(input_ids, dtype=torch.long)
         mm_token_type_ids = self._create_mm_token_type_ids(input_ids)
         return PreparedInputs(
@@ -144,6 +145,7 @@ class Qwen3_5TextMultimodalProcessor:
             input_ids=input_ids,
             attention_mask=attention_mask,
             mm_token_type_ids=mm_token_type_ids,
+            prompt_token_ids=prompt_token_ids,
             pixel_values=self._move_tensor(pixel_values, device=resolved_device, dtype=tensor_dtype),
             image_grid_thw=self._move_tensor(image_grid_thw, device=resolved_device, dtype=torch.long),
             pixel_values_videos=self._move_tensor(pixel_values_videos, device=resolved_device, dtype=tensor_dtype),

@@ -4,17 +4,20 @@ import argparse
 import json
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from anna.core.hotpath_events import hotpath_event_recorder
-from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
+from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, grouped_query_attention
+from anna.model.quantization import XPUInt4Linear
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
-from anna.runtime.hotpath_guard import scan_hotpath_files, unexpected_findings
+from anna.runtime.hotpath_guard import DEFAULT_ALLOWLIST, scan_hotpath_files, summarize_findings, unexpected_findings
 from anna.runtime.paged_kv import PagedKVManager
 from anna.runtime.service_metrics import AnnaServiceMetrics
 from anna.runtime.slot_scheduler import SlotScheduler
@@ -26,6 +29,90 @@ def _time_ms(fn: Callable[[], object], *, iters: int) -> float:
     for _ in range(max(1, iters)):
         fn()
     return (time.perf_counter() - started) * 1000.0 / max(1, iters)
+
+
+def _resolve_kv_heads(num_heads: int, requested_kv_heads: int) -> int:
+    if requested_kv_heads > 0:
+        kv_heads = int(requested_kv_heads)
+    elif num_heads % 2 == 0:
+        kv_heads = max(1, num_heads // 2)
+    else:
+        kv_heads = max(1, num_heads)
+    if num_heads % kv_heads != 0:
+        raise ValueError(f"num_heads must be divisible by kv_heads: heads={num_heads} kv_heads={kv_heads}")
+    return kv_heads
+
+
+def _repeat_kv_for_bench(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return hidden_states
+    batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, seq_len, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, seq_len, head_dim)
+
+
+def _pack_paged_kv_for_bench(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, num_kv_heads, key_len, head_dim = key.shape
+    pages_per_batch = max(1, (key_len + block_size - 1) // block_size)
+    total_pages = batch_size * pages_per_batch
+    key_pages = key.new_zeros((total_pages, num_kv_heads, block_size, head_dim))
+    value_pages = value.new_zeros((total_pages, num_kv_heads, block_size, head_dim))
+    block_tables = torch.full((batch_size, pages_per_batch), -1, dtype=torch.int32, device=key.device)
+    for batch_idx in range(batch_size):
+        for block_idx in range(pages_per_batch):
+            page_id = batch_idx * pages_per_batch + block_idx
+            start = block_idx * block_size
+            take = min(block_size, max(0, key_len - start))
+            if take > 0:
+                key_pages[page_id, :, :take, :].copy_(key[batch_idx, :, start : start + take, :])
+                value_pages[page_id, :, :take, :].copy_(value[batch_idx, :, start : start + take, :])
+            block_tables[batch_idx, block_idx] = page_id
+    return key_pages, value_pages, block_tables
+
+
+def _paged_decode_reference_for_bench(
+    query: torch.Tensor,
+    key_pages: torch.Tensor,
+    value_pages: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    scaling: float,
+) -> torch.Tensor:
+    batch_size, num_heads, _, head_dim = query.shape
+    num_kv_heads = key_pages.shape[1]
+    num_key_value_groups = max(1, num_heads // num_kv_heads)
+    outputs = []
+    for batch_idx in range(batch_size):
+        visible = int(seq_lens[batch_idx].item())
+        blocks = block_tables[batch_idx]
+        key_rows = []
+        value_rows = []
+        remaining = visible
+        for block_id in blocks.tolist():
+            if remaining <= 0 or block_id < 0:
+                break
+            take = min(remaining, key_pages.shape[2])
+            key_rows.append(key_pages[int(block_id), :, :take, :])
+            value_rows.append(value_pages[int(block_id), :, :take, :])
+            remaining -= take
+        if key_rows:
+            key_states = torch.cat(key_rows, dim=1).unsqueeze(0)
+            value_states = torch.cat(value_rows, dim=1).unsqueeze(0)
+        else:
+            key_states = key_pages.new_zeros((1, num_kv_heads, 1, head_dim))
+            value_states = value_pages.new_zeros((1, num_kv_heads, 1, head_dim))
+        repeated_key = _repeat_kv_for_bench(key_states, num_key_value_groups)
+        repeated_value = _repeat_kv_for_bench(value_states, num_key_value_groups)
+        scores = torch.matmul(query[batch_idx : batch_idx + 1], repeated_key.transpose(-1, -2)) * scaling
+        probs = torch.softmax(scores.float(), dim=-1).to(dtype=query.dtype)
+        outputs.append(torch.matmul(probs, repeated_value))
+    return torch.cat(outputs, dim=0)
 
 
 def _tiny_config(*, layers: int, heads: int, head_dim: int, block_size: int) -> Qwen3_5TextConfig:
@@ -113,9 +200,10 @@ def _bench_slot_decode_plan(
 ) -> dict[str, Any]:
     required_blocks = 0 if seq_len <= 0 else (seq_len + block_size - 1) // block_size
     resolved_max_blocks = max(max_blocks_per_seq, required_blocks + 1, 1)
+    max_slots = batch_size + 1
     manager = PagedKVManager(
-        max_slots=batch_size,
-        total_blocks=batch_size * resolved_max_blocks,
+        max_slots=max_slots,
+        total_blocks=max_slots * resolved_max_blocks,
         block_size=block_size,
         max_blocks_per_seq=resolved_max_blocks,
         device="cpu",
@@ -139,7 +227,14 @@ def _bench_slot_decode_plan(
         scheduler.mark_prefilled(request_id, next_input_id=idx + 1)
 
     plan = scheduler.build_decode_plan(request_ids=request_ids)
-    assert plan.block_tables.shape == (batch_size, resolved_max_blocks)
+    assert plan.block_tables_are_global is True
+    assert plan.seq_lens_are_global is True
+    assert plan.positions_are_global is True
+    assert plan.block_tables.shape == (max_slots, resolved_max_blocks)
+    assert plan.seq_lens.shape == (max_slots,)
+    assert plan.positions.shape == (max_slots,)
+    assert plan.batch_seq_lens.shape == (batch_size,)
+    assert plan.batch_positions.shape == (batch_size,)
     assert plan.sampling_batch_params.batch_size == batch_size
 
     plan_ms = _time_ms(lambda: scheduler.build_decode_plan(request_ids=request_ids), iters=iters)
@@ -149,8 +244,185 @@ def _bench_slot_decode_plan(
         "block_size": block_size,
         "max_blocks_per_seq": resolved_max_blocks,
         "plan_ms": plan_ms,
+        "active_batch_rows": batch_size,
+        "block_tables_are_global": bool(plan.block_tables_are_global),
+        "seq_lens_are_global": bool(plan.seq_lens_are_global),
+        "positions_are_global": bool(plan.positions_are_global),
         "block_table_rows": int(plan.block_tables.shape[0]),
         "block_table_cols": int(plan.block_tables.shape[1]),
+        "seq_lens_rows": int(plan.seq_lens.shape[0]),
+        "positions_rows": int(plan.positions.shape[0]),
+    }
+
+
+def _summarize_scheduler_kv_overhead(
+    *,
+    cache_stack_split: dict[str, Any],
+    slot_decode_plan: dict[str, Any],
+) -> dict[str, Any]:
+    stack_ms = float(cache_stack_split["stack_ms"])
+    split_ms = float(cache_stack_split["split_ms"])
+    stack_split_ms = stack_ms + split_ms
+    slot_plan_ms = float(slot_decode_plan["plan_ms"])
+    ratio = None if slot_plan_ms <= 0.0 else stack_split_ms / slot_plan_ms
+    batch_size = int(cache_stack_split["batch_size"])
+    layers = int(cache_stack_split["layers"])
+    active_rows = int(slot_decode_plan.get("active_batch_rows", batch_size))
+    global_rows = int(slot_decode_plan["block_table_rows"])
+    block_table_cols = int(slot_decode_plan["block_table_cols"])
+    seq_lens_rows = int(slot_decode_plan.get("seq_lens_rows", active_rows))
+    positions_rows = int(slot_decode_plan.get("positions_rows", active_rows))
+    return {
+        "batch_size": batch_size,
+        "seq_len": int(cache_stack_split["seq_len"]),
+        "layers": layers,
+        "block_size": int(cache_stack_split["block_size"]),
+        "legacy_cache_objects_per_step": batch_size,
+        "legacy_layer_rows_touched_per_step": batch_size * layers,
+        "slot_plan_active_rows": active_rows,
+        "slot_plan_rows": global_rows,
+        "slot_plan_block_tables_are_global": bool(slot_decode_plan.get("block_tables_are_global", False)),
+        "slot_plan_seq_lens_are_global": bool(slot_decode_plan.get("seq_lens_are_global", False)),
+        "slot_plan_positions_are_global": bool(slot_decode_plan.get("positions_are_global", False)),
+        "slot_plan_block_table_cols": block_table_cols,
+        "slot_plan_block_table_entries": active_rows * block_table_cols,
+        "slot_plan_global_block_table_entries": global_rows * block_table_cols,
+        "slot_plan_seq_lens_entries": active_rows,
+        "slot_plan_global_seq_lens_entries": seq_lens_rows,
+        "slot_plan_positions_entries": active_rows,
+        "slot_plan_global_positions_entries": positions_rows,
+        "stack_ms": stack_ms,
+        "split_ms": split_ms,
+        "stack_split_ms": stack_split_ms,
+        "slot_plan_ms": slot_plan_ms,
+        "stack_split_to_slot_plan_ratio": ratio,
+    }
+
+
+def _bench_paged_gqa_decode(
+    *,
+    batch_size: int,
+    seq_len: int,
+    heads: int,
+    kv_heads: int,
+    head_dim: int,
+    block_size: int,
+    iters: int,
+) -> dict[str, Any]:
+    resolved_kv_heads = _resolve_kv_heads(heads, kv_heads)
+    scaling = head_dim**-0.5
+    query = torch.randn(batch_size, heads, 1, head_dim)
+    key = torch.randn(batch_size, resolved_kv_heads, seq_len, head_dim)
+    value = torch.randn_like(key)
+    key_pages, value_pages, block_tables = _pack_paged_kv_for_bench(key, value, block_size=block_size)
+    global_block_tables = torch.cat(
+        [
+            torch.full_like(block_tables, -1),
+            block_tables,
+        ],
+        dim=0,
+    )
+    slot_ids = torch.arange(batch_size, dtype=torch.long) + batch_size
+    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.long)
+    global_seq_lens = torch.cat([torch.zeros_like(seq_lens), seq_lens], dim=0)
+    num_key_value_groups = max(1, heads // resolved_kv_heads)
+
+    def materialized_decode() -> torch.Tensor:
+        repeated_key = _repeat_kv_for_bench(key, num_key_value_groups)
+        repeated_value = _repeat_kv_for_bench(value, num_key_value_groups)
+        scores = torch.matmul(query, repeated_key.transpose(-1, -2)) * scaling
+        probs = torch.softmax(scores.float(), dim=-1).to(dtype=query.dtype)
+        return torch.matmul(probs, repeated_value)
+
+    def paged_reference_decode() -> torch.Tensor:
+        selected_tables = global_block_tables.index_select(0, slot_ids)
+        selected_lens = global_seq_lens.index_select(0, slot_ids)
+        return _paged_decode_reference_for_bench(
+            query,
+            key_pages,
+            value_pages,
+            selected_tables,
+            selected_lens,
+            scaling=scaling,
+        )
+
+    dense_output = materialized_decode()
+    paged_output = paged_reference_decode()
+    error = (paged_output.float() - dense_output.float()).abs()
+    materialized_ms = _time_ms(materialized_decode, iters=iters)
+    paged_reference_ms = _time_ms(paged_reference_decode, iters=iters)
+    return {
+        "backend": "cpu_reference_smoke",
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+        "heads": heads,
+        "kv_heads": resolved_kv_heads,
+        "head_dim": head_dim,
+        "block_size": block_size,
+        "pages": int(key_pages.shape[0]),
+        "block_table_rows": int(global_block_tables.shape[0]),
+        "block_table_cols": int(global_block_tables.shape[1]),
+        "materialized_ms": materialized_ms,
+        "paged_reference_ms": paged_reference_ms,
+        "max_abs_diff": float(error.max().item()),
+        "mean_abs_diff": float(error.mean().item()),
+    }
+
+
+def _bench_prefill_attention(
+    *,
+    batch_size: int,
+    seq_len: int,
+    heads: int,
+    kv_heads: int,
+    head_dim: int,
+    iters: int,
+) -> dict[str, Any]:
+    resolved_kv_heads = _resolve_kv_heads(heads, kv_heads)
+    scaling = head_dim**-0.5
+    query = torch.randn(batch_size, heads, seq_len, head_dim)
+    key = torch.randn(batch_size, resolved_kv_heads, seq_len, head_dim)
+    value = torch.randn_like(key)
+    num_key_value_groups = max(1, heads // resolved_kv_heads)
+    causal_mask = torch.arange(seq_len)[:, None] < torch.arange(seq_len)[None, :]
+    causal_mask = causal_mask.unsqueeze(0).expand(batch_size, -1, -1)
+
+    def sdpa_materialized() -> torch.Tensor:
+        repeated_key = _repeat_kv_for_bench(key, num_key_value_groups)
+        repeated_value = _repeat_kv_for_bench(value, num_key_value_groups)
+        return F.scaled_dot_product_attention(
+            query,
+            repeated_key,
+            repeated_value,
+            dropout_p=0.0,
+            is_causal=seq_len > 1,
+        )
+
+    def grouped_fallback() -> torch.Tensor:
+        return grouped_query_attention(
+            query,
+            key,
+            value,
+            scaling=scaling,
+            causal_mask=causal_mask,
+        )
+
+    sdpa_output = sdpa_materialized()
+    grouped_output = grouped_fallback()
+    error = (grouped_output.float() - sdpa_output.float()).abs()
+    sdpa_ms = _time_ms(sdpa_materialized, iters=iters)
+    grouped_ms = _time_ms(grouped_fallback, iters=iters)
+    return {
+        "backend": "torch_cpu_smoke",
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+        "heads": heads,
+        "kv_heads": resolved_kv_heads,
+        "head_dim": head_dim,
+        "sdpa_materialized_ms": sdpa_ms,
+        "grouped_fallback_ms": grouped_ms,
+        "max_abs_diff": float(error.max().item()),
+        "mean_abs_diff": float(error.mean().item()),
     }
 
 
@@ -195,14 +467,73 @@ def _bench_sampler(*, vocab_size: int, candidates: int, iters: int) -> dict[str,
     }
 
 
+def _bench_int4_linear(
+    *,
+    batch_size: int,
+    seq_len: int,
+    in_features: int,
+    out_features: int,
+    group_size: int,
+    iters: int,
+) -> dict[str, Any]:
+    rows = {
+        "decode_gemv": 1,
+        "batch_gemm": max(1, int(batch_size)),
+        "prefill_gemm": max(1, int(batch_size)) * max(1, int(seq_len)),
+    }
+    dense = torch.nn.Linear(in_features, out_features, bias=False, dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(
+        dense,
+        group_size=group_size,
+        compute_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+    result: dict[str, Any] = {
+        "in_features": in_features,
+        "out_features": out_features,
+        "group_size": group_size,
+        "backend": "cpu_dequant_smoke",
+        "prefill_tokens": max(1, int(batch_size)) * max(1, int(seq_len)),
+    }
+    for label, row_count in rows.items():
+        inputs = torch.randn(row_count, in_features, dtype=torch.bfloat16)
+        dense_weight = dense.weight.detach().to(dtype=torch.bfloat16)
+
+        def dense_once() -> torch.Tensor:
+            return F.linear(inputs, dense_weight)
+
+        def int4_once() -> torch.Tensor:
+            return quantized(inputs)
+
+        dense_output = dense_once()
+        int4_output = int4_once()
+        error = (int4_output.float() - dense_output.float()).abs()
+        dense_ms = _time_ms(dense_once, iters=iters)
+        int4_ms = _time_ms(int4_once, iters=iters)
+        result[f"{label}_rows"] = row_count
+        result[f"{label}_dense_ms"] = dense_ms
+        result[f"{label}_int4_ms"] = int4_ms
+        result[f"{label}_max_abs_diff"] = float(error.max().item())
+        result[f"{label}_mean_abs_diff"] = float(error.mean().item())
+    return result
+
+
 def _bench_hotpath_guard() -> dict[str, Any]:
     started = time.perf_counter()
     findings = scan_hotpath_files(root=Path.cwd())
     unexpected = unexpected_findings(findings)
+    summary = summarize_findings(findings)
+    allowlist = Counter(DEFAULT_ALLOWLIST)
+    stale_allowlist = allowlist - summary
+    extra_findings = summary - allowlist
     return {
         "scan_ms": (time.perf_counter() - started) * 1000.0,
         "findings": len(findings),
+        "allowlist_entries": sum(allowlist.values()),
         "unexpected": len(unexpected),
+        "allowlist_exact": summary == allowlist,
+        "stale_allowlist": sum(stale_allowlist.values()),
+        "extra_findings": sum(extra_findings.values()),
     }
 
 
@@ -213,6 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--heads", type=int, default=2)
+    parser.add_argument("--kv-heads", type=int, default=0, help="KV heads for GQA attention benchmarks. Set 0 to derive.")
     parser.add_argument("--head-dim", type=int, default=16)
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument(
@@ -223,33 +555,67 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--vocab-size", type=int, default=4096)
     parser.add_argument("--candidates", type=int, default=64)
+    parser.add_argument("--int4-in-features", type=int, default=128)
+    parser.add_argument("--int4-out-features", type=int, default=256)
+    parser.add_argument("--int4-group-size", type=int, default=32)
     parser.add_argument("--json", action="store_true")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    cache_stack_split = _bench_cache_stack_split(
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        layers=args.layers,
+        heads=args.heads,
+        head_dim=args.head_dim,
+        block_size=args.block_size,
+        iters=args.iters,
+    )
+    slot_decode_plan = _bench_slot_decode_plan(
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        block_size=args.block_size,
+        max_blocks_per_seq=args.max_blocks_per_seq,
+        iters=args.iters,
+    )
     result = {
         "hotpath_guard": _bench_hotpath_guard(),
-        "cache_stack_split": _bench_cache_stack_split(
+        "cache_stack_split": cache_stack_split,
+        "slot_decode_plan": slot_decode_plan,
+        "scheduler_kv_overhead": _summarize_scheduler_kv_overhead(
+            cache_stack_split=cache_stack_split,
+            slot_decode_plan=slot_decode_plan,
+        ),
+        "paged_gqa_decode": _bench_paged_gqa_decode(
             batch_size=args.batch_size,
             seq_len=args.seq_len,
-            layers=args.layers,
             heads=args.heads,
+            kv_heads=args.kv_heads,
             head_dim=args.head_dim,
             block_size=args.block_size,
             iters=args.iters,
         ),
-        "slot_decode_plan": _bench_slot_decode_plan(
+        "prefill_attention": _bench_prefill_attention(
             batch_size=args.batch_size,
             seq_len=args.seq_len,
-            block_size=args.block_size,
-            max_blocks_per_seq=args.max_blocks_per_seq,
+            heads=args.heads,
+            kv_heads=args.kv_heads,
+            head_dim=args.head_dim,
             iters=args.iters,
         ),
         "sampler": _bench_sampler(
             vocab_size=args.vocab_size,
             candidates=args.candidates,
+            iters=args.iters,
+        ),
+        "int4_linear": _bench_int4_linear(
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            in_features=args.int4_in_features,
+            out_features=args.int4_out_features,
+            group_size=args.int4_group_size,
             iters=args.iters,
         ),
     }
@@ -260,7 +626,7 @@ def main() -> int:
         for section, values in result.items():
             for key, value in values.items():
                 print(f"{section},{key},{value}")
-    return 1 if result["hotpath_guard"]["unexpected"] else 0
+    return 1 if result["hotpath_guard"]["unexpected"] or not result["hotpath_guard"]["allowlist_exact"] else 0
 
 
 if __name__ == "__main__":

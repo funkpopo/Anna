@@ -21,6 +21,12 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     metrics.record_paged_cache_materialization(reason="gather_layer_cache")
     metrics.record_sampler_full_vocab_sort(reason="top_p_full_logits_sort")
     metrics.record_moe_host_offset(reason="expert_offsets_cpu")
+    metrics.record_moe_stage(stage="router", seconds=0.001)
+    metrics.record_moe_stage(stage="dispatch", seconds=0.002)
+    metrics.record_moe_stage(stage="expert_gemm", seconds=0.003)
+    metrics.record_moe_stage(stage="scatter", seconds=0.004)
+    metrics.record_moe_stage(stage="staging", seconds=0.005)
+    metrics.record_moe_stage(stage="cpu_sync", seconds=0.006)
     metrics.record_prompt_tokens(12)
     metrics.record_generation_tokens(5)
     metrics.record_prompt_cache_lookup(hit=True)
@@ -64,7 +70,40 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     assert snapshot.paged_cache_materialize_count == 1
     assert snapshot.sampler_full_vocab_sort_count == 1
     assert snapshot.moe_host_offset_count == 1
+    assert snapshot.moe_router_count == 1
+    assert snapshot.moe_router_seconds_total == 0.001
+    assert snapshot.moe_router_seconds_max == 0.001
+    assert snapshot.moe_dispatch_count == 1
+    assert snapshot.moe_dispatch_seconds_total == 0.002
+    assert snapshot.moe_dispatch_seconds_max == 0.002
+    assert snapshot.moe_expert_gemm_count == 1
+    assert snapshot.moe_expert_gemm_seconds_total == 0.003
+    assert snapshot.moe_expert_gemm_seconds_max == 0.003
+    assert snapshot.moe_scatter_count == 1
+    assert snapshot.moe_scatter_seconds_total == 0.004
+    assert snapshot.moe_scatter_seconds_max == 0.004
+    assert snapshot.moe_staging_count == 1
+    assert snapshot.moe_staging_seconds_total == 0.005
+    assert snapshot.moe_staging_seconds_max == 0.005
+    assert snapshot.moe_cpu_sync_count == 1
+    assert snapshot.moe_cpu_sync_seconds_total == 0.006
+    assert snapshot.moe_cpu_sync_seconds_max == 0.006
     assert metrics.activity_event.is_set() is True
+
+
+def test_service_metrics_finishes_waiting_requests_without_touching_running_count() -> None:
+    metrics = AnnaServiceMetrics()
+    metrics.record_request_submitted(waiting=True)
+    metrics.record_request_submitted(waiting=False)
+
+    metrics.record_request_finished(success=False, from_waiting=True)
+
+    snapshot = metrics.snapshot()
+    assert snapshot.requests_started_total == 2
+    assert snapshot.requests_completed_total == 0
+    assert snapshot.requests_failed_total == 1
+    assert snapshot.running_requests == 1
+    assert snapshot.waiting_requests == 0
 
 
 def test_service_metrics_logger_formats_interval_rates() -> None:
@@ -110,6 +149,24 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
         paged_cache_materialize_count=5,
         sampler_full_vocab_sort_count=6,
         moe_host_offset_count=7,
+        moe_router_seconds_total=0.002,
+        moe_router_count=2,
+        moe_router_seconds_max=0.0015,
+        moe_dispatch_seconds_total=0.006,
+        moe_dispatch_count=3,
+        moe_dispatch_seconds_max=0.003,
+        moe_expert_gemm_seconds_total=0.012,
+        moe_expert_gemm_count=4,
+        moe_expert_gemm_seconds_max=0.004,
+        moe_scatter_seconds_total=0.005,
+        moe_scatter_count=5,
+        moe_scatter_seconds_max=0.002,
+        moe_staging_seconds_total=0.012,
+        moe_staging_count=6,
+        moe_staging_seconds_max=0.003,
+        moe_cpu_sync_seconds_total=0.014,
+        moe_cpu_sync_count=7,
+        moe_cpu_sync_seconds_max=0.004,
     )
 
     line = AnnaServiceMetricsLogger.format_interval(previous, current)
@@ -126,6 +183,11 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
     assert "Cache split avg/max: 20.0/40.0 ms" in line
     assert "Slot decode plan avg/max: 10.0/15.0 ms" in line
     assert "Hot path events: cpu_sync=3, attention_fallback=4, paged_cache_materialize=5, sampler_full_vocab_sort=6, moe_host_offset=7" in line
+    assert (
+        "MoE stage avg/max ms: router=1.000/1.500, dispatch=2.000/3.000, "
+        "expert_gemm=3.000/4.000, scatter=1.000/2.000, staging=2.000/3.000, "
+        "cpu_sync=2.000/4.000"
+    ) in line
     assert "Waiting: 1 reqs" in line
     assert "GPU KV cache usage: 50.0% (6/12 pages)" in line
     assert "Prompt cache hit rate: 75.0%" in line
@@ -147,6 +209,7 @@ def test_service_metrics_logger_logs_idle_interval_after_completed_work() -> Non
         prompt_tokens_total=32,
         generation_tokens_total=8,
         cpu_sync_count=1,
+        moe_router_count=1,
         kv_cache_total_pages=128,
     )
 

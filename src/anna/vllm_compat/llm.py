@@ -6,7 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, GenerationConfig, TextGenerationResult
-from anna.vllm_compat.outputs import CompletionOutput, RequestOutput
+from anna.vllm_compat.outputs import RequestOutput, request_output_from_result
 from anna.vllm_compat.sampling import SamplingParams, sampling_params_to_generation_config
 
 
@@ -53,22 +53,7 @@ class AnnaLLM:
 
     @staticmethod
     def _request_output_from_result(prompt: str, result: TextGenerationResult, *, request_id: str) -> RequestOutput:
-        return RequestOutput(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_token_ids=[],
-            outputs=[
-                CompletionOutput(
-                    index=0,
-                    text=result.text,
-                    token_ids=[],
-                    finish_reason=result.finish_reason,
-                    stop_reason=result.finish_reason,
-                )
-            ],
-            finished=True,
-            metrics=result.perf,
-        )
+        return request_output_from_result(prompt, result, request_id=request_id)
 
 
 def generation_config_from_sampling_params(params: SamplingParams | None) -> GenerationConfig:

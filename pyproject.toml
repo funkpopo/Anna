@@ -38,6 +38,9 @@ anna-bench = "anna.cli.bench:main"
 anna-speak = "anna.cli.qwen3_tts_speak:main"
 anna-xpu-int4-cache = "anna.cli.xpu_int4_cache:main"
 
+[project.entry-points."vllm.platform_plugins"]
+anna_xpu = "anna_vllm_xpu:register_platform"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

@@ -38,8 +38,29 @@ class PagedKVDecodePlan:
     slot_ids: torch.Tensor
     epochs: torch.Tensor
     seq_lens: torch.Tensor
+    seq_lens_are_global: bool
     positions: torch.Tensor
+    positions_are_global: bool
     block_tables: torch.Tensor
+    block_tables_are_global: bool
+
+    def _select_batch_rows(self, tensor: torch.Tensor, *, is_global: bool) -> torch.Tensor:
+        if not is_global:
+            return tensor
+        index = self.slot_ids.to(device=tensor.device, dtype=torch.long)
+        return tensor.index_select(0, index)
+
+    @property
+    def batch_seq_lens(self) -> torch.Tensor:
+        return self._select_batch_rows(self.seq_lens, is_global=self.seq_lens_are_global)
+
+    @property
+    def batch_positions(self) -> torch.Tensor:
+        return self._select_batch_rows(self.positions, is_global=self.positions_are_global)
+
+    @property
+    def batch_block_tables(self) -> torch.Tensor:
+        return self._select_batch_rows(self.block_tables, is_global=self.block_tables_are_global)
 
 
 class PagedKVManager:
@@ -343,28 +364,124 @@ class PagedKVManager:
     def prepare_decode_capacity(self, handles: Sequence[KVSlotHandle], *, append_tokens: int = 1) -> None:
         if append_tokens < 0:
             raise ValueError("append_tokens must be non-negative.")
-        for handle in handles:
-            self._validate_slot(handle.slot_id, handle.epoch)
-            target_length = self._seq_lens_host[handle.slot_id] + int(append_tokens)
-            self.ensure_token_capacity(handle.slot_id, handle.epoch, target_length)
+        slot_ids, epochs = self._validate_decode_handles(handles)
+        for slot_id, epoch in zip(slot_ids, epochs, strict=True):
+            target_length = self._seq_lens_host[slot_id] + int(append_tokens)
+            self.ensure_token_capacity(slot_id, epoch, target_length)
 
     def decode_plan(self, handles: Sequence[KVSlotHandle]) -> PagedKVDecodePlan:
         if not handles:
             raise ValueError("decode_plan requires at least one active slot.")
-        slot_ids = [int(handle.slot_id) for handle in handles]
-        epochs = [int(handle.epoch) for handle in handles]
-        for slot_id, epoch in zip(slot_ids, epochs, strict=True):
-            self._validate_slot(slot_id, epoch)
+        slot_ids, epochs = self._validate_decode_handles(handles)
 
         index = torch.tensor(slot_ids, dtype=torch.long, device=self.device)
-        seq_lens = self.seq_lens.index_select(0, index)
         return PagedKVDecodePlan(
             slot_ids=index.to(dtype=torch.int32),
             epochs=torch.tensor(epochs, dtype=torch.int64, device=self.device),
-            seq_lens=seq_lens,
-            positions=seq_lens.clone(),
-            block_tables=self.block_tables.index_select(0, index),
+            seq_lens=self.seq_lens,
+            seq_lens_are_global=True,
+            positions=self.seq_lens,
+            positions_are_global=True,
+            block_tables=self.block_tables,
+            block_tables_are_global=True,
         )
+
+    def _validate_decode_handles(self, handles: Sequence[KVSlotHandle]) -> tuple[list[int], list[int]]:
+        slot_ids: list[int] = []
+        epochs: list[int] = []
+        seen_slots: set[int] = set()
+        for handle in handles:
+            slot_id = int(handle.slot_id)
+            epoch = int(handle.epoch)
+            self._validate_slot(slot_id, epoch)
+            if slot_id in seen_slots:
+                raise ValueError("decode batch must not contain duplicate slot ids.")
+            seen_slots.add(slot_id)
+            slot_ids.append(slot_id)
+            epochs.append(epoch)
+        return slot_ids, epochs
+
+    def mirror_external_slot_tensors(
+        self,
+        *,
+        slot_ids: torch.Tensor | Sequence[int],
+        block_tables: torch.Tensor | Sequence[Sequence[int]],
+        seq_lens: torch.Tensor | Sequence[int],
+        epochs: torch.Tensor | Sequence[int] | None = None,
+        append_tokens: int = 0,
+    ) -> None:
+        """Mirror externally-owned KV metadata into the slot-indexed tensors.
+
+        This is for vLLM-style integrations where another runtime owns the
+        physical KV block allocator. It updates Anna's tensor metadata so the
+        paged attention interface can consume the same slot/block-table shape,
+        but it intentionally does not mutate Anna's allocator free lists or
+        block refcounts.
+
+        ``seq_lens`` are the lengths before the current decode tokens are
+        appended. When ``append_tokens`` is positive, CPU validation also
+        checks that every external block-table row already contains the blocks
+        needed after the append. This mirrors Anna's internal slot scheduler,
+        which reserves capacity before building a decode plan.
+        """
+        if append_tokens < 0:
+            raise ValueError("append_tokens must be non-negative.")
+
+        slot_ids_tensor = torch.as_tensor(slot_ids, dtype=torch.long, device=self.device).reshape(-1)
+        seq_lens_tensor = torch.as_tensor(seq_lens, dtype=torch.long, device=self.device).reshape(-1)
+        block_tables_tensor = torch.as_tensor(block_tables, dtype=torch.int32, device=self.device)
+        if block_tables_tensor.ndim != 2:
+            raise ValueError("block_tables must be a 2D tensor or sequence.")
+        if slot_ids_tensor.numel() != seq_lens_tensor.numel():
+            raise ValueError("slot_ids and seq_lens must have the same length.")
+        if block_tables_tensor.shape[0] != slot_ids_tensor.numel():
+            raise ValueError("block_tables must have one row per slot id.")
+        if block_tables_tensor.shape[1] > self.max_blocks_per_seq:
+            raise SlotCapacityError(
+                f"External block table has {block_tables_tensor.shape[1]} columns, "
+                f"but max_blocks_per_seq={self.max_blocks_per_seq}."
+            )
+        if epochs is None:
+            epochs_tensor = torch.zeros_like(seq_lens_tensor)
+        else:
+            epochs_tensor = torch.as_tensor(epochs, dtype=torch.long, device=self.device).reshape(-1)
+            if epochs_tensor.numel() != slot_ids_tensor.numel():
+                raise ValueError("epochs must have one value per slot id.")
+
+        if self.device.type == "cpu":
+            if bool(torch.any((slot_ids_tensor < 0) | (slot_ids_tensor >= self.max_slots))):
+                raise IndexError(f"slot_ids must be in range [0, {self.max_slots}).")
+            if int(torch.unique(slot_ids_tensor).numel()) != int(slot_ids_tensor.numel()):
+                raise ValueError("slot_ids must be unique within an external decode batch.")
+            if bool(torch.any(seq_lens_tensor < 0)):
+                raise ValueError("seq_lens must be non-negative.")
+            visible_lens_after_append = seq_lens_tensor + int(append_tokens)
+            required_blocks = torch.div(
+                visible_lens_after_append + self.block_size - 1,
+                self.block_size,
+                rounding_mode="floor",
+            )
+            if bool(torch.any(required_blocks > self.max_blocks_per_seq)):
+                raise SlotCapacityError(
+                    f"External seq_lens require more than max_blocks_per_seq={self.max_blocks_per_seq} blocks."
+                )
+            if bool(torch.any(required_blocks > block_tables_tensor.shape[1])):
+                raise SlotCapacityError("External block tables do not include enough columns for seq_lens.")
+            for row_idx in range(int(required_blocks.numel())):
+                required_count = int(required_blocks[row_idx])
+                if required_count <= 0:
+                    continue
+                if bool(torch.any(block_tables_tensor[row_idx, :required_count] < 0)):
+                    raise ValueError("External block tables are missing required prefix blocks for seq_lens.")
+            valid_block_mask = block_tables_tensor >= 0
+            if bool(torch.any(valid_block_mask & (block_tables_tensor >= self.total_blocks))):
+                raise IndexError(f"External block tables reference block ids outside [0, {self.total_blocks}).")
+
+        self.block_tables.index_fill_(0, slot_ids_tensor, -1)
+        self.block_tables[slot_ids_tensor, : block_tables_tensor.shape[1]] = block_tables_tensor
+        self.seq_lens.index_copy_(0, slot_ids_tensor, seq_lens_tensor)
+        self.slot_epochs.index_copy_(0, slot_ids_tensor, epochs_tensor)
+        self.slot_active.index_fill_(0, slot_ids_tensor, True)
 
     def slot_blocks(self, slot_id: int, epoch: int) -> tuple[int, ...]:
         self._validate_slot(slot_id, epoch)

@@ -94,8 +94,15 @@ def test_slot_model_runner_builds_decode_model_inputs_without_cache_objects() ->
     assert model_inputs.input_ids.tolist() == [[11], [22]]
     assert model_inputs.slot_ids.tolist() == [slot_a.slot_id, slot_b.slot_id]
     assert model_inputs.epochs.tolist() == [slot_a.epoch, slot_b.epoch]
-    assert model_inputs.positions.tolist() == [3, 5]
-    assert model_inputs.seq_lens.tolist() == [3, 5]
+    assert model_inputs.positions_are_global is True
+    assert model_inputs.seq_lens_are_global is True
+    assert model_inputs.positions.data_ptr() == runner.kv_manager.seq_lens.data_ptr()
+    assert model_inputs.seq_lens.data_ptr() == runner.kv_manager.seq_lens.data_ptr()
+    assert model_inputs.batch_positions.tolist() == [3, 5]
+    assert model_inputs.batch_seq_lens.tolist() == [3, 5]
+    assert model_inputs.decode_token_count == 1
+    assert model_inputs.visible_seq_lens.tolist() == [4, 6]
+    assert model_inputs.block_tables_are_global is True
     assert model_inputs.block_tables.shape == (2, 4)
     assert model_inputs.sampling_params == (
         {"temperature": 0.0, "top_k": 1},
@@ -107,14 +114,80 @@ def test_slot_model_runner_builds_decode_model_inputs_without_cache_objects() ->
 
     runner.advance_decode("req-a", next_input_id=12)
     advanced = runner.build_decode_inputs(request_ids=["req-a"])
-    assert advanced.positions.tolist() == [4]
+    assert advanced.batch_positions.tolist() == [4]
+    assert advanced.batch_seq_lens.tolist() == [4]
+    assert advanced.visible_seq_lens.tolist() == [5]
     assert advanced.input_ids.tolist() == [[12]]
+
+
+def test_slot_model_runner_marks_prefilled_batch_from_sampler_tensor() -> None:
+    runner = SlotModelRunner.from_text_config(
+        _text_config(),
+        device="cpu",
+        max_slots=2,
+        total_blocks=8,
+        max_blocks_per_seq=4,
+        max_batch_size=2,
+    )
+    runner.admit_prefill("req-a", prompt_length=3, max_new_tokens=2)
+    runner.admit_prefill("req-b", prompt_length=4, max_new_tokens=2)
+
+    marked = runner.mark_prefilled_batch(
+        request_ids=["req-a", "req-b"],
+        next_input_ids=torch.tensor([[11], [22]], dtype=torch.int32),
+        next_input_host_ids=[11, 22],
+    )
+
+    assert tuple(slot.request_id for slot in marked) == ("req-a", "req-b")
+    model_inputs = runner.build_decode_inputs()
+    assert model_inputs.request_ids == ("req-a", "req-b")
+    assert model_inputs.input_ids.tolist() == [[11], [22]]
+    assert model_inputs.positions_are_global is True
+    assert model_inputs.seq_lens_are_global is True
+    assert model_inputs.batch_positions.tolist() == [3, 4]
+    assert model_inputs.batch_seq_lens.tolist() == [3, 4]
+    assert model_inputs.visible_seq_lens.tolist() == [4, 5]
+    assert model_inputs.block_tables_are_global is True
+
+
+def test_slot_model_runner_advances_decode_batch_from_sampler_tensor() -> None:
+    runner = SlotModelRunner.from_text_config(
+        _text_config(),
+        device="cpu",
+        max_slots=2,
+        total_blocks=8,
+        max_blocks_per_seq=4,
+        max_batch_size=2,
+    )
+    runner.admit_prefill("req-a", prompt_length=3, max_new_tokens=3)
+    runner.admit_prefill("req-b", prompt_length=4, max_new_tokens=1)
+    runner.mark_prefilled("req-a", next_input_id=11, next_input_host_id=11)
+    runner.mark_prefilled("req-b", next_input_id=22, next_input_host_id=22)
+    decode_inputs = runner.build_decode_inputs()
+
+    advanced = runner.advance_decode_batch(
+        request_ids=decode_inputs.request_ids,
+        next_input_ids=torch.tensor([[12], [0]], dtype=torch.int32),
+        next_input_host_ids=[12, None],
+        finished=[False, True],
+    )
+
+    assert tuple(slot.request_id for slot in advanced) == ("req-a", "req-b")
+    assert advanced[1].status.value == "finished"
+    assert runner.active_count == 1
+    next_inputs = runner.build_decode_inputs()
+    assert next_inputs.request_ids == ("req-a",)
+    assert next_inputs.input_ids.tolist() == [[12]]
+    assert next_inputs.batch_positions.tolist() == [4]
+    assert next_inputs.visible_seq_lens.tolist() == [5]
 
 
 def test_qwen_engine_slot_runner_is_disabled_by_default_in_health() -> None:
     engine = _engine(optimization_config=EngineOptimizationConfig(prefill_chunk_size=4))
 
-    health = engine.health()["runtime_optimizations"]
+    engine_health = engine.health()
+    health = engine_health["runtime_optimizations"]
+    compatibility = engine_health["compatibility"]
 
     assert engine.slot_model_runner is None
     assert health["slot_runner"] == {"enabled": False}
@@ -123,6 +196,16 @@ def test_qwen_engine_slot_runner_is_disabled_by_default_in_health() -> None:
     assert "int4pack_available" in health["xpu_int4_kernels"]
     assert health["kernel_backends"]["xpu_int4_linear"] == "inactive"
     assert "paged_gqa_decode" in health["kernel_backends"]
+    assert compatibility["openai_api"]["enabled"] is True
+    assert compatibility["openai_api"]["vllm_runtime_compatible"] is False
+    assert compatibility["vllm_offline_shim"]["module"] == "anna.vllm_compat"
+    assert compatibility["vllm_runtime_adapter"]["module"] == "anna_vllm_xpu"
+    assert compatibility["vllm_runtime_adapter"]["integrated_vllm_worker"] is False
+    assert compatibility["vllm_runtime_adapter"]["platform_plugin_entry_point"] == (
+        "anna_xpu = anna_vllm_xpu:register_platform"
+    )
+    assert compatibility["vllm_runtime_adapter"]["integrated_platform_class"] is None
+    assert compatibility["vllm_runtime_adapter"]["slot_model_runner_enabled"] is False
 
 
 def test_qwen_engine_can_enable_experimental_slot_runner_metadata_path() -> None:
@@ -138,10 +221,12 @@ def test_qwen_engine_can_enable_experimental_slot_runner_metadata_path() -> None
     )
 
     assert engine.slot_model_runner is not None
-    health = engine.health()["runtime_optimizations"]["slot_runner"]
+    engine_health = engine.health()
+    health = engine_health["runtime_optimizations"]["slot_runner"]
     assert health["enabled"] is True
     assert health["metadata_only"] is True
     assert health["integrated_generation"] is False
     assert health["max_slots"] == 2
     assert health["total_blocks"] == 8
     assert health["max_batch_size"] == 2
+    assert engine_health["compatibility"]["vllm_runtime_adapter"]["slot_model_runner_enabled"] is True

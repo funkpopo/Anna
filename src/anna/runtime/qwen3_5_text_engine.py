@@ -58,6 +58,35 @@ _COMPILE_MODE_VALUES = frozenset({"none", "auto", "default", "reduce-overhead", 
 _KV_CACHE_QUANTIZATION_VALUES = frozenset({"none", "turboquant"})
 
 
+class RepetitionPenaltyHistory(set[int]):
+    """CPU membership mirror plus a device-resident token history buffer."""
+
+    def __init__(self, token_ids: list[int], *, buffer: torch.Tensor, length: int) -> None:
+        super().__init__(int(token_id) for token_id in token_ids)
+        self.buffer = buffer
+        self.length = int(length)
+
+    def view(self) -> torch.Tensor:
+        return self.buffer[: self.length]
+
+    def append_token(self, next_token: torch.Tensor, *, token_id: int) -> torch.Tensor:
+        if token_id in self:
+            return self.view()
+        if self.length >= int(self.buffer.shape[0]):
+            new_capacity = max(1, int(self.buffer.shape[0]) * 2)
+            resized = torch.empty((new_capacity,), dtype=self.buffer.dtype, device=self.buffer.device)
+            if self.length > 0:
+                resized[: self.length].copy_(self.buffer[: self.length])
+            self.buffer = resized
+        token = next_token.reshape(())
+        if token.device != self.buffer.device:
+            token = token.to(device=self.buffer.device)
+        self.buffer[self.length].copy_(token.to(dtype=self.buffer.dtype))
+        self.length += 1
+        self.add(int(token_id))
+        return self.view()
+
+
 def _common_prefix_length(left: str, right: str) -> int:
     limit = min(len(left), len(right))
     index = 0
@@ -234,6 +263,8 @@ class TextGenerationResult:
     reasoning_text: str | None = None
     tool_calls: list[dict[str, object]] | None = None
     perf: GenerationPerfStats | None = None
+    prompt_token_ids: list[int] = field(default_factory=list)
+    completion_token_ids: list[int] = field(default_factory=list)
 
 
 class AnnaQwen3_5TextEngine:
@@ -1363,7 +1394,9 @@ class AnnaQwen3_5TextEngine:
             kv_cache_residual_len=self.optimization_config.kv_cache_residual_len,
         )
         cache.reserve_sequence_capacity(int(prepared.input_ids.shape[1]))
-        cache.set_prompt_token_ids(prepared.input_ids)
+        prompt_token_ids = self._prepared_prompt_token_ids(prepared)
+        if prompt_token_ids is not None:
+            cache.set_prompt_token_ids(prompt_token_ids)
         return cache
 
     def _trim_runtime_cache_if_idle(self) -> None:
@@ -1502,6 +1535,33 @@ class AnnaQwen3_5TextEngine:
             "offload_mode": self.offload_mode,
             "offload_vision": self.offload_vision,
             "expert_quant": self.expert_quant,
+            "compatibility": {
+                "openai_api": {
+                    "level": 1,
+                    "enabled": True,
+                    "endpoints": (
+                        "/v1/models",
+                        "/v1/chat/completions",
+                        "/v1/completions",
+                    ),
+                    "vllm_runtime_compatible": False,
+                },
+                "vllm_offline_shim": {
+                    "level": 2,
+                    "enabled": True,
+                    "module": "anna.vllm_compat",
+                    "api": "AnnaLLM.generate",
+                },
+                "vllm_runtime_adapter": {
+                    "level": 3,
+                    "module": "anna_vllm_xpu",
+                    "available": True,
+                    "integrated_vllm_worker": False,
+                    "platform_plugin_entry_point": "anna_xpu = anna_vllm_xpu:register_platform",
+                    "integrated_platform_class": None,
+                    "slot_model_runner_enabled": slot_model_runner is not None,
+                },
+            },
             "resident_expert_layers": self.resident_expert_layers,
             "resident_expert_layer_indices": self._resident_expert_layer_indices(),
             "cached_experts_per_layer": self.cached_experts_per_layer,
@@ -1578,6 +1638,24 @@ class AnnaQwen3_5TextEngine:
                 "paged_cache_materialize_count": service_metrics.paged_cache_materialize_count,
                 "sampler_full_vocab_sort_count": service_metrics.sampler_full_vocab_sort_count,
                 "moe_host_offset_count": service_metrics.moe_host_offset_count,
+                "moe_router_count": service_metrics.moe_router_count,
+                "moe_router_seconds_total": service_metrics.moe_router_seconds_total,
+                "moe_router_seconds_max": service_metrics.moe_router_seconds_max,
+                "moe_dispatch_count": service_metrics.moe_dispatch_count,
+                "moe_dispatch_seconds_total": service_metrics.moe_dispatch_seconds_total,
+                "moe_dispatch_seconds_max": service_metrics.moe_dispatch_seconds_max,
+                "moe_expert_gemm_count": service_metrics.moe_expert_gemm_count,
+                "moe_expert_gemm_seconds_total": service_metrics.moe_expert_gemm_seconds_total,
+                "moe_expert_gemm_seconds_max": service_metrics.moe_expert_gemm_seconds_max,
+                "moe_scatter_count": service_metrics.moe_scatter_count,
+                "moe_scatter_seconds_total": service_metrics.moe_scatter_seconds_total,
+                "moe_scatter_seconds_max": service_metrics.moe_scatter_seconds_max,
+                "moe_staging_count": service_metrics.moe_staging_count,
+                "moe_staging_seconds_total": service_metrics.moe_staging_seconds_total,
+                "moe_staging_seconds_max": service_metrics.moe_staging_seconds_max,
+                "moe_cpu_sync_count": service_metrics.moe_cpu_sync_count,
+                "moe_cpu_sync_seconds_total": service_metrics.moe_cpu_sync_seconds_total,
+                "moe_cpu_sync_seconds_max": service_metrics.moe_cpu_sync_seconds_max,
             },
         }
 
@@ -1652,6 +1730,8 @@ class AnnaQwen3_5TextEngine:
             prompt_tokens=raw.prompt_tokens,
             completion_tokens=raw.completion_tokens,
             perf=raw.perf,
+            prompt_token_ids=list(raw.prompt_token_ids),
+            completion_token_ids=list(raw.completion_token_ids),
         )
 
     def stream_chat(
@@ -1811,6 +1891,7 @@ class AnnaQwen3_5TextEngine:
             "image_grid_thw": prepared.image_grid_thw if include_media else None,
             "video_grid_thw": prepared.video_grid_thw if include_media else None,
             "mm_token_type_ids": mm_token_type_ids,
+            "prompt_token_ids": self._prepared_prompt_token_ids(prepared),
         }
 
     def _forward_multimodal_input_keys(self) -> tuple[str, ...]:
@@ -1935,7 +2016,20 @@ class AnnaQwen3_5TextEngine:
         prompt_cache_max_tokens = self.optimization_config.prompt_cache_max_tokens
         if prompt_cache_max_tokens > 0 and int(prepared.input_ids.shape[1]) > prompt_cache_max_tokens:
             return None
-        return tuple(int(token_id) for token_id in prepared.input_ids[0].tolist())
+        prompt_token_ids = self._prepared_prompt_token_ids(prepared)
+        if prompt_token_ids is None:
+            return None
+        return tuple(prompt_token_ids)
+
+    @staticmethod
+    def _prepared_prompt_token_ids(prepared: PreparedInputs) -> list[int] | None:
+        prompt_token_ids = getattr(prepared, "prompt_token_ids", None)
+        if prompt_token_ids:
+            return [int(token_id) for token_id in prompt_token_ids]
+        input_ids = prepared.input_ids
+        if input_ids.device.type != "cpu" or input_ids.ndim != 2 or int(input_ids.shape[0]) != 1:
+            return None
+        return [int(input_ids[0, idx]) for idx in range(int(input_ids.shape[1]))]
 
     def _evict_prompt_cache_entry(self, key: tuple[int, ...], entry: PromptCacheEntry) -> None:
         release = getattr(entry.past_key_values, "release", None)
@@ -2238,10 +2332,8 @@ class AnnaQwen3_5TextEngine:
 
     @staticmethod
     def _prune_trivial_attention_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
-        if attention_mask is None or attention_mask.ndim != 2:
-            return attention_mask
-        if int(attention_mask.min().item()) > 0:
-            return None
+        # Do not inspect mask values here. A trivial all-ones check on XPU forces
+        # a host sync in the generation forward entrypoint.
         return attention_mask
 
     @staticmethod
@@ -2282,7 +2374,9 @@ class AnnaQwen3_5TextEngine:
         *,
         config: GenerationConfig,
     ) -> tuple[list[int], int, GenerationConfig]:
-        prompt_ids = prepared.input_ids[0].tolist()
+        prompt_ids = self._prepared_prompt_token_ids(prepared)
+        if prompt_ids is None:
+            raise AnnaEngineError("Prepared inputs must carry CPU prompt_token_ids for generation control.")
         prompt_length = int(prepared.input_ids.shape[1])
         if prompt_length == 0:
             raise AnnaEngineError("Prompt produced zero tokens.")
@@ -2627,10 +2721,12 @@ class AnnaQwen3_5TextEngine:
         *,
         config: GenerationConfig,
     ) -> TextGenerationResult:
-        completion_ids, finish_reason, prompt_tokens, completion_tokens, perf = self._generate_token_ids(
-            prepared,
-            config=config,
-        )
+        generated = self._generate_token_ids(prepared, config=config)
+        if len(generated) == 5:
+            completion_ids, finish_reason, prompt_tokens, completion_tokens, perf = generated
+            prompt_ids: list[int] = []
+        else:
+            prompt_ids, completion_ids, finish_reason, prompt_tokens, completion_tokens, perf = generated
         text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
         return TextGenerationResult(
             text=text,
@@ -2639,6 +2735,8 @@ class AnnaQwen3_5TextEngine:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             perf=perf,
+            prompt_token_ids=list(prompt_ids),
+            completion_token_ids=list(completion_ids),
         )
 
     def _stream(self, prepared: PreparedInputs, *, config: GenerationConfig) -> Iterator[StreamEvent]:
@@ -2707,39 +2805,37 @@ class AnnaQwen3_5TextEngine:
         prompt_ids: list[int],
         penalty: float,
         presence_penalty: float = 0.0,
-    ) -> tuple[torch.Tensor | None, set[int] | None]:
+        max_new_tokens: int = 0,
+    ) -> tuple[torch.Tensor | None, RepetitionPenaltyHistory | None]:
         if penalty == 1.0 and presence_penalty == 0.0:
             return None, None
         unique_ids = list(dict.fromkeys(prompt_ids))
-        if not unique_ids:
-            return None, set()
-        history_tensor = self.device_context.move_token_ids(
-            torch.tensor(unique_ids, dtype=torch.long, device=self.device_context.device)
+        capacity = max(1, len(unique_ids) + max(0, int(max_new_tokens)))
+        history_buffer = self.device_context.move_token_ids(
+            torch.empty((capacity,), dtype=torch.long, device=self.device_context.device)
         )
-        return history_tensor, set(unique_ids)
+        if unique_ids:
+            history_buffer[: len(unique_ids)] = self.device_context.move_token_ids(
+                torch.tensor(unique_ids, dtype=torch.long, device=self.device_context.device)
+            )
+        history = RepetitionPenaltyHistory(unique_ids, buffer=history_buffer, length=len(unique_ids))
+        return history.view(), history
 
     def _append_repetition_penalty_token(
         self,
         *,
         history_tensor: torch.Tensor | None,
-        history_ids: set[int] | None,
+        history_ids: RepetitionPenaltyHistory | None,
         next_token: torch.Tensor,
         token_id: int | None = None,
-    ) -> tuple[torch.Tensor | None, set[int] | None]:
+    ) -> tuple[torch.Tensor | None, RepetitionPenaltyHistory | None]:
         if history_tensor is None or history_ids is None:
             return history_tensor, history_ids
 
+        if not isinstance(history_ids, RepetitionPenaltyHistory):
+            raise TypeError("repetition penalty history must use the preallocated device buffer.")
         token_id = self._token_id_from_tensor(next_token) if token_id is None else int(token_id)
-        if token_id in history_ids:
-            return history_tensor, history_ids
-
-        history_ids.add(token_id)
-        appended = next_token.view(1)
-        if history_tensor.device != appended.device:
-            appended = appended.to(device=history_tensor.device)
-        if history_tensor.numel() == 0:
-            return appended, history_ids
-        return torch.cat([history_tensor, appended]), history_ids
+        return history_ids.append_token(next_token, token_id=token_id), history_ids
 
     def _token_id_from_tensor(self, next_token: torch.Tensor) -> int:
         return stage_single_token_id_to_host(next_token, metrics=getattr(self, "metrics", None))
@@ -2766,7 +2862,7 @@ class AnnaQwen3_5TextEngine:
         self,
         prepared: PreparedInputs,
         config: GenerationConfig,
-    ) -> tuple[list[int], str, int, int, GenerationPerfStats]:
+    ) -> tuple[list[int], list[int], str, int, int, GenerationPerfStats]:
         prompt_ids, prompt_length, config = self._validate_generation_request(prepared, config=config)
         prepared = self._move_prepared_for_generation(prepared, config=config)
 
@@ -2776,6 +2872,7 @@ class AnnaQwen3_5TextEngine:
             prompt_ids,
             config.repetition_penalty,
             config.presence_penalty,
+            max_new_tokens=config.max_new_tokens,
         )
         started_at = time.perf_counter()
         first_token_at = None
@@ -2836,6 +2933,7 @@ class AnnaQwen3_5TextEngine:
                             temperature=config.temperature,
                             top_p=config.top_p,
                             min_p=config.min_p,
+                            candidates_are_sorted=True,
                         )
                     else:
                         next_token = sample_next_token(
@@ -2856,6 +2954,7 @@ class AnnaQwen3_5TextEngine:
                         total_seconds = time.perf_counter() - started_at
                         prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
                         return (
+                            prompt_ids,
                             completion_ids,
                             "stop",
                             prompt_length,
@@ -2888,6 +2987,7 @@ class AnnaQwen3_5TextEngine:
                 total_seconds = time.perf_counter() - started_at
                 prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
                 return (
+                    prompt_ids,
                     completion_ids,
                     "length",
                     prompt_length,
@@ -2918,6 +3018,7 @@ class AnnaQwen3_5TextEngine:
             prompt_ids,
             config.repetition_penalty,
             config.presence_penalty,
+            max_new_tokens=config.max_new_tokens,
         )
         text_assembler = IncrementalTextAssembler(
             tokenizer=self.tokenizer,
@@ -2983,6 +3084,7 @@ class AnnaQwen3_5TextEngine:
                             temperature=config.temperature,
                             top_p=config.top_p,
                             min_p=config.min_p,
+                            candidates_are_sorted=True,
                         )
                     else:
                         next_token = sample_next_token(
