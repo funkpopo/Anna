@@ -493,6 +493,47 @@ def test_candidate_sampler_with_params_respects_per_row_top_k_on_wide_candidates
         assert int(sampled[1].item()) in {20, 21}
 
 
+def test_candidate_sampler_with_params_applies_penalties_before_top_k_crop() -> None:
+    logits = torch.tensor([[9.0, 8.0, 7.5, 7.0], [6.0, 5.0, 4.0, 3.0]])
+    token_ids = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
+    histories = (torch.tensor([10]), torch.tensor([20, 21]))
+    params = SamplingBatchParams.from_sampling_params(
+        (
+            {"temperature": 0.0, "top_k": 1, "top_p": 1.0, "presence_penalty": 3.0},
+            {"temperature": 0.0, "top_k": 2, "top_p": 1.0, "presence_penalty": 2.5},
+        ),
+        device="cpu",
+    )
+
+    sampled = sample_next_token_batch_from_candidates_with_params(
+        logits,
+        token_ids,
+        params,
+        generated_ids_batch=histories,
+        candidates_are_sorted=True,
+    )
+
+    assert torch.equal(sampled, torch.tensor([11, 22]))
+
+
+def test_candidate_sampler_scalar_wrapper_applies_penalties() -> None:
+    logits = torch.tensor([9.0, 8.0, 7.5])
+    token_ids = torch.tensor([10, 11, 12])
+
+    sampled = sample_next_token_from_candidates(
+        logits,
+        token_ids,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=1,
+        generated_ids=torch.tensor([10]),
+        presence_penalty=2.0,
+        candidates_are_sorted=True,
+    )
+
+    assert sampled == 11
+
+
 def test_candidate_sampler_top1_returns_only_candidate_without_sampling() -> None:
     logits = torch.tensor([[2.0], [9.0]])
     token_ids = torch.tensor([[42], [77]])

@@ -656,7 +656,13 @@ class AnnaScheduler:
         return next_active
 
     def _shared_fused_lm_head_candidate_count(self, requests: list[SchedulerRequest]) -> int | None:
-        candidate_counts = [self.engine._fused_lm_head_candidate_count(request.config) for request in requests]
+        candidate_counts = [
+            self.engine._fused_lm_head_candidate_count(
+                request.config,
+                repetition_history_ids=request.repetition_history_ids,
+            )
+            for request in requests
+        ]
         if not candidate_counts or any(candidate is None for candidate in candidate_counts):
             return None
         return max(int(candidate) for candidate in candidate_counts)
@@ -704,7 +710,11 @@ class AnnaScheduler:
                 outputs.candidate_token_ids[row_idx, -1],
                 temperature=request.config.temperature,
                 top_p=request.config.top_p,
+                top_k=request.config.top_k,
                 min_p=request.config.min_p,
+                generated_ids=request.repetition_history,
+                presence_penalty=request.config.presence_penalty,
+                repetition_penalty=request.config.repetition_penalty,
                 candidates_are_sorted=True,
             )
         return sample_next_token(
@@ -728,6 +738,7 @@ class AnnaScheduler:
                 outputs.candidate_logits[: len(requests), -1],
                 outputs.candidate_token_ids[: len(requests), -1],
                 sampling_params,
+                generated_ids_batch=tuple(request.repetition_history for request in requests),
                 candidates_are_sorted=True,
             ).reshape(-1)
         return sample_next_token_batch_with_params(

@@ -1023,6 +1023,122 @@ def test_prefill_generation_chunks_long_text_prompts() -> None:
     assert result.prompt_cache_hit is False
 
 
+def test_prefill_generation_uses_topk_candidates_for_direct_monotonic_penalties() -> None:
+    class _FakeModel:
+        def __init__(self) -> None:
+            self.topk_values: list[int] = []
+
+        def forward_text_only_topk(self, **kwargs):
+            self.topk_values.append(int(kwargs["top_k"]))
+            return SimpleNamespace(
+                candidate_logits=torch.tensor([[[9.0, 8.0, 7.0]]]),
+                candidate_token_ids=torch.tensor([[[11, 12, 13]]]),
+                past_key_values=SimpleNamespace(release=lambda: None),
+            )
+
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.optimization_config = EngineOptimizationConfig()
+    engine._prompt_cache = OrderedDict()
+    engine._compiled_text_forward = None
+    engine.model = _FakeModel()
+    engine.config = SimpleNamespace(text_config=SimpleNamespace(vocab_size=16))
+
+    history = RepetitionPenaltyHistory(
+        [4, 5],
+        buffer=torch.tensor([4, 5], dtype=torch.long),
+        length=2,
+    )
+    prepared = PreparedInputs(
+        prompt="candidate prefill",
+        input_ids=torch.tensor([[4, 5]], dtype=torch.long),
+        attention_mask=torch.ones((1, 2), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 2), dtype=torch.int32),
+        prompt_token_ids=[4, 5],
+    )
+
+    result = engine._prefill_generation_prompt(
+        prepared,
+        config=GenerationConfig(
+            max_new_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=1,
+            presence_penalty=1.5,
+            repetition_penalty=1.1,
+        ),
+        repetition_history_ids=history,
+    )
+
+    assert engine.model.topk_values == [3]
+    assert result.logits is None
+    assert result.candidate_logits is not None
+    assert result.candidate_token_ids is not None
+    assert result.candidate_logits.tolist() == [9.0, 8.0, 7.0]
+    assert result.candidate_token_ids.tolist() == [11, 12, 13]
+
+
+def test_generate_token_ids_uses_prefill_candidates_for_first_token_penalty_sampling() -> None:
+    class _FakeModel:
+        def __init__(self) -> None:
+            self.topk_values: list[int] = []
+
+        def forward_text_only_topk(self, **kwargs):
+            self.topk_values.append(int(kwargs["top_k"]))
+            return SimpleNamespace(
+                candidate_logits=torch.tensor([[[9.0, 8.0, 7.5]]]),
+                candidate_token_ids=torch.tensor([[[4, 6, 7]]]),
+                past_key_values=SimpleNamespace(release=lambda: None),
+            )
+
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine.optimization_config = EngineOptimizationConfig()
+    engine._prompt_cache = OrderedDict()
+    engine._compiled_text_forward = None
+    engine.model = _FakeModel()
+    engine.config = SimpleNamespace(
+        text_config=SimpleNamespace(
+            vocab_size=16,
+            max_position_embeddings=16,
+            eos_token_id=None,
+        )
+    )
+    engine.device_context = SimpleNamespace(
+        device=torch.device("cpu"),
+        move_prepared_inputs=lambda prepared: prepared,
+        move_token_ids=lambda token_ids: token_ids,
+        get_memory_info=lambda: None,
+    )
+    engine.execution_lock = SimpleNamespace(__enter__=lambda self: None, __exit__=lambda self, *args: None)
+    engine.tokenizer = SimpleNamespace(eos_token_ids={99})
+
+    prepared = PreparedInputs(
+        prompt="direct",
+        input_ids=torch.tensor([[4, 5]], dtype=torch.long),
+        attention_mask=torch.ones((1, 2), dtype=torch.long),
+        mm_token_type_ids=torch.zeros((1, 2), dtype=torch.int32),
+        prompt_token_ids=[4, 5],
+    )
+
+    prompt_ids, completion_ids, finish_reason, prompt_tokens, completion_tokens, _perf = engine._generate_token_ids(
+        prepared,
+        config=GenerationConfig(
+            max_new_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=1,
+            presence_penalty=4.0,
+            repetition_penalty=1.0,
+        ),
+    )
+
+    assert engine.model.topk_values == [3]
+    assert prompt_ids == [4, 5]
+    assert completion_ids == [6]
+    assert finish_reason == "length"
+    assert prompt_tokens == 2
+    assert completion_tokens == 1
+
+
 def test_prefill_generation_reuses_prompt_cache_for_exact_prompt_matches() -> None:
     class _FakeCache:
         def __init__(self, label: str) -> None:

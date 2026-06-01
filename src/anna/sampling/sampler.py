@@ -345,6 +345,51 @@ def _apply_batched_penalties_with_params(
     return flat_logits if output is None else output
 
 
+def _apply_candidate_penalties_with_params(
+    flat_logits: torch.Tensor,
+    flat_token_ids: torch.Tensor,
+    histories: Sequence[torch.Tensor | None] | None,
+    params: SamplingBatchParams,
+) -> tuple[torch.Tensor, bool]:
+    if histories is None or not params.penalty_rows:
+        return flat_logits, False
+
+    row_count = int(flat_logits.shape[0])
+    if len(histories) != row_count:
+        raise ValueError(
+            f"generated_ids_batch length {len(histories)} does not match flattened batch size {row_count}."
+        )
+
+    output: torch.Tensor | None = None
+    penalties_applied = False
+    for row_idx in params.penalty_rows:
+        generated_ids = histories[row_idx]
+        repetition_penalty = params.repetition_penalty_values[row_idx]
+        presence_penalty = params.presence_penalty_values[row_idx]
+        if generated_ids is None or generated_ids.numel() == 0:
+            continue
+        if repetition_penalty == 1.0 and presence_penalty == 0.0:
+            continue
+
+        if output is None:
+            output = flat_logits.clone()
+        row_logits = output[row_idx]
+        row_token_ids = flat_token_ids[row_idx]
+        generated_ids = generated_ids.to(device=row_token_ids.device, dtype=row_token_ids.dtype)
+        seen_candidate = torch.any(
+            row_token_ids.reshape(-1, 1) == generated_ids.reshape(1, -1),
+            dim=-1,
+        )
+        adjusted = row_logits
+        if repetition_penalty != 1.0:
+            adjusted = torch.where(row_logits < 0, row_logits * repetition_penalty, row_logits / repetition_penalty)
+        if presence_penalty != 0.0:
+            adjusted = adjusted - presence_penalty
+        output[row_idx].copy_(torch.where(seen_candidate, adjusted, row_logits))
+        penalties_applied = True
+    return (flat_logits, False) if output is None else (output, penalties_applied)
+
+
 def _sample_candidate_logits_with_tensors(
     candidate_logits: torch.Tensor,
     candidate_token_ids: torch.Tensor,
@@ -403,7 +448,11 @@ def sample_next_token_from_candidates(
     *,
     temperature: float = 0.7,
     top_p: float = 0.8,
+    top_k: int | None = None,
     min_p: float = 0.0,
+    generated_ids: torch.Tensor | None = None,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
     candidates_are_sorted: bool = False,
 ) -> torch.Tensor:
     return sample_next_token_batch_from_candidates(
@@ -411,7 +460,11 @@ def sample_next_token_from_candidates(
         candidate_token_ids,
         temperature=temperature,
         top_p=top_p,
+        top_k=top_k,
         min_p=min_p,
+        generated_ids_batch=None if generated_ids is None else (generated_ids,),
+        presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty,
         candidates_are_sorted=candidates_are_sorted,
     )
 
@@ -422,7 +475,11 @@ def sample_next_token_batch_from_candidates(
     *,
     temperature: float = 0.7,
     top_p: float = 0.8,
+    top_k: int | None = None,
     min_p: float = 0.0,
+    generated_ids_batch: Sequence[torch.Tensor | None] | None = None,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
     candidates_are_sorted: bool = False,
 ) -> torch.Tensor:
     if candidate_logits.shape != candidate_token_ids.shape:
@@ -436,6 +493,32 @@ def sample_next_token_batch_from_candidates(
     candidate_count = candidate_logits.shape[-1]
     logits = candidate_logits.reshape(-1, candidate_count)
     token_ids = candidate_token_ids.reshape(-1, candidate_count)
+    if (
+        top_k is not None
+        or generated_ids_batch is not None
+        or presence_penalty != 0.0
+        or repetition_penalty != 1.0
+    ):
+        row_count = int(logits.shape[0])
+        row_params = tuple(
+            {
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": 0 if top_k is None else int(top_k),
+                "min_p": min_p,
+                "presence_penalty": presence_penalty,
+                "repetition_penalty": repetition_penalty,
+            }
+            for _ in range(row_count)
+        )
+        params = SamplingBatchParams.from_sampling_params(row_params, device=logits.device)
+        return sample_next_token_batch_from_candidates_with_params(
+            candidate_logits,
+            candidate_token_ids,
+            params,
+            generated_ids_batch=generated_ids_batch,
+            candidates_are_sorted=candidates_are_sorted,
+        )
     if temperature <= 0.0:
         selected = torch.argmax(logits, dim=-1, keepdim=True)
         return token_ids.gather(dim=-1, index=selected).squeeze(-1).reshape(output_shape)
@@ -464,6 +547,7 @@ def sample_next_token_batch_from_candidates_with_params(
     candidate_token_ids: torch.Tensor,
     params: SamplingBatchParams,
     *,
+    generated_ids_batch: Sequence[torch.Tensor | None] | None = None,
     candidates_are_sorted: bool = False,
 ) -> torch.Tensor:
     if candidate_logits.shape != candidate_token_ids.shape:
@@ -480,6 +564,17 @@ def sample_next_token_batch_from_candidates_with_params(
     row_count = int(flat_logits.shape[0])
     if params.batch_size != row_count:
         raise ValueError(f"sampling params batch size {params.batch_size} does not match row count {row_count}.")
+    if generated_ids_batch is not None and len(generated_ids_batch) != row_count:
+        raise ValueError(
+            f"generated_ids_batch length {len(generated_ids_batch)} does not match flattened batch size {row_count}."
+        )
+    flat_logits, penalties_applied = _apply_candidate_penalties_with_params(
+        flat_logits,
+        flat_token_ids,
+        generated_ids_batch,
+        params,
+    )
+    candidates_are_sorted = candidates_are_sorted and not penalties_applied
 
     temperatures = params.temperature.to(device=flat_logits.device, dtype=flat_logits.dtype).reshape(row_count)
     top_p = params.top_p.to(device=flat_logits.device, dtype=flat_logits.dtype).reshape(row_count)

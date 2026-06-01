@@ -195,10 +195,12 @@ class PromptCacheEntry:
 
 @dataclass(slots=True)
 class PromptPrefillResult:
-    logits: torch.Tensor
+    logits: torch.Tensor | None
     past_key_values: object | None
     prefill_seconds: float
     prompt_cache_hit: bool = False
+    candidate_logits: torch.Tensor | None = None
+    candidate_token_ids: torch.Tensor | None = None
 
 
 class AnnaEngineError(RuntimeError):
@@ -2097,7 +2099,13 @@ class AnnaQwen3_5TextEngine:
             if callable(release):
                 release()
 
-    def _prefill_generation_prompt(self, prepared: PreparedInputs) -> PromptPrefillResult:
+    def _prefill_generation_prompt(
+        self,
+        prepared: PreparedInputs,
+        *,
+        config: GenerationConfig | None = None,
+        repetition_history_ids: RepetitionPenaltyHistory | None = None,
+    ) -> PromptPrefillResult:
         started_at = time.perf_counter()
         prompt_tokens = int(prepared.input_ids.shape[1])
         metrics = getattr(self, "metrics", None)
@@ -2118,6 +2126,11 @@ class AnnaQwen3_5TextEngine:
         outputs = None
         chunk_size = self.optimization_config.prefill_chunk_size
         prompt_tokens_recorded = 0
+        candidate_count = (
+            self._fused_lm_head_candidate_count(config, repetition_history_ids=repetition_history_ids)
+            if config is not None
+            else None
+        )
 
         try:
             if chunk_size > 0 and not self._has_multimodal_inputs(prepared) and int(input_ids.shape[1]) > chunk_size:
@@ -2125,19 +2138,34 @@ class AnnaQwen3_5TextEngine:
                 total_tokens = int(input_ids.shape[1])
                 for start_idx in range(0, total_tokens, chunk_size):
                     end_idx = min(total_tokens, start_idx + chunk_size)
-                    outputs = self._profiled_forward_generation_model(
-                        stage=f"prefill[{start_idx}:{end_idx}]",
-                        input_ids=input_ids[:, start_idx:end_idx],
-                        attention_mask=attention_mask[:, :end_idx] if start_idx == 0 else None,
-                        past_key_values=past_key_values,
-                        model_kwargs=self._build_prefill_model_kwargs(
-                            prepared,
-                            token_slice=slice(start_idx, end_idx),
-                            include_media=start_idx == 0,
-                        ),
-                        use_cache=True,
-                        logits_to_keep=1,
+                    chunk_outputs = None
+                    model_kwargs = self._build_prefill_model_kwargs(
+                        prepared,
+                        token_slice=slice(start_idx, end_idx),
+                        include_media=start_idx == 0,
                     )
+                    is_final_chunk = end_idx >= total_tokens
+                    if is_final_chunk and candidate_count is not None:
+                        chunk_outputs = self._forward_generation_model_topk(
+                            input_ids=input_ids[:, start_idx:end_idx],
+                            attention_mask=attention_mask[:, :end_idx] if start_idx == 0 else None,
+                            past_key_values=past_key_values,
+                            model_kwargs=model_kwargs,
+                            use_cache=True,
+                            logits_to_keep=1,
+                            top_k=candidate_count,
+                        )
+                    if chunk_outputs is None:
+                        chunk_outputs = self._profiled_forward_generation_model(
+                            stage=f"prefill[{start_idx}:{end_idx}]",
+                            input_ids=input_ids[:, start_idx:end_idx],
+                            attention_mask=attention_mask[:, :end_idx] if start_idx == 0 else None,
+                            past_key_values=past_key_values,
+                            model_kwargs=model_kwargs,
+                            use_cache=True,
+                            logits_to_keep=1,
+                        )
+                    outputs = chunk_outputs
                     past_key_values = outputs.past_key_values
                     if metrics is not None:
                         chunk_tokens = end_idx - start_idx
@@ -2145,15 +2173,27 @@ class AnnaQwen3_5TextEngine:
                             metrics.record_prompt_tokens(chunk_tokens)
                             prompt_tokens_recorded += chunk_tokens
             else:
-                outputs = self._profiled_forward_generation_model(
-                    stage="prefill",
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    past_key_values=None,
-                    model_kwargs=self._build_prefill_model_kwargs(prepared, include_media=True),
-                    use_cache=True,
-                    logits_to_keep=1,
-                )
+                model_kwargs = self._build_prefill_model_kwargs(prepared, include_media=True)
+                if candidate_count is not None:
+                    outputs = self._forward_generation_model_topk(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        past_key_values=None,
+                        model_kwargs=model_kwargs,
+                        use_cache=True,
+                        logits_to_keep=1,
+                        top_k=candidate_count,
+                    )
+                if outputs is None:
+                    outputs = self._profiled_forward_generation_model(
+                        stage="prefill",
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        past_key_values=None,
+                        model_kwargs=model_kwargs,
+                        use_cache=True,
+                        logits_to_keep=1,
+                    )
                 past_key_values = outputs.past_key_values
         except Exception:
             release = getattr(past_key_values, "release", None)
@@ -2164,13 +2204,20 @@ class AnnaQwen3_5TextEngine:
         if outputs is None:
             raise RuntimeError("Prompt prefill did not produce model outputs.")
 
-        logits = outputs.logits[0, -1]
-        self._remember_prompt_cache_entry(
-            key=cache_key,
-            logits=logits,
-            past_key_values=past_key_values,
-            prompt_tokens=int(prepared.input_ids.shape[1]),
-        )
+        logits = None
+        candidate_logits = None
+        candidate_token_ids = None
+        if hasattr(outputs, "candidate_logits") and hasattr(outputs, "candidate_token_ids"):
+            candidate_logits = outputs.candidate_logits[0, -1]
+            candidate_token_ids = outputs.candidate_token_ids[0, -1]
+        else:
+            logits = outputs.logits[0, -1]
+            self._remember_prompt_cache_entry(
+                key=cache_key,
+                logits=logits,
+                past_key_values=past_key_values,
+                prompt_tokens=int(prepared.input_ids.shape[1]),
+            )
         if metrics is not None and prompt_tokens_recorded < prompt_tokens:
             metrics.record_prompt_tokens(prompt_tokens - prompt_tokens_recorded)
         return PromptPrefillResult(
@@ -2178,6 +2225,8 @@ class AnnaQwen3_5TextEngine:
             past_key_values=past_key_values,
             prefill_seconds=time.perf_counter() - started_at,
             prompt_cache_hit=False,
+            candidate_logits=candidate_logits,
+            candidate_token_ids=candidate_token_ids,
         )
 
     def _forward_generation_model(
@@ -2221,16 +2270,32 @@ class AnnaQwen3_5TextEngine:
                 **model_kwargs,
             )
 
-    def _fused_lm_head_candidate_count(self, config: GenerationConfig) -> int | None:
-        if config.repetition_penalty != 1.0:
-            return None
-        if config.presence_penalty != 0.0:
-            return None
+    def _fused_lm_head_candidate_count(
+        self,
+        config: GenerationConfig,
+        *,
+        repetition_history_ids: RepetitionPenaltyHistory | None = None,
+    ) -> int | None:
         if config.temperature <= 0.0:
-            return 1
-        if config.top_k <= 0:
+            base_count = 1
+        elif config.top_k <= 0:
             return None
-        return int(config.top_k)
+        else:
+            base_count = int(config.top_k)
+
+        if config.repetition_penalty == 1.0 and config.presence_penalty == 0.0:
+            candidate_count = base_count
+        else:
+            if config.top_k <= 0:
+                return None
+            if config.repetition_penalty < 1.0 or config.presence_penalty < 0.0:
+                return None
+            if repetition_history_ids is None:
+                return None
+            candidate_count = base_count + len(repetition_history_ids)
+
+        vocab_size = int(self.config.text_config.vocab_size)
+        return min(candidate_count, vocab_size)
 
     def _forward_generation_model_topk(
         self,
@@ -2882,7 +2947,11 @@ class AnnaQwen3_5TextEngine:
         try:
             with steady_decode_accumulation(enabled=self.optimization_config.profile_runtime, log=logger):
                 try:
-                    prefill = self._prefill_generation_prompt(prepared)
+                    prefill = self._prefill_generation_prompt(
+                        prepared,
+                        config=config,
+                        repetition_history_ids=repetition_history_ids,
+                    )
                 except RuntimeError as exc:
                     raise self._handle_runtime_failure(exc) from exc
                 past_key_values = prefill.past_key_values
@@ -2890,12 +2959,15 @@ class AnnaQwen3_5TextEngine:
 
                 for step_idx in range(config.max_new_tokens):
                     self._raise_if_generation_cancelled(config)
-                    candidate_logits = None
-                    candidate_token_ids = None
+                    candidate_logits = prefill.candidate_logits if step_idx == 0 else None
+                    candidate_token_ids = prefill.candidate_token_ids if step_idx == 0 else None
                     if step_idx > 0:
                         try:
                             with self.execution_lock:
-                                candidate_count = self._fused_lm_head_candidate_count(config)
+                                candidate_count = self._fused_lm_head_candidate_count(
+                                    config,
+                                    repetition_history_ids=repetition_history_ids,
+                                )
                                 outputs = (
                                     self._forward_generation_model_topk(
                                         input_ids=input_ids,
@@ -2932,10 +3004,16 @@ class AnnaQwen3_5TextEngine:
                             candidate_token_ids,
                             temperature=config.temperature,
                             top_p=config.top_p,
+                            top_k=config.top_k,
                             min_p=config.min_p,
+                            generated_ids=repetition_history,
+                            presence_penalty=config.presence_penalty,
+                            repetition_penalty=config.repetition_penalty,
                             candidates_are_sorted=True,
                         )
                     else:
+                        if current_logits is None:
+                            raise RuntimeError("Generation step did not produce logits or candidate logits.")
                         next_token = sample_next_token(
                             current_logits,
                             generated_ids=repetition_history,
@@ -3033,7 +3111,11 @@ class AnnaQwen3_5TextEngine:
         try:
             with steady_decode_accumulation(enabled=self.optimization_config.profile_runtime, log=logger):
                 try:
-                    prefill = self._prefill_generation_prompt(prepared)
+                    prefill = self._prefill_generation_prompt(
+                        prepared,
+                        config=config,
+                        repetition_history_ids=repetition_history_ids,
+                    )
                 except RuntimeError as exc:
                     raise self._handle_runtime_failure(exc) from exc
                 past_key_values = prefill.past_key_values
@@ -3041,12 +3123,15 @@ class AnnaQwen3_5TextEngine:
 
                 for step_idx in range(config.max_new_tokens):
                     self._raise_if_generation_cancelled(config)
-                    candidate_logits = None
-                    candidate_token_ids = None
+                    candidate_logits = prefill.candidate_logits if step_idx == 0 else None
+                    candidate_token_ids = prefill.candidate_token_ids if step_idx == 0 else None
                     if step_idx > 0:
                         try:
                             with self.execution_lock:
-                                candidate_count = self._fused_lm_head_candidate_count(config)
+                                candidate_count = self._fused_lm_head_candidate_count(
+                                    config,
+                                    repetition_history_ids=repetition_history_ids,
+                                )
                                 outputs = (
                                     self._forward_generation_model_topk(
                                         input_ids=input_ids,
@@ -3083,10 +3168,16 @@ class AnnaQwen3_5TextEngine:
                             candidate_token_ids,
                             temperature=config.temperature,
                             top_p=config.top_p,
+                            top_k=config.top_k,
                             min_p=config.min_p,
+                            generated_ids=repetition_history,
+                            presence_penalty=config.presence_penalty,
+                            repetition_penalty=config.repetition_penalty,
                             candidates_are_sorted=True,
                         )
                     else:
+                        if current_logits is None:
+                            raise RuntimeError("Generation step did not produce logits or candidate logits.")
                         next_token = sample_next_token(
                             current_logits,
                             generated_ids=repetition_history,
