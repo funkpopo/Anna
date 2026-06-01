@@ -120,6 +120,29 @@ def _align_tensor_device(tensor: torch.Tensor | None, device: torch.device) -> t
     return tensor.to(device=device)
 
 
+def _slot_decode_position_ids(
+    slot_decode_inputs: object | None,
+    *,
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if slot_decode_inputs is None:
+        return None
+    positions = getattr(slot_decode_inputs, "positions", None)
+    if not torch.is_tensor(positions):
+        return None
+    if positions.ndim != 1 or int(positions.shape[0]) != batch_size:
+        raise RuntimeError(
+            "slot_decode_inputs.positions must be a 1D tensor with one entry per decode batch row; "
+            f"got shape={tuple(positions.shape)} batch_size={batch_size}."
+        )
+    base = positions.to(device=device, dtype=torch.long).view(batch_size, 1)
+    if seq_len == 1:
+        return base
+    return base + torch.arange(seq_len, device=device, dtype=torch.long).view(1, -1)
+
+
 class Qwen3TextModel(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
@@ -195,6 +218,7 @@ class Qwen3TextModel(nn.Module):
         past_key_values: Qwen3DynamicCache | None = None,
         inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
+        slot_decode_inputs: object | None = None,
     ) -> TextModelOutput:
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds.")
@@ -227,12 +251,22 @@ class Qwen3TextModel(nn.Module):
         if position_ids is None:
             seq_len = inputs_embeds.shape[1]
             batch_size = inputs_embeds.shape[0]
-            if past_key_values is None or past_key_values.get_batch_size() == 0:
+            slot_position_ids = _slot_decode_position_ids(
+                slot_decode_inputs,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                device=inputs_embeds.device,
+            )
+            if slot_position_ids is not None:
+                position_ids = slot_position_ids
+            elif past_key_values is None or past_key_values.get_batch_size() == 0:
                 past_seen_tokens = torch.zeros(batch_size, device=inputs_embeds.device, dtype=torch.long)
+                position_ids = torch.arange(seq_len, device=inputs_embeds.device).view(1, -1)
+                position_ids = position_ids + past_seen_tokens.view(-1, 1)
             else:
                 past_seen_tokens = past_key_values.get_seq_lengths(device=inputs_embeds.device)
-            position_ids = torch.arange(seq_len, device=inputs_embeds.device).view(1, -1)
-            position_ids = position_ids + past_seen_tokens.view(-1, 1)
+                position_ids = torch.arange(seq_len, device=inputs_embeds.device).view(1, -1)
+                position_ids = position_ids + past_seen_tokens.view(-1, 1)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -246,6 +280,7 @@ class Qwen3TextModel(nn.Module):
                     position_embeddings=position_embeddings,
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
+                    slot_decode_inputs=slot_decode_inputs,
                 )
         finally:
             if past_key_values is not None:
@@ -740,6 +775,7 @@ class Qwen3Model(nn.Module):
         video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
         use_cache: bool | None = None,
+        slot_decode_inputs: object | None = None,
     ) -> MultimodalModelOutput:
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
@@ -792,6 +828,7 @@ class Qwen3Model(nn.Module):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            slot_decode_inputs=slot_decode_inputs,
         )
         return MultimodalModelOutput(
             last_hidden_state=outputs.last_hidden_state,
@@ -851,6 +888,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
+        slot_decode_inputs: object | None = None,
     ) -> CausalLMOutput:
         outputs = self.model(
             input_ids=input_ids,
@@ -859,6 +897,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            slot_decode_inputs=slot_decode_inputs,
         )
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
@@ -880,6 +919,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
         top_k: int = 1,
+        slot_decode_inputs: object | None = None,
     ) -> CausalLMTopKOutput:
         outputs = self.model(
             input_ids=input_ids,
@@ -888,6 +928,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            slot_decode_inputs=slot_decode_inputs,
         )
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
@@ -950,6 +991,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
+        slot_decode_inputs: object | None = None,
     ) -> CausalLMOutput:
         outputs = self.model.language_model(
             input_ids=input_ids,
@@ -958,6 +1000,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            slot_decode_inputs=slot_decode_inputs,
         )
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
@@ -980,6 +1023,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
         top_k: int = 1,
+        slot_decode_inputs: object | None = None,
     ) -> CausalLMTopKOutput:
         outputs = self.model.language_model(
             input_ids=input_ids,
@@ -988,6 +1032,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            slot_decode_inputs=slot_decode_inputs,
         )
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
@@ -1009,6 +1054,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         mm_token_type_ids: torch.IntTensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
+        slot_decode_inputs: object | None = None,
     ) -> CausalLMOutput:
         outputs = self.model(
             input_ids=input_ids,
@@ -1022,6 +1068,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             video_grid_thw=video_grid_thw,
             mm_token_type_ids=mm_token_type_ids,
             use_cache=use_cache,
+            slot_decode_inputs=slot_decode_inputs,
         )
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:
@@ -1048,6 +1095,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
         top_k: int = 1,
+        slot_decode_inputs: object | None = None,
     ) -> CausalLMTopKOutput:
         outputs = self.model(
             input_ids=input_ids,
@@ -1061,6 +1109,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             video_grid_thw=video_grid_thw,
             mm_token_type_ids=mm_token_type_ids,
             use_cache=use_cache,
+            slot_decode_inputs=slot_decode_inputs,
         )
         hidden_states = outputs.last_hidden_state
         if logits_to_keep is not None and logits_to_keep > 0:

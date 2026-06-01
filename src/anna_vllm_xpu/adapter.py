@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import torch
 
@@ -65,6 +65,50 @@ def _attention_backend_from_health(health_report: Mapping[str, object]) -> AnnaX
         prefill=prefill,
         fallback=fallback,
     )
+
+
+def _get_field(obj: object, name: str, default: object | None = None) -> object | None:
+    if isinstance(obj, Mapping):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _coerce_request_ids(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, Sequence):
+        return tuple(str(item) for item in value)
+    return ()
+
+
+def extract_execute_model_request_ids(execute_model_request: object) -> tuple[str, ...]:
+    """Extract request ids from vLLM-like execute_model inputs.
+
+    The real vLLM classes are intentionally not imported here. This adapter
+    accepts the stable shapes we need for an integration boundary: either an
+    explicit ``request_ids`` field or a ``seq_group_metadata_list`` whose items
+    expose ``request_id``.
+    """
+
+    direct_ids = _coerce_request_ids(_get_field(execute_model_request, "request_ids"))
+    if direct_ids:
+        return direct_ids
+
+    seq_groups = _get_field(execute_model_request, "seq_group_metadata_list")
+    if seq_groups is None:
+        seq_groups = _get_field(execute_model_request, "seq_groups")
+    if seq_groups is None or isinstance(seq_groups, str) or not isinstance(seq_groups, Sequence):
+        return ()
+
+    request_ids: list[str] = []
+    for seq_group in seq_groups:
+        request_id = _get_field(seq_group, "request_id")
+        if request_id is None:
+            continue
+        request_ids.append(str(request_id))
+    return tuple(request_ids)
 
 
 def build_platform_capabilities(
@@ -163,6 +207,12 @@ class AnnaVLLMXPURuntimeAdapter:
             raise RuntimeError("Anna slot model runner is not enabled; vLLM runtime batches cannot be built.")
         return runner.build_decode_inputs(request_ids=request_ids, limit=limit)
 
+    def build_model_runner_inputs_from_execute_model(self, execute_model_request: object) -> object:
+        request_ids = extract_execute_model_request_ids(execute_model_request)
+        if not request_ids:
+            raise ValueError("vLLM execute_model request did not expose any request ids.")
+        return self.build_model_runner_inputs(request_ids=request_ids)
+
     @staticmethod
     def sampling_params_to_generation_config(params: SamplingParams | None) -> GenerationConfig:
         return sampling_params_to_generation_config(params)
@@ -203,6 +253,7 @@ class AnnaVLLMXPURuntimeAdapter:
             "runtime_adapter": "anna_vllm_xpu",
             "level": 3,
             "integrated_vllm_worker": False,
+            "execute_model_batch_adapter": True,
             "model": self.model_id,
             "platform": capabilities,
             "slot_model_runner_enabled": self.slot_model_runner is not None,

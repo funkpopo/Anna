@@ -93,6 +93,7 @@ class _FakeModel:
         self.text_decode_batch_sizes: list[int] = []
         self.text_prefill_topk_batch_sizes: list[int] = []
         self.text_decode_topk_batch_sizes: list[int] = []
+        self.text_decode_slot_input_request_ids: list[tuple[str, ...]] = []
         self.text_prefill_chunk_lengths: list[int] = []
         self.model = _FakePrefillRunner(self)
         self.lm_head = _FakeLMHead(self)
@@ -134,6 +135,7 @@ class _FakeModel:
         past_key_values: Qwen3DynamicCache | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
+        slot_decode_inputs: object | None = None,
     ):
         del attention_mask, use_cache, logits_to_keep
         batch_size = input_ids.shape[0]
@@ -155,6 +157,8 @@ class _FakeModel:
             )()
 
         self.text_decode_batch_sizes.append(batch_size)
+        if slot_decode_inputs is not None:
+            self.text_decode_slot_input_request_ids.append(tuple(slot_decode_inputs.request_ids))
         logits = torch.full((batch_size, 1, self.config.text_config.vocab_size), -1000.0)
         logits[:, 0, 9] = 1000.0
         return type(
@@ -175,6 +179,7 @@ class _FakeModel:
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
         top_k: int = 1,
+        slot_decode_inputs: object | None = None,
     ):
         del attention_mask, use_cache, logits_to_keep
         batch_size = input_ids.shape[0]
@@ -190,6 +195,8 @@ class _FakeModel:
             cache = self._make_cache(batch_size=batch_size, seq_len=seq_len)
         else:
             self.text_decode_topk_batch_sizes.append(batch_size)
+            if slot_decode_inputs is not None:
+                self.text_decode_slot_input_request_ids.append(tuple(slot_decode_inputs.request_ids))
             candidate_logits[:, 0, 0] = 1000.0
             candidate_token_ids[:, 0, 0] = 9
             cache = past_key_values
@@ -268,6 +275,8 @@ def test_scheduler_batches_same_length_requests() -> None:
         assert snapshot.prompt_tokens_total == 4
         assert snapshot.generation_tokens_total == 2
         assert snapshot.cpu_sync_count == 2
+        assert snapshot.cache_stack_count == 0
+        assert snapshot.cache_split_count == 0
         assert snapshot.running_requests == 0
         assert snapshot.waiting_requests == 0
     finally:
@@ -374,6 +383,9 @@ def test_scheduler_chunks_long_same_length_prefills() -> None:
         assert fake_model.text_prefill_batch_sizes == [2, 2]
         assert fake_model.text_prefill_chunk_lengths == [2, 2]
         assert fake_model.text_decode_batch_sizes == [2]
+        snapshot = engine.service_metrics_snapshot()
+        assert snapshot.cache_stack_count == 0
+        assert snapshot.cache_split_count == 0
     finally:
         scheduler.shutdown()
 
@@ -518,6 +530,8 @@ def test_scheduler_batches_mixed_length_requests_during_decode() -> None:
         assert snapshot.prompt_tokens_total == 5
         assert snapshot.generation_tokens_total == 2
         assert snapshot.cpu_sync_count == 3
+        assert snapshot.cache_stack_count == 0
+        assert snapshot.cache_split_count == 0
         assert snapshot.running_requests == 0
         assert snapshot.waiting_requests == 0
     finally:
@@ -642,6 +656,8 @@ def test_scheduler_populates_experimental_slot_decode_inputs() -> None:
         assert slot_inputs.positions.tolist() == [2, 2]
         assert slot_inputs.seq_lens.tolist() == [2, 2]
         assert slot_inputs.block_tables.shape == (2, 4)
+        assert slot_inputs.physical_block_tables is False
+        assert fake_model.text_decode_slot_input_request_ids == [("scheduler-0", "scheduler-1")]
 
         snapshot = engine.service_metrics_snapshot()
         assert snapshot.slot_decode_plan_count == 1

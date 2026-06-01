@@ -215,6 +215,7 @@ def test_slot_scheduler_builds_decode_plan_without_cache_objects() -> None:
     assert plan.epochs.tolist() == [slot_a.epoch, slot_b.epoch]
     assert plan.seq_lens.tolist() == [3, 8]
     assert plan.positions.tolist() == [3, 8]
+    assert plan.block_tables.tolist() == [[0, -1, -1, -1], [1, 2, 3, -1]]
     assert plan.block_tables.shape == (2, 4)
     assert plan.sampling_params == (
         {"temperature": 0.0, "top_p": 1.0, "top_k": 1},
@@ -267,6 +268,11 @@ def test_slot_scheduler_advances_decode_and_appends_blocks_as_needed() -> None:
     scheduler.mark_prefilled("req", next_input_id=101)
 
     assert manager.slot_blocks(slot.slot_id, slot.epoch) == (0,)
+
+    plan = scheduler.build_decode_plan()
+    assert plan.seq_lens.tolist() == [4]
+    assert plan.positions.tolist() == [4]
+    assert manager.slot_blocks(slot.slot_id, slot.epoch) == (0, 1)
 
     scheduler.advance_decode("req", next_input_id=102)
 

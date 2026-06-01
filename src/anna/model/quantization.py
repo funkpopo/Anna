@@ -709,9 +709,18 @@ class XPUInt4HotPathReport:
 def validate_xpu_int4_hotpath(module: nn.Module, *, device: torch.device | str) -> XPUInt4HotPathReport:
     """Validate that XPU int4 linears have a non-CPU hot path before serving."""
     resolved_device = torch.device(device)
+    named_modules = getattr(module, "named_modules", None)
+    if not callable(named_modules):
+        strategy = XPUInt4Linear._matmul_strategy()
+        return XPUInt4HotPathReport(
+            module_count=0,
+            matmul_strategy=strategy,
+            int4pack_available=xpu_int4pack_mm_is_available(),
+            backend="inactive",
+        )
     int4_modules = tuple(
         module_name
-        for module_name, child in module.named_modules()
+        for module_name, child in named_modules()
         if module_name and isinstance(child, XPUInt4Linear)
     )
     strategy = XPUInt4Linear._matmul_strategy()

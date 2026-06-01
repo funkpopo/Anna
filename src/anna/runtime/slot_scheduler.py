@@ -54,6 +54,7 @@ class DecodeBatchPlan:
     positions: torch.Tensor
     seq_lens: torch.Tensor
     block_tables: torch.Tensor
+    physical_block_tables: bool
     sampling_params: tuple[Any | None, ...]
     sampling_batch_params: SamplingBatchParams
 
@@ -73,6 +74,7 @@ class DecodeBatchPlan:
             positions=kv_plan.positions,
             seq_lens=kv_plan.seq_lens,
             block_tables=kv_plan.block_tables,
+            physical_block_tables=False,
             sampling_params=tuple(slot.sampling_params for slot in slots),
             sampling_batch_params=SamplingBatchParams.from_sampling_params(
                 tuple(slot.sampling_params for slot in slots),
@@ -202,7 +204,9 @@ class SlotScheduler:
             dtype=torch.long,
             device=self.kv_manager.device,
         ).view(len(slots), 1)
-        kv_plan = self.kv_manager.decode_plan(tuple(slot.handle for slot in slots))
+        handles = tuple(slot.handle for slot in slots)
+        self.kv_manager.prepare_decode_capacity(handles, append_tokens=1)
+        kv_plan = self.kv_manager.decode_plan(handles)
         return DecodeBatchPlan.from_kv_plan(slots=slots, input_ids=input_ids, kv_plan=kv_plan)
 
     def advance_decode(

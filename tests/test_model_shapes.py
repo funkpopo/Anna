@@ -314,6 +314,67 @@ def test_dynamic_cache_stack_preserves_visible_prefix_for_batched_decode_updates
     assert torch.equal(combined_value[1:2, :, 5:6, :], append_value[1:2])
 
 
+def test_dynamic_cache_batch_view_syncs_decode_updates_without_split() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config)
+    cache_a = Qwen3DynamicCache(config, allocator=allocator)
+    cache_b = Qwen3DynamicCache(config, allocator=allocator)
+    key_a = torch.randn(1, 2, 3, 16)
+    value_a = torch.randn(1, 2, 3, 16)
+    key_b = torch.randn(1, 2, 5, 16)
+    value_b = torch.randn(1, 2, 5, 16)
+    append_key = torch.randn(2, 2, 1, 16)
+    append_value = torch.randn(2, 2, 1, 16)
+
+    cache_a.update(key_a, value_a, layer_idx=1)
+    cache_b.update(key_b, value_b, layer_idx=1)
+
+    batch_view = Qwen3DynamicCache.batch_view([cache_a, cache_b], config)
+    _, _, past_lengths = batch_view.update(append_key, append_value, layer_idx=1)
+    synced = batch_view.sync_batch_view_rows()
+
+    assert synced == (cache_a, cache_b)
+    assert torch.equal(past_lengths, torch.tensor([3, 5], dtype=torch.long))
+    assert torch.equal(cache_a.visible_key_cache(1)[:, :, :3, :], key_a)
+    assert torch.equal(cache_a.visible_value_cache(1)[:, :, :3, :], value_a)
+    assert torch.equal(cache_a.visible_key_cache(1)[:, :, 3:4, :], append_key[0:1])
+    assert torch.equal(cache_a.visible_value_cache(1)[:, :, 3:4, :], append_value[0:1])
+    assert torch.equal(cache_b.visible_key_cache(1)[:, :, :5, :], key_b)
+    assert torch.equal(cache_b.visible_value_cache(1)[:, :, :5, :], value_b)
+    assert torch.equal(cache_b.visible_key_cache(1)[:, :, 5:6, :], append_key[1:2])
+    assert torch.equal(cache_b.visible_value_cache(1)[:, :, 5:6, :], append_value[1:2])
+
+
+def test_dynamic_cache_row_views_share_prefill_pages_without_split() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config)
+    cache = Qwen3DynamicCache(config, allocator=allocator, batch_size=2)
+    key = torch.randn(2, 2, 3, 16)
+    value = torch.randn(2, 2, 3, 16)
+    append_key = torch.randn(1, 2, 1, 16)
+    append_value = torch.randn(1, 2, 1, 16)
+
+    cache.update(key, value, layer_idx=1)
+
+    row_a, row_b = cache.row_views()
+    assert row_a.page_tables[1][0] is cache.page_tables[1][0]
+    assert row_b.page_tables[1][0] is cache.page_tables[1][1]
+    assert torch.equal(row_a.visible_key_cache(1), key[0:1])
+    assert torch.equal(row_b.visible_value_cache(1), value[1:2])
+
+    _, _, past_lengths = row_a.update(append_key, append_value, layer_idx=1)
+
+    assert torch.equal(past_lengths, torch.tensor([3], dtype=torch.long))
+    assert row_a.get_seq_length() == 4
+    assert row_b.get_seq_length() == 3
+    assert torch.equal(row_a.visible_key_cache(1)[:, :, :3, :], key[0:1])
+    assert torch.equal(row_a.visible_value_cache(1)[:, :, :3, :], value[0:1])
+    assert torch.equal(row_a.visible_key_cache(1)[:, :, 3:4, :], append_key)
+    assert torch.equal(row_a.visible_value_cache(1)[:, :, 3:4, :], append_value)
+    assert torch.equal(row_b.visible_key_cache(1), key[1:2])
+    assert torch.equal(row_b.visible_value_cache(1), value[1:2])
+
+
 def test_dynamic_cache_can_store_full_attention_rows_with_turboquant() -> None:
     config = _tiny_config()
     cache = Qwen3DynamicCache(
@@ -1067,6 +1128,7 @@ def test_engine_leaves_resident_expert_indices_for_auto_estimation_when_unspecif
 def test_engine_runtime_weight_quantization_converts_dense_text_linears() -> None:
     model = Qwen3_5TextForCausalLM(_tiny_config())
     before_bytes = AnnaQwen3_5TextEngine._module_nbytes(model)
+    before_candidates = AnnaQwen3_5TextEngine._runtime_weight_quantization_candidate_count(model)
 
     replacements = AnnaQwen3_5TextEngine._apply_runtime_weight_quantization(
         model=model,
@@ -1076,6 +1138,8 @@ def test_engine_runtime_weight_quantization_converts_dense_text_linears() -> Non
     after_bytes = AnnaQwen3_5TextEngine._module_nbytes(model)
 
     assert replacements > 0
+    assert before_candidates == replacements
+    assert AnnaQwen3_5TextEngine._runtime_weight_quantization_candidate_count(model) == 0
     assert after_bytes < before_bytes
     assert isinstance(model.model.layers[0].linear_attn.in_proj_qkv, XPUInt4Linear)
     assert isinstance(model.lm_head, XPUInt4Linear)
@@ -1095,6 +1159,7 @@ def test_engine_runtime_weight_quantization_skips_sparse_expert_modules() -> Non
     assert isinstance(model.model.layers[0].mlp.shared_expert.gate_proj, XPUInt4Linear)
     assert isinstance(model.model.layers[0].mlp.experts[0].gate_proj, torch.nn.Linear)
     assert isinstance(model.lm_head, XPUInt4Linear)
+    assert AnnaQwen3_5TextEngine._runtime_weight_quantization_candidate_count(model) == 0
 
 
 def test_runtime_weight_quantized_lm_head_preserves_forward_shapes() -> None:

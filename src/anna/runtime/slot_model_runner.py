@@ -32,6 +32,7 @@ class SlotDecodeModelInputs:
     positions: torch.Tensor
     seq_lens: torch.Tensor
     block_tables: torch.Tensor
+    physical_block_tables: bool
     sampling_params: tuple[Any | None, ...]
     sampling_batch_params: SamplingBatchParams
 
@@ -45,6 +46,7 @@ class SlotDecodeModelInputs:
             positions=plan.positions,
             seq_lens=plan.seq_lens,
             block_tables=plan.block_tables,
+            physical_block_tables=plan.physical_block_tables,
             sampling_params=plan.sampling_params,
             sampling_batch_params=plan.sampling_batch_params,
         )

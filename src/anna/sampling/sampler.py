@@ -269,14 +269,43 @@ def sample_next_token_batch_from_candidates_with_params(
     if params.batch_size != row_count:
         raise ValueError(f"sampling params batch size {params.batch_size} does not match row count {row_count}.")
 
-    tokens = [
-        sample_next_token_batch_from_candidates(
-            row_logits,
-            row_token_ids,
-            temperature=params.temperature_values[row_idx],
-            top_p=params.top_p_values[row_idx],
-            min_p=params.min_p_values[row_idx],
-        ).reshape(())
-        for row_idx, (row_logits, row_token_ids) in enumerate(zip(flat_logits.unbind(0), flat_token_ids.unbind(0), strict=True))
-    ]
-    return torch.stack(tokens, dim=0).reshape(output_shape)
+    temperatures = params.temperature.to(device=flat_logits.device, dtype=flat_logits.dtype).reshape(row_count)
+    top_p = params.top_p.to(device=flat_logits.device, dtype=flat_logits.dtype).reshape(row_count)
+    min_p = params.min_p.to(device=flat_logits.device, dtype=flat_logits.dtype).reshape(row_count)
+
+    selected_tokens = torch.empty((row_count,), dtype=flat_token_ids.dtype, device=flat_token_ids.device)
+    greedy_indices = torch.nonzero(temperatures <= 0.0, as_tuple=False).flatten()
+    if greedy_indices.numel() > 0:
+        greedy_selected = torch.argmax(flat_logits, dim=-1, keepdim=True)
+        greedy_tokens = flat_token_ids.gather(dim=-1, index=greedy_selected).squeeze(-1)
+        selected_tokens.index_copy_(0, greedy_indices, greedy_tokens.index_select(0, greedy_indices))
+
+    sample_indices = torch.nonzero(temperatures > 0.0, as_tuple=False).flatten()
+    if sample_indices.numel() > 0:
+        row_logits = flat_logits.index_select(0, sample_indices)
+        row_token_ids = flat_token_ids.index_select(0, sample_indices)
+        row_temperatures = temperatures.index_select(0, sample_indices).clamp_min(torch.finfo(flat_logits.dtype).eps)
+        row_top_p = top_p.index_select(0, sample_indices).clamp(min=0.0, max=1.0)
+        row_min_p = min_p.index_select(0, sample_indices).clamp(min=0.0, max=1.0)
+
+        sorted_logits, sorted_indices = torch.sort(row_logits / row_temperatures[:, None], dim=-1, descending=True)
+        sorted_token_ids = row_token_ids.gather(dim=-1, index=sorted_indices)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        cutoff = cumulative_probs > row_top_p[:, None]
+        cutoff[..., 1:] = cutoff[..., :-1].clone()
+        cutoff[..., 0] = False
+        cutoff = cutoff & (row_top_p[:, None] < 1.0)
+        filtered_logits = sorted_logits.masked_fill(cutoff, float("-inf"))
+
+        filtered_probs = torch.softmax(filtered_logits, dim=-1)
+        max_prob = torch.max(filtered_probs, dim=-1, keepdim=True).values
+        keep = filtered_probs >= max_prob * row_min_p[:, None]
+        filtered_logits = torch.where(keep, filtered_logits, torch.full_like(filtered_logits, float("-inf")))
+
+        probs = torch.softmax(filtered_logits, dim=-1)
+        sampled_indices = torch.multinomial(probs, num_samples=1)
+        sampled_tokens = sorted_token_ids.gather(dim=-1, index=sampled_indices).squeeze(-1)
+        selected_tokens.index_copy_(0, sample_indices, sampled_tokens)
+
+    return selected_tokens.reshape(output_shape)

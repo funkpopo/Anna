@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import inspect
 import logging
 import os
 import threading
@@ -24,7 +25,15 @@ from anna.model.fused_ops import (
     maybe_load_gated_delta_library,
     paged_gqa_decode_fused_is_available,
 )
-from anna.model.quantization import AutoRoundGPTQLinear, convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
+from anna.model.quantization import (
+    AWQLinear,
+    AutoRoundGPTQLinear,
+    DenseLinear,
+    convert_module_linears_to_xpu_int4,
+    estimate_module_xpu_int4_bytes,
+    XPUInt4Linear,
+    validate_xpu_int4_hotpath,
+)
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.model.turboquant import VALID_KV_CACHE_QUANT_BITS, turboquant_is_available
@@ -309,6 +318,7 @@ class AnnaQwen3_5TextEngine:
         self._compiled_text_forward = None
         self._prompt_cache: OrderedDict[tuple[int, ...], PromptCacheEntry] = OrderedDict()
         self.metrics = AnnaServiceMetrics()
+        self.xpu_int4_hotpath = validate_xpu_int4_hotpath(self.model, device=self.device_context.device)
         self._apply_runtime_optimizations()
 
     @staticmethod
@@ -430,7 +440,18 @@ class AnnaQwen3_5TextEngine:
                 if isinstance(mlp, Qwen3SparseMoeBlock):
                     mlp.profile_runtime = self.optimization_config.profile_runtime
         self._log_fused_op_health()
+        self._log_xpu_int4_hotpath()
         self._maybe_compile_text_model()
+
+    def _log_xpu_int4_hotpath(self) -> None:
+        report = self.xpu_int4_hotpath
+        logger.info(
+            "XPU int4 hot path: modules=%s strategy=%s int4pack_available=%s backend=%s",
+            report.module_count,
+            report.matmul_strategy,
+            report.int4pack_available,
+            report.backend,
+        )
 
     @staticmethod
     def _log_fused_op_health() -> None:
@@ -634,12 +655,24 @@ class AnnaQwen3_5TextEngine:
             )
             runtime_weight_quantized_replacements = 0
             if resolved_weight_quant == "int4":
-                runtime_weight_quantized_replacements = cls._apply_runtime_weight_quantization(
-                    model=model,
-                    device=device_context.device,
-                    compute_dtype=device_context.dtype,
-                )
-                release_conversion_artifacts(device_context.device)
+                runtime_weight_quantization_candidates = cls._runtime_weight_quantization_candidate_count(model)
+                if runtime_weight_quantization_candidates > 0:
+                    logger.warning(
+                        "Falling back to runtime dense XPU int4 quantization for %s module(s). "
+                        "Direct safetensors/GGUF-to-int4 placeholders should cover large-model serving paths.",
+                        runtime_weight_quantization_candidates,
+                    )
+                    runtime_weight_quantized_replacements = cls._apply_runtime_weight_quantization(
+                        model=model,
+                        device=device_context.device,
+                        compute_dtype=device_context.dtype,
+                    )
+                    release_conversion_artifacts(device_context.device)
+                else:
+                    logger.info(
+                        "Direct XPU-int4 placeholders cover all runtime weight quantization candidates; "
+                        "skipping runtime dense int4 conversion."
+                    )
             total_quantized_replacements = model_quantized_replacements + runtime_weight_quantized_replacements
             report.quantized_replacements = total_quantized_replacements
             auto_resident_indices = resolved_resident_expert_layer_indices is None
@@ -964,20 +997,11 @@ class AnnaQwen3_5TextEngine:
         device: torch.device,
         compute_dtype: torch.dtype,
     ) -> int:
-        def _should_quantize(module_name: str, _module: torch.nn.Module) -> bool:
-            normalized = module_name.replace("\\", "/")
-            return (
-                ".visual." not in normalized
-                and not normalized.startswith("model.visual.")
-                and ".mlp.experts." not in normalized
-                and ".mlp._expert_cache." not in normalized
-            )
-
         replacements = convert_module_linears_to_xpu_int4(
             model,
             compute_dtype=compute_dtype,
             device=device,
-            include_predicate=_should_quantize,
+            include_predicate=cls._should_runtime_weight_quantize,
         )
         logger.info(
             "Runtime dense XPU int4 quantization: replacements=%s device=%s compute_dtype=%s cache_dir=disabled",
@@ -986,6 +1010,31 @@ class AnnaQwen3_5TextEngine:
             compute_dtype,
         )
         return replacements
+
+    @staticmethod
+    def _should_runtime_weight_quantize(module_name: str, _module: torch.nn.Module) -> bool:
+        normalized = module_name.replace("\\", "/")
+        return (
+            ".visual." not in normalized
+            and not normalized.startswith("model.visual.")
+            and ".mlp.experts." not in normalized
+            and ".mlp._expert_cache." not in normalized
+        )
+
+    @classmethod
+    def _runtime_weight_quantization_candidate_count(cls, model: torch.nn.Module) -> int:
+        named_modules = getattr(model, "named_modules", None)
+        if not callable(named_modules):
+            return 0
+        supported_types = (AutoRoundGPTQLinear, AWQLinear, DenseLinear, torch.nn.Linear)
+        return sum(
+            1
+            for module_name, module in named_modules()
+            if module_name
+            and isinstance(module, supported_types)
+            and not isinstance(module, XPUInt4Linear)
+            and cls._should_runtime_weight_quantize(module_name, module)
+        )
 
     @classmethod
     def _prepare_loaded_quantized_modules_for_execution(
@@ -1426,6 +1475,10 @@ class AnnaQwen3_5TextEngine:
         service_metrics = self.service_metrics_snapshot()
         kv_cache_runtime_info = self._kv_cache_runtime_info()
         slot_model_runner = getattr(self, "slot_model_runner", None)
+        fused_ops_health = fused_op_health_report()
+        fused_kernel_backends = fused_ops_health.get("backends", {})
+        kernel_backends = dict(fused_kernel_backends) if isinstance(fused_kernel_backends, dict) else {}
+        kernel_backends["xpu_int4_linear"] = self.xpu_int4_hotpath.backend
         return {
             "status": "ok",
             "model": self.default_model_id,
@@ -1471,7 +1524,10 @@ class AnnaQwen3_5TextEngine:
                     else slot_model_runner.health()
                 ),
                 "xpu_int4_kernels": {
-                    "matmul_strategy": os.getenv("ANNA_XPU_INT4_MATMUL", "auto"),
+                    "module_count": self.xpu_int4_hotpath.module_count,
+                    "backend": self.xpu_int4_hotpath.backend,
+                    "int4pack_available": self.xpu_int4_hotpath.int4pack_available,
+                    "matmul_strategy": self.xpu_int4_hotpath.matmul_strategy,
                     "lm_head_local_size": os.getenv("ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE"),
                     "lm_head_block_topk_threshold": os.getenv("ANNA_XPU_INT4_LM_HEAD_BLOCK_TOPK_THRESHOLD", "65536"),
                     "lm_head_block_size": os.getenv("ANNA_XPU_INT4_LM_HEAD_BLOCK_SIZE", "4096"),
@@ -1480,7 +1536,8 @@ class AnnaQwen3_5TextEngine:
                     "lm_head_int4_topk_disabled": os.getenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK"),
                     "moe_grouped_int4_disabled": os.getenv("ANNA_XPU_DISABLE_MOE_GROUPED_INT4"),
                 },
-                "fused_ops": fused_op_health_report(),
+                "kernel_backends": kernel_backends,
+                "fused_ops": fused_ops_health,
             },
             "vision_enabled": self.config.vision_config is not None,
             "cache_device": str(self.device_context.migration_policy.execution_device),
@@ -1758,6 +1815,19 @@ class AnnaQwen3_5TextEngine:
 
     def _forward_multimodal_input_keys(self) -> tuple[str, ...]:
         return ("pixel_values", "pixel_values_videos")
+
+    @staticmethod
+    def _filter_supported_forward_kwargs(forward_fn: object, model_kwargs: dict[str, object]) -> dict[str, object]:
+        if not model_kwargs:
+            return {}
+        try:
+            signature = inspect.signature(forward_fn)
+        except (TypeError, ValueError):
+            return dict(model_kwargs)
+        parameters = signature.parameters
+        if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+            return dict(model_kwargs)
+        return {key: value for key, value in model_kwargs.items() if key in parameters}
 
     @staticmethod
     def _profile_memory_stats_snapshot(memory_stats: dict[str, int | float] | None) -> dict[str, int | float] | None:
@@ -2039,12 +2109,14 @@ class AnnaQwen3_5TextEngine:
                     if not hasattr(self.model, "forward_text_only"):
                         raise RuntimeError("Text-only generation requires Qwen3_5TextForConditionalGeneration.forward_text_only")
                     forward_fn = self.model.forward_text_only
+                text_model_kwargs = self._filter_supported_forward_kwargs(forward_fn, model_kwargs)
                 return forward_fn(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
                     use_cache=use_cache,
                     logits_to_keep=logits_to_keep,
+                    **text_model_kwargs,
                 )
             return self.model(
                 input_ids=input_ids,
@@ -2088,6 +2160,7 @@ class AnnaQwen3_5TextEngine:
                 forward_fn = getattr(self.model, "forward_text_only_topk", None)
                 if forward_fn is None:
                     return None
+                text_model_kwargs = self._filter_supported_forward_kwargs(forward_fn, model_kwargs)
                 return forward_fn(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -2095,6 +2168,7 @@ class AnnaQwen3_5TextEngine:
                     use_cache=use_cache,
                     logits_to_keep=logits_to_keep,
                     top_k=top_k,
+                    **text_model_kwargs,
                 )
             forward_fn = getattr(self.model, "forward_topk", None)
             if forward_fn is None:

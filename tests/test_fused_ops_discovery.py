@@ -54,6 +54,24 @@ def test_fused_op_health_report_exposes_key_kernel_availability(monkeypatch) -> 
     assert report["available"]["moe_grouped_int4_mlp_fused"] is True
     assert "rmsnorm_fused" in report["available"]
     assert "qk_norm_rotary_fused" in report["available"]
+    assert report["backends"]["paged_gqa_decode"] == "anna_sycl"
+    assert report["backends"]["lm_head_int4_topk"] == "anna_sycl"
+    assert report["backends"]["moe_grouped_int4_mlp"] == "anna_sycl"
+    assert report["backends"]["prefill_attention"] == "torch_scaled_dot_product_attention"
+
+
+def test_fused_op_health_report_distinguishes_disabled_int4_backends(monkeypatch) -> None:
+    monkeypatch.setattr(fused_ops, "_lm_head_int4_topk_op", lambda: object())
+    monkeypatch.setattr(fused_ops, "_moe_grouped_int4_mlp_op", lambda: object())
+    monkeypatch.setenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK", "1")
+    monkeypatch.setenv("ANNA_XPU_DISABLE_MOE_GROUPED_INT4", "1")
+
+    report = fused_ops.fused_op_health_report()
+
+    assert report["available"]["lm_head_int4_topk_fused"] is False
+    assert report["available"]["moe_grouped_int4_mlp_fused"] is False
+    assert report["backends"]["lm_head_int4_topk"] == "disabled"
+    assert report["backends"]["moe_grouped_int4_mlp"] == "disabled"
 
 
 @pytest.mark.parametrize(

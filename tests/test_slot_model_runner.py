@@ -114,8 +114,15 @@ def test_slot_model_runner_builds_decode_model_inputs_without_cache_objects() ->
 def test_qwen_engine_slot_runner_is_disabled_by_default_in_health() -> None:
     engine = _engine(optimization_config=EngineOptimizationConfig(prefill_chunk_size=4))
 
+    health = engine.health()["runtime_optimizations"]
+
     assert engine.slot_model_runner is None
-    assert engine.health()["runtime_optimizations"]["slot_runner"] == {"enabled": False}
+    assert health["slot_runner"] == {"enabled": False}
+    assert health["xpu_int4_kernels"]["module_count"] == 0
+    assert health["xpu_int4_kernels"]["backend"] == "inactive"
+    assert "int4pack_available" in health["xpu_int4_kernels"]
+    assert health["kernel_backends"]["xpu_int4_linear"] == "inactive"
+    assert "paged_gqa_decode" in health["kernel_backends"]
 
 
 def test_qwen_engine_can_enable_experimental_slot_runner_metadata_path() -> None:

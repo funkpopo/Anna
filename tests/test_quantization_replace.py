@@ -11,6 +11,7 @@ from anna.model.quantization import (
     XPUInt4Linear,
     convert_module_linears_to_xpu_int4,
     replace_linear_modules,
+    validate_xpu_int4_hotpath,
 )
 
 
@@ -218,6 +219,45 @@ def test_xpu_int4_linear_allows_xpu_dequant_fallback_only_for_debug(monkeypatch:
     monkeypatch.setenv("ANNA_XPU_INT4_ALLOW_DEQUANT_FALLBACK", "1")
 
     XPUInt4Linear._raise_if_xpu_dequant_fallback_disallowed(torch.device("xpu"))
+
+
+def test_validate_xpu_int4_hotpath_reports_inactive_for_cpu() -> None:
+    model = nn.Sequential(XPUInt4Linear(32, 16, group_size=32, device=torch.device("cpu")))
+
+    report = validate_xpu_int4_hotpath(model, device=torch.device("cpu"))
+
+    assert report.module_count == 1
+    assert report.backend == "inactive"
+
+
+def test_validate_xpu_int4_hotpath_rejects_dequant_strategy_for_xpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = nn.Sequential(XPUInt4Linear(32, 16, group_size=32, device=torch.device("cpu")))
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "dequant")
+
+    with pytest.raises(RuntimeError, match="dequant matmul strategy is not allowed"):
+        validate_xpu_int4_hotpath(model, device=torch.device("xpu"))
+
+
+def test_validate_xpu_int4_hotpath_rejects_missing_int4pack_for_xpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = nn.Sequential(XPUInt4Linear(32, 16, group_size=32, device=torch.device("cpu")))
+    monkeypatch.delenv("ANNA_XPU_INT4_MATMUL", raising=False)
+    monkeypatch.setattr("anna.model.quantization.xpu_int4pack_mm_is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="int4pack_mm_with_scales_and_zeros"):
+        validate_xpu_int4_hotpath(model, device=torch.device("xpu"))
+
+
+def test_validate_xpu_int4_hotpath_accepts_torch_int4pack_for_xpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = nn.Sequential(XPUInt4Linear(32, 16, group_size=32, device=torch.device("cpu")))
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "torch")
+    monkeypatch.setattr("anna.model.quantization.xpu_int4pack_mm_is_available", lambda: True)
+
+    report = validate_xpu_int4_hotpath(model, device=torch.device("xpu"))
+
+    assert report.module_count == 1
+    assert report.matmul_strategy == "torch"
+    assert report.int4pack_available is True
+    assert report.backend == "aten._weight_int4pack_mm_with_scales_and_zeros"
 
 
 def test_convert_module_linears_to_xpu_int4_ignores_persistent_layout_cache(

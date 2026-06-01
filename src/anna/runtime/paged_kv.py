@@ -340,6 +340,14 @@ class PagedKVManager:
         self.set_seq_len(slot_id, epoch, new_length)
         return new_length
 
+    def prepare_decode_capacity(self, handles: Sequence[KVSlotHandle], *, append_tokens: int = 1) -> None:
+        if append_tokens < 0:
+            raise ValueError("append_tokens must be non-negative.")
+        for handle in handles:
+            self._validate_slot(handle.slot_id, handle.epoch)
+            target_length = self._seq_lens_host[handle.slot_id] + int(append_tokens)
+            self.ensure_token_capacity(handle.slot_id, handle.epoch, target_length)
+
     def decode_plan(self, handles: Sequence[KVSlotHandle]) -> PagedKVDecodePlan:
         if not handles:
             raise ValueError("decode_plan requires at least one active slot.")

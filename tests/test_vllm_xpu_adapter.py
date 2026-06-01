@@ -8,7 +8,7 @@ from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.runtime.qwen3_5_text_engine import EngineOptimizationConfig, GenerationConfig, TextGenerationResult
 from anna.runtime.slot_model_runner import SlotModelRunner
 from anna.vllm_compat import RequestOutput, SamplingParams
-from anna_vllm_xpu import AnnaVLLMXPURuntimeAdapter, build_platform_capabilities
+from anna_vllm_xpu import AnnaVLLMXPURuntimeAdapter, build_platform_capabilities, extract_execute_model_request_ids
 
 
 class _FakeEngine:
@@ -133,3 +133,56 @@ def test_adapter_exposes_slot_model_runner_decode_inputs_and_kv_config() -> None
     capabilities = adapter.platform_capabilities()
     assert capabilities.kv_cache == kv_config
     assert capabilities.device_name == "Arc Test GPU"
+
+
+def test_adapter_extracts_vllm_execute_model_request_ids_without_vllm_dependency() -> None:
+    request = SimpleNamespace(
+        seq_group_metadata_list=[
+            SimpleNamespace(request_id="req-a"),
+            SimpleNamespace(request_id="req-b"),
+        ]
+    )
+
+    assert extract_execute_model_request_ids(request) == ("req-a", "req-b")
+    assert extract_execute_model_request_ids({"request_ids": ["req-c", "req-d"]}) == ("req-c", "req-d")
+
+
+def test_adapter_builds_decode_inputs_from_vllm_execute_model_shape() -> None:
+    engine = _FakeEngine()
+    engine.slot_model_runner = SlotModelRunner.from_text_config(
+        _text_config(),
+        device="cpu",
+        max_slots=2,
+        total_blocks=8,
+        max_blocks_per_seq=4,
+        max_batch_size=2,
+    )
+    engine.slot_model_runner.admit_prefill("req-a", prompt_length=4, max_new_tokens=2)
+    engine.slot_model_runner.admit_prefill("req-b", prompt_length=2, max_new_tokens=2)
+    engine.slot_model_runner.mark_prefilled("req-a", next_input_id=101)
+    engine.slot_model_runner.mark_prefilled("req-b", next_input_id=102)
+    adapter = AnnaVLLMXPURuntimeAdapter(engine=engine)
+
+    inputs = adapter.build_model_runner_inputs_from_execute_model(
+        SimpleNamespace(
+            seq_group_metadata_list=[
+                SimpleNamespace(request_id="req-b"),
+                SimpleNamespace(request_id="req-a"),
+            ]
+        )
+    )
+
+    assert inputs.request_ids == ("req-b", "req-a")
+    assert inputs.input_ids.tolist() == [[102], [101]]
+    assert inputs.positions.tolist() == [2, 4]
+
+
+def test_adapter_rejects_execute_model_shape_without_request_ids() -> None:
+    adapter = AnnaVLLMXPURuntimeAdapter(engine=_FakeEngine())
+
+    try:
+        adapter.build_model_runner_inputs_from_execute_model(SimpleNamespace(seq_group_metadata_list=[]))
+    except ValueError as exc:
+        assert "request ids" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("missing request ids should fail")

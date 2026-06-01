@@ -388,12 +388,20 @@ class AnnaScheduler:
         if outputs.past_key_values is not None and len(requests) == 1:
             split_caches = [outputs.past_key_values]
         elif outputs.past_key_values is not None:
-            split_started_at = time.perf_counter()
-            split_caches = outputs.past_key_values.split_batch()
-            if metrics is not None:
-                metrics.record_cache_split(time.perf_counter() - split_started_at)
+            row_views = getattr(outputs.past_key_values, "row_views", None)
+            if callable(row_views):
+                split_caches = list(row_views())
+            else:
+                split_started_at = time.perf_counter()
+                split_caches = outputs.past_key_values.split_batch()
+                if metrics is not None:
+                    metrics.record_cache_split(time.perf_counter() - split_started_at)
         else:
             split_caches = [None] * len(requests)
+        if len(split_caches) != len(requests):
+            raise RuntimeError(
+                f"Prefill returned {len(split_caches)} cache rows for {len(requests)} scheduler requests."
+            )
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
         active: list[SchedulerRequest | SchedulerPrefillGroup] = []
         next_tokens = self._sample_next_tokens_from_outputs(outputs, requests=requests)
@@ -450,23 +458,29 @@ class AnnaScheduler:
         if not requests:
             return []
         input_ids = torch.cat([request.input_ids for request in requests if request.input_ids is not None], dim=0)
-        self._build_slot_decode_inputs(requests)
+        slot_decode_inputs = self._build_slot_decode_inputs(requests)
         caches = [request.past_key_values for request in requests if request.past_key_values is not None]
         if not caches:
             raise RuntimeError("Scheduler decode batch is missing cache state.")
         metrics = getattr(self.engine, "metrics", None)
+        batch_cache_is_view = False
         if len(caches) == 1:
             batch_cache = caches[0]
         else:
             cache_type = type(caches[0])
-            stack = getattr(cache_type, "stack", None)
-            if not callable(stack):
-                raise RuntimeError(f"Cache type {cache_type.__name__} does not support scheduler batching.")
-            stack_started_at = time.perf_counter()
-            stack_kwargs = {"clone_turboquant_rows": False} if cache_type.__name__ == "Qwen3DynamicCache" else {}
-            batch_cache = stack(caches, self.engine.config.text_config, **stack_kwargs)
-            if metrics is not None:
-                metrics.record_cache_stack(time.perf_counter() - stack_started_at)
+            if any(type(cache) is not cache_type for cache in caches):
+                raise RuntimeError("Scheduler decode batch cannot mix cache implementations.")
+            batch_view = getattr(cache_type, "batch_view", None)
+            if not callable(batch_view):
+                raise RuntimeError(
+                    f"Cache type {cache_type.__name__} must provide batch_view() for scheduler decode batching."
+                )
+            batch_cache = batch_view(
+                caches,
+                self.engine.config.text_config,
+                clone_turboquant_rows=False,
+            )
+            batch_cache_is_view = True
 
         try:
             started_at = time.perf_counter()
@@ -476,6 +490,7 @@ class AnnaScheduler:
                     requests=requests,
                     input_ids=input_ids,
                     past_key_values=batch_cache,
+                    model_kwargs={"slot_decode_inputs": slot_decode_inputs} if slot_decode_inputs is not None else None,
                 )
         except RuntimeError as exc:
             raise self.engine._handle_runtime_failure(exc) from exc
@@ -483,20 +498,24 @@ class AnnaScheduler:
         if metrics is not None:
             metrics.record_decode_step(time.perf_counter() - started_at)
 
-        if outputs.past_key_values is not None and len(requests) == 1:
+        if batch_cache_is_view and outputs.past_key_values is not None:
+            sync_rows = getattr(outputs.past_key_values, "sync_batch_view_rows", None)
+            if not callable(sync_rows):
+                raise RuntimeError("Scheduler batch cache view did not return a synchronizable cache.")
+            split_caches = list(sync_rows())
+        elif outputs.past_key_values is not None and len(requests) == 1:
             split_caches = [outputs.past_key_values]
         elif outputs.past_key_values is not None:
-            split_started_at = time.perf_counter()
-            split_kwargs = (
-                {"clone_turboquant_rows": False}
-                if type(outputs.past_key_values).__name__ == "Qwen3DynamicCache"
-                else {}
+            raise RuntimeError(
+                "Scheduler decode returned a batched cache that is not a batch_view; "
+                "decode hot path no longer supports split_batch()."
             )
-            split_caches = outputs.past_key_values.split_batch(**split_kwargs)
-            if metrics is not None:
-                metrics.record_cache_split(time.perf_counter() - split_started_at)
         else:
             split_caches = [None] * len(requests)
+        if len(split_caches) != len(requests):
+            raise RuntimeError(
+                f"Decode returned {len(split_caches)} cache rows for {len(requests)} scheduler requests."
+            )
         next_active: list[SchedulerRequest] = []
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
         next_tokens = self._sample_next_tokens_from_outputs(outputs, requests=requests)
@@ -792,10 +811,10 @@ class AnnaScheduler:
                 continue
             runner.advance_prefill(request.slot_request_id, token_count=token_count)
 
-    def _build_slot_decode_inputs(self, requests: list[SchedulerRequest]) -> None:
+    def _build_slot_decode_inputs(self, requests: list[SchedulerRequest]) -> object | None:
         runner = self._slot_model_runner()
         if runner is None:
-            return
+            return None
         request_ids = [request.slot_request_id for request in requests]
         if any(request_id is None for request_id in request_ids):
             raise RuntimeError("Experimental slot runner is missing slot ids for a decode batch.")
@@ -804,6 +823,7 @@ class AnnaScheduler:
         metrics = getattr(self.engine, "metrics", None)
         if metrics is not None:
             metrics.record_slot_decode_plan(time.perf_counter() - started_at)
+        return self._last_slot_decode_inputs
 
     def _advance_request_slot_after_decode(
         self,

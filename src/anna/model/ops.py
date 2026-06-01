@@ -1231,6 +1231,177 @@ class Qwen3DynamicCache:
 
         return stacked
 
+    @classmethod
+    def batch_view(
+        cls,
+        caches: list["Qwen3DynamicCache"],
+        config: Qwen3_5TextConfig,
+        *,
+        clone_turboquant_rows: bool = False,
+    ) -> "Qwen3DynamicCache":
+        if not caches:
+            return cls(config)
+        if any(cache.allocator is not caches[0].allocator for cache in caches):
+            raise ValueError("Cannot batch-view caches from different allocators.")
+        if any(cache.get_batch_size() != 1 for cache in caches):
+            raise ValueError("Qwen3DynamicCache.batch_view expects one cache row per request.")
+
+        prototype = caches[0]
+        view = cls(
+            config,
+            allocator=prototype.allocator,
+            batch_size=len(caches),
+            kv_cache_quantization=prototype.kv_cache_quantization,
+            kv_cache_quant_bits=prototype.kv_cache_quant_bits,
+            kv_cache_residual_len=prototype.kv_cache_residual_len,
+        )
+        view._batch_view_rows = tuple(caches)
+        for layer_idx in range(config.num_hidden_layers):
+            view.layer_lengths[layer_idx] = [row.layer_lengths[layer_idx][0] for row in caches]
+        view.seen_tokens = max((row.get_seq_length() for row in caches), default=0)
+        view.reserved_seq_capacity = max((row.reserved_seq_capacity for row in caches), default=0)
+        if all(row.rope_deltas is None for row in caches):
+            view.rope_deltas = None
+        elif any(row.rope_deltas is None for row in caches):
+            raise ValueError("Cannot batch-view partially initialized rope deltas.")
+        else:
+            view.rope_deltas = torch.cat([row.rope_deltas for row in caches if row.rope_deltas is not None], dim=0)
+
+        for layer_idx in range(config.num_hidden_layers):
+            if view.uses_turboquant_for_layer(layer_idx):
+                for batch_idx, row in enumerate(caches):
+                    turboquant_row = row.turboquant_rows[layer_idx][0]
+                    if turboquant_row is None:
+                        view.turboquant_rows[layer_idx][batch_idx] = None
+                    elif clone_turboquant_rows:
+                        view.turboquant_rows[layer_idx][batch_idx] = turboquant_row.clone()
+                    else:
+                        view.turboquant_rows[layer_idx][batch_idx] = turboquant_row
+                continue
+            view.page_tables[layer_idx] = [row.page_tables[layer_idx][0] for row in caches]
+
+            conv_states = [row.conv_states[layer_idx] for row in caches]
+            if all(state is None for state in conv_states):
+                view.conv_states[layer_idx] = None
+            elif any(state is None for state in conv_states):
+                raise ValueError(f"Cannot batch-view partially initialized conv states at layer {layer_idx}")
+            else:
+                view.conv_states[layer_idx] = torch.cat(conv_states, dim=0)
+
+            recurrent_states = [row.recurrent_states[layer_idx] for row in caches]
+            if all(state is None for state in recurrent_states):
+                view.recurrent_states[layer_idx] = None
+            elif any(state is None for state in recurrent_states):
+                raise ValueError(f"Cannot batch-view partially initialized recurrent states at layer {layer_idx}")
+            else:
+                view.recurrent_states[layer_idx] = torch.cat(recurrent_states, dim=0)
+
+            if view._uses_contiguous_full_attention_mirror(layer_idx):
+                visible_rows: list[tuple[torch.Tensor | None, torch.Tensor | None, int]] = []
+                visible_capacity = 0
+                ref_key: torch.Tensor | None = None
+                ref_value: torch.Tensor | None = None
+                for row in caches:
+                    key_buffer, value_buffer, capacity = row._visible_layer_state(layer_idx)
+                    visible_rows.append((key_buffer, value_buffer, capacity))
+                    if key_buffer is None or value_buffer is None:
+                        continue
+                    if ref_key is None or ref_value is None:
+                        ref_key = key_buffer
+                        ref_value = value_buffer
+                    visible_capacity = max(visible_capacity, capacity)
+
+                if ref_key is not None and ref_value is not None:
+                    view_key = ref_key.new_empty((len(caches), ref_key.shape[1], visible_capacity, ref_key.shape[3]))
+                    view_value = ref_value.new_empty((len(caches), ref_value.shape[1], visible_capacity, ref_value.shape[3]))
+                    for batch_idx, (key_buffer, value_buffer, _) in enumerate(visible_rows):
+                        if key_buffer is None or value_buffer is None:
+                            continue
+                        key_copy_length = min(visible_capacity, int(key_buffer.shape[2]))
+                        value_copy_length = min(visible_capacity, int(value_buffer.shape[2]))
+                        if key_copy_length > 0:
+                            view_key[batch_idx, :, :key_copy_length, :].copy_(key_buffer[0, :, :key_copy_length, :])
+                        if value_copy_length > 0:
+                            view_value[batch_idx, :, :value_copy_length, :].copy_(
+                                value_buffer[0, :, :value_copy_length, :]
+                            )
+                    view.visible_key_caches[layer_idx] = view_key
+                    view.visible_value_caches[layer_idx] = view_value
+                    view.visible_cache_capacities[layer_idx] = visible_capacity
+
+        return view
+
+    def sync_batch_view_rows(self) -> tuple["Qwen3DynamicCache", ...]:
+        rows = getattr(self, "_batch_view_rows", None)
+        if rows is None:
+            return (self,)
+        rows = tuple(rows)
+        for batch_idx, row in enumerate(rows):
+            for layer_idx in range(self.config.num_hidden_layers):
+                row.layer_lengths[layer_idx][0] = self.layer_lengths[layer_idx][batch_idx]
+                if self.uses_turboquant_for_layer(layer_idx):
+                    row.turboquant_rows[layer_idx][0] = self.turboquant_rows[layer_idx][batch_idx]
+                if self.conv_states[layer_idx] is not None:
+                    row.conv_states[layer_idx] = self.conv_states[layer_idx][batch_idx : batch_idx + 1].contiguous()
+                if self.recurrent_states[layer_idx] is not None:
+                    row.recurrent_states[layer_idx] = self.recurrent_states[layer_idx][batch_idx : batch_idx + 1].contiguous()
+                if self.visible_key_caches[layer_idx] is not None and self.visible_value_caches[layer_idx] is not None:
+                    row.visible_key_caches[layer_idx] = self.visible_key_caches[layer_idx][
+                        batch_idx : batch_idx + 1
+                    ].contiguous()
+                    row.visible_value_caches[layer_idx] = self.visible_value_caches[layer_idx][
+                        batch_idx : batch_idx + 1
+                    ].contiguous()
+                    row.visible_cache_capacities[layer_idx] = self.visible_cache_capacities[layer_idx]
+            if self.rope_deltas is not None:
+                row.rope_deltas = self.rope_deltas[batch_idx : batch_idx + 1].contiguous()
+            row.reserved_seq_capacity = self.reserved_seq_capacity
+            row.seen_tokens = row.get_seq_length()
+        return rows
+
+    def row_views(self) -> tuple["Qwen3DynamicCache", ...]:
+        batch_size = self.get_batch_size()
+        if batch_size <= 1:
+            return (self,)
+
+        rows = tuple(
+            Qwen3DynamicCache(
+                self.config,
+                allocator=self.allocator,
+                batch_size=1,
+                kv_cache_quantization=self.kv_cache_quantization,
+                kv_cache_quant_bits=self.kv_cache_quant_bits,
+                kv_cache_residual_len=self.kv_cache_residual_len,
+            )
+            for _ in range(batch_size)
+        )
+        for batch_idx, row in enumerate(rows):
+            row.reserved_seq_capacity = self.reserved_seq_capacity
+            for layer_idx in range(self.config.num_hidden_layers):
+                row.layer_lengths[layer_idx][0] = self.layer_lengths[layer_idx][batch_idx]
+                row.visible_cache_capacities[layer_idx] = self.visible_cache_capacities[layer_idx]
+                row.page_table_capacities[layer_idx] = 0
+                row.page_table_caches[layer_idx] = None
+
+                if self.uses_turboquant_for_layer(layer_idx):
+                    row.turboquant_rows[layer_idx][0] = self.turboquant_rows[layer_idx][batch_idx]
+                else:
+                    row.page_tables[layer_idx][0] = self.page_tables[layer_idx][batch_idx]
+
+                if self.conv_states[layer_idx] is not None:
+                    row.conv_states[layer_idx] = self.conv_states[layer_idx][batch_idx : batch_idx + 1]
+                if self.recurrent_states[layer_idx] is not None:
+                    row.recurrent_states[layer_idx] = self.recurrent_states[layer_idx][batch_idx : batch_idx + 1]
+                if self.visible_key_caches[layer_idx] is not None:
+                    row.visible_key_caches[layer_idx] = self.visible_key_caches[layer_idx][batch_idx : batch_idx + 1]
+                if self.visible_value_caches[layer_idx] is not None:
+                    row.visible_value_caches[layer_idx] = self.visible_value_caches[layer_idx][batch_idx : batch_idx + 1]
+
+            if self.rope_deltas is not None:
+                row.rope_deltas = self.rope_deltas[batch_idx : batch_idx + 1]
+            row.seen_tokens = row.get_seq_length()
+        return rows
+
     def split_batch(self, *, clone_turboquant_rows: bool = True) -> list["Qwen3DynamicCache"]:
         batch_size = self.get_batch_size()
         if batch_size <= 1:
@@ -1869,6 +2040,7 @@ class Qwen3Attention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
         past_key_values: Qwen3DynamicCache | None = None,
+        slot_decode_inputs: object | None = None,
     ) -> torch.Tensor:
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
         if self.profile_runtime:
@@ -1878,12 +2050,14 @@ class Qwen3Attention(nn.Module):
                     position_embeddings=position_embeddings,
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
+                    slot_decode_inputs=slot_decode_inputs,
                 )
         return self._forward_attention(
             hidden_states,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
+            slot_decode_inputs=slot_decode_inputs,
         )
 
     def _forward_attention(
@@ -1893,6 +2067,7 @@ class Qwen3Attention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
         past_key_values: Qwen3DynamicCache | None = None,
+        slot_decode_inputs: object | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         input_shape = hidden_states.shape[:-1]
@@ -1973,6 +2148,32 @@ class Qwen3Attention(nn.Module):
                 )
                 attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
                 return self.o_proj(attn_output)
+            slot_tables_are_physical = bool(getattr(slot_decode_inputs, "physical_block_tables", False))
+            if prefer_paged_decode and slot_tables_are_physical and slot_decode_inputs is not None and past_key_values is not None:
+                slot_block_tables = getattr(slot_decode_inputs, "block_tables", None)
+                slot_seq_lens = getattr(slot_decode_inputs, "seq_lens", None)
+                if not torch.is_tensor(slot_block_tables) or not torch.is_tensor(slot_seq_lens):
+                    raise RuntimeError("slot_decode_inputs must provide tensor block_tables and seq_lens.")
+                layer = past_key_values.allocator.layers[self.layer_idx]
+                if layer.key_pages is not None and layer.value_pages is not None:
+                    gate_fused = _reshape_decode_gate_to_query_layout(
+                        gate,
+                        num_heads=query_states.size(1),
+                        head_dim=self.head_dim,
+                    )
+                    slot_ids = getattr(slot_decode_inputs, "slot_ids", None)
+                    attn_output = paged_kv_slot_batch_decode_attention(
+                        query_states,
+                        layer.key_pages,
+                        layer.value_pages,
+                        slot_block_tables.to(device=layer.key_pages.device, dtype=torch.int32),
+                        slot_seq_lens.to(device=layer.key_pages.device, dtype=torch.long) + seq_len,
+                        scaling=self.scaling,
+                        slot_ids=slot_ids if torch.is_tensor(slot_ids) else None,
+                        gate=gate_fused,
+                    )
+                    attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
+                    return self.o_proj(attn_output)
             if prefer_paged_decode and past_key_values is not None:
                 visible_lengths = past_lengths + seq_len
                 paged_state = past_key_values.paged_attention_state(self.layer_idx)
@@ -3624,6 +3825,7 @@ class Qwen3DecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
         past_key_values: Qwen3DynamicCache | None = None,
+        slot_decode_inputs: object | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -3635,6 +3837,7 @@ class Qwen3DecoderLayer(nn.Module):
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
+                slot_decode_inputs=slot_decode_inputs,
             )
         hidden_states = residual + hidden_states
         residual = hidden_states
