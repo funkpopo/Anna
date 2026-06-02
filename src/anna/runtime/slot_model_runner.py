@@ -19,6 +19,56 @@ class SlotModelRunnerConfig:
     max_blocks_per_seq: int
     max_batch_size: int
     device: torch.device
+    num_layers: int = 0
+    num_key_value_heads: int = 0
+    head_dim: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class SlotKVPageBank:
+    """Optional internal physical KV page storage for slot-owned decode.
+
+    The slot metadata manager assigns block ids in ``[0, total_blocks)``. When
+    this bank is explicitly allocated, those ids are also valid physical page
+    indices into the tensors below. The bank is not allocated by default because
+    production forward still writes prefill/decode KV through the legacy cache
+    object path.
+    """
+
+    key_pages: torch.Tensor
+    value_pages: torch.Tensor
+    num_layers: int
+    total_blocks: int
+    num_key_value_heads: int
+    block_size: int
+    head_dim: int
+
+    @property
+    def device(self) -> torch.device:
+        return self.key_pages.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.key_pages.dtype
+
+    def layer_pages(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise IndexError(f"layer_idx must be in range [0, {self.num_layers}).")
+        return self.key_pages[layer_idx], self.value_pages[layer_idx]
+
+    def health(self) -> dict[str, object]:
+        return {
+            "allocated": True,
+            "device": str(self.device),
+            "dtype": str(self.dtype),
+            "num_layers": int(self.num_layers),
+            "total_blocks": int(self.total_blocks),
+            "num_key_value_heads": int(self.num_key_value_heads),
+            "block_size": int(self.block_size),
+            "head_dim": int(self.head_dim),
+            "key_pages_shape": tuple(int(dim) for dim in self.key_pages.shape),
+            "value_pages_shape": tuple(int(dim) for dim in self.value_pages.shape),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,12 +98,71 @@ class SlotDecodeModelInputs:
     physical_block_tables: bool
     sampling_params: tuple[Any | None, ...]
     sampling_batch_params: SamplingBatchParams
+    physical_key_pages: torch.Tensor | None = None
+    physical_value_pages: torch.Tensor | None = None
 
     @property
     def decode_token_count(self) -> int:
         if self.input_ids.ndim <= 1:
             return 1
         return int(self.input_ids.shape[1])
+
+    @property
+    def batch_size(self) -> int:
+        if self.input_ids.ndim == 0:
+            return 1
+        return int(self.input_ids.shape[0])
+
+    @property
+    def contains_cache_objects(self) -> bool:
+        return False
+
+    @property
+    def block_table_ownership(self) -> str:
+        return "physical" if self.physical_block_tables else "logical_slot_metadata"
+
+    @property
+    def owns_physical_kv_pages(self) -> bool:
+        return self.physical_key_pages is not None and self.physical_value_pages is not None
+
+    @property
+    def physical_kv_layer_count(self) -> int:
+        if self.physical_key_pages is None:
+            return 0
+        return int(self.physical_key_pages.shape[0])
+
+    def physical_pages_for_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.physical_key_pages is None or self.physical_value_pages is None:
+            raise RuntimeError("Slot decode inputs do not own physical KV pages.")
+        if layer_idx < 0 or layer_idx >= int(self.physical_key_pages.shape[0]):
+            raise IndexError(f"layer_idx must be in range [0, {int(self.physical_key_pages.shape[0])}).")
+        return self.physical_key_pages[layer_idx], self.physical_value_pages[layer_idx]
+
+    def boundary_summary(self) -> dict[str, object]:
+        return {
+            "batch_size": self.batch_size,
+            "decode_token_count": self.decode_token_count,
+            "contains_cache_objects": self.contains_cache_objects,
+            "input_ids_device": str(self.input_ids.device),
+            "slot_ids_device": str(self.slot_ids.device),
+            "positions_are_global": bool(self.positions_are_global),
+            "seq_lens_are_global": bool(self.seq_lens_are_global),
+            "block_tables_are_global": bool(self.block_tables_are_global),
+            "physical_block_tables": bool(self.physical_block_tables),
+            "block_table_ownership": self.block_table_ownership,
+            "block_tables_shape": tuple(int(dim) for dim in self.block_tables.shape),
+            "seq_lens_shape": tuple(int(dim) for dim in self.seq_lens.shape),
+            "positions_shape": tuple(int(dim) for dim in self.positions.shape),
+            "sampling_batch_params": self.sampling_batch_params.batch_size == self.batch_size,
+            "owns_physical_kv_pages": self.owns_physical_kv_pages,
+            "physical_kv_layer_count": self.physical_kv_layer_count,
+            "physical_key_pages_shape": None
+            if self.physical_key_pages is None
+            else tuple(int(dim) for dim in self.physical_key_pages.shape),
+            "physical_value_pages_shape": None
+            if self.physical_value_pages is None
+            else tuple(int(dim) for dim in self.physical_value_pages.shape),
+        }
 
     def _select_batch_rows(self, tensor: torch.Tensor, *, is_global: bool) -> torch.Tensor:
         if not is_global:
@@ -82,7 +191,14 @@ class SlotDecodeModelInputs:
         return self.batch_seq_lens + self.decode_token_count
 
     @classmethod
-    def from_plan(cls, plan: DecodeBatchPlan) -> "SlotDecodeModelInputs":
+    def from_plan(
+        cls,
+        plan: DecodeBatchPlan,
+        *,
+        physical_block_tables: bool | None = None,
+        physical_key_pages: torch.Tensor | None = None,
+        physical_value_pages: torch.Tensor | None = None,
+    ) -> "SlotDecodeModelInputs":
         return cls(
             request_ids=plan.request_ids,
             input_ids=plan.input_ids,
@@ -94,9 +210,13 @@ class SlotDecodeModelInputs:
             seq_lens_are_global=plan.seq_lens_are_global,
             block_tables=plan.block_tables,
             block_tables_are_global=plan.block_tables_are_global,
-            physical_block_tables=plan.physical_block_tables,
+            physical_block_tables=plan.physical_block_tables
+            if physical_block_tables is None
+            else bool(physical_block_tables),
             sampling_params=plan.sampling_params,
             sampling_batch_params=plan.sampling_batch_params,
+            physical_key_pages=physical_key_pages,
+            physical_value_pages=physical_value_pages,
         )
 
 
@@ -128,6 +248,9 @@ def resolve_slot_model_runner_config(
         max_blocks_per_seq=resolved_max_blocks,
         max_batch_size=resolved_max_batch,
         device=torch.device(device),
+        num_layers=int(text_config.num_hidden_layers),
+        num_key_value_heads=int(text_config.num_key_value_heads),
+        head_dim=int(text_config.head_dim),
     )
 
 
@@ -150,6 +273,7 @@ class SlotModelRunner:
             device=config.device,
         )
         self.scheduler = SlotScheduler(self.kv_manager, max_batch_size=config.max_batch_size)
+        self.kv_page_bank: SlotKVPageBank | None = None
 
     @classmethod
     def from_text_config(
@@ -226,10 +350,56 @@ class SlotModelRunner:
         *,
         request_ids: Sequence[str] | None = None,
         limit: int | None = None,
+        physical_block_tables: bool = False,
     ) -> SlotDecodeModelInputs:
+        if physical_block_tables and self.kv_page_bank is None:
+            raise RuntimeError(
+                "physical_block_tables=True requires SlotModelRunner.allocate_physical_kv_page_bank() first."
+            )
+        bank = self.kv_page_bank if physical_block_tables else None
         return SlotDecodeModelInputs.from_plan(
-            self.scheduler.build_decode_plan(request_ids=request_ids, limit=limit)
+            self.scheduler.build_decode_plan(request_ids=request_ids, limit=limit),
+            physical_block_tables=bool(physical_block_tables),
+            physical_key_pages=None if bank is None else bank.key_pages,
+            physical_value_pages=None if bank is None else bank.value_pages,
         )
+
+    def allocate_physical_kv_page_bank(
+        self,
+        *,
+        dtype: torch.dtype = torch.float32,
+        num_layers: int | None = None,
+        num_key_value_heads: int | None = None,
+        head_dim: int | None = None,
+    ) -> SlotKVPageBank:
+        resolved_layers = self.config.num_layers if num_layers is None else int(num_layers)
+        resolved_heads = self.config.num_key_value_heads if num_key_value_heads is None else int(num_key_value_heads)
+        resolved_head_dim = self.config.head_dim if head_dim is None else int(head_dim)
+        if resolved_layers <= 0:
+            raise ValueError("num_layers must be positive for a physical KV page bank.")
+        if resolved_heads <= 0:
+            raise ValueError("num_key_value_heads must be positive for a physical KV page bank.")
+        if resolved_head_dim <= 0:
+            raise ValueError("head_dim must be positive for a physical KV page bank.")
+        shape = (
+            resolved_layers,
+            self.config.total_blocks,
+            resolved_heads,
+            self.config.block_size,
+            resolved_head_dim,
+        )
+        key_pages = torch.zeros(shape, dtype=dtype, device=self.config.device)
+        value_pages = torch.zeros_like(key_pages)
+        self.kv_page_bank = SlotKVPageBank(
+            key_pages=key_pages,
+            value_pages=value_pages,
+            num_layers=resolved_layers,
+            total_blocks=self.config.total_blocks,
+            num_key_value_heads=resolved_heads,
+            block_size=self.config.block_size,
+            head_dim=resolved_head_dim,
+        )
+        return self.kv_page_bank
 
     def advance_decode(
         self,
@@ -272,6 +442,7 @@ class SlotModelRunner:
             "enabled": True,
             "metadata_only": True,
             "integrated_generation": False,
+            "slot_owned_kv_writes": False,
             "device": str(self.config.device),
             "max_slots": self.config.max_slots,
             "active_slots": self.scheduler.active_count,
@@ -281,4 +452,53 @@ class SlotModelRunner:
             "free_blocks": self.kv_manager.free_block_count,
             "max_blocks_per_seq": self.config.max_blocks_per_seq,
             "max_batch_size": self.config.max_batch_size,
+            "metadata_tensors": {
+                "block_tables": True,
+                "seq_lens": True,
+                "positions_alias_seq_lens": True,
+                "slot_epochs": True,
+                "slot_active": True,
+                "block_refcounts": True,
+                "device": str(self.kv_manager.device),
+                "block_tables_shape": tuple(int(dim) for dim in self.kv_manager.block_tables.shape),
+                "seq_lens_shape": tuple(int(dim) for dim in self.kv_manager.seq_lens.shape),
+                "slot_epochs_shape": tuple(int(dim) for dim in self.kv_manager.slot_epochs.shape),
+                "block_refcounts_shape": tuple(int(dim) for dim in self.kv_manager.block_refcounts.shape),
+            },
+            "decode_plan": {
+                "contains_cache_objects": False,
+                "input_ids": True,
+                "slot_ids": True,
+                "epochs": True,
+                "block_tables_are_global": True,
+                "seq_lens_are_global": True,
+                "positions_are_global": True,
+                "physical_block_tables": False,
+                "physical_block_tables_available": self.kv_page_bank is not None,
+                "block_table_ownership": "logical_slot_metadata",
+                "owns_physical_kv_pages": self.kv_page_bank is not None,
+                "sampling_batch_params": True,
+            },
+            "kv_write_path": {
+                "physical_page_write_helper": True,
+                "physical_decode_page_write_helper": True,
+                "physical_prefill_page_write_helper": True,
+                "external_physical_block_tables_supported": True,
+                "internal_block_tables_are_physical": False,
+                "prefill_slot_owned_writes": False,
+                "decode_slot_owned_writes": False,
+                "legacy_cache_object_required_for_forward": True,
+                "tensor_bank_ready": self.kv_page_bank is not None,
+            },
+            "physical_kv_page_bank": (
+                {"allocated": False}
+                if self.kv_page_bank is None
+                else self.kv_page_bank.health()
+            ),
+            "token_buffers": {
+                "next_input_device_tensor": True,
+                "slot_owned_output_token_buffer": True,
+                "host_output_ids_mirror": True,
+            },
+            "sampling_batch_params_cache": self.scheduler.sampling_batch_params_cache_stats(),
         }

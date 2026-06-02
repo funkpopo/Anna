@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from anna.model import ops as model_ops
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig, Qwen3_5TextModelConfig
 from anna.runtime.device import DeviceContext
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, EngineOptimizationConfig
@@ -61,6 +62,9 @@ def test_slot_model_runner_resolves_config_from_text_config() -> None:
     assert resolved.total_blocks == 12
     assert resolved.max_batch_size == 2
     assert resolved.device == torch.device("cpu")
+    assert resolved.num_layers == 1
+    assert resolved.num_key_value_heads == 1
+    assert resolved.head_dim == 8
 
 
 def test_slot_model_runner_builds_decode_model_inputs_without_cache_objects() -> None:
@@ -111,6 +115,37 @@ def test_slot_model_runner_builds_decode_model_inputs_without_cache_objects() ->
     assert model_inputs.sampling_batch_params.temperature.tolist() == pytest.approx([0.0, 0.8])
     assert model_inputs.sampling_batch_params.top_k.tolist() == [1, 2]
     assert not hasattr(model_inputs, "past_key_values")
+    assert model_inputs.contains_cache_objects is False
+    assert model_inputs.boundary_summary() == {
+        "batch_size": 2,
+        "decode_token_count": 1,
+        "contains_cache_objects": False,
+        "input_ids_device": "cpu",
+        "slot_ids_device": "cpu",
+        "positions_are_global": True,
+        "seq_lens_are_global": True,
+        "block_tables_are_global": True,
+        "physical_block_tables": False,
+        "block_table_ownership": "logical_slot_metadata",
+        "block_tables_shape": (2, 4),
+        "seq_lens_shape": (2,),
+        "positions_shape": (2,),
+        "sampling_batch_params": True,
+        "owns_physical_kv_pages": False,
+        "physical_kv_layer_count": 0,
+        "physical_key_pages_shape": None,
+        "physical_value_pages_shape": None,
+    }
+
+    repeated = runner.build_decode_inputs(request_ids=["req-a", "req-b"])
+    assert repeated.sampling_batch_params is model_inputs.sampling_batch_params
+    assert runner.health()["sampling_batch_params_cache"] == {
+        "entries": 1,
+        "max_entries": 64,
+        "hits": 1,
+        "misses": 1,
+        "evictions": 0,
+    }
 
     runner.advance_decode("req-a", next_input_id=12)
     advanced = runner.build_decode_inputs(request_ids=["req-a"])
@@ -182,6 +217,87 @@ def test_slot_model_runner_advances_decode_batch_from_sampler_tensor() -> None:
     assert next_inputs.visible_seq_lens.tolist() == [5]
 
 
+def test_slot_model_runner_can_emit_explicit_internal_physical_kv_page_bank() -> None:
+    text_config = _text_config()
+    runner = SlotModelRunner.from_text_config(
+        text_config,
+        device="cpu",
+        max_slots=2,
+        total_blocks=8,
+        max_blocks_per_seq=4,
+        max_batch_size=2,
+    )
+    runner.admit_prefill("req-a", prompt_length=3, max_new_tokens=2)
+    runner.admit_prefill("req-b", prompt_length=5, max_new_tokens=2)
+    runner.mark_prefilled("req-a", next_input_id=11)
+    runner.mark_prefilled("req-b", next_input_id=22)
+
+    with pytest.raises(RuntimeError, match="allocate_physical_kv_page_bank"):
+        runner.build_decode_inputs(physical_block_tables=True)
+
+    bank = runner.allocate_physical_kv_page_bank(dtype=torch.float32, num_layers=2)
+    assert bank.health() == {
+        "allocated": True,
+        "device": "cpu",
+        "dtype": "torch.float32",
+        "num_layers": 2,
+        "total_blocks": 8,
+        "num_key_value_heads": text_config.num_key_value_heads,
+        "block_size": text_config.cache_block_size,
+        "head_dim": text_config.head_dim,
+        "key_pages_shape": (
+            2,
+            8,
+            text_config.num_key_value_heads,
+            text_config.cache_block_size,
+            text_config.head_dim,
+        ),
+        "value_pages_shape": (
+            2,
+            8,
+            text_config.num_key_value_heads,
+            text_config.cache_block_size,
+            text_config.head_dim,
+        ),
+    }
+
+    model_inputs = runner.build_decode_inputs(physical_block_tables=True)
+    assert model_inputs.physical_block_tables is True
+    assert model_inputs.block_table_ownership == "physical"
+    assert model_inputs.owns_physical_kv_pages is True
+    assert model_inputs.physical_kv_layer_count == 2
+    assert model_inputs.boundary_summary()["physical_key_pages_shape"] == bank.health()["key_pages_shape"]
+
+    key_pages, value_pages = model_inputs.physical_pages_for_layer(0)
+    key_states = torch.tensor(
+        [
+            [[[101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0]]],
+            [[[201.0, 202.0, 203.0, 204.0, 205.0, 206.0, 207.0, 208.0]]],
+        ]
+    )
+    value_states = key_states + 1000.0
+
+    visible = model_ops.write_slot_decode_kv_to_pages(
+        key_states,
+        value_states,
+        key_pages,
+        value_pages,
+        model_inputs.block_tables,
+        model_inputs.seq_lens,
+        slot_ids=model_inputs.slot_ids,
+        block_tables_are_global=model_inputs.block_tables_are_global,
+        seq_lens_are_global=model_inputs.seq_lens_are_global,
+    )
+
+    assert torch.equal(visible, torch.tensor([4, 6], dtype=torch.long))
+    assert torch.count_nonzero(key_pages) == 16
+    assert torch.count_nonzero(value_pages) == 16
+    assert torch.count_nonzero(bank.key_pages[1]) == 0
+    assert runner.health()["decode_plan"]["physical_block_tables_available"] is True
+    assert runner.health()["kv_write_path"]["tensor_bank_ready"] is True
+    assert runner.health()["slot_owned_kv_writes"] is False
+
+
 def test_qwen_engine_slot_runner_is_disabled_by_default_in_health() -> None:
     engine = _engine(optimization_config=EngineOptimizationConfig(prefill_chunk_size=4))
 
@@ -191,14 +307,33 @@ def test_qwen_engine_slot_runner_is_disabled_by_default_in_health() -> None:
 
     assert engine.slot_model_runner is None
     assert health["slot_runner"] == {"enabled": False}
+    assert health["moe_runtime_boundary"] == {
+        "layer_count": 0,
+        "resident_layers": 0,
+        "offload_layers": 0,
+        "host_wave_planning_required_layers": 0,
+        "xpu_host_planning_blocked_layers": 0,
+        "resident_grouped_int4_ready_layers": 0,
+        "layers": [],
+    }
     assert health["xpu_int4_kernels"]["module_count"] == 0
     assert health["xpu_int4_kernels"]["backend"] == "inactive"
     assert "int4pack_available" in health["xpu_int4_kernels"]
     assert health["sampler"] == {
         "backend": "torch_tensor_fallback",
         "custom_xpu_kernel": False,
+        "xpu_kernel_ready": False,
+        "xpu_kernel_reason": "custom_xpu_sampler_kernel_not_implemented",
         "batch_params": True,
+        "batch_params_cache": True,
+        "batch_params_cache_benchmark": "sampling_params_cache",
         "candidate_sampler": True,
+        "candidate_sampler_coverage": {
+            "top_k": True,
+            "top_k_one_deterministic": True,
+            "top_k_top_p_min_p": True,
+            "positive_penalty_overfetch": True,
+        },
         "candidate_penalty_overfetch": True,
         "candidate_penalty_overfetch_requires": {
             "top_k_gt": 0,
@@ -206,7 +341,18 @@ def test_qwen_engine_slot_runner_is_disabled_by_default_in_health() -> None:
             "repetition_penalty_gte": 1.0,
         },
         "direct_prefill_candidates": True,
-        "full_vocab_fallback_metric": "sampler_full_vocab_sort_count",
+        "full_vocab_fallback_metric": "sampler_full_vocab_fallback_count",
+        "legacy_full_vocab_sort_metric": "sampler_full_vocab_sort_count",
+        "full_vocab_fallback_reasons": (
+            "top_p_full_logits_sort",
+            "min_p_full_logits_softmax",
+            "plain_full_logits_multinomial",
+        ),
+        "full_vocab_fallback_requires_xpu_kernel": (
+            "top_p_full_logits_sort",
+            "min_p_full_logits_softmax",
+            "plain_full_logits_multinomial",
+        ),
     }
     assert health["kernel_backends"]["xpu_int4_linear"] == "inactive"
     assert "paged_gqa_decode" in health["kernel_backends"]
@@ -240,7 +386,107 @@ def test_qwen_engine_can_enable_experimental_slot_runner_metadata_path() -> None
     assert health["enabled"] is True
     assert health["metadata_only"] is True
     assert health["integrated_generation"] is False
+    assert health["slot_owned_kv_writes"] is False
     assert health["max_slots"] == 2
     assert health["total_blocks"] == 8
     assert health["max_batch_size"] == 2
+    assert health["metadata_tensors"] == {
+        "block_tables": True,
+        "seq_lens": True,
+        "positions_alias_seq_lens": True,
+        "slot_epochs": True,
+        "slot_active": True,
+        "block_refcounts": True,
+        "device": "cpu",
+        "block_tables_shape": (2, 4),
+        "seq_lens_shape": (2,),
+        "slot_epochs_shape": (2,),
+        "block_refcounts_shape": (8,),
+    }
+    assert health["decode_plan"] == {
+        "contains_cache_objects": False,
+        "input_ids": True,
+        "slot_ids": True,
+        "epochs": True,
+        "block_tables_are_global": True,
+        "seq_lens_are_global": True,
+        "positions_are_global": True,
+        "physical_block_tables": False,
+        "physical_block_tables_available": False,
+        "block_table_ownership": "logical_slot_metadata",
+        "owns_physical_kv_pages": False,
+        "sampling_batch_params": True,
+    }
+    assert health["kv_write_path"] == {
+        "physical_page_write_helper": True,
+        "physical_decode_page_write_helper": True,
+        "physical_prefill_page_write_helper": True,
+        "external_physical_block_tables_supported": True,
+        "internal_block_tables_are_physical": False,
+        "prefill_slot_owned_writes": False,
+        "decode_slot_owned_writes": False,
+        "legacy_cache_object_required_for_forward": True,
+        "tensor_bank_ready": False,
+    }
+    assert health["physical_kv_page_bank"] == {"allocated": False}
+    assert health["token_buffers"] == {
+        "next_input_device_tensor": True,
+        "slot_owned_output_token_buffer": True,
+        "host_output_ids_mirror": True,
+    }
+    assert health["sampling_batch_params_cache"] == {
+        "entries": 0,
+        "max_entries": 64,
+        "hits": 0,
+        "misses": 0,
+        "evictions": 0,
+    }
     assert engine_health["compatibility"]["vllm_runtime_adapter"]["slot_model_runner_enabled"] is True
+
+
+def test_qwen_engine_rejects_physical_kv_page_bank_without_slot_runner() -> None:
+    with pytest.raises(ValueError, match="slot_runner_physical_kv_page_bank=True requires slot_runner_enabled=True"):
+        _engine(
+            optimization_config=EngineOptimizationConfig(
+                slot_runner_physical_kv_page_bank=True,
+            )
+        )
+
+
+def test_qwen_engine_can_preallocate_experimental_slot_runner_physical_kv_page_bank() -> None:
+    engine = _engine(
+        optimization_config=EngineOptimizationConfig(
+            prefill_chunk_size=4,
+            slot_runner_enabled=True,
+            slot_runner_max_slots=2,
+            slot_runner_total_blocks=8,
+            slot_runner_max_blocks_per_seq=4,
+            slot_runner_max_batch_size=2,
+            slot_runner_physical_kv_page_bank=True,
+        )
+    )
+
+    assert engine.slot_model_runner is not None
+    health = engine.health()["runtime_optimizations"]["slot_runner"]
+    assert health["slot_owned_kv_writes"] is False
+    assert health["decode_plan"]["physical_block_tables"] is False
+    assert health["decode_plan"]["physical_block_tables_available"] is True
+    assert health["decode_plan"]["block_table_ownership"] == "logical_slot_metadata"
+    assert health["decode_plan"]["owns_physical_kv_pages"] is True
+    assert health["kv_write_path"]["internal_block_tables_are_physical"] is False
+    assert health["kv_write_path"]["prefill_slot_owned_writes"] is False
+    assert health["kv_write_path"]["decode_slot_owned_writes"] is False
+    assert health["kv_write_path"]["legacy_cache_object_required_for_forward"] is True
+    assert health["kv_write_path"]["tensor_bank_ready"] is True
+    assert health["physical_kv_page_bank"] == {
+        "allocated": True,
+        "device": "cpu",
+        "dtype": "torch.float32",
+        "num_layers": 1,
+        "total_blocks": 8,
+        "num_key_value_heads": 1,
+        "block_size": 4,
+        "head_dim": 8,
+        "key_pages_shape": (1, 8, 1, 4, 8),
+        "value_pages_shape": (1, 8, 1, 4, 8),
+    }

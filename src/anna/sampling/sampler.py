@@ -4,7 +4,7 @@ from collections.abc import Sequence
 
 import torch
 
-from anna.core.hotpath_events import record_sampler_full_vocab_sort
+from anna.core.hotpath_events import record_sampler_full_vocab_fallback, record_sampler_full_vocab_sort
 from anna.sampling.params import SamplingBatchParams
 
 
@@ -192,6 +192,10 @@ def sample_next_token_batch(
     next_logits = apply_top_k(next_logits, top_k)
     if top_p < 1.0:
         record_sampler_full_vocab_sort("top_p_full_logits_sort", count=row_count)
+    elif min_p > 0.0:
+        record_sampler_full_vocab_fallback("min_p_full_logits_softmax", count=row_count)
+    else:
+        record_sampler_full_vocab_fallback("plain_full_logits_multinomial", count=row_count)
     next_logits = apply_top_p(next_logits, top_p)
     next_logits = apply_min_p(next_logits, min_p)
     probs = torch.softmax(next_logits, dim=-1)
@@ -289,6 +293,13 @@ def sample_next_token_batch_with_params(
         full_token_ids = full_token_ids.expand(len(rows), vocab_size)
         if apply_top_p:
             record_sampler_full_vocab_sort("top_p_full_logits_sort", count=len(rows))
+        else:
+            min_p_rows = sum(1 for idx in rows if params.min_p_values[idx] > 0.0)
+            if min_p_rows:
+                record_sampler_full_vocab_fallback("min_p_full_logits_softmax", count=min_p_rows)
+            plain_rows = len(rows) - min_p_rows
+            if plain_rows:
+                record_sampler_full_vocab_fallback("plain_full_logits_multinomial", count=plain_rows)
         sampled_tokens = _sample_candidate_logits_with_tensors(
             full_logits,
             full_token_ids,

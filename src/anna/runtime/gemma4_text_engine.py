@@ -173,6 +173,7 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         slot_runner_total_blocks: int = 0,
         slot_runner_max_blocks_per_seq: int = 0,
         slot_runner_max_batch_size: int = 0,
+        slot_runner_physical_kv_page_bank: bool = False,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
         default_temperature: float | None = None,
@@ -214,6 +215,8 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             ignored_slot_runner_options.append(f"slot_runner_max_blocks_per_seq={slot_runner_max_blocks_per_seq}")
         if slot_runner_max_batch_size:
             ignored_slot_runner_options.append(f"slot_runner_max_batch_size={slot_runner_max_batch_size}")
+        if slot_runner_physical_kv_page_bank:
+            ignored_slot_runner_options.append("slot_runner_physical_kv_page_bank=True")
         if ignored_slot_runner_options:
             logger.info(
                 "Ignoring Qwen3.5 slot-runner options for Gemma4 model load: %s",

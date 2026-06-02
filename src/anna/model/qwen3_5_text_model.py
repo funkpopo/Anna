@@ -318,6 +318,15 @@ class Qwen3TextModel(nn.Module):
             "turboquant_bits": self.kv_cache_quant_bits if turboquant_enabled else None,
             "turboquant_residual_len": self.kv_cache_residual_len if turboquant_enabled else None,
             "turboquant_applies_to": "full_attention_only" if turboquant_enabled else "disabled",
+            "turboquant_metadata": {
+                "tensor_mirror": turboquant_enabled,
+                "selected_view": turboquant_enabled,
+                "row_object_backing": turboquant_enabled,
+                "tensor_bank_ready": False,
+                "tensor_bank_reason": (
+                    "slot_indexed_turboquant_tensor_bank_not_implemented" if turboquant_enabled else "disabled"
+                ),
+            },
             "full_attention_layers": len(full_attention_layer_indices),
             "full_attention_layer_indices": full_attention_layer_indices,
             "turboquant_quantized_layers": len(full_attention_layer_indices) if turboquant_enabled else 0,
@@ -961,6 +970,9 @@ class Qwen3_5TextForCausalLM(nn.Module):
             hidden_states = hidden_states[:, -logits_to_keep:, :]
         values, indices = _lm_head_topk(self.lm_head, hidden_states, top_k)
         return CausalLMTopKOutput(candidate_logits=values, candidate_token_ids=indices, past_key_values=outputs.past_key_values)
+
+    def kv_cache_runtime_info(self) -> dict[str, object]:
+        return self.model.kv_cache_runtime_info()
 
 
 class Qwen3_5TextForConditionalGeneration(nn.Module):

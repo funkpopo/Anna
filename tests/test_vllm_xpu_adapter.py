@@ -14,6 +14,7 @@ from anna.runtime.paged_kv import SlotCapacityError
 from anna.runtime.qwen3_5_text_engine import EngineOptimizationConfig, GenerationConfig, TextGenerationResult
 from anna.runtime.service_metrics import AnnaServiceMetrics
 from anna.runtime.slot_model_runner import SlotModelRunner
+from anna.sampling.params import SamplingBatchParams
 from anna.vllm_compat import RequestOutput, SamplingParams
 from anna_vllm_xpu import (
     AnnaVLLMXPURuntimeAdapter,
@@ -89,6 +90,13 @@ def test_build_platform_capabilities_reports_attention_backend_from_fused_health
     assert capabilities.attention_backend.paged_decode is True
     assert capabilities.attention_backend.prefill == "torch_scaled_dot_product_attention"
     assert capabilities.attention_backend.fallback is None
+    assert capabilities.attention_backend.prefill_xpu_kernel_ready is False
+    assert capabilities.attention_backend.prefill_xpu_kernel_reason == (
+        "custom_prefill_attention_kernel_not_implemented"
+    )
+    assert capabilities.attention_backend.prefill_fallback_reason == (
+        "anna_vllm_xpu_torch_sdpa_prefill_attention"
+    )
     assert capabilities.fused_ops["lm_head_int4_topk_fused"] is True
     assert capabilities.supported_dtypes[0] == "torch.float16"
 
@@ -120,11 +128,30 @@ def test_adapter_converts_sampling_and_outputs_without_vllm_dependency() -> None
     assert health["integrated_vllm_worker"] is False
     assert health["slot_model_runner_enabled"] is False
     assert health["platform_plugin_entry_point"] == "anna_xpu = anna_vllm_xpu:register_platform"
+    assert health["attention_backend_boundary"]["prefill_backend"] == "torch_scaled_dot_product_attention"
+    assert health["attention_backend_boundary"]["prefill_xpu_kernel_ready"] is False
+    assert health["attention_backend_boundary"]["prefill_xpu_kernel_reason"] == (
+        "custom_prefill_attention_kernel_not_implemented"
+    )
+    assert health["attention_backend_boundary"]["prefill_records_attention_fallback"] is True
+    assert health["attention_backend_boundary"]["prefill_fallback_reason"] == (
+        "anna_vllm_xpu_torch_sdpa_prefill_attention"
+    )
     assert health["sampler"] == {
         "backend": "torch_tensor_fallback",
         "custom_xpu_kernel": False,
+        "xpu_kernel_ready": False,
+        "xpu_kernel_reason": "custom_xpu_sampler_kernel_not_implemented",
         "batch_params": True,
+        "batch_params_cache": True,
+        "batch_params_cache_benchmark": "sampling_params_cache",
         "candidate_sampler": True,
+        "candidate_sampler_coverage": {
+            "top_k": True,
+            "top_k_one_deterministic": True,
+            "top_k_top_p_min_p": True,
+            "positive_penalty_overfetch": True,
+        },
         "candidate_penalty_overfetch": True,
         "candidate_penalty_overfetch_requires": {
             "top_k_gt": 0,
@@ -132,7 +159,18 @@ def test_adapter_converts_sampling_and_outputs_without_vllm_dependency() -> None
             "repetition_penalty_gte": 1.0,
         },
         "direct_prefill_candidates": True,
-        "full_vocab_fallback_metric": "sampler_full_vocab_sort_count",
+        "full_vocab_fallback_metric": "sampler_full_vocab_fallback_count",
+        "legacy_full_vocab_sort_metric": "sampler_full_vocab_sort_count",
+        "full_vocab_fallback_reasons": (
+            "top_p_full_logits_sort",
+            "min_p_full_logits_softmax",
+            "plain_full_logits_multinomial",
+        ),
+        "full_vocab_fallback_requires_xpu_kernel": (
+            "top_p_full_logits_sort",
+            "min_p_full_logits_softmax",
+            "plain_full_logits_multinomial",
+        ),
     }
 
 
@@ -269,6 +307,7 @@ def test_adapter_imports_external_kv_decode_batch_into_slot_metadata() -> None:
     assert inputs.block_tables.tolist() == [[5, 6, -1, -1], [1, -1, -1, -1]]
     assert inputs.block_tables_are_global is False
     assert inputs.physical_block_tables is True
+    assert inputs.block_table_ownership == "physical"
     assert inputs.sampling_batch_params.temperature.tolist() == pytest.approx([0.7, 0.0])
     assert inputs.sampling_batch_params.top_k.tolist() == [8, 1]
 
@@ -289,6 +328,75 @@ def test_adapter_imports_external_kv_decode_batch_into_slot_metadata() -> None:
     assert health["kv_cache_connector"] is True
 
 
+def test_adapter_reuses_external_kv_sampling_batch_params(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = _FakeEngine()
+    engine.slot_model_runner = SlotModelRunner.from_text_config(
+        _text_config(),
+        device="cpu",
+        max_slots=4,
+        total_blocks=16,
+        max_blocks_per_seq=4,
+        max_batch_size=2,
+    )
+    adapter = AnnaVLLMXPURuntimeAdapter(engine=engine)
+    connector = adapter.kv_cache_connector()
+    assert connector is adapter.kv_cache_connector()
+    original_from_sampling_params = SamplingBatchParams.from_sampling_params
+    calls: list[int] = []
+
+    def _counting_from_sampling_params(sampling_params, *, device):
+        calls.append(len(tuple(sampling_params)))
+        return original_from_sampling_params(sampling_params, device=device)
+
+    monkeypatch.setattr(
+        SamplingBatchParams,
+        "from_sampling_params",
+        staticmethod(_counting_from_sampling_params),
+    )
+    sampling_params = (
+        {"temperature": 0.7, "top_p": 0.9, "top_k": 8},
+        {"temperature": 0.0, "top_p": 1.0, "top_k": 1},
+    )
+
+    first = adapter.import_external_kv_decode_batch(
+        request_ids=("req-b", "req-a"),
+        input_ids=[202, 101],
+        slot_ids=[2, 0],
+        block_tables=[[5, 6, -1, -1], [1, -1, -1, -1]],
+        seq_lens=[7, 2],
+        epochs=[11, 9],
+        sampling_params=sampling_params,
+    )
+    second = adapter.import_external_kv_decode_batch(
+        request_ids=("req-b", "req-a"),
+        input_ids=[203, 102],
+        slot_ids=[2, 0],
+        block_tables=[[5, 6, 7, -1], [1, -1, -1, -1]],
+        seq_lens=[8, 3],
+        epochs=[11, 9],
+        sampling_params=sampling_params,
+    )
+
+    assert first.sampling_batch_params is second.sampling_batch_params
+    assert first.sampling_batch_params.top_k.tolist() == [8, 1]
+    assert connector.health() == {
+        "device": "cpu",
+        "mirrors_external_metadata": True,
+        "owns_physical_kv_pages": False,
+        "physical_block_tables_default": True,
+        "block_table_ownership": "external_physical_or_compatible",
+        "sampling_batch_params_cache": {
+            "entries": 1,
+            "max_entries": 64,
+            "hits": 1,
+            "misses": 1,
+            "evictions": 0,
+        },
+    }
+    assert adapter.health()["kv_cache_connector_health"] == connector.health()
+    assert calls == [2]
+
+
 def test_adapter_attention_backend_registry_exposes_decode_and_prefill(monkeypatch: pytest.MonkeyPatch) -> None:
     capabilities = build_platform_capabilities(
         health_report={"available": {"paged_gqa_decode_fused": True}},
@@ -300,6 +408,17 @@ def test_adapter_attention_backend_registry_exposes_decode_and_prefill(monkeypat
     assert registry.paged_decode_entrypoint == "anna.model.ops.paged_kv_slot_batch_decode_attention"
     assert registry.prefill_entrypoint == "torch.nn.functional.scaled_dot_product_attention"
     assert registry.prefill_backend == "torch_scaled_dot_product_attention"
+    assert registry.health() == {
+        "name": "anna.paged_gqa",
+        "paged_decode_entrypoint": "anna.model.ops.paged_kv_slot_batch_decode_attention",
+        "paged_decode_supported": True,
+        "prefill_entrypoint": "torch.nn.functional.scaled_dot_product_attention",
+        "prefill_backend": "torch_scaled_dot_product_attention",
+        "prefill_xpu_kernel_ready": False,
+        "prefill_xpu_kernel_reason": "custom_prefill_attention_kernel_not_implemented",
+        "prefill_records_attention_fallback": True,
+        "prefill_fallback_reason": "anna_vllm_xpu_torch_sdpa_prefill_attention",
+    }
 
     observed: dict[str, torch.Tensor] = {}
 
@@ -351,6 +470,9 @@ def test_adapter_attention_backend_registry_exposes_decode_and_prefill(monkeypat
 
     adapter = AnnaVLLMXPURuntimeAdapter(engine=_FakeEngine())
     assert adapter.health()["attention_backend_registry"] is True
+    assert adapter.health()["attention_backend_boundary"]["prefill_fallback_reason"] == (
+        "anna_vllm_xpu_torch_sdpa_prefill_attention"
+    )
 
 
 def test_adapter_attention_backend_rejects_paged_decode_when_fused_op_missing() -> None:

@@ -791,6 +791,87 @@ def _append_benchmark_row(
     )
 
 
+ARC_PROFILE_FIELDNAMES = (
+    "profile",
+    "device_name",
+    "strategy",
+    "local_size",
+    "gate_local_size",
+    "down_local_size",
+    "M",
+    "K",
+    "N",
+    "top_k",
+    "tokens_per_expert",
+    "experts",
+    "hidden_size",
+    "intermediate_size",
+    "group_size",
+    "dtype",
+    "baseline_ms",
+    "candidate_ms",
+    "speedup",
+    "max_abs_diff",
+)
+
+
+def _format_csv_value(value: object | None) -> str:
+    return "-" if value is None else str(value)
+
+
+def _format_csv_float(value: float | None, *, digits: int = 4) -> str:
+    return "-" if value is None else f"{value:.{digits}f}"
+
+
+def _append_arc_profile_row(
+    rows: list[dict[str, str]],
+    *,
+    profile: str,
+    device_name: str,
+    dtype: torch.dtype,
+    baseline_ms: float,
+    candidate_ms: float,
+    max_abs_diff: float,
+    group_size: int,
+    strategy: str | None = None,
+    local_size: int | None = None,
+    gate_local_size: int | None = None,
+    down_local_size: int | None = None,
+    m: int | None = None,
+    k: int | None = None,
+    n: int | None = None,
+    top_k: int | None = None,
+    tokens_per_expert: int | None = None,
+    experts: int | None = None,
+    hidden_size: int | None = None,
+    intermediate_size: int | None = None,
+) -> None:
+    rows.append(
+        {
+            "profile": profile,
+            "device_name": device_name,
+            "strategy": _format_csv_value(strategy),
+            "local_size": _format_csv_value(local_size),
+            "gate_local_size": _format_csv_value(gate_local_size),
+            "down_local_size": _format_csv_value(down_local_size),
+            "M": _format_csv_value(m),
+            "K": _format_csv_value(k),
+            "N": _format_csv_value(n),
+            "top_k": _format_csv_value(top_k),
+            "tokens_per_expert": _format_csv_value(tokens_per_expert),
+            "experts": _format_csv_value(experts),
+            "hidden_size": _format_csv_value(hidden_size),
+            "intermediate_size": _format_csv_value(intermediate_size),
+            "group_size": str(group_size),
+            "dtype": str(dtype),
+            "baseline_ms": _format_csv_float(baseline_ms),
+            "candidate_ms": _format_csv_float(candidate_ms),
+            "speedup": _format_speedup(baseline_ms, candidate_ms),
+            "max_abs_diff": _format_csv_float(max_abs_diff, digits=6),
+        }
+    )
+
+
 def _write_benchmark_csv(path: str, rows: list[dict[str, str]]) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -798,6 +879,22 @@ def _write_benchmark_csv(path: str, rows: list[dict[str, str]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=("op", "baseline_ms", "fused_ms", "speedup", "max_abs_diff"))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _write_arc_profile_csv(path: str, rows: list[dict[str, str]]) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=ARC_PROFILE_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _validate_benchmark_args(args: argparse.Namespace) -> None:
+    if args.arc_int4_only and not args.arc_profile:
+        raise ValueError("--arc-int4-only requires --arc-profile")
+    if args.arc_csv_output is not None and not args.arc_profile:
+        raise ValueError("--arc-csv-output requires --arc-profile")
 
 
 def main() -> None:
@@ -841,7 +938,14 @@ def main() -> None:
         default=None,
         help="Write the general hotspot benchmark rows to this CSV file.",
     )
+    parser.add_argument(
+        "--arc-csv-output",
+        type=str,
+        default=None,
+        help="Write --arc-profile rows to this CSV file.",
+    )
     args = parser.parse_args()
+    _validate_benchmark_args(args)
 
     if not hasattr(torch, "xpu") or not torch.xpu.is_available():
         raise RuntimeError("torch.xpu is unavailable in the active environment.")
@@ -869,8 +973,6 @@ def main() -> None:
     if xpu_info is not None:
         print(f"device_name={xpu_info.name}")
         print(f"device_index={xpu_info.device_index}")
-    if args.arc_int4_only and not args.arc_profile:
-        raise ValueError("--arc-int4-only requires --arc-profile")
     if not args.arc_int4_only:
         rmsnorm_baseline_ms, rmsnorm_fused_ms, rmsnorm_diff = _benchmark_rmsnorm(
             batch_size=args.batch_size,
@@ -1176,6 +1278,8 @@ def main() -> None:
             _write_benchmark_csv(args.csv_output, benchmark_rows)
             print(f"csv_output={args.csv_output}")
     if args.arc_profile:
+        arc_profile_rows: list[dict[str, str]] = []
+        device_name = "" if xpu_info is None else xpu_info.name
         print(
             "arc_int4_profile,device_name,strategy,M,K,N,group_size,dtype,"
             "baseline_ms,candidate_ms,speedup,max_abs_diff"
@@ -1199,7 +1303,20 @@ def main() -> None:
                 iters=args.iters,
                 strategy="auto",
             )
-            device_name = "" if xpu_info is None else xpu_info.name
+            _append_arc_profile_row(
+                arc_profile_rows,
+                profile="arc_int4_profile",
+                device_name=device_name,
+                strategy="auto",
+                m=m,
+                k=k,
+                n=n,
+                group_size=args.int4_group_size,
+                dtype=dtype,
+                baseline_ms=baseline_ms,
+                candidate_ms=candidate_ms,
+                max_abs_diff=diff,
+            )
             print(
                 f"arc_int4_profile,{device_name},auto,{m},{k},{n},{args.int4_group_size},{dtype},"
                 f"{baseline_ms:.4f},{candidate_ms:.4f},{_format_speedup(baseline_ms, candidate_ms)},{diff:.6f}"
@@ -1217,7 +1334,21 @@ def main() -> None:
                 iters=args.iters,
                 local_size=local_size,
             )
-            device_name = "" if xpu_info is None else xpu_info.name
+            _append_arc_profile_row(
+                arc_profile_rows,
+                profile="arc_lm_head_int4_topk_profile",
+                device_name=device_name,
+                local_size=local_size,
+                m=args.int4_m,
+                k=int4_k,
+                n=lm_head_vocab_size,
+                top_k=max(1, args.top_k),
+                group_size=args.int4_group_size,
+                dtype=dtype,
+                baseline_ms=baseline_ms,
+                candidate_ms=candidate_ms,
+                max_abs_diff=diff,
+            )
             print(
                 f"arc_lm_head_int4_topk_profile,{device_name},{local_size},{args.int4_m},{int4_k},{lm_head_vocab_size},"
                 f"{max(1, args.top_k)},{args.int4_group_size},{dtype},"
@@ -1244,13 +1375,31 @@ def main() -> None:
                     gate_local_size=gate_local_size,
                     down_local_size=down_local_size,
                 )
-                device_name = "" if xpu_info is None else xpu_info.name
+                _append_arc_profile_row(
+                    arc_profile_rows,
+                    profile="arc_moe_grouped_int4_mlp_profile",
+                    device_name=device_name,
+                    gate_local_size=gate_local_size,
+                    down_local_size=down_local_size,
+                    tokens_per_expert=max(1, args.int4_m),
+                    experts=max(1, min(args.experts, 8)),
+                    hidden_size=moe_hidden_size,
+                    intermediate_size=moe_intermediate_size,
+                    group_size=args.int4_group_size,
+                    dtype=dtype,
+                    baseline_ms=baseline_ms,
+                    candidate_ms=candidate_ms,
+                    max_abs_diff=diff,
+                )
                 print(
                     f"arc_moe_grouped_int4_mlp_profile,{device_name},{gate_local_size},{down_local_size},"
                     f"{max(1, args.int4_m)},{max(1, min(args.experts, 8))},{moe_hidden_size},{moe_intermediate_size},"
                     f"{args.int4_group_size},{dtype},{baseline_ms:.4f},{candidate_ms:.4f},"
                     f"{_format_speedup(baseline_ms, candidate_ms)},{diff:.6f}"
                 )
+        if args.arc_csv_output is not None:
+            _write_arc_profile_csv(args.arc_csv_output, arc_profile_rows)
+            print(f"arc_csv_output={args.arc_csv_output}")
 
     print("next_paths")
     print("single-token variable-visible decode now maps to native masked GQA; multi-token masked decode remains the main full-attention gap.")

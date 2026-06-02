@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import torch
 import pytest
 
@@ -12,7 +14,7 @@ from anna.sampling.sampler import (
     sample_next_token_from_candidates,
 )
 from anna.sampling.capabilities import sampler_capability_report
-from anna.sampling.params import SamplingBatchParams
+from anna.sampling.params import SamplingBatchParams, SamplingBatchParamsCache, sampling_params_cache_key
 from anna.core.hotpath_events import hotpath_event_recorder
 from anna.runtime.service_metrics import AnnaServiceMetrics
 
@@ -21,8 +23,18 @@ def test_sampler_capability_report_exposes_current_backend_boundary() -> None:
     assert sampler_capability_report() == {
         "backend": "torch_tensor_fallback",
         "custom_xpu_kernel": False,
+        "xpu_kernel_ready": False,
+        "xpu_kernel_reason": "custom_xpu_sampler_kernel_not_implemented",
         "batch_params": True,
+        "batch_params_cache": True,
+        "batch_params_cache_benchmark": "sampling_params_cache",
         "candidate_sampler": True,
+        "candidate_sampler_coverage": {
+            "top_k": True,
+            "top_k_one_deterministic": True,
+            "top_k_top_p_min_p": True,
+            "positive_penalty_overfetch": True,
+        },
         "candidate_penalty_overfetch": True,
         "candidate_penalty_overfetch_requires": {
             "top_k_gt": 0,
@@ -30,7 +42,91 @@ def test_sampler_capability_report_exposes_current_backend_boundary() -> None:
             "repetition_penalty_gte": 1.0,
         },
         "direct_prefill_candidates": True,
-        "full_vocab_fallback_metric": "sampler_full_vocab_sort_count",
+        "full_vocab_fallback_metric": "sampler_full_vocab_fallback_count",
+        "legacy_full_vocab_sort_metric": "sampler_full_vocab_sort_count",
+        "full_vocab_fallback_reasons": (
+            "top_p_full_logits_sort",
+            "min_p_full_logits_softmax",
+            "plain_full_logits_multinomial",
+        ),
+        "full_vocab_fallback_requires_xpu_kernel": (
+            "top_p_full_logits_sort",
+            "min_p_full_logits_softmax",
+            "plain_full_logits_multinomial",
+        ),
+    }
+
+
+def test_sampling_params_cache_key_normalizes_param_shapes() -> None:
+    dict_params = {
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "top_k": 4,
+        "min_p": 0.1,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.2,
+    }
+    object_params = SimpleNamespace(**dict_params)
+
+    assert sampling_params_cache_key((dict_params,), device="cpu") == sampling_params_cache_key(
+        (object_params,),
+        device=torch.device("cpu"),
+    )
+    assert sampling_params_cache_key((None,), device="cpu") == (
+        "cpu",
+        ((0.7, 0.8, 20, 0.0, 1.5, 1.0),),
+    )
+
+
+def test_sampling_batch_params_cache_reuses_normalized_keys_and_evicts_lru(monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = SamplingBatchParamsCache(max_entries=2)
+    original_from_sampling_params = SamplingBatchParams.from_sampling_params
+    calls: list[int] = []
+
+    def _counting_from_sampling_params(sampling_params, *, device):
+        calls.append(len(tuple(sampling_params)))
+        return original_from_sampling_params(sampling_params, device=device)
+
+    monkeypatch.setattr(
+        SamplingBatchParams,
+        "from_sampling_params",
+        staticmethod(_counting_from_sampling_params),
+    )
+    first_params = ({"temperature": 0.2, "top_p": 1.0, "top_k": 2},)
+    equivalent_first_params = (SimpleNamespace(temperature=0.2, top_p=1.0, top_k=2),)
+    second_params = ({"temperature": 0.3, "top_p": 1.0, "top_k": 3},)
+    third_params = ({"temperature": 0.4, "top_p": 1.0, "top_k": 4},)
+
+    first = cache.get(first_params, device="cpu")
+    equivalent_first = cache.get(equivalent_first_params, device=torch.device("cpu"))
+    second = cache.get(second_params, device="cpu")
+    refreshed_first = cache.get(first_params, device="cpu")
+    third = cache.get(third_params, device="cpu")
+    second_after_evict = cache.get(second_params, device="cpu")
+
+    assert first is equivalent_first
+    assert first is refreshed_first
+    assert second is not third
+    assert second_after_evict is not second
+    assert len(cache) == 2
+    assert cache.stats() == {
+        "entries": 2,
+        "max_entries": 2,
+        "hits": 2,
+        "misses": 4,
+        "evictions": 2,
+    }
+    assert calls == [1, 1, 1, 1]
+
+    cache.clear()
+
+    assert len(cache) == 0
+    assert cache.stats() == {
+        "entries": 0,
+        "max_entries": 2,
+        "hits": 0,
+        "misses": 0,
+        "evictions": 0,
     }
 
 
@@ -139,6 +235,7 @@ def test_top_k_sampling_avoids_full_vocab_top_p_sort_metric() -> None:
 
     assert int(token.item()) in {0, 1}
     assert metrics.snapshot().sampler_full_vocab_sort_count == 0
+    assert metrics.snapshot().sampler_full_vocab_fallback_count == 0
 
 
 def test_top_k_one_sampling_is_deterministic_without_rng_or_full_vocab_sort() -> None:
@@ -154,6 +251,7 @@ def test_top_k_one_sampling_is_deterministic_without_rng_or_full_vocab_sort() ->
     assert torch.equal(first, torch.tensor([1, 0]))
     assert torch.equal(second, first)
     assert metrics.snapshot().sampler_full_vocab_sort_count == 0
+    assert metrics.snapshot().sampler_full_vocab_fallback_count == 0
 
 
 def test_top_p_without_top_k_records_full_vocab_sort_metric() -> None:
@@ -163,7 +261,27 @@ def test_top_p_without_top_k_records_full_vocab_sort_metric() -> None:
     with hotpath_event_recorder(metrics):
         sample_next_token_batch(logits, temperature=1.0, top_k=0, top_p=0.9, min_p=0.0)
 
-    assert metrics.snapshot().sampler_full_vocab_sort_count == 1
+    snapshot = metrics.snapshot()
+    assert snapshot.sampler_full_vocab_sort_count == 1
+    assert snapshot.sampler_full_vocab_fallback_count == 1
+    assert snapshot.sampler_full_vocab_fallback_reasons == {"top_p_full_logits_sort": 1}
+
+
+def test_full_vocab_without_top_p_records_min_p_and_plain_fallback_reasons() -> None:
+    metrics = AnnaServiceMetrics()
+    logits = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
+
+    with hotpath_event_recorder(metrics):
+        sample_next_token_batch(logits, temperature=1.0, top_k=0, top_p=1.0, min_p=0.2)
+        sample_next_token_batch(logits, temperature=1.0, top_k=0, top_p=1.0, min_p=0.0)
+
+    snapshot = metrics.snapshot()
+    assert snapshot.sampler_full_vocab_sort_count == 0
+    assert snapshot.sampler_full_vocab_fallback_count == 2
+    assert snapshot.sampler_full_vocab_fallback_reasons == {
+        "min_p_full_logits_softmax": 1,
+        "plain_full_logits_multinomial": 1,
+    }
 
 
 def test_sample_next_token_batch_greedy_matches_reference_with_penalties() -> None:
@@ -399,6 +517,7 @@ def test_sample_next_token_batch_with_params_treats_top_k_one_sample_rows_as_top
     assert sampled[1] in (0, 2)
     assert sampled[2] == 0
     assert metrics.snapshot().sampler_full_vocab_sort_count == 0
+    assert metrics.snapshot().sampler_full_vocab_fallback_count == 0
 
 
 def test_sample_next_token_batch_with_params_counts_only_full_vocab_top_p_rows() -> None:
@@ -433,7 +552,13 @@ def test_sample_next_token_batch_with_params_counts_only_full_vocab_top_p_rows()
         sampled = sample_next_token_batch_with_params(logits, params)
 
     assert sampled.shape == (3,)
-    assert metrics.snapshot().sampler_full_vocab_sort_count == 1
+    snapshot = metrics.snapshot()
+    assert snapshot.sampler_full_vocab_sort_count == 1
+    assert snapshot.sampler_full_vocab_fallback_count == 3
+    assert snapshot.sampler_full_vocab_fallback_reasons == {
+        "plain_full_logits_multinomial": 2,
+        "top_p_full_logits_sort": 1,
+    }
 
 
 def test_candidate_sampler_with_params_supports_per_row_sampling_config() -> None:

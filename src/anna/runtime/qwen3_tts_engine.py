@@ -94,6 +94,7 @@ class AnnaQwen3TTSEngine:
         slot_runner_total_blocks: int = 0,
         slot_runner_max_blocks_per_seq: int = 0,
         slot_runner_max_batch_size: int = 0,
+        slot_runner_physical_kv_page_bank: bool = False,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
         default_temperature: float | None = None,
@@ -164,6 +165,8 @@ class AnnaQwen3TTSEngine:
             ignored_options.append(f"slot_runner_max_blocks_per_seq={slot_runner_max_blocks_per_seq}")
         if slot_runner_max_batch_size:
             ignored_options.append(f"slot_runner_max_batch_size={slot_runner_max_batch_size}")
+        if slot_runner_physical_kv_page_bank:
+            ignored_options.append("slot_runner_physical_kv_page_bank=True")
         if offload_mode != "auto":
             ignored_options.append(f"offload_mode={offload_mode}")
         if offload_vision:

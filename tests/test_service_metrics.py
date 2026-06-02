@@ -69,7 +69,14 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     assert snapshot.attention_fallback_count == 1
     assert snapshot.paged_cache_materialize_count == 1
     assert snapshot.sampler_full_vocab_sort_count == 1
+    assert snapshot.sampler_full_vocab_fallback_count == 1
     assert snapshot.moe_host_offset_count == 1
+    assert snapshot.cpu_sync_reasons == {"token_id_cpu_staging": 2}
+    assert snapshot.attention_fallback_reasons == {"grouped_attention": 1}
+    assert snapshot.paged_cache_materialize_reasons == {"gather_layer_cache": 1}
+    assert snapshot.sampler_full_vocab_sort_reasons == {"top_p_full_logits_sort": 1}
+    assert snapshot.sampler_full_vocab_fallback_reasons == {"top_p_full_logits_sort": 1}
+    assert snapshot.moe_host_offset_reasons == {"expert_offsets_cpu": 1}
     assert snapshot.moe_router_count == 1
     assert snapshot.moe_router_seconds_total == 0.001
     assert snapshot.moe_router_seconds_max == 0.001
@@ -89,6 +96,35 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     assert snapshot.moe_cpu_sync_seconds_total == 0.006
     assert snapshot.moe_cpu_sync_seconds_max == 0.006
     assert metrics.activity_event.is_set() is True
+
+
+def test_service_metrics_groups_hotpath_events_by_reason() -> None:
+    metrics = AnnaServiceMetrics()
+
+    metrics.record_cpu_sync(reason="token_id_cpu_staging", count=2)
+    metrics.record_cpu_sync(reason="token_id_cpu_staging")
+    metrics.record_cpu_sync(reason="", count=1)
+    metrics.record_attention_fallback(reason="grouped_attention", count=3)
+    metrics.record_paged_cache_materialization(reason="gather_layer_cache", count=4)
+    metrics.record_sampler_full_vocab_sort(reason="top_p_full_logits_sort", count=5)
+    metrics.record_sampler_full_vocab_fallback(reason="min_p_full_logits_softmax", count=7)
+    metrics.record_moe_host_offset(reason="expert_offsets_cpu", count=6)
+
+    snapshot = metrics.snapshot()
+
+    assert snapshot.cpu_sync_count == 4
+    assert snapshot.cpu_sync_reasons == {
+        "token_id_cpu_staging": 3,
+        "unspecified": 1,
+    }
+    assert snapshot.attention_fallback_reasons == {"grouped_attention": 3}
+    assert snapshot.paged_cache_materialize_reasons == {"gather_layer_cache": 4}
+    assert snapshot.sampler_full_vocab_sort_reasons == {"top_p_full_logits_sort": 5}
+    assert snapshot.sampler_full_vocab_fallback_reasons == {
+        "top_p_full_logits_sort": 5,
+        "min_p_full_logits_softmax": 7,
+    }
+    assert snapshot.moe_host_offset_reasons == {"expert_offsets_cpu": 6}
 
 
 def test_service_metrics_finishes_waiting_requests_without_touching_running_count() -> None:
@@ -148,6 +184,7 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
         attention_fallback_count=4,
         paged_cache_materialize_count=5,
         sampler_full_vocab_sort_count=6,
+        sampler_full_vocab_fallback_count=8,
         moe_host_offset_count=7,
         moe_router_seconds_total=0.002,
         moe_router_count=2,
@@ -182,7 +219,10 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
     assert "Cache stack avg/max: 20.0/30.0 ms" in line
     assert "Cache split avg/max: 20.0/40.0 ms" in line
     assert "Slot decode plan avg/max: 10.0/15.0 ms" in line
-    assert "Hot path events: cpu_sync=3, attention_fallback=4, paged_cache_materialize=5, sampler_full_vocab_sort=6, moe_host_offset=7" in line
+    assert (
+        "Hot path events: cpu_sync=3, attention_fallback=4, paged_cache_materialize=5, "
+        "sampler_full_vocab_sort=6, sampler_full_vocab_fallback=8, moe_host_offset=7"
+    ) in line
     assert (
         "MoE stage avg/max ms: router=1.000/1.500, dispatch=2.000/3.000, "
         "expert_gemm=3.000/4.000, scatter=1.000/2.000, staging=2.000/3.000, "

@@ -9,6 +9,7 @@ from anna.core.hotpath_events import (
     record_moe_host_offset,
     record_moe_stage,
     record_paged_cache_materialization,
+    record_sampler_full_vocab_fallback,
     record_sampler_full_vocab_sort,
 )
 from anna.runtime.hotpath_guard import scan_hotpath_file, scan_hotpath_files, unexpected_findings
@@ -177,6 +178,7 @@ def test_hotpath_event_context_records_service_metrics() -> None:
         record_attention_fallback("grouped_attention")
         record_paged_cache_materialization("gather_layer_cache")
         record_sampler_full_vocab_sort("top_p_full_logits_sort")
+        record_sampler_full_vocab_fallback("min_p_full_logits_softmax", count=2)
         record_moe_host_offset("expert_offsets_cpu")
         record_moe_stage("router", 0.001)
         record_moe_stage("dispatch", 0.002)
@@ -190,7 +192,17 @@ def test_hotpath_event_context_records_service_metrics() -> None:
     assert snapshot.attention_fallback_count == 1
     assert snapshot.paged_cache_materialize_count == 1
     assert snapshot.sampler_full_vocab_sort_count == 1
+    assert snapshot.sampler_full_vocab_fallback_count == 3
     assert snapshot.moe_host_offset_count == 1
+    assert snapshot.cpu_sync_reasons == {"token_id_cpu_staging": 2}
+    assert snapshot.attention_fallback_reasons == {"grouped_attention": 1}
+    assert snapshot.paged_cache_materialize_reasons == {"gather_layer_cache": 1}
+    assert snapshot.sampler_full_vocab_sort_reasons == {"top_p_full_logits_sort": 1}
+    assert snapshot.sampler_full_vocab_fallback_reasons == {
+        "top_p_full_logits_sort": 1,
+        "min_p_full_logits_softmax": 2,
+    }
+    assert snapshot.moe_host_offset_reasons == {"expert_offsets_cpu": 1}
     assert snapshot.moe_router_count == 1
     assert snapshot.moe_dispatch_count == 1
     assert snapshot.moe_expert_gemm_count == 1

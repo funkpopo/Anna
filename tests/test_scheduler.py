@@ -5,7 +5,7 @@ import torch
 from anna.mm.prepared_inputs import PreparedInputs
 from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig, Qwen3_5TextConfig
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
-from anna.runtime.device import RuntimeSafetyPolicy
+from anna.runtime.device import RuntimeSafetyPolicy, TensorMigrationPolicy
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, EngineOptimizationConfig, GenerationConfig
 from anna.runtime.scheduler import AnnaScheduler, SchedulerRequest
 from anna.sampling.params import SamplingBatchParams
@@ -33,6 +33,14 @@ class _FakeDeviceContext:
     def __init__(self) -> None:
         self.device = torch.device("cpu")
         self.dtype = torch.float32
+        self.requested_dtype = "float32"
+        self.reported_dtype = "float32"
+        self.migration_policy = TensorMigrationPolicy(
+            preprocess_device=torch.device("cpu"),
+            execution_device=torch.device("cpu"),
+            parameter_dtype=torch.float32,
+            cache_dtype=torch.float32,
+        )
         self.safety_policy = RuntimeSafetyPolicy()
 
     def get_memory_info(self):
@@ -379,6 +387,20 @@ def test_scheduler_reuses_sampling_batch_params_for_same_active_batch(monkeypatc
         assert request_b.error is None
         assert fake_model.text_prefill_batch_sizes == [2]
         assert fake_model.text_decode_batch_sizes == [2]
+        assert scheduler.sampling_batch_params_cache_stats() == {
+            "entries": 1,
+            "max_entries": 64,
+            "hits": 1,
+            "misses": 1,
+            "evictions": 0,
+        }
+        assert engine.health()["runtime_optimizations"]["scheduler_sampling_batch_params_cache"] == {
+            "entries": 1,
+            "max_entries": 64,
+            "hits": 1,
+            "misses": 1,
+            "evictions": 0,
+        }
         assert calls == [2]
     finally:
         scheduler.shutdown()

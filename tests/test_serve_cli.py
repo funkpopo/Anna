@@ -95,6 +95,7 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "64",
             "--slot-runner-max-batch-size",
             "4",
+            "--slot-runner-physical-kv-page-bank",
             "--metrics-log-interval-seconds",
             "3.5",
         ]
@@ -129,6 +130,7 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.slot_runner_total_blocks == 256
     assert args.slot_runner_max_blocks_per_seq == 64
     assert args.slot_runner_max_batch_size == 4
+    assert args.slot_runner_physical_kv_page_bank is True
     assert args.metrics_log_interval_seconds == 3.5
 
 
@@ -193,6 +195,7 @@ def test_serve_parser_defaults_to_direct_generation() -> None:
     assert args.slot_runner_total_blocks == 0
     assert args.slot_runner_max_blocks_per_seq == 0
     assert args.slot_runner_max_batch_size == 0
+    assert args.slot_runner_physical_kv_page_bank is False
     assert args.metrics_log_interval_seconds == 10.0
 
 

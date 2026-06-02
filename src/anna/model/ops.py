@@ -139,6 +139,51 @@ class _GroupedInt4ExpertBank:
     resident_active_slots: torch.Tensor | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class Qwen3TurboQuantMetadataView:
+    layer_idx: int
+    row_lengths: torch.Tensor
+    row_active: torch.Tensor
+    source_row_ids: torch.Tensor | None = None
+    row_object_backing: bool = True
+    tensor_bank_ready: bool = False
+
+    @property
+    def batch_size(self) -> int:
+        return int(self.row_lengths.shape[0])
+
+    @property
+    def device(self) -> torch.device:
+        return self.row_lengths.device
+
+    @property
+    def row_lengths_shape(self) -> tuple[int, ...]:
+        return tuple(int(dim) for dim in self.row_lengths.shape)
+
+    @property
+    def row_active_shape(self) -> tuple[int, ...]:
+        return tuple(int(dim) for dim in self.row_active.shape)
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "layer_idx": self.layer_idx,
+            "batch_size": self.batch_size,
+            "device": str(self.device),
+            "row_lengths_shape": self.row_lengths_shape,
+            "row_lengths_dtype": str(self.row_lengths.dtype),
+            "row_active_shape": self.row_active_shape,
+            "row_active_dtype": str(self.row_active.dtype),
+            "source_row_ids_shape": (
+                None
+                if self.source_row_ids is None
+                else tuple(int(dim) for dim in self.source_row_ids.shape)
+            ),
+            "tensor_metadata": True,
+            "row_object_backing": self.row_object_backing,
+            "tensor_bank_ready": self.tensor_bank_ready,
+        }
+
+
 class Qwen3PagedLayerAllocator:
     def __init__(
         self,
@@ -565,6 +610,99 @@ class Qwen3DynamicCache:
             return None
         self._ensure_turboquant_metadata_layer(layer_idx, self.get_batch_size())
         return self.turboquant_row_lengths[layer_idx], self.turboquant_row_active[layer_idx]
+
+    def turboquant_metadata_view(
+        self,
+        layer_idx: int,
+        *,
+        row_ids: torch.Tensor | None = None,
+    ) -> Qwen3TurboQuantMetadataView | None:
+        metadata = self.turboquant_metadata(layer_idx)
+        if metadata is None:
+            return None
+
+        row_lengths, row_active = metadata
+        source_row_ids = row_ids
+        if row_ids is not None:
+            if row_ids.ndim != 1:
+                raise RuntimeError("TurboQuant metadata row_ids must be a 1D tensor.")
+            if row_ids.device.type == "xpu" and row_lengths.device.type != "xpu":
+                raise RuntimeError(
+                    "Refusing to select CPU TurboQuant metadata with XPU row_ids; move the cache metadata "
+                    "to XPU first so slot-indexed decode does not pull metadata back to host."
+                )
+            index = row_ids.to(device=row_lengths.device, dtype=torch.long)
+            row_lengths = row_lengths.index_select(0, index)
+            row_active = row_active.index_select(0, index)
+
+        return Qwen3TurboQuantMetadataView(
+            layer_idx=layer_idx,
+            row_lengths=row_lengths,
+            row_active=row_active,
+            source_row_ids=source_row_ids,
+        )
+
+    def turboquant_runtime_boundary(self) -> dict[str, object]:
+        enabled = self.kv_cache_quantization == "turboquant"
+        layers: list[dict[str, object]] = []
+        row_object_rows_total = 0
+        active_row_objects_total = 0
+        tensor_metadata_layers = 0
+        batch_size = self.get_batch_size()
+
+        for layer_idx in sorted(self._turboquant_layer_index_set):
+            rows = self.turboquant_rows[layer_idx] if layer_idx < len(self.turboquant_rows) else []
+            row_slots = len(rows)
+            row_object_rows = sum(1 for row in rows if row is not None)
+            active_row_objects = sum(1 for row in rows if row is not None and int(row.length) > 0)
+            row_object_rows_total += row_object_rows
+            active_row_objects_total += active_row_objects
+
+            row_lengths = self.turboquant_row_lengths[layer_idx]
+            row_active = self.turboquant_row_active[layer_idx]
+            tensor_metadata_ready = (
+                row_lengths.ndim == 1
+                and row_active.ndim == 1
+                and int(row_lengths.shape[0]) == row_slots
+                and int(row_active.shape[0]) == row_slots
+            )
+            if tensor_metadata_ready:
+                tensor_metadata_layers += 1
+
+            layers.append(
+                {
+                    "layer_idx": int(layer_idx),
+                    "row_slots": int(row_slots),
+                    "row_object_rows": int(row_object_rows),
+                    "active_row_objects": int(active_row_objects),
+                    "tensor_metadata_ready": tensor_metadata_ready,
+                    "row_lengths_device": str(row_lengths.device),
+                    "row_active_device": str(row_active.device),
+                    "row_lengths_shape": tuple(int(dim) for dim in row_lengths.shape),
+                    "row_active_shape": tuple(int(dim) for dim in row_active.shape),
+                    "row_object_backing": True,
+                    "tensor_bank_ready": False,
+                }
+            )
+
+        return {
+            "enabled": enabled,
+            "mode": self.kv_cache_quantization,
+            "batch_size": int(batch_size),
+            "quantized_layer_count": len(self._turboquant_layer_index_set),
+            "quantized_layer_indices": tuple(int(layer_idx) for layer_idx in sorted(self._turboquant_layer_index_set)),
+            "tensor_metadata_layers": int(tensor_metadata_layers),
+            "row_object_backing": enabled,
+            "row_object_rows": int(row_object_rows_total),
+            "active_row_objects": int(active_row_objects_total),
+            "tensor_mirror": enabled,
+            "selected_view": enabled,
+            "tensor_bank_ready": False,
+            "tensor_bank_reason": (
+                "slot_indexed_turboquant_tensor_bank_not_implemented" if enabled else "disabled"
+            ),
+            "layers": layers,
+        }
 
     def uses_turboquant_for_layer(self, layer_idx: int) -> bool:
         return layer_idx in self._turboquant_layer_index_set
@@ -2008,8 +2146,179 @@ def _require_slot_decode_physical_pages(
         raise RuntimeError(
             "slot_decode_inputs.physical_block_tables=True requires initialized physical KV pages; "
             "refusing to fall back to legacy Qwen3DynamicCache.page_tables for slot-owned decode."
-        )
+    )
     return layer.key_pages, layer.value_pages
+
+
+def _slot_decode_input_physical_pages(
+    slot_decode_inputs: object,
+    layer_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    pages_for_layer = getattr(slot_decode_inputs, "physical_pages_for_layer", None)
+    if callable(pages_for_layer):
+        key_pages, value_pages = pages_for_layer(layer_idx)
+        if not torch.is_tensor(key_pages) or not torch.is_tensor(value_pages):
+            raise RuntimeError("slot_decode_inputs.physical_pages_for_layer() must return tensor KV pages.")
+        return key_pages, value_pages
+
+    key_pages = getattr(slot_decode_inputs, "physical_key_pages", None)
+    value_pages = getattr(slot_decode_inputs, "physical_value_pages", None)
+    if key_pages is None and value_pages is None:
+        return None
+    if not torch.is_tensor(key_pages) or not torch.is_tensor(value_pages):
+        raise RuntimeError("slot_decode_inputs physical KV pages must be tensors.")
+    if key_pages.ndim == 5 and value_pages.ndim == 5:
+        if layer_idx < 0 or layer_idx >= int(key_pages.shape[0]):
+            raise IndexError(f"slot_decode_inputs physical KV layer index is out of range: {layer_idx}")
+        return key_pages[layer_idx], value_pages[layer_idx]
+    return key_pages, value_pages
+
+
+def _resolve_slot_decode_physical_pages(
+    slot_decode_inputs: object,
+    past_key_values: Qwen3DynamicCache | None,
+    layer_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    slot_pages = _slot_decode_input_physical_pages(slot_decode_inputs, layer_idx)
+    if slot_pages is not None:
+        return slot_pages
+    if past_key_values is None:
+        record_attention_fallback("qwen3_slot_paged_decode_pages_missing")
+        raise RuntimeError(
+            "slot_decode_inputs.physical_block_tables=True requires physical KV pages from slot_decode_inputs "
+            "or initialized physical KV pages on Qwen3DynamicCache."
+        )
+    return _require_slot_decode_physical_pages(past_key_values, layer_idx)
+
+
+def write_slot_decode_kv_to_pages(
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    key_pages: torch.Tensor,
+    value_pages: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    slot_ids: torch.Tensor | None = None,
+    block_tables_are_global: bool = False,
+    seq_lens_are_global: bool = False,
+) -> torch.Tensor:
+    """Append decode K/V states into slot-owned physical KV pages.
+
+    ``seq_lens`` are the lengths before the current decode tokens are written.
+    The returned tensor is the visible length after the append. This helper is
+    intentionally independent of ``Qwen3DynamicCache.page_tables`` so the
+    slot-owned write path can be tested before the full model forward is moved
+    off legacy cache objects.
+    """
+    if key_states.ndim != 4 or value_states.ndim != 4:
+        raise RuntimeError("slot KV writes expect key/value states shaped [batch, kv_heads, tokens, head_dim].")
+    if key_pages.ndim != 4 or value_pages.ndim != 4:
+        raise RuntimeError("slot KV writes expect key/value pages shaped [blocks, kv_heads, block_size, head_dim].")
+    if key_states.shape != value_states.shape:
+        raise RuntimeError("slot KV writes require matching key_states/value_states shapes.")
+    if key_pages.shape != value_pages.shape:
+        raise RuntimeError("slot KV writes require matching key_pages/value_pages shapes.")
+    if key_states.shape[1] != key_pages.shape[1] or key_states.shape[3] != key_pages.shape[3]:
+        raise RuntimeError("slot KV write state layout does not match KV page layout.")
+    if key_states.device != key_pages.device or value_states.device != value_pages.device:
+        raise RuntimeError("slot KV writes require key/value states and pages to be on the same device.")
+    if block_tables.ndim != 2:
+        raise RuntimeError("slot KV writes expect block_tables shape [slots_or_batch, max_blocks].")
+    if seq_lens.ndim != 1:
+        raise RuntimeError("slot KV writes expect seq_lens shape [slots_or_batch].")
+
+    if key_pages.device.type == "xpu":
+        if block_tables.device.type != "xpu" or seq_lens.device.type != "xpu":
+            raise RuntimeError("slot KV writes on XPU require block_tables and seq_lens to already be XPU tensors.")
+        if slot_ids is not None and slot_ids.device.type != "xpu":
+            raise RuntimeError("slot KV writes on XPU require slot_ids to already be an XPU tensor.")
+
+    batch_size = int(key_states.shape[0])
+    decode_token_count = int(key_states.shape[2])
+    if batch_size <= 0 or decode_token_count <= 0:
+        raise RuntimeError("slot KV writes require a non-empty batch and at least one decode token.")
+
+    selected_block_tables = block_tables
+    selected_seq_lens = seq_lens
+    if block_tables_are_global or int(block_tables.shape[0]) != batch_size:
+        if slot_ids is None:
+            raise RuntimeError("slot_ids are required when block_tables are global tensors.")
+        if slot_ids.ndim != 1 or int(slot_ids.shape[0]) != batch_size:
+            raise RuntimeError("slot_ids must be a 1D tensor with one entry per decode batch row.")
+        index = slot_ids.to(device=block_tables.device, dtype=torch.long)
+        selected_block_tables = block_tables.index_select(0, index)
+    if seq_lens_are_global or int(seq_lens.shape[0]) != batch_size:
+        if slot_ids is None:
+            raise RuntimeError("slot_ids are required when seq_lens are global tensors.")
+        if slot_ids.ndim != 1 or int(slot_ids.shape[0]) != batch_size:
+            raise RuntimeError("slot_ids must be a 1D tensor with one entry per decode batch row.")
+        index = slot_ids.to(device=seq_lens.device, dtype=torch.long)
+        selected_seq_lens = seq_lens.index_select(0, index)
+    if int(selected_block_tables.shape[0]) != batch_size:
+        raise RuntimeError("selected block table row count must match decode batch size.")
+    if int(selected_seq_lens.shape[0]) != batch_size:
+        raise RuntimeError("selected seq_lens length must match decode batch size.")
+
+    writer_block_tables = selected_block_tables.to(device=key_pages.device, dtype=torch.long)
+    writer_seq_lens = selected_seq_lens.to(device=key_pages.device, dtype=torch.long)
+    block_size = int(key_pages.shape[2])
+    visible_seq_lens = writer_seq_lens + decode_token_count
+
+    if key_pages.device.type == "cpu":
+        if bool(torch.any(writer_seq_lens < 0)):
+            raise RuntimeError("slot KV writes require non-negative seq_lens.")
+        required_blocks = torch.div(visible_seq_lens + block_size - 1, block_size, rounding_mode="floor")
+        if bool(torch.any(required_blocks > writer_block_tables.shape[1])):
+            raise RuntimeError("slot KV writes require block_tables to include append capacity.")
+
+    for token_idx in range(decode_token_count):
+        positions = writer_seq_lens + token_idx
+        block_indices = torch.div(positions, block_size, rounding_mode="floor").to(dtype=torch.long)
+        block_offsets = torch.remainder(positions, block_size).to(dtype=torch.long)
+        if key_pages.device.type == "cpu":
+            if bool(torch.any(block_indices < 0)) or bool(torch.any(block_indices >= writer_block_tables.shape[1])):
+                raise RuntimeError("slot KV write position is outside the provided block table.")
+        page_ids = writer_block_tables.gather(1, block_indices.view(batch_size, 1)).reshape(-1)
+        if key_pages.device.type == "cpu":
+            if bool(torch.any(page_ids < 0)) or bool(torch.any(page_ids >= key_pages.shape[0])):
+                raise RuntimeError("slot KV write block table contains an invalid physical page id.")
+        key_pages[page_ids, :, block_offsets, :] = key_states[:, :, token_idx, :].to(dtype=key_pages.dtype)
+        value_pages[page_ids, :, block_offsets, :] = value_states[:, :, token_idx, :].to(dtype=value_pages.dtype)
+
+    return visible_seq_lens
+
+
+def write_slot_prefill_kv_to_pages(
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    key_pages: torch.Tensor,
+    value_pages: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    slot_ids: torch.Tensor | None = None,
+    block_tables_are_global: bool = False,
+    seq_lens_are_global: bool = False,
+) -> torch.Tensor:
+    """Append a prefill K/V chunk into slot-owned physical KV pages.
+
+    This is the low-level page write primitive needed by the future slot-owned
+    prefill runner. It deliberately shares the decode writer implementation
+    because both paths append one or more already-projected K/V tokens into the
+    same physical page layout.
+    """
+    return write_slot_decode_kv_to_pages(
+        key_states,
+        value_states,
+        key_pages,
+        value_pages,
+        block_tables,
+        seq_lens,
+        slot_ids=slot_ids,
+        block_tables_are_global=block_tables_are_global,
+        seq_lens_are_global=seq_lens_are_global,
+    )
 
 
 def _slot_decode_visible_seq_lens(
@@ -2319,25 +2628,61 @@ class Qwen3Attention(nn.Module):
 
         past_lengths = torch.zeros(batch_size, device=hidden_states.device, dtype=torch.long)
         use_turboquant_cache = past_key_values is not None and past_key_values.uses_turboquant_for_layer(self.layer_idx)
+        slot_tables_are_physical = bool(getattr(slot_decode_inputs, "physical_block_tables", False))
+        use_slot_physical_decode = (
+            hidden_states.device.type == "xpu"
+            and seq_len == 1
+            and attention_mask is None
+            and slot_tables_are_physical
+            and slot_decode_inputs is not None
+            and not use_turboquant_cache
+        )
         prefer_paged_decode = (
             hidden_states.device.type == "xpu"
             and seq_len == 1
             and attention_mask is None
-            and past_key_values is not None
+            and (past_key_values is not None or use_slot_physical_decode)
             and not use_turboquant_cache
         )
-        if past_key_values is not None:
-            require_dense_cache = not prefer_paged_decode
-            if use_turboquant_cache and attention_mask is None and seq_len == 1:
-                require_dense_cache = False
-            key_states, value_states, past_lengths = past_key_values.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-                require_dense_cache=require_dense_cache,
-            )
+        slot_physical_key_pages: torch.Tensor | None = None
+        slot_physical_value_pages: torch.Tensor | None = None
+        slot_physical_visible_seq_lens: torch.Tensor | None = None
+        if past_key_values is not None or use_slot_physical_decode:
+            if use_slot_physical_decode and slot_decode_inputs is not None:
+                slot_block_tables = getattr(slot_decode_inputs, "block_tables", None)
+                slot_seq_lens = getattr(slot_decode_inputs, "seq_lens", None)
+                if not torch.is_tensor(slot_block_tables) or not torch.is_tensor(slot_seq_lens):
+                    raise RuntimeError("slot_decode_inputs must provide tensor block_tables and seq_lens.")
+                slot_physical_key_pages, slot_physical_value_pages = _resolve_slot_decode_physical_pages(
+                    slot_decode_inputs,
+                    past_key_values,
+                    self.layer_idx,
+                )
+                slot_ids = getattr(slot_decode_inputs, "slot_ids", None)
+                slot_physical_visible_seq_lens = write_slot_decode_kv_to_pages(
+                    key_states,
+                    value_states,
+                    slot_physical_key_pages,
+                    slot_physical_value_pages,
+                    slot_block_tables,
+                    slot_seq_lens,
+                    slot_ids=slot_ids if torch.is_tensor(slot_ids) else None,
+                    block_tables_are_global=bool(getattr(slot_decode_inputs, "block_tables_are_global", False)),
+                    seq_lens_are_global=bool(getattr(slot_decode_inputs, "seq_lens_are_global", False)),
+                )
+                past_lengths = slot_physical_visible_seq_lens - seq_len
+            elif past_key_values is not None:
+                require_dense_cache = not prefer_paged_decode
+                if use_turboquant_cache and attention_mask is None and seq_len == 1:
+                    require_dense_cache = False
+                key_states, value_states, past_lengths = past_key_values.update(
+                    key_states,
+                    value_states,
+                    self.layer_idx,
+                    require_dense_cache=require_dense_cache,
+                )
 
-        if past_key_values is None and attention_mask is None:
+        if past_key_values is None and not use_slot_physical_decode and attention_mask is None:
             if hidden_states.device.type == "xpu" and seq_len > 1:
                 record_attention_fallback("qwen3_xpu_sdpa_prefill_attention")
             attn_output = F.scaled_dot_product_attention(
@@ -2367,30 +2712,38 @@ class Qwen3Attention(nn.Module):
                 )
                 attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
                 return self.o_proj(attn_output)
-            slot_tables_are_physical = bool(getattr(slot_decode_inputs, "physical_block_tables", False))
-            if prefer_paged_decode and slot_tables_are_physical and slot_decode_inputs is not None and past_key_values is not None:
+            if use_slot_physical_decode and slot_decode_inputs is not None:
                 slot_block_tables = getattr(slot_decode_inputs, "block_tables", None)
                 slot_seq_lens = getattr(slot_decode_inputs, "seq_lens", None)
                 if not torch.is_tensor(slot_block_tables) or not torch.is_tensor(slot_seq_lens):
                     raise RuntimeError("slot_decode_inputs must provide tensor block_tables and seq_lens.")
-                key_pages, value_pages = _require_slot_decode_physical_pages(past_key_values, self.layer_idx)
+                if slot_physical_key_pages is None or slot_physical_value_pages is None:
+                    slot_physical_key_pages, slot_physical_value_pages = _resolve_slot_decode_physical_pages(
+                        slot_decode_inputs,
+                        past_key_values,
+                        self.layer_idx,
+                    )
                 gate_fused = _reshape_decode_gate_to_query_layout(
                     gate,
                     num_heads=query_states.size(1),
                     head_dim=self.head_dim,
                 )
                 slot_ids = getattr(slot_decode_inputs, "slot_ids", None)
-                visible_seq_lens = _slot_decode_visible_seq_lens(
-                    slot_decode_inputs,
-                    seq_lens=slot_seq_lens,
-                    decode_token_count=seq_len,
+                visible_seq_lens = (
+                    slot_physical_visible_seq_lens
+                    if torch.is_tensor(slot_physical_visible_seq_lens)
+                    else _slot_decode_visible_seq_lens(
+                        slot_decode_inputs,
+                        seq_lens=slot_seq_lens,
+                        decode_token_count=seq_len,
+                    )
                 )
                 attn_output = paged_kv_slot_batch_decode_attention(
                     query_states,
-                    key_pages,
-                    value_pages,
-                    slot_block_tables.to(device=key_pages.device, dtype=torch.int32),
-                    visible_seq_lens.to(device=key_pages.device, dtype=torch.long),
+                    slot_physical_key_pages,
+                    slot_physical_value_pages,
+                    slot_block_tables.to(device=slot_physical_key_pages.device, dtype=torch.int32),
+                    visible_seq_lens.to(device=slot_physical_key_pages.device, dtype=torch.long),
                     scaling=self.scaling,
                     slot_ids=slot_ids if torch.is_tensor(slot_ids) else None,
                     block_tables_are_global=bool(getattr(slot_decode_inputs, "block_tables_are_global", False)),
@@ -3101,6 +3454,111 @@ class Qwen3SparseMoeBlock(nn.Module):
             and self.execution_device.type == "xpu"
             and self.expert_quant == "int4"
         )
+
+    @staticmethod
+    def _runtime_boundary_tensor_info(tensor: object | None) -> dict[str, object]:
+        if tensor is None:
+            return {
+                "present": False,
+                "device": None,
+                "device_type": None,
+                "shape": None,
+            }
+        device = getattr(tensor, "device", None)
+        shape = getattr(tensor, "shape", None)
+        return {
+            "present": True,
+            "device": None if device is None else str(device),
+            "device_type": None if device is None else getattr(device, "type", None),
+            "shape": None if shape is None else tuple(int(dim) for dim in shape),
+        }
+
+    def runtime_boundary(self) -> dict[str, object]:
+        execution_device = self.execution_device
+        execution_device_type = None if execution_device is None else execution_device.type
+        should_use_xpu_int4 = self._should_use_xpu_int4()
+        resident_grouped_int4_configured = bool(self.resident_experts and should_use_xpu_int4)
+        host_wave_planning_required = not resident_grouped_int4_configured
+        host_planning_allowed = execution_device_type != "xpu" or _xpu_moe_host_planning_fallback_allowed()
+
+        bank = self._grouped_int4_bank
+        filled_slots = 0 if bank is None else sum(1 for expert_idx in bank.slot_to_expert if expert_idx is not None)
+        resident_active_experts_ready = bank is not None and bank.resident_active_experts is not None
+        resident_active_slots_ready = bank is not None and bank.resident_active_slots is not None
+        resident_active_tensors_ready = resident_active_experts_ready and resident_active_slots_ready
+        bank_weight_device_type = None if bank is None else bank.gate_qweight.device.type
+        resident_active_experts_device_type = (
+            None if bank is None or bank.resident_active_experts is None else bank.resident_active_experts.device.type
+        )
+        resident_active_slots_device_type = (
+            None if bank is None or bank.resident_active_slots is None else bank.resident_active_slots.device.type
+        )
+        bank_device_matches_execution = bool(
+            bank is not None
+            and execution_device_type is not None
+            and bank_weight_device_type == execution_device_type
+            and resident_active_experts_device_type == execution_device_type
+            and resident_active_slots_device_type == execution_device_type
+        )
+        bank_full_resident = bool(bank is not None and filled_slots >= self.num_experts)
+        resident_grouped_int4_ready = bool(
+            resident_grouped_int4_configured
+            and bank is not None
+            and bank_full_resident
+            and resident_active_tensors_ready
+            and bank_device_matches_execution
+        )
+
+        if resident_grouped_int4_configured:
+            backend = "resident_grouped_int4"
+        elif self.offload_experts and should_use_xpu_int4:
+            backend = "offload_grouped_int4_host_wave_plan"
+        elif self.offload_experts:
+            backend = "offload_dense_host_wave_plan"
+        else:
+            backend = "dense_per_expert_host_wave_plan"
+
+        return {
+            "resident_experts": bool(self.resident_experts),
+            "offload_experts": bool(self.offload_experts),
+            "execution_device": None if execution_device is None else str(execution_device),
+            "execution_device_type": execution_device_type,
+            "expert_quant": self.expert_quant,
+            "expert_quant_group_size": int(self.expert_quant_group_size),
+            "should_use_xpu_int4": bool(should_use_xpu_int4),
+            "num_experts": int(self.num_experts),
+            "top_k": int(self.top_k),
+            "cached_experts_per_layer": int(self.cached_experts_per_layer),
+            "backend": backend,
+            "resident_grouped_int4_configured": resident_grouped_int4_configured,
+            "resident_grouped_int4_ready": resident_grouped_int4_ready,
+            "can_use_resident_grouped_int4_no_host_planning": resident_grouped_int4_configured,
+            "host_wave_planning_required": host_wave_planning_required,
+            "offload_host_wave_planning_required": bool(self.offload_experts and host_wave_planning_required),
+            "host_planning_fallback_allowed": bool(host_planning_allowed),
+            "xpu_host_planning_fallback_env": _XPU_MOE_ALLOW_HOST_PLANNING_ENV,
+            "xpu_host_planning_fallback_env_enabled": _xpu_moe_host_planning_fallback_allowed(),
+            "host_experts_pinned": bool(self.host_experts_pinned),
+            "host_prepacked_experts_pinned": bool(self.host_prepacked_experts_pinned),
+            "host_prepacked_cache_entries": len(self._host_prepacked_expert_cache),
+            "expert_cache_entries": len(self._expert_cache),
+            "grouped_int4_lru_entries": len(self._grouped_int4_lru),
+            "grouped_int4_bank": {
+                "exists": bank is not None,
+                "capacity": 0 if bank is None else int(bank.capacity),
+                "filled_slots": int(filled_slots),
+                "full_resident": bank_full_resident,
+                "weight": self._runtime_boundary_tensor_info(None if bank is None else bank.gate_qweight),
+                "resident_active_experts": self._runtime_boundary_tensor_info(
+                    None if bank is None else bank.resident_active_experts
+                ),
+                "resident_active_slots": self._runtime_boundary_tensor_info(
+                    None if bank is None else bank.resident_active_slots
+                ),
+                "resident_active_tensors_ready": resident_active_tensors_ready,
+                "device_matches_execution": bank_device_matches_execution,
+            },
+        }
 
     @staticmethod
     def _pin_module_host_memory(module: nn.Module) -> bool:

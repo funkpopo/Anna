@@ -15,6 +15,8 @@ class HotPathEventRecorder(Protocol):
 
     def record_sampler_full_vocab_sort(self, *, reason: str, count: int = 1) -> None: ...
 
+    def record_sampler_full_vocab_fallback(self, *, reason: str, count: int = 1) -> None: ...
+
     def record_moe_host_offset(self, *, reason: str, count: int = 1) -> None: ...
 
     def record_moe_stage(self, *, stage: str, seconds: float) -> None: ...
@@ -55,6 +57,10 @@ def record_paged_cache_materialization(reason: str, *, count: int = 1) -> None:
 
 def record_sampler_full_vocab_sort(reason: str, *, count: int = 1) -> None:
     _record("record_sampler_full_vocab_sort", reason=reason, count=count)
+
+
+def record_sampler_full_vocab_fallback(reason: str, *, count: int = 1) -> None:
+    _record("record_sampler_full_vocab_fallback", reason=reason, count=count)
 
 
 def record_moe_host_offset(reason: str, *, count: int = 1) -> None:

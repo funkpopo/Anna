@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,14 @@ class ServiceMetricsSnapshot:
     attention_fallback_count: int = 0
     paged_cache_materialize_count: int = 0
     sampler_full_vocab_sort_count: int = 0
+    sampler_full_vocab_fallback_count: int = 0
     moe_host_offset_count: int = 0
+    cpu_sync_reasons: dict[str, int] = field(default_factory=dict)
+    attention_fallback_reasons: dict[str, int] = field(default_factory=dict)
+    paged_cache_materialize_reasons: dict[str, int] = field(default_factory=dict)
+    sampler_full_vocab_sort_reasons: dict[str, int] = field(default_factory=dict)
+    sampler_full_vocab_fallback_reasons: dict[str, int] = field(default_factory=dict)
+    moe_host_offset_reasons: dict[str, int] = field(default_factory=dict)
     moe_router_seconds_total: float = 0.0
     moe_router_count: int = 0
     moe_router_seconds_max: float = 0.0
@@ -123,7 +130,14 @@ class AnnaServiceMetrics:
         self._attention_fallback_count = 0
         self._paged_cache_materialize_count = 0
         self._sampler_full_vocab_sort_count = 0
+        self._sampler_full_vocab_fallback_count = 0
         self._moe_host_offset_count = 0
+        self._cpu_sync_reasons: dict[str, int] = {}
+        self._attention_fallback_reasons: dict[str, int] = {}
+        self._paged_cache_materialize_reasons: dict[str, int] = {}
+        self._sampler_full_vocab_sort_reasons: dict[str, int] = {}
+        self._sampler_full_vocab_fallback_reasons: dict[str, int] = {}
+        self._moe_host_offset_reasons: dict[str, int] = {}
         self._moe_router_seconds_total = 0.0
         self._moe_router_count = 0
         self._moe_router_seconds_max = 0.0
@@ -215,49 +229,70 @@ class AnnaServiceMetrics:
     def _normalize_count(count: int) -> int:
         return max(0, int(count))
 
+    @staticmethod
+    def _normalize_reason(reason: str) -> str:
+        normalized = str(reason).strip()
+        return normalized or "unspecified"
+
+    @staticmethod
+    def _record_reason(target: dict[str, int], *, reason: str, count: int) -> None:
+        normalized_reason = AnnaServiceMetrics._normalize_reason(reason)
+        target[normalized_reason] = target.get(normalized_reason, 0) + count
+
     def record_cpu_sync(self, *, reason: str = "", count: int = 1) -> None:
-        del reason
         normalized = self._normalize_count(count)
         if normalized <= 0:
             return
         with self._lock:
             self._cpu_sync_count += normalized
+            self._record_reason(self._cpu_sync_reasons, reason=reason, count=normalized)
         self._activity_event.set()
 
     def record_attention_fallback(self, *, reason: str = "", count: int = 1) -> None:
-        del reason
         normalized = self._normalize_count(count)
         if normalized <= 0:
             return
         with self._lock:
             self._attention_fallback_count += normalized
+            self._record_reason(self._attention_fallback_reasons, reason=reason, count=normalized)
         self._activity_event.set()
 
     def record_paged_cache_materialization(self, *, reason: str = "", count: int = 1) -> None:
-        del reason
         normalized = self._normalize_count(count)
         if normalized <= 0:
             return
         with self._lock:
             self._paged_cache_materialize_count += normalized
+            self._record_reason(self._paged_cache_materialize_reasons, reason=reason, count=normalized)
         self._activity_event.set()
 
     def record_sampler_full_vocab_sort(self, *, reason: str = "", count: int = 1) -> None:
-        del reason
         normalized = self._normalize_count(count)
         if normalized <= 0:
             return
         with self._lock:
             self._sampler_full_vocab_sort_count += normalized
+            self._record_reason(self._sampler_full_vocab_sort_reasons, reason=reason, count=normalized)
+            self._sampler_full_vocab_fallback_count += normalized
+            self._record_reason(self._sampler_full_vocab_fallback_reasons, reason=reason, count=normalized)
+        self._activity_event.set()
+
+    def record_sampler_full_vocab_fallback(self, *, reason: str = "", count: int = 1) -> None:
+        normalized = self._normalize_count(count)
+        if normalized <= 0:
+            return
+        with self._lock:
+            self._sampler_full_vocab_fallback_count += normalized
+            self._record_reason(self._sampler_full_vocab_fallback_reasons, reason=reason, count=normalized)
         self._activity_event.set()
 
     def record_moe_host_offset(self, *, reason: str = "", count: int = 1) -> None:
-        del reason
         normalized = self._normalize_count(count)
         if normalized <= 0:
             return
         with self._lock:
             self._moe_host_offset_count += normalized
+            self._record_reason(self._moe_host_offset_reasons, reason=reason, count=normalized)
         self._activity_event.set()
 
     def record_moe_stage(self, *, stage: str, seconds: float) -> None:
@@ -381,7 +416,14 @@ class AnnaServiceMetrics:
                 attention_fallback_count=self._attention_fallback_count,
                 paged_cache_materialize_count=self._paged_cache_materialize_count,
                 sampler_full_vocab_sort_count=self._sampler_full_vocab_sort_count,
+                sampler_full_vocab_fallback_count=self._sampler_full_vocab_fallback_count,
                 moe_host_offset_count=self._moe_host_offset_count,
+                cpu_sync_reasons=dict(self._cpu_sync_reasons),
+                attention_fallback_reasons=dict(self._attention_fallback_reasons),
+                paged_cache_materialize_reasons=dict(self._paged_cache_materialize_reasons),
+                sampler_full_vocab_sort_reasons=dict(self._sampler_full_vocab_sort_reasons),
+                sampler_full_vocab_fallback_reasons=dict(self._sampler_full_vocab_fallback_reasons),
+                moe_host_offset_reasons=dict(self._moe_host_offset_reasons),
                 moe_router_seconds_total=self._moe_router_seconds_total,
                 moe_router_count=self._moe_router_count,
                 moe_router_seconds_max=self._moe_router_seconds_max,
@@ -460,6 +502,10 @@ class AnnaServiceMetricsLogger:
         attention_fallback_count = max(0, current.attention_fallback_count - previous.attention_fallback_count)
         paged_cache_materialize_count = max(0, current.paged_cache_materialize_count - previous.paged_cache_materialize_count)
         sampler_full_vocab_sort_count = max(0, current.sampler_full_vocab_sort_count - previous.sampler_full_vocab_sort_count)
+        sampler_full_vocab_fallback_count = max(
+            0,
+            current.sampler_full_vocab_fallback_count - previous.sampler_full_vocab_fallback_count,
+        )
         moe_host_offset_count = max(0, current.moe_host_offset_count - previous.moe_host_offset_count)
         moe_router_total = max(0.0, current.moe_router_seconds_total - previous.moe_router_seconds_total)
         moe_router_count = max(0, current.moe_router_count - previous.moe_router_count)
@@ -516,7 +562,9 @@ class AnnaServiceMetricsLogger:
             f"{current.slot_decode_plan_seconds_max * 1000.0:.1f} ms, "
             f"Hot path events: cpu_sync={cpu_sync_count}, attention_fallback={attention_fallback_count}, "
             f"paged_cache_materialize={paged_cache_materialize_count}, "
-            f"sampler_full_vocab_sort={sampler_full_vocab_sort_count}, moe_host_offset={moe_host_offset_count}, "
+            f"sampler_full_vocab_sort={sampler_full_vocab_sort_count}, "
+            f"sampler_full_vocab_fallback={sampler_full_vocab_fallback_count}, "
+            f"moe_host_offset={moe_host_offset_count}, "
             f"MoE stage avg/max ms: router={moe_router_avg_ms:.3f}/"
             f"{current.moe_router_seconds_max * 1000.0:.3f}, dispatch={moe_dispatch_avg_ms:.3f}/"
             f"{current.moe_dispatch_seconds_max * 1000.0:.3f}, expert_gemm={moe_expert_gemm_avg_ms:.3f}/"
@@ -554,6 +602,7 @@ class AnnaServiceMetricsLogger:
             current.attention_fallback_count - previous.attention_fallback_count,
             current.paged_cache_materialize_count - previous.paged_cache_materialize_count,
             current.sampler_full_vocab_sort_count - previous.sampler_full_vocab_sort_count,
+            current.sampler_full_vocab_fallback_count - previous.sampler_full_vocab_fallback_count,
             current.moe_host_offset_count - previous.moe_host_offset_count,
             current.moe_router_count - previous.moe_router_count,
             current.moe_dispatch_count - previous.moe_dispatch_count,

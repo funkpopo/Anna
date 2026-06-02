@@ -20,6 +20,7 @@ from anna.model.ops import (
 )
 from anna.model.quantization import XPUInt4Linear
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
+from anna.model.qwen3_5_text_model import Qwen3_5TextForCausalLM
 from anna.model.turboquant import dequantize_turboquant_values, quantize_turboquant_values
 
 
@@ -1272,10 +1273,18 @@ def test_qwen3_attention_xpu_single_token_decode_uses_physical_slot_block_tables
                 AssertionError("physical slot decode must not materialize dense KV")
             ),
         )
+        monkeypatch.setattr(
+            cache,
+            "update",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("physical slot decode must write KV through slot block tables")
+            ),
+        )
 
         slot_inputs = type("SlotInputs", (), {})()
         slot_inputs.physical_block_tables = True
         slot_inputs.block_tables = page_table
+        slot_inputs.block_tables_are_global = True
         slot_inputs.seq_lens = visible_lengths
         slot_inputs.slot_ids = torch.tensor([0, 1], device="xpu", dtype=torch.int32)
         append_position_ids = torch.full((2, 1), prompt_states.shape[1], device="xpu", dtype=torch.long)
@@ -1298,6 +1307,211 @@ def test_qwen3_attention_xpu_single_token_decode_uses_physical_slot_block_tables
         1,
         config.head_dim,
     )
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_qwen3_attention_xpu_slot_owned_physical_pages_do_not_require_legacy_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if (
+        not maybe_load_gated_delta_library()
+        or not hasattr(torch.ops.anna, "qk_norm_rotary_fused")
+    ):
+        pytest.skip("Anna fused-op library is not built")
+
+    observed: dict[str, torch.Tensor] = {}
+
+    def _stub_slot_paged_decode(
+        query_states: torch.Tensor,
+        key_pages: torch.Tensor,
+        value_pages: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        scaling: float,
+        slot_ids: torch.Tensor | None = None,
+        block_tables_are_global: bool = False,
+        seq_lens_are_global: bool = False,
+        gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del scaling, seq_lens_are_global
+        observed["key_pages_shape"] = torch.tensor(key_pages.shape, device="cpu")
+        observed["value_pages_shape"] = torch.tensor(value_pages.shape, device="cpu")
+        observed["block_tables"] = block_tables.detach().cpu()
+        observed["seq_lens"] = seq_lens.detach().cpu()
+        observed["slot_ids"] = torch.empty(0, dtype=torch.int32) if slot_ids is None else slot_ids.detach().cpu()
+        observed["block_tables_are_global"] = torch.tensor(bool(block_tables_are_global))
+        observed["gate_shape"] = torch.tensor((), dtype=torch.long) if gate is None else torch.tensor(gate.shape)
+        return torch.zeros_like(query_states)
+
+    monkeypatch.setattr(model_ops, "paged_kv_slot_batch_decode_attention", _stub_slot_paged_decode)
+    config = Qwen3_5TextConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        layer_types=["full_attention"],
+    )
+    attention = Qwen3Attention(config, 0).eval().to("xpu", dtype=torch.bfloat16)
+    rotary = Qwen3TextRotaryEmbedding(config).to("xpu")
+    append_states = torch.randn(2, 1, config.hidden_size, device="xpu", dtype=torch.bfloat16)
+    total_blocks = 6
+    physical_key_pages = torch.zeros(
+        (config.num_hidden_layers, total_blocks, config.num_key_value_heads, config.cache_block_size, config.head_dim),
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+    physical_value_pages = torch.zeros_like(physical_key_pages)
+    block_tables = torch.tensor(
+        [
+            [0, 1, -1],
+            [2, 3, -1],
+        ],
+        device="xpu",
+        dtype=torch.int32,
+    )
+    seq_lens = torch.tensor([3, 5], device="xpu", dtype=torch.long)
+
+    slot_inputs = type("SlotInputs", (), {})()
+    slot_inputs.physical_block_tables = True
+    slot_inputs.block_tables = block_tables
+    slot_inputs.block_tables_are_global = False
+    slot_inputs.seq_lens = seq_lens
+    slot_inputs.seq_lens_are_global = False
+    slot_inputs.slot_ids = torch.tensor([0, 1], device="xpu", dtype=torch.int32)
+    slot_inputs.physical_key_pages = physical_key_pages
+    slot_inputs.physical_value_pages = physical_value_pages
+
+    with torch.no_grad():
+        append_position_ids = seq_lens.view(-1, 1)
+        output = attention(
+            append_states,
+            rotary(append_states, append_position_ids),
+            past_key_values=None,
+            slot_decode_inputs=slot_inputs,
+        )
+
+    torch.xpu.synchronize()
+    assert output.shape == append_states.shape
+    assert torch.equal(observed["block_tables"], block_tables.cpu())
+    assert torch.equal(observed["seq_lens"], torch.tensor([4, 6], dtype=torch.long))
+    assert torch.equal(observed["slot_ids"], torch.tensor([0, 1], dtype=torch.int32))
+    assert not bool(observed["block_tables_are_global"])
+    assert tuple(int(dim) for dim in observed["key_pages_shape"].tolist()) == (
+        total_blocks,
+        config.num_key_value_heads,
+        config.cache_block_size,
+        config.head_dim,
+    )
+    assert tuple(int(dim) for dim in observed["value_pages_shape"].tolist()) == (
+        total_blocks,
+        config.num_key_value_heads,
+        config.cache_block_size,
+        config.head_dim,
+    )
+    assert tuple(int(dim) for dim in observed["gate_shape"].tolist()) == (
+        2,
+        config.num_attention_heads,
+        1,
+        config.head_dim,
+    )
+    assert int(torch.count_nonzero(physical_key_pages[0]).cpu()) > 0
+    assert int(torch.count_nonzero(physical_value_pages[0]).cpu()) > 0
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_qwen3_causal_lm_xpu_slot_owned_physical_pages_reach_attention_without_legacy_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if (
+        not maybe_load_gated_delta_library()
+        or not hasattr(torch.ops.anna, "qk_norm_rotary_fused")
+    ):
+        pytest.skip("Anna fused-op library is not built")
+
+    observed: dict[str, torch.Tensor] = {}
+
+    def _stub_slot_paged_decode(
+        query_states: torch.Tensor,
+        key_pages: torch.Tensor,
+        value_pages: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        scaling: float,
+        slot_ids: torch.Tensor | None = None,
+        block_tables_are_global: bool = False,
+        seq_lens_are_global: bool = False,
+        gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del key_pages, value_pages, scaling, seq_lens_are_global, gate
+        observed["block_tables"] = block_tables.detach().cpu()
+        observed["seq_lens"] = seq_lens.detach().cpu()
+        observed["slot_ids"] = torch.empty(0, dtype=torch.int32) if slot_ids is None else slot_ids.detach().cpu()
+        observed["block_tables_are_global"] = torch.tensor(bool(block_tables_are_global))
+        return torch.zeros_like(query_states)
+
+    monkeypatch.setattr(model_ops, "paged_kv_slot_batch_decode_attention", _stub_slot_paged_decode)
+    config = Qwen3_5TextConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        layer_types=["full_attention"],
+        vocab_size=128,
+    )
+    model = Qwen3_5TextForCausalLM(config).eval().to("xpu", dtype=torch.bfloat16)
+    inputs_embeds = torch.randn(2, 1, config.hidden_size, device="xpu", dtype=torch.bfloat16)
+    total_blocks = 6
+    physical_key_pages = torch.zeros(
+        (config.num_hidden_layers, total_blocks, config.num_key_value_heads, config.cache_block_size, config.head_dim),
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+    physical_value_pages = torch.zeros_like(physical_key_pages)
+    block_tables = torch.tensor(
+        [
+            [0, 1, -1],
+            [2, 3, -1],
+        ],
+        device="xpu",
+        dtype=torch.int32,
+    )
+    seq_lens = torch.tensor([2, 5], device="xpu", dtype=torch.long)
+
+    slot_inputs = type("SlotInputs", (), {})()
+    slot_inputs.physical_block_tables = True
+    slot_inputs.block_tables = block_tables
+    slot_inputs.block_tables_are_global = False
+    slot_inputs.seq_lens = seq_lens
+    slot_inputs.seq_lens_are_global = False
+    slot_inputs.positions = seq_lens
+    slot_inputs.positions_are_global = False
+    slot_inputs.slot_ids = torch.tensor([0, 1], device="xpu", dtype=torch.int32)
+    slot_inputs.physical_key_pages = physical_key_pages
+    slot_inputs.physical_value_pages = physical_value_pages
+
+    with torch.no_grad():
+        outputs = model(
+            inputs_embeds=inputs_embeds,
+            use_cache=False,
+            logits_to_keep=1,
+            slot_decode_inputs=slot_inputs,
+        )
+
+    torch.xpu.synchronize()
+    assert outputs.past_key_values is None
+    assert outputs.logits.shape == (2, 1, config.vocab_size)
+    assert torch.equal(observed["block_tables"], block_tables.cpu())
+    assert torch.equal(observed["seq_lens"], torch.tensor([3, 6], dtype=torch.long))
+    assert torch.equal(observed["slot_ids"], torch.tensor([0, 1], dtype=torch.int32))
+    assert not bool(observed["block_tables_are_global"])
+    assert int(torch.count_nonzero(physical_key_pages[0]).cpu()) > 0
+    assert int(torch.count_nonzero(physical_value_pages[0]).cpu()) > 0
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")

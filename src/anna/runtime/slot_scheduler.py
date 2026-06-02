@@ -6,7 +6,7 @@ from typing import Any, Sequence
 
 import torch
 
-from anna.sampling.params import SamplingBatchParams
+from anna.sampling.params import SamplingBatchParams, SamplingBatchParamsCache
 from anna.runtime.paged_kv import KVSlotHandle, PagedKVDecodePlan, PagedKVManager, SlotCapacityError
 
 
@@ -95,7 +95,9 @@ class DecodeBatchPlan:
         slots: Sequence[SequenceSlot],
         input_ids: torch.Tensor,
         kv_plan: PagedKVDecodePlan,
+        sampling_batch_params: SamplingBatchParams | None = None,
     ) -> "DecodeBatchPlan":
+        sampling_params = tuple(slot.sampling_params for slot in slots)
         return cls(
             request_ids=tuple(slot.request_id for slot in slots),
             slot_ids=kv_plan.slot_ids,
@@ -108,11 +110,10 @@ class DecodeBatchPlan:
             block_tables=kv_plan.block_tables,
             block_tables_are_global=kv_plan.block_tables_are_global,
             physical_block_tables=False,
-            sampling_params=tuple(slot.sampling_params for slot in slots),
-            sampling_batch_params=SamplingBatchParams.from_sampling_params(
-                tuple(slot.sampling_params for slot in slots),
-                device=input_ids.device,
-            ),
+            sampling_params=sampling_params,
+            sampling_batch_params=sampling_batch_params
+            if sampling_batch_params is not None
+            else SamplingBatchParams.from_sampling_params(sampling_params, device=input_ids.device),
         )
 
 
@@ -133,10 +134,14 @@ class SlotScheduler:
         self._active_by_slot: dict[int, SequenceSlot] = {}
         self._completed_by_request: dict[str, SequenceSlot] = {}
         self._next_admission_index = 0
+        self._sampling_batch_params_cache = SamplingBatchParamsCache(max_entries=64)
 
     @property
     def active_count(self) -> int:
         return len(self._active_by_request)
+
+    def sampling_batch_params_cache_stats(self) -> dict[str, int]:
+        return self._sampling_batch_params_cache.stats()
 
     def admit(
         self,
@@ -305,7 +310,24 @@ class SlotScheduler:
         handles = tuple(slot.handle for slot in slots)
         self.kv_manager.prepare_decode_capacity(handles, append_tokens=1)
         kv_plan = self.kv_manager.decode_plan(handles)
-        return DecodeBatchPlan.from_kv_plan(slots=slots, input_ids=input_ids, kv_plan=kv_plan)
+        sampling_batch_params = self._sampling_batch_params_for_slots(slots, device=input_ids.device)
+        return DecodeBatchPlan.from_kv_plan(
+            slots=slots,
+            input_ids=input_ids,
+            kv_plan=kv_plan,
+            sampling_batch_params=sampling_batch_params,
+        )
+
+    def _sampling_batch_params_for_slots(
+        self,
+        slots: Sequence[SequenceSlot],
+        *,
+        device: torch.device | str,
+    ) -> SamplingBatchParams:
+        return self._sampling_batch_params_cache.get(
+            tuple(slot.sampling_params for slot in slots),
+            device=device,
+        )
 
     def advance_decode(
         self,

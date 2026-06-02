@@ -35,7 +35,21 @@ def test_runtime_hotpath_bench_includes_slot_decode_plan() -> None:
     assert result["block_table_cols"] == 3
     assert result["seq_lens_rows"] == 3
     assert result["positions_rows"] == 3
+    assert result["decode_boundary_batch_size"] == 2
+    assert result["decode_boundary_token_count"] == 1
+    assert result["decode_boundary_contains_cache_objects"] is False
+    assert result["decode_boundary_sampling_batch_params"] is True
+    assert result["decode_boundary_block_table_ownership"] == "logical_slot_metadata"
+    assert result["decode_boundary_owns_physical_kv_pages"] is False
+    assert result["decode_boundary_physical_kv_layer_count"] == 0
+    assert result["slot_owned_output_token_buffer"] is True
+    assert result["slot_owned_kv_write_helper"] is True
+    assert result["slot_owned_kv_page_bank_available"] is False
+    assert result["slot_owned_kv_writes"] is False
+    assert result["legacy_cache_object_required_for_forward"] is True
+    assert result["slot_kv_visible_seq_lens_shape"] == (2,)
     assert result["plan_ms"] >= 0.0
+    assert result["slot_kv_write_ms"] >= 0.0
 
 
 def test_runtime_hotpath_bench_summarizes_scheduler_kv_overhead() -> None:
@@ -56,6 +70,16 @@ def test_runtime_hotpath_bench_summarizes_scheduler_kv_overhead() -> None:
             "block_table_cols": 3,
             "seq_lens_rows": 3,
             "positions_rows": 3,
+            "decode_boundary_contains_cache_objects": False,
+            "decode_boundary_sampling_batch_params": True,
+            "decode_boundary_block_table_ownership": "logical_slot_metadata",
+            "decode_boundary_owns_physical_kv_pages": False,
+            "decode_boundary_physical_kv_layer_count": 0,
+            "slot_owned_output_token_buffer": True,
+            "slot_owned_kv_write_helper": True,
+            "slot_owned_kv_page_bank_available": False,
+            "slot_owned_kv_writes": False,
+            "legacy_cache_object_required_for_forward": True,
         },
     )
 
@@ -77,6 +101,16 @@ def test_runtime_hotpath_bench_summarizes_scheduler_kv_overhead() -> None:
     assert result["slot_plan_global_seq_lens_entries"] == 3
     assert result["slot_plan_positions_entries"] == 3
     assert result["slot_plan_global_positions_entries"] == 3
+    assert result["slot_decode_boundary_contains_cache_objects"] is False
+    assert result["slot_decode_boundary_sampling_batch_params"] is True
+    assert result["slot_decode_boundary_block_table_ownership"] == "logical_slot_metadata"
+    assert result["slot_decode_boundary_owns_physical_kv_pages"] is False
+    assert result["slot_decode_boundary_physical_kv_layer_count"] == 0
+    assert result["slot_owned_output_token_buffer"] is True
+    assert result["slot_owned_kv_write_helper"] is True
+    assert result["slot_owned_kv_page_bank_available"] is False
+    assert result["slot_owned_kv_writes"] is False
+    assert result["legacy_cache_object_required_for_forward"] is True
     assert result["stack_ms"] == 2.0
     assert result["split_ms"] == 3.0
     assert result["stack_split_ms"] == 5.0
@@ -108,6 +142,60 @@ def test_runtime_hotpath_bench_sampler_reports_candidate_and_full_vocab() -> Non
     assert result["candidate_ms"] >= 0.0
     assert result["candidate_penalty_ms"] >= 0.0
     assert result["sampler_full_vocab_sort_count"] == 1
+    assert result["sampler_full_vocab_fallback_count"] == 1
+    assert result["sampler_full_vocab_fallback_reasons"] == {"top_p_full_logits_sort": 1}
+
+
+def test_runtime_hotpath_bench_reports_sampling_params_cache_reuse() -> None:
+    bench = _load_bench_module()
+
+    result = bench._bench_sampling_params_cache(batch_size=4, iters=1)
+
+    assert result["batch_size"] == 4
+    assert result["cache_entries"] == 1
+    assert result["cache_max_entries"] == 4
+    assert result["cache_hits"] >= 2
+    assert result["cache_misses"] == 1
+    assert result["cache_evictions"] == 0
+    assert result["cached_batch_size"] == 4
+    assert result["greedy_rows"] == 2
+    assert result["sample_rows"] == 2
+    assert result["penalty_rows"] == 2
+    assert result["normalized_key_reuse"] is True
+    assert result["cached_identity_stable"] is True
+    assert result["uncached_ms"] >= 0.0
+    assert result["cached_ms"] >= 0.0
+    assert result["uncached_to_cached_ratio"] is None or result["uncached_to_cached_ratio"] >= 0.0
+
+
+def test_runtime_hotpath_bench_reports_turboquant_metadata_view() -> None:
+    bench = _load_bench_module()
+
+    result = bench._bench_turboquant_metadata_view(batch_size=4, layers=2, iters=1)
+
+    assert result["batch_size"] == 4
+    assert result["layers"] == 2
+    assert result["layer_idx"] == 0
+    assert result["metadata_device"] == "cpu"
+    assert result["row_lengths_shape"] == (4,)
+    assert result["row_active_shape"] == (4,)
+    assert result["selected_row_lengths_shape"] == (4,)
+    assert result["selected_source_row_ids_shape"] == (4,)
+    assert result["full_view_uses_metadata_storage"] is True
+    assert result["selected_view_uses_metadata_storage"] is False
+    assert result["row_object_backing"] is True
+    assert result["tensor_bank_ready"] is False
+    assert result["runtime_boundary_enabled"] is True
+    assert result["runtime_boundary_quantized_layers"] == 2
+    assert result["runtime_boundary_tensor_metadata_layers"] == 2
+    assert result["runtime_boundary_row_object_rows"] == 4
+    assert result["runtime_boundary_active_row_objects"] == 4
+    assert result["runtime_boundary_tensor_bank_ready"] is False
+    assert result["runtime_boundary_tensor_bank_reason"] == "slot_indexed_turboquant_tensor_bank_not_implemented"
+    assert result["non_turboquant_boundary_tensor_bank_reason"] == "disabled"
+    assert result["non_turboquant_view_is_none"] is True
+    assert result["full_view_ms"] >= 0.0
+    assert result["selected_view_ms"] >= 0.0
 
 
 def test_runtime_hotpath_bench_includes_paged_gqa_decode_shapes() -> None:

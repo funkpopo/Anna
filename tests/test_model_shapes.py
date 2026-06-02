@@ -196,6 +196,28 @@ def test_qwen_text_model_decode_cache_with_turboquant_stays_numerically_close() 
     assert diff < 1.5
 
 
+def test_qwen_kv_cache_runtime_info_reports_turboquant_metadata_boundary() -> None:
+    model = Qwen3_5TextForCausalLM(_tiny_config()).eval()
+    model.configure_runtime(
+        torch.device("cpu"),
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+
+    info = model.kv_cache_runtime_info()
+
+    assert info["mode"] == "turboquant"
+    assert info["turboquant_enabled"] is True
+    assert info["turboquant_metadata"] == {
+        "tensor_mirror": True,
+        "selected_view": True,
+        "row_object_backing": True,
+        "tensor_bank_ready": False,
+        "tensor_bank_reason": "slot_indexed_turboquant_tensor_bank_not_implemented",
+    }
+
+
 def test_qwen3_incremental_decode() -> None:
     with _temporary_torch_seed(0):
         model = Qwen3_5TextForCausalLM(_tiny_config())
@@ -684,6 +706,14 @@ def test_dynamic_cache_turboquant_metadata_tracks_lifecycle() -> None:
     )
 
     assert Qwen3DynamicCache(config).turboquant_metadata(1) is None
+    non_turboquant_boundary = Qwen3DynamicCache(config).turboquant_runtime_boundary()
+    assert non_turboquant_boundary["enabled"] is False
+    assert non_turboquant_boundary["mode"] == "none"
+    assert non_turboquant_boundary["batch_size"] == 0
+    assert non_turboquant_boundary["quantized_layer_count"] == 0
+    assert non_turboquant_boundary["tensor_bank_ready"] is False
+    assert non_turboquant_boundary["tensor_bank_reason"] == "disabled"
+    assert non_turboquant_boundary["layers"] == []
     cache_a.update(torch.randn(1, 2, 3, 16), torch.randn(1, 2, 3, 16), layer_idx=1, require_dense_cache=False)
     cache_b.update(torch.randn(1, 2, 4, 16), torch.randn(1, 2, 4, 16), layer_idx=1, require_dense_cache=False)
 
@@ -700,6 +730,73 @@ def test_dynamic_cache_turboquant_metadata_tracks_lifecycle() -> None:
     view_lengths, view_active = batch_view.turboquant_metadata(1) or (None, None)
     assert torch.equal(view_lengths, torch.tensor([3, 4], dtype=torch.long))
     assert torch.equal(view_active, torch.tensor([True, True], dtype=torch.bool))
+    boundary = batch_view.turboquant_runtime_boundary()
+    assert boundary["enabled"] is True
+    assert boundary["mode"] == "turboquant"
+    assert boundary["batch_size"] == 2
+    assert boundary["quantized_layer_count"] == 2
+    assert boundary["quantized_layer_indices"] == (1, 3)
+    assert boundary["tensor_metadata_layers"] == 2
+    assert boundary["row_object_backing"] is True
+    assert boundary["row_object_rows"] == 2
+    assert boundary["active_row_objects"] == 2
+    assert boundary["tensor_mirror"] is True
+    assert boundary["selected_view"] is True
+    assert boundary["tensor_bank_ready"] is False
+    assert boundary["tensor_bank_reason"] == "slot_indexed_turboquant_tensor_bank_not_implemented"
+    boundary_layers = boundary["layers"]
+    assert isinstance(boundary_layers, list)
+    assert boundary_layers[0]["layer_idx"] == 1
+    assert boundary_layers[0]["row_slots"] == 2
+    assert boundary_layers[0]["row_object_rows"] == 2
+    assert boundary_layers[0]["active_row_objects"] == 2
+    assert boundary_layers[0]["tensor_metadata_ready"] is True
+    assert boundary_layers[0]["row_lengths_device"] == "cpu"
+    assert boundary_layers[0]["row_active_device"] == "cpu"
+    assert boundary_layers[0]["row_lengths_shape"] == (2,)
+    assert boundary_layers[0]["row_active_shape"] == (2,)
+    assert boundary_layers[0]["row_object_backing"] is True
+    assert boundary_layers[0]["tensor_bank_ready"] is False
+    assert boundary_layers[1]["layer_idx"] == 3
+    assert boundary_layers[1]["row_slots"] == 2
+    assert boundary_layers[1]["row_object_rows"] == 0
+    assert boundary_layers[1]["active_row_objects"] == 0
+
+    assert Qwen3DynamicCache(config).turboquant_metadata_view(1) is None
+    metadata_view = batch_view.turboquant_metadata_view(1)
+    assert metadata_view is not None
+    assert metadata_view.layer_idx == 1
+    assert metadata_view.batch_size == 2
+    assert metadata_view.row_lengths.data_ptr() == view_lengths.data_ptr()
+    assert metadata_view.row_active.data_ptr() == view_active.data_ptr()
+    assert metadata_view.source_row_ids is None
+    assert metadata_view.row_lengths_shape == (2,)
+    assert metadata_view.row_active_shape == (2,)
+    assert metadata_view.row_object_backing is True
+    assert metadata_view.tensor_bank_ready is False
+    assert metadata_view.summary() == {
+        "layer_idx": 1,
+        "batch_size": 2,
+        "device": "cpu",
+        "row_lengths_shape": (2,),
+        "row_lengths_dtype": "torch.int64",
+        "row_active_shape": (2,),
+        "row_active_dtype": "torch.bool",
+        "source_row_ids_shape": None,
+        "tensor_metadata": True,
+        "row_object_backing": True,
+        "tensor_bank_ready": False,
+    }
+
+    row_ids = torch.tensor([1, 0], dtype=torch.int32)
+    selected_view = batch_view.turboquant_metadata_view(1, row_ids=row_ids)
+    assert selected_view is not None
+    assert selected_view.source_row_ids is row_ids
+    assert torch.equal(selected_view.row_lengths, torch.tensor([4, 3], dtype=torch.long))
+    assert torch.equal(selected_view.row_active, torch.tensor([True, True], dtype=torch.bool))
+    assert selected_view.summary()["source_row_ids_shape"] == (2,)
+    with pytest.raises(RuntimeError, match="row_ids must be a 1D tensor"):
+        batch_view.turboquant_metadata_view(1, row_ids=torch.tensor([[0]], dtype=torch.long))
 
     batch_view.update(torch.randn(2, 2, 1, 16), torch.randn(2, 2, 1, 16), layer_idx=1, require_dense_cache=False)
     updated_lengths, updated_active = batch_view.turboquant_metadata(1) or (None, None)
@@ -1273,6 +1370,146 @@ def test_sparse_moe_host_planning_helper_is_cpu_debug_only() -> None:
     assert snapshot.moe_cpu_sync_count == 0
 
 
+def test_sparse_moe_runtime_boundary_reports_default_cpu_control_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ANNA_XPU_MOE_ALLOW_HOST_PLANNING_FALLBACK", raising=False)
+    block = Qwen3SparseMoeBlock(_tiny_moe_config()).eval()
+
+    boundary = block.runtime_boundary()
+
+    assert boundary["resident_experts"] is False
+    assert boundary["offload_experts"] is False
+    assert boundary["execution_device"] is None
+    assert boundary["backend"] == "dense_per_expert_host_wave_plan"
+    assert boundary["host_wave_planning_required"] is True
+    assert boundary["host_planning_fallback_allowed"] is True
+    assert boundary["xpu_host_planning_fallback_env_enabled"] is False
+    assert boundary["can_use_resident_grouped_int4_no_host_planning"] is False
+    assert boundary["resident_grouped_int4_ready"] is False
+    assert boundary["grouped_int4_bank"] == {
+        "exists": False,
+        "capacity": 0,
+        "filled_slots": 0,
+        "full_resident": False,
+        "weight": {
+            "present": False,
+            "device": None,
+            "device_type": None,
+            "shape": None,
+        },
+        "resident_active_experts": {
+            "present": False,
+            "device": None,
+            "device_type": None,
+            "shape": None,
+        },
+        "resident_active_slots": {
+            "present": False,
+            "device": None,
+            "device_type": None,
+            "shape": None,
+        },
+        "resident_active_tensors_ready": False,
+        "device_matches_execution": False,
+    }
+
+
+def test_sparse_moe_runtime_boundary_reports_resident_grouped_int4_no_host_planning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeTensor:
+        def __init__(self, *, device: str, shape: tuple[int, ...]) -> None:
+            self.device = torch.device(device)
+            self.shape = shape
+
+    monkeypatch.delenv("ANNA_XPU_MOE_ALLOW_HOST_PLANNING_FALLBACK", raising=False)
+    block = Qwen3SparseMoeBlock(_tiny_moe_config()).eval()
+    block.resident_experts = True
+    block.execution_device = torch.device("xpu")
+    block.expert_quant = "int4"
+    block._grouped_int4_bank = model_ops._GroupedInt4ExpertBank(
+        capacity=block.num_experts,
+        hidden_dim=block._config.hidden_size,
+        intermediate_dim=block._config.moe_intermediate_size,
+        group_size=128,
+        gate_qweight=_FakeTensor(device="xpu", shape=(block.num_experts, 1, 1)),  # type: ignore[arg-type]
+        gate_qscale=_FakeTensor(device="xpu", shape=(block.num_experts, 1, 1)),  # type: ignore[arg-type]
+        gate_qzeros=_FakeTensor(device="xpu", shape=(block.num_experts, 1, 1)),  # type: ignore[arg-type]
+        up_qweight=_FakeTensor(device="xpu", shape=(block.num_experts, 1, 1)),  # type: ignore[arg-type]
+        up_qscale=_FakeTensor(device="xpu", shape=(block.num_experts, 1, 1)),  # type: ignore[arg-type]
+        up_qzeros=_FakeTensor(device="xpu", shape=(block.num_experts, 1, 1)),  # type: ignore[arg-type]
+        down_qweight=_FakeTensor(device="xpu", shape=(block.num_experts, 1, 1)),  # type: ignore[arg-type]
+        down_qscale=_FakeTensor(device="xpu", shape=(block.num_experts, 1, 1)),  # type: ignore[arg-type]
+        down_qzeros=_FakeTensor(device="xpu", shape=(block.num_experts, 1, 1)),  # type: ignore[arg-type]
+        slot_to_expert=list(range(block.num_experts)),
+        expert_to_slot={expert_idx: expert_idx for expert_idx in range(block.num_experts)},
+        resident_active_experts=_FakeTensor(device="xpu", shape=(block.num_experts,)),  # type: ignore[arg-type]
+        resident_active_slots=_FakeTensor(device="xpu", shape=(block.num_experts,)),  # type: ignore[arg-type]
+    )
+
+    boundary = block.runtime_boundary()
+
+    assert boundary["resident_experts"] is True
+    assert boundary["offload_experts"] is False
+    assert boundary["execution_device"] == "xpu"
+    assert boundary["expert_quant"] == "int4"
+    assert boundary["should_use_xpu_int4"] is True
+    assert boundary["backend"] == "resident_grouped_int4"
+    assert boundary["host_wave_planning_required"] is False
+    assert boundary["host_planning_fallback_allowed"] is False
+    assert boundary["can_use_resident_grouped_int4_no_host_planning"] is True
+    assert boundary["resident_grouped_int4_ready"] is True
+    bank = boundary["grouped_int4_bank"]
+    assert isinstance(bank, dict)
+    assert bank["exists"] is True
+    assert bank["capacity"] == block.num_experts
+    assert bank["filled_slots"] == block.num_experts
+    assert bank["full_resident"] is True
+    assert bank["resident_active_tensors_ready"] is True
+    assert bank["device_matches_execution"] is True
+    assert bank["weight"] == {
+        "present": True,
+        "device": "xpu",
+        "device_type": "xpu",
+        "shape": (block.num_experts, 1, 1),
+    }
+    assert bank["resident_active_experts"] == {
+        "present": True,
+        "device": "xpu",
+        "device_type": "xpu",
+        "shape": (block.num_experts,),
+    }
+
+
+def test_sparse_moe_runtime_boundary_reports_xpu_offload_host_planning_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ANNA_XPU_MOE_ALLOW_HOST_PLANNING_FALLBACK", raising=False)
+    block = Qwen3SparseMoeBlock(_tiny_moe_config()).eval()
+    block.offload_experts = True
+    block.execution_device = torch.device("xpu")
+    block.expert_quant = "int4"
+    block.cached_experts_per_layer = 2
+
+    boundary = block.runtime_boundary()
+
+    assert boundary["resident_experts"] is False
+    assert boundary["offload_experts"] is True
+    assert boundary["backend"] == "offload_grouped_int4_host_wave_plan"
+    assert boundary["host_wave_planning_required"] is True
+    assert boundary["offload_host_wave_planning_required"] is True
+    assert boundary["host_planning_fallback_allowed"] is False
+    assert boundary["xpu_host_planning_fallback_env_enabled"] is False
+    assert boundary["cached_experts_per_layer"] == 2
+
+    monkeypatch.setenv("ANNA_XPU_MOE_ALLOW_HOST_PLANNING_FALLBACK", "1")
+    debug_boundary = block.runtime_boundary()
+    assert debug_boundary["host_wave_planning_required"] is True
+    assert debug_boundary["host_planning_fallback_allowed"] is True
+    assert debug_boundary["xpu_host_planning_fallback_env_enabled"] is True
+
+
 def test_sparse_moe_resident_grouped_int4_path_skips_host_offset_planning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1365,6 +1602,35 @@ def test_qwen3_runtime_can_pin_sparse_moe_layers_by_decoder_index() -> None:
     assert resident_layer_indices == [1]
     offloaded_sparse_layers = [layer.mlp for layer in model.model.layers if isinstance(layer.mlp, Qwen3SparseMoeBlock) and layer.mlp.offload_experts]
     assert all(layer.cached_experts_per_layer == 3 for layer in offloaded_sparse_layers)
+
+
+def test_engine_moe_runtime_boundary_aggregates_sparse_layer_status() -> None:
+    model = Qwen3_5TextForCausalLM(_tiny_moe_config())
+    model.configure_runtime(
+        torch.device("cpu"),
+        offload_experts=True,
+        resident_expert_layer_indices=(1,),
+        cached_experts_per_layer=3,
+    )
+    engine = AnnaQwen3_5TextEngine.__new__(AnnaQwen3_5TextEngine)
+    engine.model = model
+
+    boundary = engine._moe_runtime_boundary()
+
+    assert boundary["layer_count"] == 3
+    assert boundary["resident_layers"] == 1
+    assert boundary["offload_layers"] == 2
+    assert boundary["host_wave_planning_required_layers"] == 3
+    assert boundary["xpu_host_planning_blocked_layers"] == 0
+    assert boundary["resident_grouped_int4_ready_layers"] == 0
+    layers = boundary["layers"]
+    assert isinstance(layers, list)
+    assert [layer["layer_idx"] for layer in layers] == [0, 1, 2]
+    assert [layer["resident_experts"] for layer in layers] == [False, True, False]
+    assert [layer["offload_experts"] for layer in layers] == [True, False, True]
+    assert all(layer["execution_device_type"] == "cpu" for layer in layers)
+    assert all(layer["host_planning_fallback_allowed"] is True for layer in layers)
+    assert all(layer["cached_experts_per_layer"] == 3 for layer in layers)
 
 
 def test_sparse_moe_cached_expert_materialization_copies_weights_without_aliasing_source() -> None:

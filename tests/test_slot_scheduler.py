@@ -5,6 +5,7 @@ import torch
 
 from anna.runtime.paged_kv import PagedKVManager, SlotCapacityError, StaleSlotError
 from anna.runtime.slot_scheduler import SlotScheduler, SlotState
+from anna.sampling.params import SamplingBatchParams
 
 
 def test_paged_kv_manager_allocates_releases_and_reuses_slot_with_new_epoch() -> None:
@@ -287,6 +288,51 @@ def test_slot_scheduler_builds_decode_plan_without_cache_objects() -> None:
     assert plan.sampling_batch_params.top_p_values == (1.0, 0.9)
     assert plan.sampling_batch_params.top_k_values == (1, 3)
     assert not hasattr(plan, "past_key_values")
+
+
+def test_slot_scheduler_reuses_sampling_batch_params_for_same_decode_batch(monkeypatch) -> None:
+    manager = PagedKVManager(max_slots=2, total_blocks=8, block_size=4, max_blocks_per_seq=3)
+    scheduler = SlotScheduler(manager, max_batch_size=2)
+    scheduler.admit(
+        "a",
+        prompt_length=3,
+        max_new_tokens=2,
+        sampling_params={"temperature": 0.0, "top_p": 1.0, "top_k": 1},
+    )
+    scheduler.admit(
+        "b",
+        prompt_length=5,
+        max_new_tokens=2,
+        sampling_params={"temperature": 0.8, "top_p": 0.9, "top_k": 3},
+    )
+    scheduler.mark_prefilled("a", next_input_id=11)
+    scheduler.mark_prefilled("b", next_input_id=22)
+    original_from_sampling_params = SamplingBatchParams.from_sampling_params
+    calls: list[int] = []
+
+    def _counting_from_sampling_params(sampling_params, *, device):
+        calls.append(len(tuple(sampling_params)))
+        return original_from_sampling_params(sampling_params, device=device)
+
+    monkeypatch.setattr(
+        SamplingBatchParams,
+        "from_sampling_params",
+        staticmethod(_counting_from_sampling_params),
+    )
+
+    first = scheduler.build_decode_plan(request_ids=["a", "b"])
+    second = scheduler.build_decode_plan(request_ids=["a", "b"])
+
+    assert first.sampling_batch_params is second.sampling_batch_params
+    assert first.sampling_batch_params.top_k.tolist() == [1, 3]
+    assert scheduler.sampling_batch_params_cache_stats() == {
+        "entries": 1,
+        "max_entries": 64,
+        "hits": 1,
+        "misses": 1,
+        "evictions": 0,
+    }
+    assert calls == [2]
 
 
 def test_slot_scheduler_advances_chunked_prefill_metadata_before_decode() -> None:

@@ -231,6 +231,98 @@ def test_slot_decode_visible_seq_lens_selects_global_seq_lens() -> None:
     assert torch.equal(visible, torch.tensor([12, 5], dtype=torch.long))
 
 
+def test_write_slot_decode_kv_to_pages_uses_global_slot_block_tables() -> None:
+    key_pages = torch.zeros(8, 1, 4, 3)
+    value_pages = torch.zeros_like(key_pages)
+    key_states = torch.tensor(
+        [
+            [[[101.0, 102.0, 103.0]]],
+            [[[201.0, 202.0, 203.0]]],
+        ]
+    )
+    value_states = key_states + 1000.0
+    block_tables = torch.tensor(
+        [
+            [0, -1, -1],
+            [2, 3, -1],
+            [5, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+    seq_lens = torch.tensor([1, 5, 2], dtype=torch.long)
+    slot_ids = torch.tensor([1, 2], dtype=torch.int32)
+
+    visible = model_ops.write_slot_decode_kv_to_pages(
+        key_states,
+        value_states,
+        key_pages,
+        value_pages,
+        block_tables,
+        seq_lens,
+        slot_ids=slot_ids,
+        block_tables_are_global=True,
+        seq_lens_are_global=True,
+    )
+
+    assert torch.equal(visible, torch.tensor([6, 3], dtype=torch.long))
+    assert torch.equal(key_pages[3, :, 1, :], key_states[0, :, 0, :])
+    assert torch.equal(value_pages[3, :, 1, :], value_states[0, :, 0, :])
+    assert torch.equal(key_pages[5, :, 2, :], key_states[1, :, 0, :])
+    assert torch.equal(value_pages[5, :, 2, :], value_states[1, :, 0, :])
+    assert torch.count_nonzero(key_pages).item() == 6
+    assert torch.count_nonzero(value_pages).item() == 6
+
+
+def test_write_slot_prefill_kv_to_pages_writes_multi_token_chunk_across_blocks() -> None:
+    key_pages = torch.zeros(8, 1, 4, 3)
+    value_pages = torch.zeros_like(key_pages)
+    key_states = torch.tensor(
+        [
+            [[[101.0, 102.0, 103.0], [111.0, 112.0, 113.0], [121.0, 122.0, 123.0]]],
+            [[[201.0, 202.0, 203.0], [211.0, 212.0, 213.0], [221.0, 222.0, 223.0]]],
+        ]
+    )
+    value_states = key_states + 1000.0
+    block_tables = torch.tensor(
+        [
+            [0, -1, -1],
+            [2, 3, -1],
+            [5, 6, -1],
+        ],
+        dtype=torch.int32,
+    )
+    seq_lens = torch.tensor([0, 3, 2], dtype=torch.long)
+    slot_ids = torch.tensor([1, 2], dtype=torch.int32)
+
+    visible = model_ops.write_slot_prefill_kv_to_pages(
+        key_states,
+        value_states,
+        key_pages,
+        value_pages,
+        block_tables,
+        seq_lens,
+        slot_ids=slot_ids,
+        block_tables_are_global=True,
+        seq_lens_are_global=True,
+    )
+
+    assert torch.equal(visible, torch.tensor([6, 5], dtype=torch.long))
+    assert torch.equal(key_pages[2, :, 3, :], key_states[0, :, 0, :])
+    assert torch.equal(value_pages[2, :, 3, :], value_states[0, :, 0, :])
+    assert torch.equal(key_pages[3, :, 0, :], key_states[0, :, 1, :])
+    assert torch.equal(value_pages[3, :, 0, :], value_states[0, :, 1, :])
+    assert torch.equal(key_pages[3, :, 1, :], key_states[0, :, 2, :])
+    assert torch.equal(value_pages[3, :, 1, :], value_states[0, :, 2, :])
+    assert torch.equal(key_pages[5, :, 2, :], key_states[1, :, 0, :])
+    assert torch.equal(value_pages[5, :, 2, :], value_states[1, :, 0, :])
+    assert torch.equal(key_pages[5, :, 3, :], key_states[1, :, 1, :])
+    assert torch.equal(value_pages[5, :, 3, :], value_states[1, :, 1, :])
+    assert torch.equal(key_pages[6, :, 0, :], key_states[1, :, 2, :])
+    assert torch.equal(value_pages[6, :, 0, :], value_states[1, :, 2, :])
+    assert torch.count_nonzero(key_pages).item() == 18
+    assert torch.count_nonzero(value_pages).item() == 18
+
+
 def test_physical_slot_decode_requires_initialized_kv_pages() -> None:
     config = Qwen3_5TextConfig(
         hidden_size=16,
@@ -261,3 +353,25 @@ def test_physical_slot_decode_requires_initialized_kv_pages() -> None:
             raise AssertionError("physical slot decode without pages should fail")
 
     assert metrics.snapshot().attention_fallback_count == 1
+
+
+def test_slot_decode_physical_pages_prefers_slot_owned_page_bank() -> None:
+    key_pages = torch.zeros(2, 8, 1, 4, 3)
+    value_pages = torch.ones_like(key_pages)
+    slot_inputs = type(
+        "SlotInputs",
+        (),
+        {
+            "physical_key_pages": key_pages,
+            "physical_value_pages": value_pages,
+        },
+    )()
+
+    selected_key_pages, selected_value_pages = model_ops._resolve_slot_decode_physical_pages(
+        slot_inputs,
+        None,
+        1,
+    )
+
+    assert selected_key_pages.data_ptr() == key_pages[1].data_ptr()
+    assert selected_value_pages.data_ptr() == value_pages[1].data_ptr()

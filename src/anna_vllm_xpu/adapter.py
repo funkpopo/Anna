@@ -18,7 +18,7 @@ from anna.runtime.slot_model_runner import (
     resolve_slot_model_runner_config,
 )
 from anna.sampling.capabilities import sampler_capability_report
-from anna.sampling.params import SamplingBatchParams
+from anna.sampling.params import SamplingBatchParams, SamplingBatchParamsCache
 from anna.vllm_compat.outputs import RequestOutput, request_output_from_result
 from anna.vllm_compat.sampling import SamplingParams, sampling_params_to_generation_config
 
@@ -29,6 +29,9 @@ class AnnaXPUAttentionBackend:
     paged_decode: bool
     prefill: str
     fallback: str | None = None
+    prefill_xpu_kernel_ready: bool = False
+    prefill_xpu_kernel_reason: str = "custom_prefill_attention_kernel_not_implemented"
+    prefill_fallback_reason: str = "anna_vllm_xpu_torch_sdpa_prefill_attention"
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +119,41 @@ class AnnaXPUAttentionBackendRegistry:
         if self.capabilities is None:
             return "torch_scaled_dot_product_attention"
         return self.capabilities.attention_backend.prefill
+
+    @property
+    def prefill_xpu_kernel_ready(self) -> bool:
+        if self.capabilities is None:
+            return False
+        return bool(self.capabilities.attention_backend.prefill_xpu_kernel_ready)
+
+    @property
+    def prefill_xpu_kernel_reason(self) -> str:
+        if self.prefill_xpu_kernel_ready:
+            return "ready"
+        if self.capabilities is None:
+            return "custom_prefill_attention_kernel_not_implemented"
+        return self.capabilities.attention_backend.prefill_xpu_kernel_reason
+
+    @property
+    def prefill_fallback_reason(self) -> str | None:
+        if self.prefill_xpu_kernel_ready:
+            return None
+        if self.capabilities is None:
+            return "anna_vllm_xpu_torch_sdpa_prefill_attention"
+        return self.capabilities.attention_backend.prefill_fallback_reason
+
+    def health(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "paged_decode_entrypoint": self.paged_decode_entrypoint,
+            "paged_decode_supported": self.paged_decode_supported,
+            "prefill_entrypoint": self.prefill_entrypoint,
+            "prefill_backend": self.prefill_backend,
+            "prefill_xpu_kernel_ready": self.prefill_xpu_kernel_ready,
+            "prefill_xpu_kernel_reason": self.prefill_xpu_kernel_reason,
+            "prefill_records_attention_fallback": not self.prefill_xpu_kernel_ready,
+            "prefill_fallback_reason": self.prefill_fallback_reason,
+        }
 
     def paged_decode(
         self,
@@ -220,6 +258,7 @@ class AnnaXPUKVCacheConnector:
 
     def __init__(self, runner: SlotModelRunner) -> None:
         self.runner = runner
+        self._sampling_batch_params_cache = SamplingBatchParamsCache(max_entries=64)
 
     @property
     def device(self) -> torch.device:
@@ -325,11 +364,24 @@ class AnnaXPUKVCacheConnector:
             block_tables_are_global=False,
             physical_block_tables=bool(physical_block_tables),
             sampling_params=resolved_sampling_params,
-            sampling_batch_params=SamplingBatchParams.from_sampling_params(
-                resolved_sampling_params,
-                device=self.device,
-            ),
+            sampling_batch_params=self._sampling_batch_params_for_external_batch(resolved_sampling_params),
         )
+
+    def _sampling_batch_params_for_external_batch(
+        self,
+        sampling_params: Sequence[Any | None],
+    ) -> SamplingBatchParams:
+        return self._sampling_batch_params_cache.get(tuple(sampling_params), device=self.device)
+
+    def health(self) -> dict[str, object]:
+        return {
+            "device": str(self.device),
+            "mirrors_external_metadata": True,
+            "owns_physical_kv_pages": False,
+            "physical_block_tables_default": True,
+            "block_table_ownership": "external_physical_or_compatible",
+            "sampling_batch_params_cache": self._sampling_batch_params_cache.stats(),
+        }
 
 
 def _dtype_name(dtype: torch.dtype | str) -> str:
@@ -348,6 +400,9 @@ def _attention_backend_from_health(health_report: Mapping[str, object]) -> AnnaX
         paged_decode=paged_decode,
         prefill=prefill,
         fallback=fallback,
+        prefill_xpu_kernel_ready=False,
+        prefill_xpu_kernel_reason="custom_prefill_attention_kernel_not_implemented",
+        prefill_fallback_reason="anna_vllm_xpu_torch_sdpa_prefill_attention",
     )
 
 
@@ -490,6 +545,8 @@ class AnnaVLLMXPURuntimeAdapter:
                 raise ValueError("Either engine or model must be provided.")
             engine = AnnaQwen3_5TextEngine.from_model_dir(model, model_id=model_id, **engine_kwargs)
         self.engine = engine
+        self._kv_cache_connector: AnnaXPUKVCacheConnector | None = None
+        self._kv_cache_connector_runner: SlotModelRunner | None = None
 
     @property
     def model_id(self) -> str:
@@ -529,7 +586,10 @@ class AnnaVLLMXPURuntimeAdapter:
         runner = self.slot_model_runner
         if runner is None:
             raise RuntimeError("Anna slot model runner is not enabled; KV cache connector cannot be created.")
-        return AnnaXPUKVCacheConnector(runner)
+        if self._kv_cache_connector is None or self._kv_cache_connector_runner is not runner:
+            self._kv_cache_connector = AnnaXPUKVCacheConnector(runner)
+            self._kv_cache_connector_runner = runner
+        return self._kv_cache_connector
 
     def attention_backend_registry(self) -> AnnaXPUAttentionBackendRegistry:
         return AnnaXPUAttentionBackendRegistry(self.platform_capabilities())
@@ -650,7 +710,13 @@ class AnnaVLLMXPURuntimeAdapter:
             "platform_plugin_entry_point": plugin_spec.platform_entry_point,
             "execute_model_batch_adapter": True,
             "kv_cache_connector": self.slot_model_runner is not None,
+            "kv_cache_connector_health": (
+                None
+                if self._kv_cache_connector is None
+                else self._kv_cache_connector.health()
+            ),
             "attention_backend_registry": True,
+            "attention_backend_boundary": self.attention_backend_registry().health(),
             "sampler": sampler_capability_report(),
             "model": self.model_id,
             "platform": capabilities,

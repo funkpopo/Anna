@@ -3,7 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from collections import OrderedDict, defaultdict, deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterator
 
@@ -12,7 +12,7 @@ import torch
 from anna.mm.prepared_inputs import PreparedInputsLike
 from anna.runtime.streaming import IncrementalTextAssembler
 from anna.runtime.token_staging import stage_token_ids_to_host
-from anna.sampling.params import SamplingBatchParams
+from anna.sampling.params import SamplingBatchParams, SamplingBatchParamsCache
 from anna.sampling.sampler import (
     sample_next_token,
     sample_next_token_batch_from_candidates_with_params,
@@ -84,8 +84,7 @@ class AnnaScheduler:
         self._decode_steps_since_prefill = 0
         self._next_request_index = 0
         self._last_slot_decode_inputs = None
-        self._sampling_batch_params_cache: OrderedDict[tuple[object, ...], SamplingBatchParams] = OrderedDict()
-        self._sampling_batch_params_cache_size = 64
+        self._sampling_batch_params_cache = SamplingBatchParamsCache(max_entries=64)
         self._pending: deque[SchedulerRequest] = deque()
         self._condition = threading.Condition()
         self._stop = False
@@ -98,6 +97,9 @@ class AnnaScheduler:
             self._stop = True
             self._condition.notify_all()
         self._worker.join(timeout=5.0)
+
+    def sampling_batch_params_cache_stats(self) -> dict[str, int]:
+        return self._sampling_batch_params_cache.stats()
 
     def generate(self, prepared: PreparedInputsLike, *, config: "GenerationConfig") -> "TextGenerationResult":
         request = self._submit(prepared, config=config, stream=False)
@@ -748,32 +750,10 @@ class AnnaScheduler:
 
     def _sampling_batch_params_for_requests(self, requests: list[SchedulerRequest]) -> SamplingBatchParams:
         device = torch.device(self.engine.device_context.device)
-        rows = tuple(
-            (
-                float(request.config.temperature),
-                float(request.config.top_p),
-                int(request.config.top_k),
-                float(request.config.min_p),
-                float(request.config.presence_penalty),
-                float(request.config.repetition_penalty),
-            )
-            for request in requests
-        )
-        cache_key: tuple[object, ...] = (str(device), rows)
-        cached = self._sampling_batch_params_cache.get(cache_key)
-        if cached is not None:
-            self._sampling_batch_params_cache.move_to_end(cache_key)
-            return cached
-
-        sampling_params = SamplingBatchParams.from_sampling_params(
+        return self._sampling_batch_params_cache.get(
             tuple(request.config for request in requests),
             device=device,
         )
-        self._sampling_batch_params_cache[cache_key] = sampling_params
-        self._sampling_batch_params_cache.move_to_end(cache_key)
-        while len(self._sampling_batch_params_cache) > self._sampling_batch_params_cache_size:
-            self._sampling_batch_params_cache.popitem(last=False)
-        return sampling_params
 
     def _batch_text_inputs(self, requests: list[SchedulerRequest]) -> PreparedInputsLike:
         max_prompt_length = max(request.prompt_length for request in requests)

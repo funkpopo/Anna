@@ -429,6 +429,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max decode batch size for the experimental slot runner. Set 0 to use the slot count.",
     )
     parser.add_argument(
+        "--slot-runner-physical-kv-page-bank",
+        action="store_true",
+        help="Explicitly allocate the experimental slot runner's internal physical KV page bank. "
+        "This is a migration boundary for slot-owned KV writes and does not make the production "
+        "scheduler use slot-owned KV by default.",
+    )
+    parser.add_argument(
         "--metrics-log-interval-seconds",
         type=_non_negative_float,
         default=10.0,
@@ -471,6 +478,7 @@ def main() -> None:
         slot_runner_total_blocks=args.slot_runner_total_blocks,
         slot_runner_max_blocks_per_seq=args.slot_runner_max_blocks_per_seq,
         slot_runner_max_batch_size=args.slot_runner_max_batch_size,
+        slot_runner_physical_kv_page_bank=args.slot_runner_physical_kv_page_bank,
         default_max_completion_tokens=args.max_completion_tokens,
         default_temperature=args.temperature,
         default_top_p=args.top_p,
@@ -522,6 +530,7 @@ def main() -> None:
         slot_runner_total_blocks=settings.slot_runner_total_blocks,
         slot_runner_max_blocks_per_seq=settings.slot_runner_max_blocks_per_seq,
         slot_runner_max_batch_size=settings.slot_runner_max_batch_size,
+        slot_runner_physical_kv_page_bank=settings.slot_runner_physical_kv_page_bank,
         safety_policy=_build_safety_policy(settings),
         default_max_completion_tokens=settings.default_max_completion_tokens,
         default_temperature=settings.default_temperature,

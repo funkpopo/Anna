@@ -14,13 +14,15 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from anna.core.hotpath_events import hotpath_event_recorder
-from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, grouped_query_attention
+from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, grouped_query_attention, write_slot_decode_kv_to_pages
 from anna.model.quantization import XPUInt4Linear
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.runtime.hotpath_guard import DEFAULT_ALLOWLIST, scan_hotpath_files, summarize_findings, unexpected_findings
 from anna.runtime.paged_kv import PagedKVManager
 from anna.runtime.service_metrics import AnnaServiceMetrics
+from anna.runtime.slot_model_runner import SlotDecodeModelInputs
 from anna.runtime.slot_scheduler import SlotScheduler
+from anna.sampling.params import SamplingBatchParams, SamplingBatchParamsCache
 from anna.sampling.sampler import sample_next_token, sample_next_token_from_candidates
 
 
@@ -227,6 +229,23 @@ def _bench_slot_decode_plan(
         scheduler.mark_prefilled(request_id, next_input_id=idx + 1)
 
     plan = scheduler.build_decode_plan(request_ids=request_ids)
+    model_inputs = SlotDecodeModelInputs.from_plan(plan)
+    boundary = model_inputs.boundary_summary()
+    key_pages = torch.zeros((manager.total_blocks, 1, manager.block_size, 8), dtype=torch.float32)
+    value_pages = torch.zeros_like(key_pages)
+    key_states = torch.randn(batch_size, 1, 1, 8)
+    value_states = torch.randn_like(key_states)
+    visible_seq_lens = write_slot_decode_kv_to_pages(
+        key_states,
+        value_states,
+        key_pages,
+        value_pages,
+        plan.block_tables,
+        plan.seq_lens,
+        slot_ids=plan.slot_ids,
+        block_tables_are_global=plan.block_tables_are_global,
+        seq_lens_are_global=plan.seq_lens_are_global,
+    )
     assert plan.block_tables_are_global is True
     assert plan.seq_lens_are_global is True
     assert plan.positions_are_global is True
@@ -236,14 +255,30 @@ def _bench_slot_decode_plan(
     assert plan.batch_seq_lens.shape == (batch_size,)
     assert plan.batch_positions.shape == (batch_size,)
     assert plan.sampling_batch_params.batch_size == batch_size
+    assert visible_seq_lens.shape == (batch_size,)
 
     plan_ms = _time_ms(lambda: scheduler.build_decode_plan(request_ids=request_ids), iters=iters)
+    slot_kv_write_ms = _time_ms(
+        lambda: write_slot_decode_kv_to_pages(
+            key_states,
+            value_states,
+            key_pages,
+            value_pages,
+            plan.block_tables,
+            plan.seq_lens,
+            slot_ids=plan.slot_ids,
+            block_tables_are_global=plan.block_tables_are_global,
+            seq_lens_are_global=plan.seq_lens_are_global,
+        ),
+        iters=iters,
+    )
     return {
         "batch_size": batch_size,
         "seq_len": seq_len,
         "block_size": block_size,
         "max_blocks_per_seq": resolved_max_blocks,
         "plan_ms": plan_ms,
+        "slot_kv_write_ms": slot_kv_write_ms,
         "active_batch_rows": batch_size,
         "block_tables_are_global": bool(plan.block_tables_are_global),
         "seq_lens_are_global": bool(plan.seq_lens_are_global),
@@ -252,6 +287,22 @@ def _bench_slot_decode_plan(
         "block_table_cols": int(plan.block_tables.shape[1]),
         "seq_lens_rows": int(plan.seq_lens.shape[0]),
         "positions_rows": int(plan.positions.shape[0]),
+        "decode_boundary_batch_size": int(boundary["batch_size"]),
+        "decode_boundary_token_count": int(boundary["decode_token_count"]),
+        "decode_boundary_contains_cache_objects": bool(boundary["contains_cache_objects"]),
+        "decode_boundary_sampling_batch_params": bool(boundary["sampling_batch_params"]),
+        "decode_boundary_block_table_ownership": str(boundary["block_table_ownership"]),
+        "decode_boundary_owns_physical_kv_pages": bool(boundary["owns_physical_kv_pages"]),
+        "decode_boundary_physical_kv_layer_count": int(boundary["physical_kv_layer_count"]),
+        "slot_owned_output_token_buffer": all(
+            slot.output_token_buffer is not None and slot.output_token_buffer.device == manager.device
+            for slot in scheduler.ready_decode_slots()
+        ),
+        "slot_owned_kv_write_helper": True,
+        "slot_owned_kv_page_bank_available": False,
+        "slot_owned_kv_writes": False,
+        "legacy_cache_object_required_for_forward": True,
+        "slot_kv_visible_seq_lens_shape": tuple(int(dim) for dim in visible_seq_lens.shape),
     }
 
 
@@ -291,6 +342,28 @@ def _summarize_scheduler_kv_overhead(
         "slot_plan_global_seq_lens_entries": seq_lens_rows,
         "slot_plan_positions_entries": active_rows,
         "slot_plan_global_positions_entries": positions_rows,
+        "slot_decode_boundary_contains_cache_objects": bool(
+            slot_decode_plan.get("decode_boundary_contains_cache_objects", True)
+        ),
+        "slot_decode_boundary_sampling_batch_params": bool(
+            slot_decode_plan.get("decode_boundary_sampling_batch_params", False)
+        ),
+        "slot_decode_boundary_block_table_ownership": str(
+            slot_decode_plan.get("decode_boundary_block_table_ownership", "unknown")
+        ),
+        "slot_decode_boundary_owns_physical_kv_pages": bool(
+            slot_decode_plan.get("decode_boundary_owns_physical_kv_pages", False)
+        ),
+        "slot_decode_boundary_physical_kv_layer_count": int(
+            slot_decode_plan.get("decode_boundary_physical_kv_layer_count", 0)
+        ),
+        "slot_owned_output_token_buffer": bool(slot_decode_plan.get("slot_owned_output_token_buffer", False)),
+        "slot_owned_kv_write_helper": bool(slot_decode_plan.get("slot_owned_kv_write_helper", False)),
+        "slot_owned_kv_page_bank_available": bool(slot_decode_plan.get("slot_owned_kv_page_bank_available", False)),
+        "slot_owned_kv_writes": bool(slot_decode_plan.get("slot_owned_kv_writes", False)),
+        "legacy_cache_object_required_for_forward": bool(
+            slot_decode_plan.get("legacy_cache_object_required_for_forward", True)
+        ),
         "stack_ms": stack_ms,
         "split_ms": split_ms,
         "stack_split_ms": stack_split_ms,
@@ -480,6 +553,130 @@ def _bench_sampler(*, vocab_size: int, candidates: int, iters: int) -> dict[str,
         "candidate_ms": candidate_ms,
         "candidate_penalty_ms": candidate_penalty_ms,
         "sampler_full_vocab_sort_count": snapshot.sampler_full_vocab_sort_count,
+        "sampler_full_vocab_fallback_count": snapshot.sampler_full_vocab_fallback_count,
+        "sampler_full_vocab_fallback_reasons": snapshot.sampler_full_vocab_fallback_reasons,
+    }
+
+
+def _bench_sampling_params_cache(*, batch_size: int, iters: int) -> dict[str, Any]:
+    resolved_batch_size = max(1, int(batch_size))
+    row_params = tuple(
+        {
+            "temperature": 0.0 if row_idx % 2 == 0 else 0.7,
+            "top_p": 1.0 if row_idx % 2 == 0 else 0.8,
+            "top_k": 1 if row_idx % 2 == 0 else 32,
+            "min_p": 0.0,
+            "presence_penalty": 0.0 if row_idx % 3 else 0.1,
+            "repetition_penalty": 1.0 if row_idx % 3 else 1.05,
+        }
+        for row_idx in range(resolved_batch_size)
+    )
+    equivalent_row_params = tuple(dict(params) for params in row_params)
+    cache = SamplingBatchParamsCache(max_entries=4)
+    first = cache.get(row_params, device="cpu")
+    normalized_reuse = cache.get(equivalent_row_params, device=torch.device("cpu")) is first
+
+    def uncached() -> SamplingBatchParams:
+        return SamplingBatchParams.from_sampling_params(row_params, device="cpu")
+
+    def cached() -> SamplingBatchParams:
+        return cache.get(row_params, device="cpu")
+
+    uncached_ms = _time_ms(uncached, iters=iters)
+    cached_ms = _time_ms(cached, iters=iters)
+    cached_identity_stable = cached() is first
+    cache_stats = cache.stats()
+    ratio = None if cached_ms <= 0.0 else uncached_ms / cached_ms
+    return {
+        "batch_size": resolved_batch_size,
+        "cache_entries": cache_stats["entries"],
+        "cache_max_entries": cache_stats["max_entries"],
+        "cache_hits": cache_stats["hits"],
+        "cache_misses": cache_stats["misses"],
+        "cache_evictions": cache_stats["evictions"],
+        "cached_batch_size": first.batch_size,
+        "greedy_rows": len(first.greedy_rows),
+        "sample_rows": len(first.sample_rows),
+        "penalty_rows": len(first.penalty_rows),
+        "normalized_key_reuse": bool(normalized_reuse),
+        "cached_identity_stable": bool(cached_identity_stable),
+        "uncached_ms": uncached_ms,
+        "cached_ms": cached_ms,
+        "uncached_to_cached_ratio": ratio,
+    }
+
+
+def _bench_turboquant_metadata_view(*, batch_size: int, layers: int, iters: int) -> dict[str, Any]:
+    class _FakeTurboQuantRow:
+        def __init__(self, length: int) -> None:
+            self.length = int(length)
+            self.device = torch.device("cpu")
+
+    resolved_batch_size = max(1, int(batch_size))
+    resolved_layers = max(1, int(layers))
+    config = _tiny_config(layers=resolved_layers, heads=2, head_dim=8, block_size=8)
+    cache = Qwen3DynamicCache(
+        config,
+        batch_size=resolved_batch_size,
+        kv_cache_quantization="turboquant",
+        kv_cache_quant_bits=4,
+        kv_cache_residual_len=2,
+    )
+    layer_idx = 0
+    for row_idx in range(resolved_batch_size):
+        row = _FakeTurboQuantRow(row_idx + 1)
+        cache.turboquant_rows[layer_idx][row_idx] = row  # type: ignore[assignment]
+        cache.layer_lengths[layer_idx][row_idx] = row.length
+        cache._set_turboquant_row_metadata(layer_idx, row_idx, row)  # type: ignore[arg-type]
+
+    row_ids = torch.arange(resolved_batch_size - 1, -1, -1, dtype=torch.int32)
+    full_view = cache.turboquant_metadata_view(layer_idx)
+    selected_view = cache.turboquant_metadata_view(layer_idx, row_ids=row_ids)
+    non_turboquant_view = Qwen3DynamicCache(config).turboquant_metadata_view(layer_idx)
+    if full_view is None or selected_view is None:
+        raise RuntimeError("TurboQuant metadata benchmark expected initialized metadata views.")
+
+    def full_once() -> object:
+        return cache.turboquant_metadata_view(layer_idx)
+
+    def selected_once() -> object:
+        return cache.turboquant_metadata_view(layer_idx, row_ids=row_ids)
+
+    full_view_ms = _time_ms(full_once, iters=iters)
+    selected_view_ms = _time_ms(selected_once, iters=iters)
+    full_summary = full_view.summary()
+    selected_summary = selected_view.summary()
+    runtime_boundary = cache.turboquant_runtime_boundary()
+    non_turboquant_boundary = Qwen3DynamicCache(config).turboquant_runtime_boundary()
+    return {
+        "batch_size": resolved_batch_size,
+        "layers": resolved_layers,
+        "layer_idx": layer_idx,
+        "metadata_device": str(full_view.device),
+        "row_lengths_shape": full_summary["row_lengths_shape"],
+        "row_active_shape": full_summary["row_active_shape"],
+        "selected_row_lengths_shape": selected_summary["row_lengths_shape"],
+        "selected_source_row_ids_shape": selected_summary["source_row_ids_shape"],
+        "full_view_uses_metadata_storage": bool(
+            full_view.row_lengths.data_ptr() == cache.turboquant_row_lengths[layer_idx].data_ptr()
+            and full_view.row_active.data_ptr() == cache.turboquant_row_active[layer_idx].data_ptr()
+        ),
+        "selected_view_uses_metadata_storage": bool(
+            selected_view.row_lengths.data_ptr() == cache.turboquant_row_lengths[layer_idx].data_ptr()
+        ),
+        "row_object_backing": bool(full_summary["row_object_backing"]),
+        "tensor_bank_ready": bool(full_summary["tensor_bank_ready"]),
+        "runtime_boundary_enabled": bool(runtime_boundary["enabled"]),
+        "runtime_boundary_quantized_layers": int(runtime_boundary["quantized_layer_count"]),
+        "runtime_boundary_tensor_metadata_layers": int(runtime_boundary["tensor_metadata_layers"]),
+        "runtime_boundary_row_object_rows": int(runtime_boundary["row_object_rows"]),
+        "runtime_boundary_active_row_objects": int(runtime_boundary["active_row_objects"]),
+        "runtime_boundary_tensor_bank_ready": bool(runtime_boundary["tensor_bank_ready"]),
+        "runtime_boundary_tensor_bank_reason": runtime_boundary["tensor_bank_reason"],
+        "non_turboquant_boundary_tensor_bank_reason": non_turboquant_boundary["tensor_bank_reason"],
+        "non_turboquant_view_is_none": non_turboquant_view is None,
+        "full_view_ms": full_view_ms,
+        "selected_view_ms": selected_view_ms,
     }
 
 
@@ -624,6 +821,15 @@ def main() -> int:
         "sampler": _bench_sampler(
             vocab_size=args.vocab_size,
             candidates=args.candidates,
+            iters=args.iters,
+        ),
+        "sampling_params_cache": _bench_sampling_params_cache(
+            batch_size=args.batch_size,
+            iters=args.iters,
+        ),
+        "turboquant_metadata_view": _bench_turboquant_metadata_view(
+            batch_size=args.batch_size,
+            layers=args.layers,
             iters=args.iters,
         ),
         "int4_linear": _bench_int4_linear(

@@ -185,6 +185,7 @@ class EngineOptimizationConfig:
     slot_runner_total_blocks: int = 0
     slot_runner_max_blocks_per_seq: int = 0
     slot_runner_max_batch_size: int = 0
+    slot_runner_physical_kv_page_bank: bool = False
 
 
 @dataclass(slots=True)
@@ -380,10 +381,15 @@ class AnnaQwen3_5TextEngine:
             slot_runner_total_blocks=max(0, int(config.slot_runner_total_blocks)),
             slot_runner_max_blocks_per_seq=max(0, int(config.slot_runner_max_blocks_per_seq)),
             slot_runner_max_batch_size=max(0, int(config.slot_runner_max_batch_size)),
+            slot_runner_physical_kv_page_bank=bool(config.slot_runner_physical_kv_page_bank),
         )
 
     def _build_slot_model_runner(self) -> SlotModelRunner | None:
         if not self.optimization_config.slot_runner_enabled:
+            if self.optimization_config.slot_runner_physical_kv_page_bank:
+                raise ValueError(
+                    "slot_runner_physical_kv_page_bank=True requires slot_runner_enabled=True."
+                )
             return None
         runner = SlotModelRunner.from_text_config(
             self.config.text_config,
@@ -393,6 +399,8 @@ class AnnaQwen3_5TextEngine:
             max_blocks_per_seq=self.optimization_config.slot_runner_max_blocks_per_seq,
             max_batch_size=self.optimization_config.slot_runner_max_batch_size,
         )
+        if self.optimization_config.slot_runner_physical_kv_page_bank:
+            runner.allocate_physical_kv_page_bank(dtype=self.device_context.dtype)
         logger.info("Enabled experimental slot model runner metadata path: %s", runner.health())
         return runner
 
@@ -544,6 +552,15 @@ class AnnaQwen3_5TextEngine:
             "turboquant_bits": self.optimization_config.kv_cache_quant_bits if turboquant_enabled else None,
             "turboquant_residual_len": self.optimization_config.kv_cache_residual_len if turboquant_enabled else None,
             "turboquant_applies_to": "full_attention_only" if turboquant_enabled else "disabled",
+            "turboquant_metadata": {
+                "tensor_mirror": turboquant_enabled,
+                "selected_view": turboquant_enabled,
+                "row_object_backing": turboquant_enabled,
+                "tensor_bank_ready": False,
+                "tensor_bank_reason": (
+                    "slot_indexed_turboquant_tensor_bank_not_implemented" if turboquant_enabled else "disabled"
+                ),
+            },
             "full_attention_layers": len(full_attention_layers),
             "full_attention_layer_indices": full_attention_layers,
             "turboquant_quantized_layers": len(full_attention_layers) if turboquant_enabled else 0,
@@ -572,6 +589,7 @@ class AnnaQwen3_5TextEngine:
         slot_runner_total_blocks: int = 0,
         slot_runner_max_blocks_per_seq: int = 0,
         slot_runner_max_batch_size: int = 0,
+        slot_runner_physical_kv_page_bank: bool = False,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
         default_temperature: float | None = None,
@@ -920,6 +938,7 @@ class AnnaQwen3_5TextEngine:
                 slot_runner_total_blocks=slot_runner_total_blocks,
                 slot_runner_max_blocks_per_seq=slot_runner_max_blocks_per_seq,
                 slot_runner_max_batch_size=slot_runner_max_batch_size,
+                slot_runner_physical_kv_page_bank=slot_runner_physical_kv_page_bank,
             ),
         )
         kv_cache_info = engine._kv_cache_runtime_info()
@@ -1511,10 +1530,16 @@ class AnnaQwen3_5TextEngine:
         service_metrics = self.service_metrics_snapshot()
         kv_cache_runtime_info = self._kv_cache_runtime_info()
         slot_model_runner = getattr(self, "slot_model_runner", None)
+        scheduler = getattr(self, "scheduler", None)
+        scheduler_sampling_cache_stats = None
+        scheduler_cache_stats = getattr(scheduler, "sampling_batch_params_cache_stats", None)
+        if callable(scheduler_cache_stats):
+            scheduler_sampling_cache_stats = scheduler_cache_stats()
         fused_ops_health = fused_op_health_report()
         fused_kernel_backends = fused_ops_health.get("backends", {})
         kernel_backends = dict(fused_kernel_backends) if isinstance(fused_kernel_backends, dict) else {}
         kernel_backends["xpu_int4_linear"] = self.xpu_int4_hotpath.backend
+        moe_runtime_boundary = self._moe_runtime_boundary()
         return {
             "status": "ok",
             "model": self.default_model_id,
@@ -1587,6 +1612,8 @@ class AnnaQwen3_5TextEngine:
                     else slot_model_runner.health()
                 ),
                 "sampler": sampler_capability_report(),
+                "moe_runtime_boundary": moe_runtime_boundary,
+                "scheduler_sampling_batch_params_cache": scheduler_sampling_cache_stats,
                 "xpu_int4_kernels": {
                     "module_count": self.xpu_int4_hotpath.module_count,
                     "backend": self.xpu_int4_hotpath.backend,
@@ -1641,7 +1668,14 @@ class AnnaQwen3_5TextEngine:
                 "attention_fallback_count": service_metrics.attention_fallback_count,
                 "paged_cache_materialize_count": service_metrics.paged_cache_materialize_count,
                 "sampler_full_vocab_sort_count": service_metrics.sampler_full_vocab_sort_count,
+                "sampler_full_vocab_fallback_count": service_metrics.sampler_full_vocab_fallback_count,
                 "moe_host_offset_count": service_metrics.moe_host_offset_count,
+                "cpu_sync_reasons": service_metrics.cpu_sync_reasons,
+                "attention_fallback_reasons": service_metrics.attention_fallback_reasons,
+                "paged_cache_materialize_reasons": service_metrics.paged_cache_materialize_reasons,
+                "sampler_full_vocab_sort_reasons": service_metrics.sampler_full_vocab_sort_reasons,
+                "sampler_full_vocab_fallback_reasons": service_metrics.sampler_full_vocab_fallback_reasons,
+                "moe_host_offset_reasons": service_metrics.moe_host_offset_reasons,
                 "moe_router_count": service_metrics.moe_router_count,
                 "moe_router_seconds_total": service_metrics.moe_router_seconds_total,
                 "moe_router_seconds_max": service_metrics.moe_router_seconds_max,
@@ -1661,6 +1695,53 @@ class AnnaQwen3_5TextEngine:
                 "moe_cpu_sync_seconds_total": service_metrics.moe_cpu_sync_seconds_total,
                 "moe_cpu_sync_seconds_max": service_metrics.moe_cpu_sync_seconds_max,
             },
+        }
+
+    def _moe_runtime_boundary(self) -> dict[str, object]:
+        text_model = self._text_model(self.model)
+        if text_model is None or not hasattr(text_model, "layers"):
+            return {
+                "layer_count": 0,
+                "resident_layers": 0,
+                "offload_layers": 0,
+                "host_wave_planning_required_layers": 0,
+                "xpu_host_planning_blocked_layers": 0,
+                "resident_grouped_int4_ready_layers": 0,
+                "layers": [],
+            }
+
+        layers: list[dict[str, object]] = []
+        resident_layers = 0
+        offload_layers = 0
+        host_wave_planning_required_layers = 0
+        xpu_host_planning_blocked_layers = 0
+        resident_grouped_int4_ready_layers = 0
+        for layer_idx, layer in enumerate(text_model.layers):
+            mlp = getattr(layer, "mlp", None)
+            if not isinstance(mlp, Qwen3SparseMoeBlock):
+                continue
+            boundary = dict(mlp.runtime_boundary())
+            boundary["layer_idx"] = layer_idx
+            layers.append(boundary)
+            if boundary.get("resident_experts"):
+                resident_layers += 1
+            if boundary.get("offload_experts"):
+                offload_layers += 1
+            if boundary.get("host_wave_planning_required"):
+                host_wave_planning_required_layers += 1
+                if boundary.get("execution_device_type") == "xpu" and not boundary.get("host_planning_fallback_allowed"):
+                    xpu_host_planning_blocked_layers += 1
+            if boundary.get("resident_grouped_int4_ready"):
+                resident_grouped_int4_ready_layers += 1
+
+        return {
+            "layer_count": len(layers),
+            "resident_layers": resident_layers,
+            "offload_layers": offload_layers,
+            "host_wave_planning_required_layers": host_wave_planning_required_layers,
+            "xpu_host_planning_blocked_layers": xpu_host_planning_blocked_layers,
+            "resident_grouped_int4_ready_layers": resident_grouped_int4_ready_layers,
+            "layers": layers,
         }
 
     def _resident_expert_layer_indices(self) -> list[int]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +16,27 @@ def _param_value(params: Any | None, name: str, default: float | int) -> float |
     else:
         value = getattr(params, name, default)
     return default if value is None else value
+
+
+def sampling_params_cache_key(
+    sampling_params: Sequence[Any | None],
+    *,
+    device: torch.device | str,
+) -> tuple[object, ...]:
+    """Stable cache key for per-row sampler tensor views."""
+
+    rows = tuple(
+        (
+            float(_param_value(params, "temperature", 0.7)),
+            float(_param_value(params, "top_p", 0.8)),
+            max(0, int(_param_value(params, "top_k", 20))),
+            float(_param_value(params, "min_p", 0.0)),
+            float(_param_value(params, "presence_penalty", 1.5)),
+            float(_param_value(params, "repetition_penalty", 1.0)),
+        )
+        for params in sampling_params
+    )
+    return (str(torch.device(device)), rows)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,3 +157,57 @@ class SamplingBatchParams:
             candidate_top_p_indices=_indices(candidate_top_p_rows),
             penalty_indices=_indices(penalty_rows),
         )
+
+
+class SamplingBatchParamsCache:
+    """Small LRU cache for per-row sampler tensor views."""
+
+    def __init__(self, *, max_entries: int = 64) -> None:
+        if max_entries <= 0:
+            raise ValueError("max_entries must be positive.")
+        self.max_entries = int(max_entries)
+        self._entries: OrderedDict[tuple[object, ...], SamplingBatchParams] = OrderedDict()
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "entries": len(self._entries),
+            "max_entries": self.max_entries,
+            "hits": self._hits,
+            "misses": self._misses,
+            "evictions": self._evictions,
+        }
+
+    def get(
+        self,
+        sampling_params: Sequence[Any | None],
+        *,
+        device: torch.device | str,
+    ) -> SamplingBatchParams:
+        sampling_param_tuple = tuple(sampling_params)
+        cache_key = sampling_params_cache_key(sampling_param_tuple, device=device)
+        cached = self._entries.get(cache_key)
+        if cached is not None:
+            self._hits += 1
+            self._entries.move_to_end(cache_key)
+            return cached
+
+        self._misses += 1
+        params = SamplingBatchParams.from_sampling_params(sampling_param_tuple, device=device)
+        self._entries[cache_key] = params
+        self._entries.move_to_end(cache_key)
+        while len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+            self._evictions += 1
+        return params
