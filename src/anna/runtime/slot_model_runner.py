@@ -7,8 +7,8 @@ import torch
 
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.sampling.params import SamplingBatchParams
-from anna.runtime.paged_kv import PagedKVManager
-from anna.runtime.slot_scheduler import DecodeBatchPlan, SequenceSlot, SlotScheduler
+from anna.runtime.paged_kv import PagedKVManager, SlotCapacityError
+from anna.runtime.slot_scheduler import DecodeBatchPlan, SequenceSlot, SlotScheduler, SlotState
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,13 +26,13 @@ class SlotModelRunnerConfig:
 
 @dataclass(frozen=True, slots=True)
 class SlotKVPageBank:
-    """Optional internal physical KV page storage for slot-owned decode.
+    """Optional internal physical KV page storage for slot-owned KV writes.
 
     The slot metadata manager assigns block ids in ``[0, total_blocks)``. When
     this bank is explicitly allocated, those ids are also valid physical page
-    indices into the tensors below. The bank is not allocated by default because
-    production forward still writes prefill/decode KV through the legacy cache
-    object path.
+    indices into the tensors below. The bank is not allocated by default; even
+    when it is allocated, decode still waits for the production forward path to
+    read the same slot-owned pages safely.
     """
 
     key_pages: torch.Tensor
@@ -220,6 +220,129 @@ class SlotDecodeModelInputs:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SlotPrefillModelInputs:
+    """Tensor view for a future slot-owned prefill chunk forward.
+
+    ``seq_lens`` and ``positions`` describe the slot lengths before this
+    chunk is written. With ``physical_block_tables=True``, Qwen attention can
+    write the chunk's K/V into the internal page bank as a side effect. The
+    legacy cache object is still required for the current output/continuation
+    path until decode is moved onto the same slot-owned pages.
+    """
+
+    request_ids: tuple[str, ...]
+    input_ids: torch.Tensor
+    slot_ids: torch.Tensor
+    epochs: torch.Tensor
+    positions: torch.Tensor
+    positions_are_global: bool
+    seq_lens: torch.Tensor
+    seq_lens_are_global: bool
+    block_tables: torch.Tensor
+    block_tables_are_global: bool
+    physical_block_tables: bool
+    physical_key_pages: torch.Tensor | None = None
+    physical_value_pages: torch.Tensor | None = None
+
+    @property
+    def prefill_token_count(self) -> int:
+        if self.input_ids.ndim <= 1:
+            return 1
+        return int(self.input_ids.shape[1])
+
+    @property
+    def batch_size(self) -> int:
+        if self.input_ids.ndim == 0:
+            return 1
+        return int(self.input_ids.shape[0])
+
+    @property
+    def contains_cache_objects(self) -> bool:
+        return False
+
+    @property
+    def block_table_ownership(self) -> str:
+        return "physical" if self.physical_block_tables else "logical_slot_metadata"
+
+    @property
+    def owns_physical_kv_pages(self) -> bool:
+        return self.physical_key_pages is not None and self.physical_value_pages is not None
+
+    @property
+    def physical_kv_layer_count(self) -> int:
+        if self.physical_key_pages is None:
+            return 0
+        return int(self.physical_key_pages.shape[0])
+
+    def physical_pages_for_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.physical_key_pages is None or self.physical_value_pages is None:
+            raise RuntimeError("Slot prefill inputs do not own physical KV pages.")
+        if layer_idx < 0 or layer_idx >= int(self.physical_key_pages.shape[0]):
+            raise IndexError(f"layer_idx must be in range [0, {int(self.physical_key_pages.shape[0])}).")
+        return self.physical_key_pages[layer_idx], self.physical_value_pages[layer_idx]
+
+    def _select_batch_rows(self, tensor: torch.Tensor, *, is_global: bool) -> torch.Tensor:
+        if not is_global:
+            return tensor
+        index = self.slot_ids.to(device=tensor.device, dtype=torch.long)
+        return tensor.index_select(0, index)
+
+    @property
+    def batch_positions(self) -> torch.Tensor:
+        return self._select_batch_rows(self.positions, is_global=self.positions_are_global)
+
+    @property
+    def batch_position_ids(self) -> torch.Tensor:
+        base = self.batch_positions.to(dtype=torch.long).view(self.batch_size, 1)
+        return base + torch.arange(
+            self.prefill_token_count,
+            dtype=torch.long,
+            device=base.device,
+        ).view(1, -1)
+
+    @property
+    def batch_seq_lens(self) -> torch.Tensor:
+        return self._select_batch_rows(self.seq_lens, is_global=self.seq_lens_are_global)
+
+    @property
+    def batch_block_tables(self) -> torch.Tensor:
+        return self._select_batch_rows(self.block_tables, is_global=self.block_tables_are_global)
+
+    @property
+    def visible_seq_lens(self) -> torch.Tensor:
+        return self.batch_visible_seq_lens
+
+    @property
+    def batch_visible_seq_lens(self) -> torch.Tensor:
+        return self.batch_seq_lens + self.prefill_token_count
+
+    def boundary_summary(self) -> dict[str, object]:
+        return {
+            "batch_size": self.batch_size,
+            "prefill_token_count": self.prefill_token_count,
+            "contains_cache_objects": self.contains_cache_objects,
+            "input_ids_device": str(self.input_ids.device),
+            "slot_ids_device": str(self.slot_ids.device),
+            "positions_are_global": bool(self.positions_are_global),
+            "seq_lens_are_global": bool(self.seq_lens_are_global),
+            "block_tables_are_global": bool(self.block_tables_are_global),
+            "physical_block_tables": bool(self.physical_block_tables),
+            "block_table_ownership": self.block_table_ownership,
+            "block_tables_shape": tuple(int(dim) for dim in self.block_tables.shape),
+            "seq_lens_shape": tuple(int(dim) for dim in self.seq_lens.shape),
+            "positions_shape": tuple(int(dim) for dim in self.positions.shape),
+            "owns_physical_kv_pages": self.owns_physical_kv_pages,
+            "physical_kv_layer_count": self.physical_kv_layer_count,
+            "physical_key_pages_shape": None
+            if self.physical_key_pages is None
+            else tuple(int(dim) for dim in self.physical_key_pages.shape),
+            "physical_value_pages_shape": None
+            if self.physical_value_pages is None
+            else tuple(int(dim) for dim in self.physical_value_pages.shape),
+        }
+
+
 def resolve_slot_model_runner_config(
     text_config: Qwen3_5TextConfig,
     *,
@@ -345,6 +468,93 @@ class SlotModelRunner:
             next_input_host_ids=next_input_host_ids,
         )
 
+    def build_prefill_inputs(
+        self,
+        *,
+        request_ids: Sequence[str],
+        input_ids: torch.Tensor,
+        physical_block_tables: bool = False,
+    ) -> SlotPrefillModelInputs:
+        request_id_tuple = tuple(str(request_id) for request_id in request_ids)
+        if not request_id_tuple:
+            raise ValueError("request_ids must contain at least one request.")
+        if len(set(request_id_tuple)) != len(request_id_tuple):
+            raise ValueError("request_ids must be unique within a prefill batch.")
+        if len(request_id_tuple) > self.config.max_batch_size:
+            raise ValueError(
+                f"Requested prefill batch size {len(request_id_tuple)} exceeds max_batch_size={self.config.max_batch_size}."
+            )
+        if physical_block_tables and self.kv_page_bank is None:
+            raise RuntimeError(
+                "physical_block_tables=True requires SlotModelRunner.allocate_physical_kv_page_bank() first."
+            )
+
+        chunk_input_ids = input_ids.detach()
+        if chunk_input_ids.ndim == 1:
+            if len(request_id_tuple) != 1:
+                raise ValueError("1D prefill input_ids can only be used for a single request.")
+            chunk_input_ids = chunk_input_ids.view(1, -1)
+        if chunk_input_ids.ndim != 2:
+            raise ValueError("prefill input_ids must be shaped [batch, chunk_tokens].")
+        if int(chunk_input_ids.shape[0]) != len(request_id_tuple):
+            raise ValueError("prefill input_ids must contain one row per request id.")
+        chunk_tokens = int(chunk_input_ids.shape[1])
+        if chunk_tokens <= 0:
+            raise ValueError("prefill input_ids must contain at least one token per row.")
+        if chunk_input_ids.device != self.config.device:
+            chunk_input_ids = chunk_input_ids.to(device=self.config.device)
+        if chunk_input_ids.dtype != torch.long:
+            chunk_input_ids = chunk_input_ids.to(dtype=torch.long)
+
+        slots = tuple(self.scheduler.get(request_id) for request_id in request_id_tuple)
+        target_prefilled_by_slot: list[tuple[SequenceSlot, int]] = []
+        additional_blocks_needed = 0
+        for slot in slots:
+            if slot.status is not SlotState.WAITING_PREFILL:
+                raise ValueError(f"Request {slot.request_id!r} is not waiting for prefill.")
+            target_prefilled = slot.prefilled_tokens + chunk_tokens
+            if target_prefilled > slot.prompt_length:
+                raise ValueError(
+                    f"Request {slot.request_id!r} prefill chunk would reach {target_prefilled} tokens, "
+                    f"but prompt_length={slot.prompt_length}."
+                )
+            required_blocks = self.kv_manager.required_blocks_for_tokens(target_prefilled)
+            if required_blocks > self.kv_manager.max_blocks_per_seq:
+                raise SlotCapacityError(
+                    f"Request {slot.request_id!r} needs {required_blocks} KV blocks, "
+                    f"but max_blocks_per_seq={self.kv_manager.max_blocks_per_seq}."
+                )
+            current_blocks = len(self.kv_manager.slot_blocks(slot.slot_id, slot.epoch))
+            additional_blocks_needed += max(0, required_blocks - current_blocks)
+            target_prefilled_by_slot.append((slot, target_prefilled))
+        if additional_blocks_needed > self.kv_manager.free_block_count:
+            raise ValueError(
+                f"Prefill chunk needs {additional_blocks_needed} additional KV blocks, "
+                f"but only {self.kv_manager.free_block_count} are free."
+            )
+
+        for slot, target_prefilled in target_prefilled_by_slot:
+            self.kv_manager.ensure_token_capacity(slot.slot_id, slot.epoch, target_prefilled)
+
+        slot_ids = torch.tensor([slot.slot_id for slot in slots], dtype=torch.int32, device=self.config.device)
+        epochs = torch.tensor([slot.epoch for slot in slots], dtype=torch.int64, device=self.config.device)
+        bank = self.kv_page_bank if physical_block_tables else None
+        return SlotPrefillModelInputs(
+            request_ids=request_id_tuple,
+            input_ids=chunk_input_ids,
+            slot_ids=slot_ids,
+            epochs=epochs,
+            positions=self.kv_manager.seq_lens,
+            positions_are_global=True,
+            seq_lens=self.kv_manager.seq_lens,
+            seq_lens_are_global=True,
+            block_tables=self.kv_manager.block_tables,
+            block_tables_are_global=True,
+            physical_block_tables=bool(physical_block_tables),
+            physical_key_pages=None if bank is None else bank.key_pages,
+            physical_value_pages=None if bank is None else bank.value_pages,
+        )
+
     def build_decode_inputs(
         self,
         *,
@@ -438,6 +648,7 @@ class SlotModelRunner:
         return self.scheduler.cancel(request_id)
 
     def health(self) -> dict[str, object]:
+        prefill_physical_ready = self.kv_page_bank is not None
         return {
             "enabled": True,
             "metadata_only": True,
@@ -465,6 +676,22 @@ class SlotModelRunner:
                 "slot_epochs_shape": tuple(int(dim) for dim in self.kv_manager.slot_epochs.shape),
                 "block_refcounts_shape": tuple(int(dim) for dim in self.kv_manager.block_refcounts.shape),
             },
+            "prefill_plan": {
+                "contains_cache_objects": False,
+                "input_ids": True,
+                "slot_ids": True,
+                "epochs": True,
+                "block_tables_are_global": True,
+                "seq_lens_are_global": True,
+                "positions_are_global": True,
+                "physical_block_tables": prefill_physical_ready,
+                "physical_block_tables_available": self.kv_page_bank is not None,
+                "block_table_ownership": "physical" if prefill_physical_ready else "logical_slot_metadata",
+                "owns_physical_kv_pages": self.kv_page_bank is not None,
+                "chunk_input_contract": True,
+                "commits_seq_lens": False,
+                "production_forward_integrated": prefill_physical_ready,
+            },
             "decode_plan": {
                 "contains_cache_objects": False,
                 "input_ids": True,
@@ -484,8 +711,14 @@ class SlotModelRunner:
                 "physical_decode_page_write_helper": True,
                 "physical_prefill_page_write_helper": True,
                 "external_physical_block_tables_supported": True,
-                "internal_block_tables_are_physical": False,
-                "prefill_slot_owned_writes": False,
+                "internal_block_tables_are_physical": prefill_physical_ready,
+                "internal_physical_decode_ready": False,
+                "internal_physical_decode_reason": (
+                    "slot_owned_decode_forward_not_integrated"
+                    if self.kv_page_bank is not None
+                    else "physical_kv_page_bank_not_allocated"
+                ),
+                "prefill_slot_owned_writes": prefill_physical_ready,
                 "decode_slot_owned_writes": False,
                 "legacy_cache_object_required_for_forward": True,
                 "tensor_bank_ready": self.kv_page_bank is not None,

@@ -217,6 +217,135 @@ def test_slot_model_runner_advances_decode_batch_from_sampler_tensor() -> None:
     assert next_inputs.visible_seq_lens.tolist() == [5]
 
 
+def test_slot_model_runner_builds_physical_prefill_inputs_without_advancing_seq_len() -> None:
+    text_config = _text_config()
+    runner = SlotModelRunner.from_text_config(
+        text_config,
+        device="cpu",
+        max_slots=2,
+        total_blocks=8,
+        max_blocks_per_seq=4,
+        max_batch_size=2,
+    )
+    slot_a = runner.admit_prefill("req-a", prompt_length=6, max_new_tokens=2)
+    slot_b = runner.admit_prefill("req-b", prompt_length=5, max_new_tokens=2)
+    runner.advance_prefill("req-a", token_count=3)
+    runner.advance_prefill("req-b", token_count=2)
+    chunk_ids = torch.tensor([[31, 32, 33], [41, 42, 43]], dtype=torch.long)
+
+    with pytest.raises(RuntimeError, match="allocate_physical_kv_page_bank"):
+        runner.build_prefill_inputs(
+            request_ids=["req-a", "req-b"],
+            input_ids=chunk_ids,
+            physical_block_tables=True,
+        )
+
+    bank = runner.allocate_physical_kv_page_bank(dtype=torch.float32, num_layers=2)
+    prefill_inputs = runner.build_prefill_inputs(
+        request_ids=["req-a", "req-b"],
+        input_ids=chunk_ids,
+        physical_block_tables=True,
+    )
+
+    assert prefill_inputs.request_ids == ("req-a", "req-b")
+    assert prefill_inputs.input_ids.tolist() == [[31, 32, 33], [41, 42, 43]]
+    assert prefill_inputs.slot_ids.tolist() == [slot_a.slot_id, slot_b.slot_id]
+    assert prefill_inputs.epochs.tolist() == [slot_a.epoch, slot_b.epoch]
+    assert prefill_inputs.prefill_token_count == 3
+    assert prefill_inputs.contains_cache_objects is False
+    assert prefill_inputs.positions_are_global is True
+    assert prefill_inputs.seq_lens_are_global is True
+    assert prefill_inputs.block_tables_are_global is True
+    assert prefill_inputs.positions.data_ptr() == runner.kv_manager.seq_lens.data_ptr()
+    assert prefill_inputs.seq_lens.data_ptr() == runner.kv_manager.seq_lens.data_ptr()
+    assert prefill_inputs.batch_positions.tolist() == [3, 2]
+    assert prefill_inputs.batch_seq_lens.tolist() == [3, 2]
+    assert prefill_inputs.batch_visible_seq_lens.tolist() == [6, 5]
+    assert prefill_inputs.batch_position_ids.tolist() == [[3, 4, 5], [2, 3, 4]]
+    assert prefill_inputs.physical_block_tables is True
+    assert prefill_inputs.block_table_ownership == "physical"
+    assert prefill_inputs.owns_physical_kv_pages is True
+    assert prefill_inputs.physical_kv_layer_count == 2
+    assert prefill_inputs.boundary_summary()["physical_key_pages_shape"] == bank.health()["key_pages_shape"]
+
+    key_pages, value_pages = prefill_inputs.physical_pages_for_layer(0)
+    key_states = torch.tensor(
+        [
+            [
+                [
+                    [101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0],
+                    [111.0, 112.0, 113.0, 114.0, 115.0, 116.0, 117.0, 118.0],
+                    [121.0, 122.0, 123.0, 124.0, 125.0, 126.0, 127.0, 128.0],
+                ]
+            ],
+            [
+                [
+                    [201.0, 202.0, 203.0, 204.0, 205.0, 206.0, 207.0, 208.0],
+                    [211.0, 212.0, 213.0, 214.0, 215.0, 216.0, 217.0, 218.0],
+                    [221.0, 222.0, 223.0, 224.0, 225.0, 226.0, 227.0, 228.0],
+                ]
+            ],
+        ]
+    )
+    value_states = key_states + 1000.0
+
+    visible = model_ops.write_slot_prefill_kv_to_pages(
+        key_states,
+        value_states,
+        key_pages,
+        value_pages,
+        prefill_inputs.block_tables,
+        prefill_inputs.seq_lens,
+        slot_ids=prefill_inputs.slot_ids,
+        block_tables_are_global=prefill_inputs.block_tables_are_global,
+        seq_lens_are_global=prefill_inputs.seq_lens_are_global,
+    )
+
+    assert torch.equal(visible, torch.tensor([6, 5], dtype=torch.long))
+    slot_a_blocks = prefill_inputs.batch_block_tables[0]
+    slot_b_blocks = prefill_inputs.batch_block_tables[1]
+    assert torch.equal(key_pages[slot_a_blocks[0], :, 3, :], key_states[0, :, 0, :])
+    assert torch.equal(value_pages[slot_a_blocks[0], :, 3, :], value_states[0, :, 0, :])
+    assert torch.equal(key_pages[slot_a_blocks[1], :, 0, :], key_states[0, :, 1, :])
+    assert torch.equal(value_pages[slot_a_blocks[1], :, 0, :], value_states[0, :, 1, :])
+    assert torch.equal(key_pages[slot_a_blocks[1], :, 1, :], key_states[0, :, 2, :])
+    assert torch.equal(value_pages[slot_a_blocks[1], :, 1, :], value_states[0, :, 2, :])
+    assert torch.equal(key_pages[slot_b_blocks[0], :, 2, :], key_states[1, :, 0, :])
+    assert torch.equal(value_pages[slot_b_blocks[0], :, 2, :], value_states[1, :, 0, :])
+    assert torch.equal(key_pages[slot_b_blocks[0], :, 3, :], key_states[1, :, 1, :])
+    assert torch.equal(value_pages[slot_b_blocks[0], :, 3, :], value_states[1, :, 1, :])
+    assert torch.equal(key_pages[slot_b_blocks[1], :, 0, :], key_states[1, :, 2, :])
+    assert torch.equal(value_pages[slot_b_blocks[1], :, 0, :], value_states[1, :, 2, :])
+
+    assert runner.kv_manager.seq_lens.tolist() == [3, 2]
+    runner.advance_prefill("req-a", token_count=3)
+    runner.advance_prefill("req-b", token_count=3)
+    assert runner.kv_manager.seq_lens.tolist() == [6, 5]
+
+
+def test_slot_model_runner_prefill_input_validation_does_not_partially_reserve_blocks() -> None:
+    runner = SlotModelRunner.from_text_config(
+        _text_config(),
+        device="cpu",
+        max_slots=2,
+        total_blocks=8,
+        max_blocks_per_seq=4,
+        max_batch_size=2,
+    )
+    runner.admit_prefill("req-a", prompt_length=4, max_new_tokens=2)
+    runner.admit_prefill("req-b", prompt_length=2, max_new_tokens=2)
+
+    with pytest.raises(ValueError, match="req-b.*prefill chunk would reach 4 tokens"):
+        runner.build_prefill_inputs(
+            request_ids=["req-a", "req-b"],
+            input_ids=torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24]], dtype=torch.long),
+        )
+
+    assert runner.kv_manager.free_block_count == 8
+    assert runner.kv_manager.seq_lens.tolist() == [0, 0]
+    assert runner.kv_manager.block_tables.tolist() == [[-1, -1, -1, -1], [-1, -1, -1, -1]]
+
+
 def test_slot_model_runner_can_emit_explicit_internal_physical_kv_page_bank() -> None:
     text_config = _text_config()
     runner = SlotModelRunner.from_text_config(
@@ -403,6 +532,22 @@ def test_qwen_engine_can_enable_experimental_slot_runner_metadata_path() -> None
         "slot_epochs_shape": (2,),
         "block_refcounts_shape": (8,),
     }
+    assert health["prefill_plan"] == {
+        "contains_cache_objects": False,
+        "input_ids": True,
+        "slot_ids": True,
+        "epochs": True,
+        "block_tables_are_global": True,
+        "seq_lens_are_global": True,
+        "positions_are_global": True,
+        "physical_block_tables": False,
+        "physical_block_tables_available": False,
+        "block_table_ownership": "logical_slot_metadata",
+        "owns_physical_kv_pages": False,
+        "chunk_input_contract": True,
+        "commits_seq_lens": False,
+        "production_forward_integrated": False,
+    }
     assert health["decode_plan"] == {
         "contains_cache_objects": False,
         "input_ids": True,
@@ -423,6 +568,8 @@ def test_qwen_engine_can_enable_experimental_slot_runner_metadata_path() -> None
         "physical_prefill_page_write_helper": True,
         "external_physical_block_tables_supported": True,
         "internal_block_tables_are_physical": False,
+        "internal_physical_decode_ready": False,
+        "internal_physical_decode_reason": "physical_kv_page_bank_not_allocated",
         "prefill_slot_owned_writes": False,
         "decode_slot_owned_writes": False,
         "legacy_cache_object_required_for_forward": True,
@@ -469,12 +616,21 @@ def test_qwen_engine_can_preallocate_experimental_slot_runner_physical_kv_page_b
     assert engine.slot_model_runner is not None
     health = engine.health()["runtime_optimizations"]["slot_runner"]
     assert health["slot_owned_kv_writes"] is False
+    assert health["prefill_plan"]["physical_block_tables"] is True
+    assert health["prefill_plan"]["physical_block_tables_available"] is True
+    assert health["prefill_plan"]["block_table_ownership"] == "physical"
+    assert health["prefill_plan"]["owns_physical_kv_pages"] is True
+    assert health["prefill_plan"]["chunk_input_contract"] is True
+    assert health["prefill_plan"]["commits_seq_lens"] is False
+    assert health["prefill_plan"]["production_forward_integrated"] is True
     assert health["decode_plan"]["physical_block_tables"] is False
     assert health["decode_plan"]["physical_block_tables_available"] is True
     assert health["decode_plan"]["block_table_ownership"] == "logical_slot_metadata"
     assert health["decode_plan"]["owns_physical_kv_pages"] is True
-    assert health["kv_write_path"]["internal_block_tables_are_physical"] is False
-    assert health["kv_write_path"]["prefill_slot_owned_writes"] is False
+    assert health["kv_write_path"]["internal_block_tables_are_physical"] is True
+    assert health["kv_write_path"]["internal_physical_decode_ready"] is False
+    assert health["kv_write_path"]["internal_physical_decode_reason"] == "slot_owned_decode_forward_not_integrated"
+    assert health["kv_write_path"]["prefill_slot_owned_writes"] is True
     assert health["kv_write_path"]["decode_slot_owned_writes"] is False
     assert health["kv_write_path"]["legacy_cache_object_required_for_forward"] is True
     assert health["kv_write_path"]["tensor_bank_ready"] is True

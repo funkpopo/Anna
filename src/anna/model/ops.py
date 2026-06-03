@@ -2191,6 +2191,43 @@ def _resolve_slot_decode_physical_pages(
     return _require_slot_decode_physical_pages(past_key_values, layer_idx)
 
 
+def _slot_prefill_input_physical_pages(
+    slot_prefill_inputs: object,
+    layer_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    pages_for_layer = getattr(slot_prefill_inputs, "physical_pages_for_layer", None)
+    if callable(pages_for_layer):
+        key_pages, value_pages = pages_for_layer(layer_idx)
+        if not torch.is_tensor(key_pages) or not torch.is_tensor(value_pages):
+            raise RuntimeError("slot_prefill_inputs.physical_pages_for_layer() must return tensor KV pages.")
+        return key_pages, value_pages
+
+    key_pages = getattr(slot_prefill_inputs, "physical_key_pages", None)
+    value_pages = getattr(slot_prefill_inputs, "physical_value_pages", None)
+    if key_pages is None and value_pages is None:
+        return None
+    if not torch.is_tensor(key_pages) or not torch.is_tensor(value_pages):
+        raise RuntimeError("slot_prefill_inputs physical KV pages must be tensors.")
+    if key_pages.ndim == 5 and value_pages.ndim == 5:
+        if layer_idx < 0 or layer_idx >= int(key_pages.shape[0]):
+            raise IndexError(f"slot_prefill_inputs physical KV layer index is out of range: {layer_idx}")
+        return key_pages[layer_idx], value_pages[layer_idx]
+    return key_pages, value_pages
+
+
+def _resolve_slot_prefill_physical_pages(
+    slot_prefill_inputs: object,
+    layer_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    slot_pages = _slot_prefill_input_physical_pages(slot_prefill_inputs, layer_idx)
+    if slot_pages is not None:
+        return slot_pages
+    record_attention_fallback("qwen3_slot_paged_prefill_pages_missing")
+    raise RuntimeError(
+        "slot_prefill_inputs.physical_block_tables=True requires physical KV pages from slot_prefill_inputs."
+    )
+
+
 def write_slot_decode_kv_to_pages(
     key_states: torch.Tensor,
     value_states: torch.Tensor,
@@ -2567,6 +2604,7 @@ class Qwen3Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values: Qwen3DynamicCache | None = None,
         slot_decode_inputs: object | None = None,
+        slot_prefill_inputs: object | None = None,
     ) -> torch.Tensor:
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
         if self.profile_runtime:
@@ -2577,6 +2615,7 @@ class Qwen3Attention(nn.Module):
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
                     slot_decode_inputs=slot_decode_inputs,
+                    slot_prefill_inputs=slot_prefill_inputs,
                 )
         return self._forward_attention(
             hidden_states,
@@ -2584,6 +2623,7 @@ class Qwen3Attention(nn.Module):
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             slot_decode_inputs=slot_decode_inputs,
+            slot_prefill_inputs=slot_prefill_inputs,
         )
 
     def _forward_attention(
@@ -2594,6 +2634,7 @@ class Qwen3Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values: Qwen3DynamicCache | None = None,
         slot_decode_inputs: object | None = None,
+        slot_prefill_inputs: object | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         input_shape = hidden_states.shape[:-1]
@@ -2629,12 +2670,18 @@ class Qwen3Attention(nn.Module):
         past_lengths = torch.zeros(batch_size, device=hidden_states.device, dtype=torch.long)
         use_turboquant_cache = past_key_values is not None and past_key_values.uses_turboquant_for_layer(self.layer_idx)
         slot_tables_are_physical = bool(getattr(slot_decode_inputs, "physical_block_tables", False))
+        slot_prefill_tables_are_physical = bool(getattr(slot_prefill_inputs, "physical_block_tables", False))
         use_slot_physical_decode = (
             hidden_states.device.type == "xpu"
             and seq_len == 1
             and attention_mask is None
             and slot_tables_are_physical
             and slot_decode_inputs is not None
+            and not use_turboquant_cache
+        )
+        use_slot_physical_prefill_write = (
+            slot_prefill_inputs is not None
+            and slot_prefill_tables_are_physical
             and not use_turboquant_cache
         )
         prefer_paged_decode = (
@@ -2647,6 +2694,28 @@ class Qwen3Attention(nn.Module):
         slot_physical_key_pages: torch.Tensor | None = None
         slot_physical_value_pages: torch.Tensor | None = None
         slot_physical_visible_seq_lens: torch.Tensor | None = None
+        if use_slot_physical_prefill_write and slot_prefill_inputs is not None:
+            slot_prefill_block_tables = getattr(slot_prefill_inputs, "block_tables", None)
+            slot_prefill_seq_lens = getattr(slot_prefill_inputs, "seq_lens", None)
+            if not torch.is_tensor(slot_prefill_block_tables) or not torch.is_tensor(slot_prefill_seq_lens):
+                raise RuntimeError("slot_prefill_inputs must provide tensor block_tables and seq_lens.")
+            slot_prefill_key_pages, slot_prefill_value_pages = _resolve_slot_prefill_physical_pages(
+                slot_prefill_inputs,
+                self.layer_idx,
+            )
+            slot_prefill_ids = getattr(slot_prefill_inputs, "slot_ids", None)
+            write_slot_prefill_kv_to_pages(
+                key_states,
+                value_states,
+                slot_prefill_key_pages,
+                slot_prefill_value_pages,
+                slot_prefill_block_tables,
+                slot_prefill_seq_lens,
+                slot_ids=slot_prefill_ids if torch.is_tensor(slot_prefill_ids) else None,
+                block_tables_are_global=bool(getattr(slot_prefill_inputs, "block_tables_are_global", False)),
+                seq_lens_are_global=bool(getattr(slot_prefill_inputs, "seq_lens_are_global", False)),
+            )
+
         if past_key_values is not None or use_slot_physical_decode:
             if use_slot_physical_decode and slot_decode_inputs is not None:
                 slot_block_tables = getattr(slot_decode_inputs, "block_tables", None)
@@ -4633,6 +4702,7 @@ class Qwen3DecoderLayer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values: Qwen3DynamicCache | None = None,
         slot_decode_inputs: object | None = None,
+        slot_prefill_inputs: object | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -4645,6 +4715,7 @@ class Qwen3DecoderLayer(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 slot_decode_inputs=slot_decode_inputs,
+                slot_prefill_inputs=slot_prefill_inputs,
             )
         hidden_states = residual + hidden_states
         residual = hidden_states

@@ -42,14 +42,27 @@ def test_runtime_hotpath_bench_includes_slot_decode_plan() -> None:
     assert result["decode_boundary_block_table_ownership"] == "logical_slot_metadata"
     assert result["decode_boundary_owns_physical_kv_pages"] is False
     assert result["decode_boundary_physical_kv_layer_count"] == 0
+    assert result["prefill_boundary_physical_block_tables"] is True
+    assert result["prefill_boundary_block_table_ownership"] == "physical"
+    assert result["prefill_boundary_owns_physical_kv_pages"] is True
+    assert result["prefill_boundary_physical_kv_layer_count"] == 1
     assert result["slot_owned_output_token_buffer"] is True
     assert result["slot_owned_kv_write_helper"] is True
-    assert result["slot_owned_kv_page_bank_available"] is False
+    assert result["slot_owned_decode_kv_write_helper"] is True
+    assert result["slot_owned_prefill_kv_write_helper"] is True
+    assert result["slot_owned_kv_page_bank_available"] is True
+    assert result["slot_owned_prefill_writes"] is True
+    assert result["slot_owned_decode_writes"] is False
     assert result["slot_owned_kv_writes"] is False
     assert result["legacy_cache_object_required_for_forward"] is True
     assert result["slot_kv_visible_seq_lens_shape"] == (2,)
+    assert result["slot_decode_kv_visible_seq_lens_shape"] == (2,)
+    assert result["slot_prefill_kv_visible_seq_lens_shape"] == (2,)
+    assert result["slot_prefill_chunk_tokens"] == 5
     assert result["plan_ms"] >= 0.0
     assert result["slot_kv_write_ms"] >= 0.0
+    assert result["slot_decode_kv_write_ms"] >= 0.0
+    assert result["slot_prefill_kv_write_ms"] >= 0.0
 
 
 def test_runtime_hotpath_bench_summarizes_scheduler_kv_overhead() -> None:
@@ -75,11 +88,22 @@ def test_runtime_hotpath_bench_summarizes_scheduler_kv_overhead() -> None:
             "decode_boundary_block_table_ownership": "logical_slot_metadata",
             "decode_boundary_owns_physical_kv_pages": False,
             "decode_boundary_physical_kv_layer_count": 0,
+            "prefill_boundary_physical_block_tables": True,
+            "prefill_boundary_block_table_ownership": "physical",
+            "prefill_boundary_owns_physical_kv_pages": True,
+            "prefill_boundary_physical_kv_layer_count": 1,
             "slot_owned_output_token_buffer": True,
             "slot_owned_kv_write_helper": True,
-            "slot_owned_kv_page_bank_available": False,
+            "slot_owned_decode_kv_write_helper": True,
+            "slot_owned_prefill_kv_write_helper": True,
+            "slot_owned_kv_page_bank_available": True,
+            "slot_owned_prefill_writes": True,
+            "slot_owned_decode_writes": False,
             "slot_owned_kv_writes": False,
             "legacy_cache_object_required_for_forward": True,
+            "slot_kv_write_ms": 0.75,
+            "slot_decode_kv_write_ms": 0.75,
+            "slot_prefill_kv_write_ms": 1.5,
         },
     )
 
@@ -106,15 +130,26 @@ def test_runtime_hotpath_bench_summarizes_scheduler_kv_overhead() -> None:
     assert result["slot_decode_boundary_block_table_ownership"] == "logical_slot_metadata"
     assert result["slot_decode_boundary_owns_physical_kv_pages"] is False
     assert result["slot_decode_boundary_physical_kv_layer_count"] == 0
+    assert result["slot_prefill_boundary_physical_block_tables"] is True
+    assert result["slot_prefill_boundary_block_table_ownership"] == "physical"
+    assert result["slot_prefill_boundary_owns_physical_kv_pages"] is True
+    assert result["slot_prefill_boundary_physical_kv_layer_count"] == 1
     assert result["slot_owned_output_token_buffer"] is True
     assert result["slot_owned_kv_write_helper"] is True
-    assert result["slot_owned_kv_page_bank_available"] is False
+    assert result["slot_owned_decode_kv_write_helper"] is True
+    assert result["slot_owned_prefill_kv_write_helper"] is True
+    assert result["slot_owned_kv_page_bank_available"] is True
+    assert result["slot_owned_prefill_writes"] is True
+    assert result["slot_owned_decode_writes"] is False
     assert result["slot_owned_kv_writes"] is False
     assert result["legacy_cache_object_required_for_forward"] is True
     assert result["stack_ms"] == 2.0
     assert result["split_ms"] == 3.0
     assert result["stack_split_ms"] == 5.0
     assert result["slot_plan_ms"] == 1.25
+    assert result["slot_kv_write_ms"] == 0.75
+    assert result["slot_decode_kv_write_ms"] == 0.75
+    assert result["slot_prefill_kv_write_ms"] == 1.5
     assert result["stack_split_to_slot_plan_ratio"] == 4.0
 
 

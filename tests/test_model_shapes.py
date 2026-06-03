@@ -27,6 +27,7 @@ from anna.model.ops import (
 from anna.model.qwen3_5_text_model import Qwen3_5TextForCausalLM
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine
 from anna.runtime.service_metrics import AnnaServiceMetrics
+from anna.runtime.slot_model_runner import SlotModelRunner
 
 
 @contextmanager
@@ -163,6 +164,88 @@ def test_qwen3_forward_shapes() -> None:
     assert outputs.logits.shape == (1, 6, 256)
     assert outputs.past_key_values is not None
     assert outputs.past_key_values.get_seq_length() == 6
+
+
+def test_qwen3_forwards_slot_prefill_inputs_to_attention_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen_prefill_inputs: list[object | None] = []
+    original_forward = Qwen3Attention.forward
+
+    def _record_attention_forward(self, *args, **kwargs):
+        seen_prefill_inputs.append(kwargs.get("slot_prefill_inputs"))
+        return original_forward(self, *args, **kwargs)
+
+    monkeypatch.setattr(Qwen3Attention, "forward", _record_attention_forward)
+    slot_prefill_inputs = object()
+    with _temporary_torch_seed(0), torch.no_grad():
+        model = Qwen3_5TextForCausalLM(_tiny_config()).eval()
+        input_ids = torch.randint(0, 256, (1, 4))
+        outputs = model(
+            input_ids=input_ids,
+            use_cache=True,
+            slot_prefill_inputs=slot_prefill_inputs,
+        )
+
+    assert outputs.logits.shape == (1, 4, 256)
+    assert outputs.past_key_values is not None
+    assert seen_prefill_inputs == [slot_prefill_inputs, slot_prefill_inputs]
+
+
+def test_qwen3_slot_prefill_inputs_write_physical_pages_from_attention() -> None:
+    config = Qwen3_5TextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        max_position_embeddings=16,
+        cache_block_size=2,
+        layer_types=["full_attention"],
+    )
+    runner = SlotModelRunner.from_text_config(
+        config,
+        device="cpu",
+        max_slots=1,
+        total_blocks=4,
+        max_blocks_per_seq=4,
+        max_batch_size=1,
+    )
+    runner.allocate_physical_kv_page_bank(dtype=torch.float32, num_layers=1)
+    runner.admit_prefill("req", prompt_length=3, max_new_tokens=1)
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    slot_prefill_inputs = runner.build_prefill_inputs(
+        request_ids=["req"],
+        input_ids=input_ids,
+        physical_block_tables=True,
+    )
+
+    with _temporary_torch_seed(0), torch.no_grad():
+        model = Qwen3_5TextForCausalLM(config).eval()
+        outputs = model(
+            input_ids=input_ids,
+            use_cache=True,
+            slot_prefill_inputs=slot_prefill_inputs,
+        )
+
+    assert outputs.past_key_values is not None
+    legacy_key, legacy_value, legacy_lengths = outputs.past_key_values._gather_layer_cache(0)
+    assert legacy_key is not None
+    assert legacy_value is not None
+    assert torch.equal(legacy_lengths, torch.tensor([3], dtype=torch.long))
+
+    key_pages, value_pages = slot_prefill_inputs.physical_pages_for_layer(0)
+    block_table = slot_prefill_inputs.batch_block_tables[0]
+    first_block = int(block_table[0])
+    second_block = int(block_table[1])
+    assert torch.allclose(key_pages[first_block, :, :2, :], legacy_key[0, :, :2, :])
+    assert torch.allclose(value_pages[first_block, :, :2, :], legacy_value[0, :, :2, :])
+    assert torch.allclose(key_pages[second_block, :, :1, :], legacy_key[0, :, 2:3, :])
+    assert torch.allclose(value_pages[second_block, :, :1, :], legacy_value[0, :, 2:3, :])
 
 
 def test_qwen_text_model_decode_cache_with_turboquant_stays_numerically_close() -> None:

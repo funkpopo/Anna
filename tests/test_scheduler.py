@@ -4,6 +4,7 @@ import torch
 
 from anna.mm.prepared_inputs import PreparedInputs
 from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig, Qwen3_5TextConfig
+from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator
 from anna.runtime.device import RuntimeSafetyPolicy, TensorMigrationPolicy
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine, EngineOptimizationConfig, GenerationConfig
@@ -14,6 +15,7 @@ from anna.sampling.params import SamplingBatchParams
 class _FakeTokenizer:
     def __init__(self) -> None:
         self._pieces = {
+            0: "",
             1: "A",
             2: "B",
             9: "",
@@ -109,6 +111,9 @@ class _FakeModel:
         self.text_decode_slot_input_request_ids: list[tuple[str, ...]] = []
         self.text_decode_slot_input_batch_positions: list[list[int]] = []
         self.text_decode_slot_input_batch_seq_lens: list[list[int]] = []
+        self.text_decode_slot_input_physical_block_tables: list[bool] = []
+        self.text_decode_slot_input_block_table_ownership: list[str] = []
+        self.text_prefill_slot_inputs_seen: list[object | None] = []
         self.text_prefill_chunk_lengths: list[int] = []
         self.model = _FakePrefillRunner(self)
         self.lm_head = _FakeLMHead(self)
@@ -151,12 +156,14 @@ class _FakeModel:
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
         slot_decode_inputs: object | None = None,
+        slot_prefill_inputs: object | None = None,
     ):
         del attention_mask, use_cache, logits_to_keep
         batch_size = input_ids.shape[0]
         if past_key_values is None or input_ids.shape[1] > 1:
             seq_len = input_ids.shape[1]
             self.text_prefill_batch_sizes.append(batch_size)
+            self.text_prefill_slot_inputs_seen.append(slot_prefill_inputs)
             self.text_prefill_chunk_lengths.append(seq_len)
             logits = torch.full((batch_size, 1, self.config.text_config.vocab_size), -1000.0)
             planned = [1, 2]
@@ -176,6 +183,8 @@ class _FakeModel:
             self.text_decode_slot_input_request_ids.append(tuple(slot_decode_inputs.request_ids))
             self.text_decode_slot_input_batch_positions.append(slot_decode_inputs.batch_positions.tolist())
             self.text_decode_slot_input_batch_seq_lens.append(slot_decode_inputs.batch_seq_lens.tolist())
+            self.text_decode_slot_input_physical_block_tables.append(bool(slot_decode_inputs.physical_block_tables))
+            self.text_decode_slot_input_block_table_ownership.append(str(slot_decode_inputs.block_table_ownership))
         logits = torch.full((batch_size, 1, self.config.text_config.vocab_size), -1000.0)
         logits[:, 0, 9] = 1000.0
         return type(
@@ -197,6 +206,7 @@ class _FakeModel:
         logits_to_keep: int | None = None,
         top_k: int = 1,
         slot_decode_inputs: object | None = None,
+        slot_prefill_inputs: object | None = None,
     ):
         del attention_mask, use_cache, logits_to_keep
         batch_size = input_ids.shape[0]
@@ -205,6 +215,7 @@ class _FakeModel:
         if past_key_values is None or input_ids.shape[1] > 1:
             seq_len = input_ids.shape[1]
             self.text_prefill_topk_batch_sizes.append(batch_size)
+            self.text_prefill_slot_inputs_seen.append(slot_prefill_inputs)
             self.text_prefill_topk_values.append(top_k)
             planned = [1, 2]
             for idx in range(batch_size):
@@ -218,6 +229,8 @@ class _FakeModel:
                 self.text_decode_slot_input_request_ids.append(tuple(slot_decode_inputs.request_ids))
                 self.text_decode_slot_input_batch_positions.append(slot_decode_inputs.batch_positions.tolist())
                 self.text_decode_slot_input_batch_seq_lens.append(slot_decode_inputs.batch_seq_lens.tolist())
+                self.text_decode_slot_input_physical_block_tables.append(bool(slot_decode_inputs.physical_block_tables))
+                self.text_decode_slot_input_block_table_ownership.append(str(slot_decode_inputs.block_table_ownership))
             candidate_logits[:, 0, 0] = 1000.0
             candidate_token_ids[:, 0, 0] = 9
             cache = past_key_values
@@ -556,7 +569,9 @@ def test_scheduler_advances_slot_metadata_for_chunked_prefill() -> None:
 
     assert engine.slot_model_runner is not None
     original_advance_prefill = engine.slot_model_runner.advance_prefill
+    original_build_prefill_inputs = engine.slot_model_runner.build_prefill_inputs
     prefill_updates: list[tuple[str, int, int, int, tuple[int, ...]]] = []
+    prefill_input_snapshots: list[dict[str, object]] = []
 
     def _record_advance_prefill(request_id: str, *, token_count: int):
         slot = original_advance_prefill(request_id, token_count=token_count)
@@ -565,6 +580,30 @@ def test_scheduler_advances_slot_metadata_for_chunked_prefill() -> None:
         prefill_updates.append((request_id, token_count, slot.prefilled_tokens, slot.seq_len, blocks))
         return slot
 
+    def _record_build_prefill_inputs(*, request_ids, input_ids, physical_block_tables: bool = False):
+        slot_inputs = original_build_prefill_inputs(
+            request_ids=request_ids,
+            input_ids=input_ids,
+            physical_block_tables=physical_block_tables,
+        )
+        prefill_input_snapshots.append(
+            {
+                "request_ids": slot_inputs.request_ids,
+                "input_ids": slot_inputs.input_ids.tolist(),
+                "prefill_token_count": slot_inputs.prefill_token_count,
+                "positions_are_global": slot_inputs.positions_are_global,
+                "seq_lens_are_global": slot_inputs.seq_lens_are_global,
+                "block_tables_are_global": slot_inputs.block_tables_are_global,
+                "batch_positions": slot_inputs.batch_positions.tolist(),
+                "batch_seq_lens": slot_inputs.batch_seq_lens.tolist(),
+                "batch_visible_seq_lens": slot_inputs.batch_visible_seq_lens.tolist(),
+                "physical_block_tables": slot_inputs.physical_block_tables,
+                "contains_cache_objects": slot_inputs.contains_cache_objects,
+            }
+        )
+        return slot_inputs
+
+    engine.slot_model_runner.build_prefill_inputs = _record_build_prefill_inputs
     engine.slot_model_runner.advance_prefill = _record_advance_prefill
 
     try:
@@ -592,6 +631,206 @@ def test_scheduler_advances_slot_metadata_for_chunked_prefill() -> None:
         ]
         assert [len(blocks) for *_, blocks in prefill_updates] == [1, 1, 2, 2]
         assert fake_model.text_prefill_chunk_lengths == [2, 2]
+
+        slot_prefill_inputs = scheduler._last_slot_prefill_inputs
+        assert slot_prefill_inputs is not None
+        assert len(fake_model.text_prefill_slot_inputs_seen) == 2
+        assert fake_model.text_prefill_slot_inputs_seen[-1] is slot_prefill_inputs
+        assert fake_model.text_prefill_slot_inputs_seen[-1].request_ids == ("scheduler-0", "scheduler-1")
+        assert fake_model.text_prefill_slot_inputs_seen[-1].input_ids.tolist() == [[6, 7], [11, 12]]
+        assert len(prefill_input_snapshots) == 2
+        assert prefill_input_snapshots[-1] == {
+            "request_ids": ("scheduler-0", "scheduler-1"),
+            "input_ids": [[6, 7], [11, 12]],
+            "prefill_token_count": 2,
+            "positions_are_global": True,
+            "seq_lens_are_global": True,
+            "block_tables_are_global": True,
+            "batch_positions": [2, 2],
+            "batch_seq_lens": [2, 2],
+            "batch_visible_seq_lens": [4, 4],
+            "physical_block_tables": False,
+            "contains_cache_objects": False,
+        }
+    finally:
+        scheduler.shutdown()
+
+
+def test_scheduler_uses_physical_prefill_inputs_when_page_bank_exists() -> None:
+    config = Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            vocab_size=16,
+            eos_token_id=9,
+            pad_token_id=0,
+            cache_block_size=2,
+            layer_types=["full_attention"],
+        )
+    )
+    fake_model = _FakeModel(config)
+    engine = AnnaQwen3_5TextEngine(
+        model=fake_model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="fake",
+        device_context=_FakeDeviceContext(),
+        optimization_config=EngineOptimizationConfig(
+            slot_runner_enabled=True,
+            slot_runner_max_slots=2,
+            slot_runner_total_blocks=8,
+            slot_runner_max_blocks_per_seq=4,
+            slot_runner_max_batch_size=2,
+            slot_runner_physical_kv_page_bank=True,
+        ),
+    )
+    scheduler = AnnaScheduler(engine, max_batch_size=2, batch_wait_ms=20.0)
+    engine.set_scheduler(scheduler)
+
+    try:
+        request = scheduler._submit(
+            _prepared([4, 5]),
+            config=GenerationConfig(max_new_tokens=1, temperature=0.0, top_p=1.0, top_k=0),
+            stream=False,
+        )
+
+        assert request.done.wait(timeout=2.0)
+        assert request.error is None
+
+        slot_prefill_inputs = scheduler._last_slot_prefill_inputs
+        assert slot_prefill_inputs is not None
+        assert fake_model.text_prefill_slot_inputs_seen[-1] is slot_prefill_inputs
+        assert slot_prefill_inputs.request_ids == ("scheduler-0",)
+        assert slot_prefill_inputs.input_ids.tolist() == [[4, 5]]
+        assert slot_prefill_inputs.physical_block_tables is True
+        assert slot_prefill_inputs.block_table_ownership == "physical"
+        assert slot_prefill_inputs.owns_physical_kv_pages is True
+        assert slot_prefill_inputs.physical_kv_layer_count == 1
+        key_pages, value_pages = slot_prefill_inputs.physical_pages_for_layer(0)
+        assert key_pages.shape == (8, 1, 2, 4)
+        assert value_pages.shape == (8, 1, 2, 4)
+    finally:
+        scheduler.shutdown()
+
+
+def test_scheduler_physical_prefill_inputs_write_tiny_qwen_page_bank() -> None:
+    torch.manual_seed(0)
+    text_config = Qwen3_5TextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        max_position_embeddings=16,
+        eos_token_id=31,
+        pad_token_id=0,
+        cache_block_size=2,
+        layer_types=["full_attention"],
+    )
+    model_config = Qwen3_5TextModelConfig(text_config=text_config)
+    model = Qwen3_5TextForConditionalGeneration(model_config).eval()
+    model.configure_runtime(torch.device("cpu"))
+    with torch.no_grad():
+        model.lm_head.weight.zero_()
+
+    legacy_snapshots: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    original_forward_text_only = model.forward_text_only
+
+    def _record_forward_text_only(**kwargs):
+        slot_prefill_inputs = kwargs.get("slot_prefill_inputs")
+        forward_kwargs = {
+            key: kwargs[key]
+            for key in (
+                "input_ids",
+                "attention_mask",
+                "position_ids",
+                "past_key_values",
+                "inputs_embeds",
+                "use_cache",
+                "logits_to_keep",
+                "slot_decode_inputs",
+                "slot_prefill_inputs",
+                "prompt_token_ids",
+            )
+            if key in kwargs
+        }
+        with torch.no_grad():
+            outputs = original_forward_text_only(**forward_kwargs)
+        if slot_prefill_inputs is not None and outputs.past_key_values is not None:
+            key_cache, value_cache, lengths = outputs.past_key_values._gather_layer_cache(0)
+            assert key_cache is not None
+            assert value_cache is not None
+            legacy_snapshots.append(
+                (
+                    key_cache.detach().clone(),
+                    value_cache.detach().clone(),
+                    lengths.detach().clone(),
+                    slot_prefill_inputs.batch_block_tables[0].detach().clone(),
+                )
+            )
+        return outputs
+
+    model.forward_text_only = _record_forward_text_only  # type: ignore[method-assign]
+    engine = AnnaQwen3_5TextEngine(
+        model=model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="tiny-qwen",
+        device_context=_FakeDeviceContext(),
+        optimization_config=EngineOptimizationConfig(
+            prefill_chunk_size=2,
+            slot_runner_enabled=True,
+            slot_runner_max_slots=1,
+            slot_runner_total_blocks=4,
+            slot_runner_max_blocks_per_seq=4,
+            slot_runner_max_batch_size=1,
+            slot_runner_physical_kv_page_bank=True,
+        ),
+    )
+    scheduler = AnnaScheduler(engine, max_batch_size=1, batch_wait_ms=20.0)
+    engine.set_scheduler(scheduler)
+
+    try:
+        request = scheduler._submit(
+            _prepared([1, 2, 3]),
+            config=GenerationConfig(max_new_tokens=1, temperature=0.0, top_p=1.0, top_k=0),
+            stream=False,
+        )
+
+        assert request.done.wait(timeout=2.0)
+        assert request.error is None
+        assert request.result is not None
+        assert request.result.completion_token_ids == [0]
+
+        assert len(legacy_snapshots) == 2
+        assert torch.equal(legacy_snapshots[0][2], torch.tensor([2], dtype=torch.long))
+        legacy_key, legacy_value, legacy_lengths, block_table = legacy_snapshots[-1]
+        assert torch.equal(legacy_lengths, torch.tensor([3], dtype=torch.long))
+
+        slot_prefill_inputs = scheduler._last_slot_prefill_inputs
+        assert slot_prefill_inputs is not None
+        assert slot_prefill_inputs.physical_block_tables is True
+        key_pages, value_pages = slot_prefill_inputs.physical_pages_for_layer(0)
+        first_block = int(block_table[0])
+        second_block = int(block_table[1])
+        assert torch.allclose(key_pages[first_block, :, :2, :], legacy_key[0, :, :2, :])
+        assert torch.allclose(value_pages[first_block, :, :2, :], legacy_value[0, :, :2, :])
+        assert torch.allclose(key_pages[second_block, :, :1, :], legacy_key[0, :, 2:3, :])
+        assert torch.allclose(value_pages[second_block, :, :1, :], legacy_value[0, :, 2:3, :])
     finally:
         scheduler.shutdown()
 
@@ -1015,6 +1254,78 @@ def test_scheduler_populates_experimental_slot_decode_inputs() -> None:
         assert snapshot.slot_decode_plan_seconds_total >= 0.0
         assert engine.slot_model_runner.active_count == 0
         assert engine.slot_model_runner.kv_manager.free_slot_count == 2
+    finally:
+        scheduler.shutdown()
+
+
+def test_scheduler_keeps_decode_inputs_logical_when_physical_page_bank_exists() -> None:
+    config = Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            vocab_size=16,
+            eos_token_id=9,
+            pad_token_id=0,
+            max_position_embeddings=16,
+            cache_block_size=2,
+            layer_types=["full_attention"],
+        )
+    )
+    fake_model = _FakeModel(config)
+    engine = AnnaQwen3_5TextEngine(
+        model=fake_model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="fake",
+        device_context=_FakeDeviceContext(),
+        optimization_config=EngineOptimizationConfig(
+            slot_runner_enabled=True,
+            slot_runner_max_slots=2,
+            slot_runner_total_blocks=8,
+            slot_runner_max_blocks_per_seq=4,
+            slot_runner_max_batch_size=2,
+            slot_runner_physical_kv_page_bank=True,
+        ),
+    )
+    scheduler = AnnaScheduler(engine, max_batch_size=2, batch_wait_ms=20.0)
+    engine.set_scheduler(scheduler)
+
+    try:
+        request_a = scheduler._submit(
+            _prepared([4, 5]),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            stream=False,
+        )
+        request_b = scheduler._submit(
+            _prepared([6, 7]),
+            config=GenerationConfig(max_new_tokens=2, temperature=0.0, top_p=1.0, top_k=0),
+            stream=False,
+        )
+
+        assert request_a.done.wait(timeout=2.0)
+        assert request_b.done.wait(timeout=2.0)
+        assert request_a.error is None
+        assert request_b.error is None
+
+        slot_prefill_inputs = scheduler._last_slot_prefill_inputs
+        assert slot_prefill_inputs is not None
+        assert slot_prefill_inputs.physical_block_tables is True
+        assert slot_prefill_inputs.block_table_ownership == "physical"
+
+        slot_decode_inputs = scheduler._last_slot_decode_inputs
+        assert slot_decode_inputs is not None
+        assert slot_decode_inputs.physical_block_tables is False
+        assert slot_decode_inputs.block_table_ownership == "logical_slot_metadata"
+        assert fake_model.text_decode_slot_input_physical_block_tables == [False]
+        assert fake_model.text_decode_slot_input_block_table_ownership == ["logical_slot_metadata"]
     finally:
         scheduler.shutdown()
 

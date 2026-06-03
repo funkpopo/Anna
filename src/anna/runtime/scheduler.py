@@ -83,6 +83,7 @@ class AnnaScheduler:
         self.prefill_interval_steps = max(1, int(prefill_interval_steps))
         self._decode_steps_since_prefill = 0
         self._next_request_index = 0
+        self._last_slot_prefill_inputs = None
         self._last_slot_decode_inputs = None
         self._sampling_batch_params_cache = SamplingBatchParamsCache(max_entries=64)
         self._pending: deque[SchedulerRequest] = deque()
@@ -397,6 +398,10 @@ class AnnaScheduler:
             prompt_token_ids=list(group.batched.prompt_token_ids),
         )
         chunk = self.engine.device_context.move_prepared_inputs(chunk)
+        slot_prefill_inputs = self._build_slot_prefill_inputs(requests, chunk.input_ids)
+        model_kwargs = self.engine._build_prefill_model_kwargs(chunk, include_media=start_idx == 0)
+        if slot_prefill_inputs is not None:
+            model_kwargs["slot_prefill_inputs"] = slot_prefill_inputs
         try:
             started_at = time.perf_counter()
             with self.engine.execution_lock:
@@ -407,7 +412,7 @@ class AnnaScheduler:
                         input_ids=chunk.input_ids,
                         attention_mask=chunk.attention_mask,
                         past_key_values=group.past_key_values,
-                        model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=start_idx == 0),
+                        model_kwargs=model_kwargs,
                     )
                 else:
                     outputs = self.engine._profiled_forward_generation_model(
@@ -415,7 +420,7 @@ class AnnaScheduler:
                         input_ids=chunk.input_ids,
                         attention_mask=chunk.attention_mask,
                         past_key_values=group.past_key_values,
-                        model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=start_idx == 0),
+                        model_kwargs=model_kwargs,
                         use_cache=True,
                         logits_to_keep=1,
                     )
@@ -953,6 +958,21 @@ class AnnaScheduler:
             if request.slot_request_id is None:
                 continue
             runner.advance_prefill(request.slot_request_id, token_count=token_count)
+
+    def _build_slot_prefill_inputs(self, requests: list[SchedulerRequest], input_ids: torch.Tensor) -> object | None:
+        runner = self._slot_model_runner()
+        if runner is None:
+            return None
+        request_ids = [request.slot_request_id for request in requests]
+        if any(request_id is None for request_id in request_ids):
+            raise RuntimeError("Experimental slot runner is missing slot ids for a prefill batch.")
+        physical_block_tables = getattr(runner, "kv_page_bank", None) is not None
+        self._last_slot_prefill_inputs = runner.build_prefill_inputs(
+            request_ids=[str(request_id) for request_id in request_ids],
+            input_ids=input_ids,
+            physical_block_tables=physical_block_tables,
+        )
+        return self._last_slot_prefill_inputs
 
     def _build_slot_decode_inputs(self, requests: list[SchedulerRequest]) -> object | None:
         runner = self._slot_model_runner()

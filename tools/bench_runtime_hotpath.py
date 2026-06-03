@@ -14,13 +14,19 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from anna.core.hotpath_events import hotpath_event_recorder
-from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, grouped_query_attention, write_slot_decode_kv_to_pages
+from anna.model.ops import (
+    Qwen3DynamicCache,
+    Qwen3PageAllocator,
+    grouped_query_attention,
+    write_slot_decode_kv_to_pages,
+    write_slot_prefill_kv_to_pages,
+)
 from anna.model.quantization import XPUInt4Linear
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.runtime.hotpath_guard import DEFAULT_ALLOWLIST, scan_hotpath_files, summarize_findings, unexpected_findings
 from anna.runtime.paged_kv import PagedKVManager
 from anna.runtime.service_metrics import AnnaServiceMetrics
-from anna.runtime.slot_model_runner import SlotDecodeModelInputs
+from anna.runtime.slot_model_runner import SlotDecodeModelInputs, SlotModelRunner
 from anna.runtime.slot_scheduler import SlotScheduler
 from anna.sampling.params import SamplingBatchParams, SamplingBatchParamsCache
 from anna.sampling.sampler import sample_next_token, sample_next_token_from_candidates
@@ -231,21 +237,76 @@ def _bench_slot_decode_plan(
     plan = scheduler.build_decode_plan(request_ids=request_ids)
     model_inputs = SlotDecodeModelInputs.from_plan(plan)
     boundary = model_inputs.boundary_summary()
-    key_pages = torch.zeros((manager.total_blocks, 1, manager.block_size, 8), dtype=torch.float32)
-    value_pages = torch.zeros_like(key_pages)
-    key_states = torch.randn(batch_size, 1, 1, 8)
-    value_states = torch.randn_like(key_states)
-    visible_seq_lens = write_slot_decode_kv_to_pages(
-        key_states,
-        value_states,
-        key_pages,
-        value_pages,
+    decode_key_pages = torch.zeros((manager.total_blocks, 1, manager.block_size, 8), dtype=torch.float32)
+    decode_value_pages = torch.zeros_like(decode_key_pages)
+    decode_key_states = torch.randn(batch_size, 1, 1, 8)
+    decode_value_states = torch.randn_like(decode_key_states)
+    decode_visible_seq_lens = write_slot_decode_kv_to_pages(
+        decode_key_states,
+        decode_value_states,
+        decode_key_pages,
+        decode_value_pages,
         plan.block_tables,
         plan.seq_lens,
         slot_ids=plan.slot_ids,
         block_tables_are_global=plan.block_tables_are_global,
         seq_lens_are_global=plan.seq_lens_are_global,
     )
+    prefill_chunk_tokens = max(1, min(block_size + 1, max(seq_len, 1)))
+    prefill_base_len = max(0, seq_len - prefill_chunk_tokens)
+    prefill_seq_lens = plan.seq_lens.clone()
+    prefill_seq_lens.index_fill_(0, plan.slot_ids.to(dtype=torch.long), prefill_base_len)
+    prefill_key_pages = torch.zeros_like(decode_key_pages)
+    prefill_value_pages = torch.zeros_like(decode_value_pages)
+    prefill_key_states = torch.randn(batch_size, 1, prefill_chunk_tokens, 8)
+    prefill_value_states = torch.randn_like(prefill_key_states)
+    prefill_visible_seq_lens = write_slot_prefill_kv_to_pages(
+        prefill_key_states,
+        prefill_value_states,
+        prefill_key_pages,
+        prefill_value_pages,
+        plan.block_tables,
+        prefill_seq_lens,
+        slot_ids=plan.slot_ids,
+        block_tables_are_global=plan.block_tables_are_global,
+        seq_lens_are_global=plan.seq_lens_are_global,
+    )
+    text_config = Qwen3_5TextConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=8,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
+        vocab_size=32,
+        cache_block_size=block_size,
+        layer_types=["full_attention"],
+    )
+    physical_runner = SlotModelRunner.from_text_config(
+        text_config,
+        device="cpu",
+        max_slots=max_slots,
+        total_blocks=max_slots * resolved_max_blocks,
+        max_blocks_per_seq=resolved_max_blocks,
+        max_batch_size=batch_size,
+    )
+    physical_runner.allocate_physical_kv_page_bank(dtype=torch.float32, num_layers=1)
+    physical_prompt_len = max(seq_len, prefill_chunk_tokens)
+    physical_base_len = max(0, physical_prompt_len - prefill_chunk_tokens)
+    for request_id in request_ids:
+        physical_runner.admit_prefill(request_id, prompt_length=physical_prompt_len, max_new_tokens=4)
+        if physical_base_len > 0:
+            physical_runner.advance_prefill(request_id, token_count=physical_base_len)
+    physical_prefill_inputs = physical_runner.build_prefill_inputs(
+        request_ids=request_ids,
+        input_ids=torch.zeros((batch_size, prefill_chunk_tokens), dtype=torch.long),
+        physical_block_tables=True,
+    )
+    prefill_boundary = physical_prefill_inputs.boundary_summary()
     assert plan.block_tables_are_global is True
     assert plan.seq_lens_are_global is True
     assert plan.positions_are_global is True
@@ -255,17 +316,32 @@ def _bench_slot_decode_plan(
     assert plan.batch_seq_lens.shape == (batch_size,)
     assert plan.batch_positions.shape == (batch_size,)
     assert plan.sampling_batch_params.batch_size == batch_size
-    assert visible_seq_lens.shape == (batch_size,)
+    assert decode_visible_seq_lens.shape == (batch_size,)
+    assert prefill_visible_seq_lens.shape == (batch_size,)
 
     plan_ms = _time_ms(lambda: scheduler.build_decode_plan(request_ids=request_ids), iters=iters)
-    slot_kv_write_ms = _time_ms(
+    slot_decode_kv_write_ms = _time_ms(
         lambda: write_slot_decode_kv_to_pages(
-            key_states,
-            value_states,
-            key_pages,
-            value_pages,
+            decode_key_states,
+            decode_value_states,
+            decode_key_pages,
+            decode_value_pages,
             plan.block_tables,
             plan.seq_lens,
+            slot_ids=plan.slot_ids,
+            block_tables_are_global=plan.block_tables_are_global,
+            seq_lens_are_global=plan.seq_lens_are_global,
+        ),
+        iters=iters,
+    )
+    slot_prefill_kv_write_ms = _time_ms(
+        lambda: write_slot_prefill_kv_to_pages(
+            prefill_key_states,
+            prefill_value_states,
+            prefill_key_pages,
+            prefill_value_pages,
+            plan.block_tables,
+            prefill_seq_lens,
             slot_ids=plan.slot_ids,
             block_tables_are_global=plan.block_tables_are_global,
             seq_lens_are_global=plan.seq_lens_are_global,
@@ -278,7 +354,10 @@ def _bench_slot_decode_plan(
         "block_size": block_size,
         "max_blocks_per_seq": resolved_max_blocks,
         "plan_ms": plan_ms,
-        "slot_kv_write_ms": slot_kv_write_ms,
+        "slot_kv_write_ms": slot_decode_kv_write_ms,
+        "slot_decode_kv_write_ms": slot_decode_kv_write_ms,
+        "slot_prefill_kv_write_ms": slot_prefill_kv_write_ms,
+        "slot_prefill_chunk_tokens": prefill_chunk_tokens,
         "active_batch_rows": batch_size,
         "block_tables_are_global": bool(plan.block_tables_are_global),
         "seq_lens_are_global": bool(plan.seq_lens_are_global),
@@ -294,15 +373,25 @@ def _bench_slot_decode_plan(
         "decode_boundary_block_table_ownership": str(boundary["block_table_ownership"]),
         "decode_boundary_owns_physical_kv_pages": bool(boundary["owns_physical_kv_pages"]),
         "decode_boundary_physical_kv_layer_count": int(boundary["physical_kv_layer_count"]),
+        "prefill_boundary_physical_block_tables": bool(prefill_boundary["physical_block_tables"]),
+        "prefill_boundary_block_table_ownership": str(prefill_boundary["block_table_ownership"]),
+        "prefill_boundary_owns_physical_kv_pages": bool(prefill_boundary["owns_physical_kv_pages"]),
+        "prefill_boundary_physical_kv_layer_count": int(prefill_boundary["physical_kv_layer_count"]),
         "slot_owned_output_token_buffer": all(
             slot.output_token_buffer is not None and slot.output_token_buffer.device == manager.device
             for slot in scheduler.ready_decode_slots()
         ),
         "slot_owned_kv_write_helper": True,
-        "slot_owned_kv_page_bank_available": False,
+        "slot_owned_decode_kv_write_helper": True,
+        "slot_owned_prefill_kv_write_helper": True,
+        "slot_owned_kv_page_bank_available": True,
+        "slot_owned_prefill_writes": True,
+        "slot_owned_decode_writes": False,
         "slot_owned_kv_writes": False,
         "legacy_cache_object_required_for_forward": True,
-        "slot_kv_visible_seq_lens_shape": tuple(int(dim) for dim in visible_seq_lens.shape),
+        "slot_kv_visible_seq_lens_shape": tuple(int(dim) for dim in decode_visible_seq_lens.shape),
+        "slot_decode_kv_visible_seq_lens_shape": tuple(int(dim) for dim in decode_visible_seq_lens.shape),
+        "slot_prefill_kv_visible_seq_lens_shape": tuple(int(dim) for dim in prefill_visible_seq_lens.shape),
     }
 
 
@@ -357,9 +446,32 @@ def _summarize_scheduler_kv_overhead(
         "slot_decode_boundary_physical_kv_layer_count": int(
             slot_decode_plan.get("decode_boundary_physical_kv_layer_count", 0)
         ),
+        "slot_prefill_boundary_physical_block_tables": bool(
+            slot_decode_plan.get("prefill_boundary_physical_block_tables", False)
+        ),
+        "slot_prefill_boundary_block_table_ownership": str(
+            slot_decode_plan.get("prefill_boundary_block_table_ownership", "unknown")
+        ),
+        "slot_prefill_boundary_owns_physical_kv_pages": bool(
+            slot_decode_plan.get("prefill_boundary_owns_physical_kv_pages", False)
+        ),
+        "slot_prefill_boundary_physical_kv_layer_count": int(
+            slot_decode_plan.get("prefill_boundary_physical_kv_layer_count", 0)
+        ),
         "slot_owned_output_token_buffer": bool(slot_decode_plan.get("slot_owned_output_token_buffer", False)),
         "slot_owned_kv_write_helper": bool(slot_decode_plan.get("slot_owned_kv_write_helper", False)),
+        "slot_owned_decode_kv_write_helper": bool(
+            slot_decode_plan.get(
+                "slot_owned_decode_kv_write_helper",
+                slot_decode_plan.get("slot_owned_kv_write_helper", False),
+            )
+        ),
+        "slot_owned_prefill_kv_write_helper": bool(
+            slot_decode_plan.get("slot_owned_prefill_kv_write_helper", False)
+        ),
         "slot_owned_kv_page_bank_available": bool(slot_decode_plan.get("slot_owned_kv_page_bank_available", False)),
+        "slot_owned_prefill_writes": bool(slot_decode_plan.get("slot_owned_prefill_writes", False)),
+        "slot_owned_decode_writes": bool(slot_decode_plan.get("slot_owned_decode_writes", False)),
         "slot_owned_kv_writes": bool(slot_decode_plan.get("slot_owned_kv_writes", False)),
         "legacy_cache_object_required_for_forward": bool(
             slot_decode_plan.get("legacy_cache_object_required_for_forward", True)
@@ -368,6 +480,11 @@ def _summarize_scheduler_kv_overhead(
         "split_ms": split_ms,
         "stack_split_ms": stack_split_ms,
         "slot_plan_ms": slot_plan_ms,
+        "slot_kv_write_ms": float(slot_decode_plan.get("slot_kv_write_ms", 0.0)),
+        "slot_decode_kv_write_ms": float(
+            slot_decode_plan.get("slot_decode_kv_write_ms", slot_decode_plan.get("slot_kv_write_ms", 0.0))
+        ),
+        "slot_prefill_kv_write_ms": float(slot_decode_plan.get("slot_prefill_kv_write_ms", 0.0)),
         "stack_split_to_slot_plan_ratio": ratio,
     }
 

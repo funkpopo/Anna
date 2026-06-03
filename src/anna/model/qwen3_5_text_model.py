@@ -234,6 +234,7 @@ class Qwen3TextModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
         slot_decode_inputs: object | None = None,
+        slot_prefill_inputs: object | None = None,
         prompt_token_ids: Sequence[int] | None = None,
     ) -> TextModelOutput:
         if (input_ids is None) == (inputs_embeds is None):
@@ -299,6 +300,7 @@ class Qwen3TextModel(nn.Module):
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
                     slot_decode_inputs=slot_decode_inputs,
+                    slot_prefill_inputs=slot_prefill_inputs,
                 )
         finally:
             if past_key_values is not None:
@@ -803,6 +805,7 @@ class Qwen3Model(nn.Module):
         mm_token_type_ids: torch.IntTensor | None = None,
         use_cache: bool | None = None,
         slot_decode_inputs: object | None = None,
+        slot_prefill_inputs: object | None = None,
         prompt_token_ids: Sequence[int] | None = None,
     ) -> MultimodalModelOutput:
         if (input_ids is None) == (inputs_embeds is None):
@@ -859,6 +862,7 @@ class Qwen3Model(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            slot_prefill_inputs=slot_prefill_inputs,
             prompt_token_ids=prompt_token_ids,
         )
         return MultimodalModelOutput(
@@ -920,6 +924,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
         slot_decode_inputs: object | None = None,
+        slot_prefill_inputs: object | None = None,
         prompt_token_ids: Sequence[int] | None = None,
     ) -> CausalLMOutput:
         outputs = self.model(
@@ -930,6 +935,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            slot_prefill_inputs=slot_prefill_inputs,
             prompt_token_ids=prompt_token_ids,
         )
         hidden_states = outputs.last_hidden_state
@@ -953,6 +959,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
         logits_to_keep: int | None = None,
         top_k: int = 1,
         slot_decode_inputs: object | None = None,
+        slot_prefill_inputs: object | None = None,
         prompt_token_ids: Sequence[int] | None = None,
     ) -> CausalLMTopKOutput:
         outputs = self.model(
@@ -963,6 +970,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            slot_prefill_inputs=slot_prefill_inputs,
             prompt_token_ids=prompt_token_ids,
         )
         hidden_states = outputs.last_hidden_state
@@ -1030,6 +1038,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
         slot_decode_inputs: object | None = None,
+        slot_prefill_inputs: object | None = None,
         prompt_token_ids: Sequence[int] | None = None,
     ) -> CausalLMOutput:
         outputs = self.model.language_model(
@@ -1040,6 +1049,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            slot_prefill_inputs=slot_prefill_inputs,
             prompt_token_ids=prompt_token_ids,
         )
         hidden_states = outputs.last_hidden_state
@@ -1064,6 +1074,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         logits_to_keep: int | None = None,
         top_k: int = 1,
         slot_decode_inputs: object | None = None,
+        slot_prefill_inputs: object | None = None,
         prompt_token_ids: Sequence[int] | None = None,
     ) -> CausalLMTopKOutput:
         outputs = self.model.language_model(
@@ -1074,6 +1085,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            slot_prefill_inputs=slot_prefill_inputs,
             prompt_token_ids=prompt_token_ids,
         )
         hidden_states = outputs.last_hidden_state
@@ -1097,6 +1109,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
         slot_decode_inputs: object | None = None,
+        slot_prefill_inputs: object | None = None,
         prompt_token_ids: Sequence[int] | None = None,
     ) -> CausalLMOutput:
         outputs = self.model(
@@ -1112,6 +1125,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             mm_token_type_ids=mm_token_type_ids,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            slot_prefill_inputs=slot_prefill_inputs,
             prompt_token_ids=prompt_token_ids,
         )
         hidden_states = outputs.last_hidden_state
@@ -1140,6 +1154,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         logits_to_keep: int | None = None,
         top_k: int = 1,
         slot_decode_inputs: object | None = None,
+        slot_prefill_inputs: object | None = None,
         prompt_token_ids: Sequence[int] | None = None,
     ) -> CausalLMTopKOutput:
         outputs = self.model(
@@ -1155,6 +1170,7 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
             mm_token_type_ids=mm_token_type_ids,
             use_cache=use_cache,
             slot_decode_inputs=slot_decode_inputs,
+            slot_prefill_inputs=slot_prefill_inputs,
             prompt_token_ids=prompt_token_ids,
         )
         hidden_states = outputs.last_hidden_state
