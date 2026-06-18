@@ -145,8 +145,9 @@ def main() -> None:
     )
     model_dir = resolve_model_dir(args.model_dir)
     model_family_info = inspect_model_family(model_dir)
-    if model_family_info.model_family == "qwen3_tts":
-        raise SystemExit("The selected model belongs to the qwen3_tts family. Use anna-speak instead of anna-generate.")
+    if model_family_info.model_family in {"qwen3_tts", "qwen3_asr"}:
+        command = "anna-speak" if model_family_info.model_family == "qwen3_tts" else "anna-transcribe"
+        raise SystemExit(f"The selected model belongs to the {model_family_info.model_family} family. Use {command} instead of anna-generate.")
     model_name = resolve_model_name(model_name=args.model_name, model_dir=model_dir)
     settings = GenerateSettings(
         model_dir=model_dir,

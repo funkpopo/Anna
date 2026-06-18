@@ -136,3 +136,10 @@ class SpeechRequest(BaseModel):
     subtalker_top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     subtalker_top_k: int = Field(default=50, ge=0)
     non_streaming_mode: bool = True
+
+
+class TranscriptionRequest(BaseModel):
+    model: str | None = None
+    language: str | None = None
+    response_format: Literal["json", "text", "verbose_json"] = "json"
+    return_timestamps: bool = Field(default=False, validation_alias=AliasChoices("return_timestamps", "timestamp_granularities"))

@@ -37,6 +37,26 @@ def test_inspect_model_family_detects_qwen3_tts_model(tmp_path: Path) -> None:
     assert info.architectures == ("Qwen3TTSForConditionalGeneration",)
 
 
+def test_inspect_model_family_detects_qwen3_asr_model(tmp_path: Path) -> None:
+    model_dir = tmp_path / "asr-model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_asr",
+                "architectures": ["Qwen3ASRForConditionalGeneration"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    info = inspect_model_family(model_dir)
+
+    assert info.model_family == "qwen3_asr"
+    assert info.model_type == "qwen3_asr"
+    assert info.architectures == ("Qwen3ASRForConditionalGeneration",)
+
+
 def test_inspect_model_family_detects_gemma4_model(tmp_path: Path) -> None:
     model_dir = tmp_path / "gemma4-model"
     model_dir.mkdir()

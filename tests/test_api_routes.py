@@ -121,6 +121,7 @@ def test_list_app_routes_includes_openapi_and_completion_endpoints() -> None:
     assert ("/v1/chat/completions", "POST") in routes
     assert ("/v1/completions", "POST") in routes
     assert ("/v1/audio/speech", "POST") in routes
+    assert ("/v1/audio/transcriptions", "POST") in routes
 
 def test_streaming_chat_returns_sse_error_frame_for_engine_failures() -> None:
     client = TestClient(create_app(_FailingStreamEngine()))
@@ -1054,3 +1055,71 @@ def test_audio_speech_rejects_models_without_speech_support() -> None:
 
     assert response.status_code == 400
     assert response.json()["error"]["message"] == "The loaded qwen3_5_text model family does not support speech synthesis."
+
+
+def test_audio_transcriptions_returns_json_and_forwards_request_fields() -> None:
+    class _TranscriptionEngine:
+        default_model_id = "fake-asr-model"
+        model_family = "qwen3_asr"
+
+        def __init__(self) -> None:
+            self.last_request = None
+
+        def health(self) -> dict[str, str]:
+            return {"status": "ok"}
+
+        def list_models(self) -> list[str]:
+            return [self.default_model_id]
+
+        def transcribe_qwen3_asr_audio(self, audio, *, config, filename=None):
+            from anna.runtime.qwen3_asr_engine import Qwen3ASRTranscriptionResult
+
+            self.last_request = {
+                "audio": audio,
+                "config": config,
+                "filename": filename,
+            }
+            return Qwen3ASRTranscriptionResult(
+                text="hello world",
+                language="English",
+                timestamps=[{"text": "hello", "start": 0.0, "end": 0.2}],
+                total_seconds=0.5,
+            )
+
+    engine = _TranscriptionEngine()
+    client = TestClient(create_app(engine))
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={
+            "model": "fake-asr-model",
+            "language": "English",
+            "response_format": "verbose_json",
+            "return_timestamps": "true",
+        },
+        files={"file": ("sample.wav", b"RIFF....", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["text"] == "hello world"
+    assert payload["model"] == "fake-asr-model"
+    assert payload["language"] == "English"
+    assert payload["timestamps"] == [{"text": "hello", "start": 0.0, "end": 0.2}]
+    assert engine.last_request is not None
+    assert engine.last_request["audio"] == b"RIFF...."
+    assert engine.last_request["filename"] == "sample.wav"
+    assert engine.last_request["config"].language == "English"
+    assert engine.last_request["config"].return_timestamps is True
+
+
+def test_audio_transcriptions_rejects_models_without_transcription_support() -> None:
+    client = TestClient(create_app(_CapturingEngine()))
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("sample.wav", b"RIFF....", "audio/wav")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "The loaded qwen3_5_text model family does not support audio transcription."

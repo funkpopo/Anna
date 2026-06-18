@@ -2,18 +2,18 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-Anna is a local inference runtime for large language, multimodal, and speech models. It provides an OpenAI-compatible HTTP API and command-line tools for local generation, serving, benchmarking, and Qwen3-TTS speech synthesis.
+Anna is a local inference runtime for large language, multimodal, and speech models. It provides an OpenAI-compatible HTTP API and command-line tools for local generation, serving, benchmarking, Qwen3-TTS speech synthesis, and Qwen3-ASR speech recognition.
 
 The runtime is built on PyTorch and is optimized for Intel Arc / XPU. CPU execution is useful for development and smaller tests.
 
 ## Features
 
-- OpenAI-compatible endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/audio/speech`, `/v1/models`
+- OpenAI-compatible endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/models`
 - Non-streaming and streaming text generation
 - Chat, plain text completion, multimodal chat, function calling, and reasoning output
-- Qwen3-TTS speech synthesis
+- Qwen3-TTS speech synthesis and Qwen3-ASR speech recognition
 - Intel XPU options for `torch.compile`, KV-cache quantization, int4 weight quantization, MoE expert offload, prompt cache, and continuous batching
-- CLI tools: `anna-serve`, `anna-generate`, `anna-bench`, `anna-speak`, `anna-xpu-int4-cache`
+- CLI tools: `anna-serve`, `anna-generate`, `anna-bench`, `anna-speak`, `anna-transcribe`, `anna-xpu-int4-cache`
 
 ## Supported Models
 
@@ -24,10 +24,11 @@ Model family detection is based on `config.json`:
 | `model_type` | Runtime | Main use |
 | --- | --- | --- |
 | `qwen3_tts` | Qwen3-TTS | Speech synthesis |
+| `qwen3_asr` | Qwen3-ASR | Speech recognition |
 | `gemma4` | Gemma 4 | Text, chat, multimodal chat with audio |
 | anything else | Qwen3.5 text / VL | Text, chat, image/video multimodal chat |
 
-Use `anna-generate` and `anna-bench` for text-generation models. Use `anna-speak` for Qwen3-TTS. Use `anna-serve` for any supported family; unsupported routes return an API error for the loaded model.
+Use `anna-generate` and `anna-bench` for text-generation models. Use `anna-speak` for Qwen3-TTS. Use `anna-transcribe` for Qwen3-ASR. Use `anna-serve` for any supported family; unsupported routes return an API error for the loaded model.
 
 ## Requirements
 
@@ -38,6 +39,8 @@ Use `anna-generate` and `anna-bench` for text-generation models. Use `anna-speak
 - Optional fused XPU operator build: Intel oneAPI DPC++ compiler, and Visual Studio Build Tools on Windows
 
 The package declares Python dependencies in `pyproject.toml`. PyTorch and Intel GPU drivers should be installed according to your target machine.
+
+Qwen3-ASR depends on `qwen-asr` and `python-multipart`. Anna loads it on Intel XPU only; there is no CPU or alternate backend fallback for the ASR runtime. If XPU is unavailable, model loading fails immediately.
 
 ## Installation
 
@@ -84,6 +87,18 @@ Optional: build the fused XPU operator:
 ```bash
 python tools/build_gated_delta_fused_op.py
 ```
+
+Example local setup for Windows + Intel Arc A770:
+
+```powershell
+conda activate anna
+$env:ANNA_DPCPP = "D:\Intel\oneAPI\compiler\latest\bin\dpcpp.exe"
+$env:ANNA_VCVARS64 = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+python -m pip install -e ".[dev]"
+python -c "import torch; print(torch.xpu.is_available()); print(torch.xpu.get_device_name(0))"
+```
+
+You do not need to build the fused operator just to run Qwen3-ASR; it is used by selected Anna custom XPU operator paths.
 
 ## Quick Start
 
@@ -146,6 +161,39 @@ anna-speak \
   --input "Hello from Anna." \
   --output out.wav
 ```
+
+Transcribe audio with Qwen3-ASR:
+
+```bash
+anna-transcribe \
+  --model-dir models/Qwen3-ASR-1.7B \
+  --audio input.wav \
+  --device xpu \
+  --language English
+```
+
+If your local directory is `models/Qwen3-ASR-0.6B`, pass that path instead. Anna detects the model family from `model_type: qwen3_asr` in `config.json`, not from the directory name.
+
+You can also serve Qwen3-ASR through the OpenAI-compatible transcription endpoint:
+
+```bash
+anna-serve \
+  --model-dir models/Qwen3-ASR-1.7B \
+  --device xpu \
+  --dtype bfloat16 \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+```bash
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -F model=Qwen3-ASR-1.7B \
+  -F file=@input.wav \
+  -F language=English \
+  -F response_format=verbose_json
+```
+
+Omit `language` to let Qwen3-ASR identify it automatically. Use `response_format=text` for plain text, or `response_format=verbose_json` for model ID, language, and timing metadata. Pass `return_timestamps=true` to request timestamp output.
 
 ## Intel XPU Examples
 
@@ -223,6 +271,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 | `/v1/chat/completions` | `POST` | Chat and multimodal chat |
 | `/v1/completions` | `POST` | Plain text completion |
 | `/v1/audio/speech` | `POST` | Qwen3-TTS speech synthesis |
+| `/v1/audio/transcriptions` | `POST` | Qwen3-ASR speech recognition |
 
 ## `anna-serve` Options
 
@@ -301,6 +350,7 @@ anna-serve --help
 anna-generate --help
 anna-bench --help
 anna-speak --help
+anna-transcribe --help
 ```
 
 ## Troubleshooting

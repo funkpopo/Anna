@@ -6,6 +6,7 @@ from typing import Any
 from anna.core.model_family import inspect_model_family
 from anna.runtime.gemma4_text_engine import AnnaGemma4TextEngine
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine
+from anna.runtime.qwen3_asr_engine import AnnaQwen3ASREngine
 from anna.runtime.qwen3_tts_engine import AnnaQwen3TTSEngine
 
 
@@ -141,6 +142,8 @@ def load_model_runtime_from_model_dir(
     model_family_info = inspect_model_family(model_dir)
     if model_family_info.model_family == "qwen3_tts":
         return AnnaQwen3TTSEngine.from_model_dir(model_dir, **shared)
+    if model_family_info.model_family == "qwen3_asr":
+        return AnnaQwen3ASREngine.from_model_dir(model_dir, **shared)
     if model_family_info.model_family == "gemma4":
         return AnnaGemma4TextEngine.from_model_dir(model_dir, **shared)
     return AnnaQwen3_5TextEngine.from_model_dir(model_dir, **shared)

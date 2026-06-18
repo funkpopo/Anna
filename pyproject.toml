@@ -15,6 +15,8 @@ dependencies = [
     "numpy>=2.3,<3.0",
     "pillow>=11.3,<12.0",
     "pydantic>=2.11,<3.0",
+    "python-multipart>=0.0.20,<1.0",
+    "qwen-asr>=0.0.6,<0.1",
     "qwen-tts==0.1.1",
     "safetensors>=0.6,<1.0",
     "soundfile>=0.13,<1.0",
@@ -36,6 +38,7 @@ anna-serve = "anna.cli.serve:main"
 anna-generate = "anna.cli.generate:main"
 anna-bench = "anna.cli.bench:main"
 anna-speak = "anna.cli.qwen3_tts_speak:main"
+anna-transcribe = "anna.cli.qwen3_asr_transcribe:main"
 anna-xpu-int4-cache = "anna.cli.xpu_int4_cache:main"
 
 [tool.setuptools.packages.find]

@@ -12,10 +12,10 @@ from typing import AsyncIterator, Callable, Iterator, TypeVar
 
 import numpy as np
 import soundfile as sf
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from anna.api.schemas import ChatCompletionRequest, CompletionRequest, SpeechRequest
+from anna.api.schemas import ChatCompletionRequest, CompletionRequest, SpeechRequest, TranscriptionRequest
 from anna.core.format_utils import format_bytes
 from anna.runtime.qwen3_5_text_engine import (
     AnnaEngineError,
@@ -27,6 +27,7 @@ from anna.runtime.qwen3_5_text_engine import (
     normalize_reasoning_format,
 )
 from anna.runtime.qwen3_tts_engine import Qwen3TTSSynthesisConfig
+from anna.runtime.qwen3_asr_engine import Qwen3ASRTranscriptionConfig
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -885,3 +886,72 @@ def audio_speech(request: Request, payload: SpeechRequest):
         "Content-Disposition": f'inline; filename=\"speech.{extension}\"',
     }
     return Response(content=audio_bytes, media_type=media_type, headers=headers)
+
+
+@router.post("/v1/audio/transcriptions")
+async def audio_transcriptions(
+    request: Request,
+    file: UploadFile = File(...),
+    model: str | None = Form(default=None),
+    language: str | None = Form(default=None),
+    response_format: str = Form(default="json"),
+    return_timestamps: bool = Form(default=False),
+):
+    try:
+        payload = TranscriptionRequest(
+            model=model,
+            language=language,
+            response_format=response_format,
+            return_timestamps=return_timestamps,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    engine = _engine(request)
+    transcribe_qwen3_asr_audio = _require_method(
+        engine,
+        "transcribe_qwen3_asr_audio",
+        message=f"The loaded {_model_family_name(engine)} model family does not support audio transcription.",
+        code="unsupported_audio_transcription",
+    )
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Transcription file must not be empty.")
+
+    model_id = payload.model or engine.default_model_id
+    memory_before = _memory_snapshot(engine)
+    started_at = time.perf_counter()
+    try:
+        result = transcribe_qwen3_asr_audio(
+            audio_bytes,
+            filename=file.filename,
+            config=Qwen3ASRTranscriptionConfig(
+                language=payload.language,
+                return_timestamps=payload.return_timestamps,
+            ),
+        )
+    except AnnaEngineError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    memory_after = _memory_snapshot(engine)
+    elapsed_seconds = time.perf_counter() - started_at
+    logger.info(
+        "audio_transcription model=%s total_seconds=%.3f engine_seconds=%.3f xpu_free_before=%s xpu_free_after=%s",
+        model_id,
+        elapsed_seconds,
+        result.total_seconds,
+        format_bytes(None if memory_before is None else memory_before.free_bytes),
+        format_bytes(None if memory_after is None else memory_after.free_bytes),
+    )
+
+    if payload.response_format == "text":
+        return Response(content=result.text, media_type="text/plain; charset=utf-8")
+
+    response_payload: dict[str, object] = {"text": result.text}
+    if payload.response_format == "verbose_json":
+        response_payload["model"] = model_id
+        response_payload["language"] = result.language
+        response_payload["duration"] = result.total_seconds
+        if result.timestamps is not None:
+            response_payload["timestamps"] = result.timestamps
+    return JSONResponse(response_payload)

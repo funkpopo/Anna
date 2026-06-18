@@ -8,7 +8,7 @@ from typing import Literal
 from anna.core.gguf_model import resolve_gguf_model_files
 
 
-SupportedModelFamily = Literal["qwen3_5_text", "qwen3_tts", "gemma4"]
+SupportedModelFamily = Literal["qwen3_5_text", "qwen3_tts", "qwen3_asr", "gemma4"]
 
 
 @dataclass(slots=True)
@@ -42,6 +42,8 @@ def inspect_model_family(model_dir: str | Path) -> ModelFamilyInfo:
     architectures = tuple(str(value) for value in config_data.get("architectures", []))
     if model_type == "qwen3_tts":
         model_family: SupportedModelFamily = "qwen3_tts"
+    elif model_type == "qwen3_asr":
+        model_family = "qwen3_asr"
     elif model_type == "gemma4":
         model_family = "gemma4"
     else:
