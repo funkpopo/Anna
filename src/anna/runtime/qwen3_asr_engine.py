@@ -3,10 +3,13 @@ from __future__ import annotations
 import logging
 import tempfile
 import threading
-import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+import time
 from typing import Any
+
+import torch
 
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.qwen3_5_text_engine import AnnaEngineError
@@ -23,6 +26,7 @@ def _stringify_dtype(dtype) -> str:
 @dataclass(slots=True)
 class Qwen3ASRTranscriptionConfig:
     language: str | None = None
+    context: str = ""
     return_timestamps: bool = False
 
 
@@ -51,13 +55,20 @@ class AnnaQwen3ASREngine:
         model_id: str,
         device_context: DeviceContext,
         supported_languages: list[str] | None,
+        xpu_tensor_numel: int,
+        xpu_tensor_devices: dict[str, int],
     ) -> None:
         self.model = model
         self.default_model_id = model_id
         self.device_context = device_context
         self.supported_languages = supported_languages
+        self.xpu_tensor_numel = xpu_tensor_numel
+        self.xpu_tensor_devices = xpu_tensor_devices
         self.metrics = AnnaServiceMetrics()
         self.execution_lock = threading.Lock()
+        self._xpu_forward_observed_count = 0
+        self._last_xpu_elapsed_ms: float | None = None
+        self._xpu_guard_handles = self._install_xpu_execution_guards()
 
     @classmethod
     def from_model_dir(
@@ -73,6 +84,9 @@ class AnnaQwen3ASREngine:
         prompt_cache_size: int = 0,
         prompt_cache_max_tokens: int = 0,
         profile_runtime: bool = False,
+        kv_cache_quantization: str = "none",
+        kv_cache_quant_bits: int = 4,
+        kv_cache_residual_len: int = 128,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
         default_temperature: float | None = None,
@@ -90,6 +104,8 @@ class AnnaQwen3ASREngine:
         resident_expert_layers: int | None = None,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         cached_experts_per_layer: int | None = None,
+        asr_max_inference_batch_size: int = 1,
+        asr_max_new_tokens: int = 512,
     ) -> "AnnaQwen3ASREngine":
         del (
             default_max_completion_tokens,
@@ -114,6 +130,10 @@ class AnnaQwen3ASREngine:
             )
         if safety_policy is not None:
             device_context.safety_policy = safety_policy
+        if asr_max_inference_batch_size <= 0:
+            raise ValueError("Qwen3-ASR asr_max_inference_batch_size must be > 0.")
+        if asr_max_new_tokens <= 0:
+            raise ValueError("Qwen3-ASR asr_max_new_tokens must be > 0.")
 
         ignored_options: list[str] = []
         if compile_mode != "none":
@@ -128,6 +148,12 @@ class AnnaQwen3ASREngine:
             ignored_options.append(f"prompt_cache_max_tokens={prompt_cache_max_tokens}")
         if profile_runtime:
             ignored_options.append("profile_runtime=True")
+        if kv_cache_quantization != "none":
+            ignored_options.append(f"kv_cache_quantization={kv_cache_quantization}")
+        if kv_cache_quant_bits != 4:
+            ignored_options.append(f"kv_cache_quant_bits={kv_cache_quant_bits}")
+        if kv_cache_residual_len != 128:
+            ignored_options.append(f"kv_cache_residual_len={kv_cache_residual_len}")
         if offload_mode != "auto":
             ignored_options.append(f"offload_mode={offload_mode}")
         if offload_vision:
@@ -153,17 +179,23 @@ class AnnaQwen3ASREngine:
             device_map=str(device_context.device),
             attn_implementation="eager",
             local_files_only=True,
+            max_inference_batch_size=asr_max_inference_batch_size,
+            max_new_tokens=asr_max_new_tokens,
         )
         device_context.synchronize()
+        xpu_tensor_numel, xpu_tensor_devices = cls._validate_xpu_only_model(model, device_context.device)
         elapsed = time.perf_counter() - started_at
 
         resolved_model_id = model_id or model_path.name
         logger.info(
-            "Loaded Qwen3-ASR model %s on %s (compute=%s, requested=%s) in %.2fs",
+            "Loaded Qwen3-ASR model %s on %s (compute=%s, requested=%s, max_inference_batch_size=%s, max_new_tokens=%s, xpu_tensor_numel=%s) in %.2fs",
             resolved_model_id,
             device_context.device,
             device_context.dtype,
             device_context.requested_dtype,
+            asr_max_inference_batch_size,
+            asr_max_new_tokens,
+            xpu_tensor_numel,
             elapsed,
         )
         return cls(
@@ -171,7 +203,161 @@ class AnnaQwen3ASREngine:
             model_id=resolved_model_id,
             device_context=device_context,
             supported_languages=cls._read_supported_languages(model_path),
+            xpu_tensor_numel=xpu_tensor_numel,
+            xpu_tensor_devices=xpu_tensor_devices,
         )
+
+    @staticmethod
+    def _normalize_device(value: Any) -> torch.device | None:
+        if value is None:
+            return None
+        try:
+            return torch.device(value)
+        except (TypeError, RuntimeError):
+            return None
+
+    @classmethod
+    def _validate_xpu_only_model(cls, model: Any, expected_device: torch.device) -> tuple[int, dict[str, int]]:
+        if getattr(model, "backend", None) != "transformers":
+            raise RuntimeError(
+                "Qwen3-ASR in Anna uses the transformers backend on Intel XPU only. "
+                f"Unsupported qwen-asr backend: {getattr(model, 'backend', None)!r}."
+            )
+
+        wrapper_device = cls._normalize_device(getattr(model, "device", None))
+        if wrapper_device is None or wrapper_device.type != "xpu":
+            raise RuntimeError(f"Qwen3-ASR wrapper is not bound to XPU after load: device={getattr(model, 'device', None)!r}.")
+
+        actual_model = getattr(model, "model", None)
+        if not isinstance(actual_model, torch.nn.Module):
+            raise RuntimeError("Qwen3-ASR backend did not expose a torch.nn.Module model for XPU validation.")
+
+        module_device = cls._normalize_device(getattr(actual_model, "device", None))
+        if module_device is not None and module_device.type != "xpu":
+            raise RuntimeError(f"Qwen3-ASR torch module is not bound to XPU after load: device={module_device}.")
+
+        hf_device_map = getattr(actual_model, "hf_device_map", None)
+        if isinstance(hf_device_map, Mapping):
+            non_xpu_entries = {
+                str(key): str(value)
+                for key, value in hf_device_map.items()
+                if cls._normalize_device(value) is None or cls._normalize_device(value).type != "xpu"
+            }
+            if non_xpu_entries:
+                raise RuntimeError(f"Qwen3-ASR loaded with non-XPU device_map entries: {non_xpu_entries}.")
+
+        tensor_devices: dict[str, int] = {}
+        bad_tensors: list[str] = []
+        total_numel = 0
+        tensor_count = 0
+        for collection_name, iterator in (
+            ("parameter", actual_model.named_parameters(recurse=True)),
+            ("buffer", actual_model.named_buffers(recurse=True)),
+        ):
+            for name, tensor in iterator:
+                tensor_count += 1
+                numel = int(tensor.numel())
+                total_numel += numel
+                device_name = str(tensor.device)
+                tensor_devices[device_name] = tensor_devices.get(device_name, 0) + numel
+                if tensor.device.type != "xpu":
+                    bad_tensors.append(f"{collection_name} {name} on {tensor.device} shape={tuple(tensor.shape)}")
+
+        if tensor_count == 0:
+            raise RuntimeError("Qwen3-ASR model exposes no tensors; refusing to run without an XPU tensor audit.")
+        if bad_tensors:
+            preview = "; ".join(bad_tensors[:8])
+            suffix = "" if len(bad_tensors) <= 8 else f"; ... {len(bad_tensors) - 8} more"
+            raise RuntimeError(f"Qwen3-ASR model has tensors outside XPU: {preview}{suffix}.")
+        if expected_device.type != "xpu":
+            raise RuntimeError(f"Qwen3-ASR expected device must be XPU, got {expected_device}.")
+        return total_numel, tensor_devices
+
+    def _install_xpu_execution_guards(self) -> list[Any]:
+        actual_model = getattr(self.model, "model", None)
+        if not isinstance(actual_model, torch.nn.Module):
+            raise RuntimeError("Qwen3-ASR backend did not expose a torch.nn.Module model for execution guards.")
+
+        candidates: list[tuple[str, torch.nn.Module]] = []
+        for name in ("thinker", "thinker.audio_tower", "thinker.model"):
+            module = actual_model
+            for part in name.split("."):
+                module = getattr(module, part, None)
+                if module is None:
+                    break
+            if isinstance(module, torch.nn.Module) and all(module is not existing for _, existing in candidates):
+                candidates.append((name, module))
+        if not candidates:
+            candidates.append(("model", actual_model))
+
+        handles: list[Any] = []
+        for name, module in candidates:
+            handles.append(module.register_forward_pre_hook(self._make_xpu_guard_hook(name), with_kwargs=True))
+        return handles
+
+    def _make_xpu_guard_hook(self, module_name: str):
+        def _guard(_module, args, kwargs):
+            self._assert_tensor_tree_on_xpu(args, context=f"{module_name} args")
+            self._assert_tensor_tree_on_xpu(kwargs, context=f"{module_name} kwargs")
+            self._xpu_forward_observed_count += 1
+
+        return _guard
+
+    def _assert_tensor_tree_on_xpu(self, value: Any, *, context: str) -> int:
+        bad_tensors: list[str] = []
+        seen_objects: set[int] = set()
+
+        def _walk(item: Any, path: str) -> int:
+            object_id = id(item)
+            if object_id in seen_objects:
+                return 0
+            if isinstance(item, (Mapping, list, tuple, set, frozenset)):
+                seen_objects.add(object_id)
+            if isinstance(item, torch.Tensor):
+                if item.device.type != "xpu":
+                    bad_tensors.append(f"{path} on {item.device} shape={tuple(item.shape)}")
+                return 1
+            if isinstance(item, Mapping):
+                count = 0
+                for key, child in item.items():
+                    count += _walk(child, f"{path}.{key}")
+                return count
+            if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
+                count = 0
+                for index, child in enumerate(item):
+                    count += _walk(child, f"{path}[{index}]")
+                return count
+            return 0
+
+        tensor_count = _walk(value, context)
+        if bad_tensors:
+            preview = "; ".join(bad_tensors[:8])
+            suffix = "" if len(bad_tensors) <= 8 else f"; ... {len(bad_tensors) - 8} more"
+            raise RuntimeError(f"Qwen3-ASR attempted to execute with non-XPU tensors: {preview}{suffix}.")
+        return tensor_count
+
+    def _start_xpu_execution_probe(self) -> tuple[Any | None, Any | None]:
+        xpu = getattr(torch, "xpu", None)
+        event_cls = getattr(xpu, "Event", None) if xpu is not None else None
+        if event_cls is None:
+            raise RuntimeError("Qwen3-ASR XPU execution verification requires torch.xpu.Event.")
+        start_event = event_cls(enable_timing=True)
+        end_event = event_cls(enable_timing=True)
+        start_event.record()
+        return start_event, end_event
+
+    def _finish_xpu_execution_probe(self, probe: tuple[Any | None, Any | None], *, forward_count_before: int) -> None:
+        start_event, end_event = probe
+        if end_event is not None:
+            end_event.record()
+        self.device_context.synchronize()
+        if self._xpu_forward_observed_count <= forward_count_before:
+            raise RuntimeError("Qwen3-ASR transcription completed without observing an XPU model forward pass.")
+        if start_event is not None and end_event is not None:
+            try:
+                self._last_xpu_elapsed_ms = float(start_event.elapsed_time(end_event))
+            except RuntimeError as exc:
+                raise RuntimeError("Qwen3-ASR XPU execution verification failed to read torch.xpu.Event timing.") from exc
 
     @staticmethod
     def _read_supported_languages(model_path: Path) -> list[str] | None:
@@ -209,6 +395,14 @@ class AnnaQwen3ASREngine:
             "supports_text_completions": False,
             "supports_chat_completions": False,
             "supported_languages": self.supported_languages,
+            "xpu_execution_enforced": True,
+            "xpu_tensor_numel": self.xpu_tensor_numel,
+            "xpu_tensor_devices": self.xpu_tensor_devices,
+            "xpu_forward_observed_count": self._xpu_forward_observed_count,
+            "last_xpu_elapsed_ms": self._last_xpu_elapsed_ms,
+            "xpu_device": None
+            if self.device_context.xpu_info is None
+            else self.device_context.xpu_info.as_log_fields(),
             "memory": None
             if memory_info is None
             else {
@@ -265,12 +459,15 @@ class AnnaQwen3ASREngine:
             audio_input = str(temp_path)
 
         try:
+            forward_count_before = self._xpu_forward_observed_count
+            probe = self._start_xpu_execution_probe()
             raw = self.model.transcribe(
                 audio=audio_input,
+                context=config.context,
                 language=config.language,
                 return_time_stamps=config.return_timestamps,
             )
-            self.device_context.synchronize()
+            self._finish_xpu_execution_probe(probe, forward_count_before=forward_count_before)
         except RuntimeError as exc:
             raise self._handle_runtime_failure(exc) from exc
         except ValueError as exc:
@@ -297,9 +494,18 @@ class AnnaQwen3ASREngine:
             language = item.get("language", config.language)
             timestamps = item.get("timestamps", item.get("time_stamps", item.get("timestamp")))
         else:
-            text = str(item)
-            language = config.language
-            timestamps = None
+            text_value = (
+                getattr(item, "text", None)
+                or getattr(item, "transcription", None)
+                or getattr(item, "sentence", None)
+            )
+            text = "" if item is None else str(item) if text_value is None else str(text_value)
+            language = getattr(item, "language", config.language)
+            timestamps = (
+                getattr(item, "timestamps", None)
+                or getattr(item, "time_stamps", None)
+                or getattr(item, "timestamp", None)
+            )
         if not text.strip():
             raise AnnaEngineError(
                 "Qwen3-ASR produced an empty transcription.",

@@ -16,7 +16,15 @@ def test_transcribe_parser_accepts_asr_arguments() -> None:
             "xpu",
             "--language",
             "English",
+            "--context",
+            "project vocabulary",
             "--return-timestamps",
+            "--asr-max-inference-batch-size",
+            "2",
+            "--asr-max-new-tokens",
+            "64",
+            "--xpu-device-index",
+            "0",
         ]
     )
 
@@ -24,4 +32,8 @@ def test_transcribe_parser_accepts_asr_arguments() -> None:
     assert args.audio == "input.wav"
     assert args.device == "xpu"
     assert args.language == "English"
+    assert args.context == "project vocabulary"
     assert args.return_timestamps is True
+    assert args.asr_max_inference_batch_size == 2
+    assert args.asr_max_new_tokens == 64
+    assert args.xpu_device_index == 0

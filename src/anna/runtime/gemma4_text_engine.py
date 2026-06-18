@@ -185,7 +185,10 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         resident_expert_layers: int | None = None,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         cached_experts_per_layer: int | None = None,
+        asr_max_inference_batch_size: int = 1,
+        asr_max_new_tokens: int = 512,
     ) -> "AnnaGemma4TextEngine":
+        del asr_max_inference_batch_size, asr_max_new_tokens
         if offload_mode.lower() not in {"auto", "none"}:
             raise ValueError("Gemma4 text runtime does not support expert offload.")
         if expert_quant.lower() not in {"auto", "none"}:

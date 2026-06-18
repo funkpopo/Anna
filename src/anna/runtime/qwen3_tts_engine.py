@@ -86,6 +86,9 @@ class AnnaQwen3TTSEngine:
         prompt_cache_size: int = 0,
         prompt_cache_max_tokens: int = 0,
         profile_runtime: bool = False,
+        kv_cache_quantization: str = "none",
+        kv_cache_quant_bits: int = 4,
+        kv_cache_residual_len: int = 128,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
         default_temperature: float | None = None,
@@ -103,6 +106,8 @@ class AnnaQwen3TTSEngine:
         resident_expert_layers: int | None = None,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         cached_experts_per_layer: int | None = None,
+        asr_max_inference_batch_size: int = 1,
+        asr_max_new_tokens: int = 512,
     ) -> "AnnaQwen3TTSEngine":
         del (
             default_max_completion_tokens,
@@ -140,6 +145,12 @@ class AnnaQwen3TTSEngine:
             ignored_options.append(f"prompt_cache_max_tokens={prompt_cache_max_tokens}")
         if profile_runtime:
             ignored_options.append("profile_runtime=True")
+        if kv_cache_quantization != "none":
+            ignored_options.append(f"kv_cache_quantization={kv_cache_quantization}")
+        if kv_cache_quant_bits != 4:
+            ignored_options.append(f"kv_cache_quant_bits={kv_cache_quant_bits}")
+        if kv_cache_residual_len != 128:
+            ignored_options.append(f"kv_cache_residual_len={kv_cache_residual_len}")
         if offload_mode != "auto":
             ignored_options.append(f"offload_mode={offload_mode}")
         if offload_vision:
@@ -148,6 +159,10 @@ class AnnaQwen3TTSEngine:
             ignored_options.append(f"expert_quant={expert_quant}")
         if weight_quant != "auto":
             ignored_options.append(f"weight_quant={weight_quant}")
+        if asr_max_inference_batch_size != 1:
+            ignored_options.append(f"asr_max_inference_batch_size={asr_max_inference_batch_size}")
+        if asr_max_new_tokens != 512:
+            ignored_options.append(f"asr_max_new_tokens={asr_max_new_tokens}")
         if ignored_options:
             logger.info(
                 "Ignoring text-generation runtime options for qwen3_tts model load: %s",

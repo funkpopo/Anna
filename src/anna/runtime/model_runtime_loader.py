@@ -41,6 +41,8 @@ def _shared_from_model_dir_kwargs(
     resident_expert_layers: int | None = None,
     resident_expert_layer_indices: tuple[int, ...] | None = None,
     cached_experts_per_layer: int | None = None,
+    asr_max_inference_batch_size: int = 1,
+    asr_max_new_tokens: int = 512,
 ) -> dict[str, Any]:
     return {
         "model_id": model_id,
@@ -72,6 +74,8 @@ def _shared_from_model_dir_kwargs(
         "resident_expert_layers": resident_expert_layers,
         "resident_expert_layer_indices": resident_expert_layer_indices,
         "cached_experts_per_layer": cached_experts_per_layer,
+        "asr_max_inference_batch_size": asr_max_inference_batch_size,
+        "asr_max_new_tokens": asr_max_new_tokens,
     }
 
 
@@ -107,6 +111,8 @@ def load_model_runtime_from_model_dir(
     resident_expert_layers: int | None = None,
     resident_expert_layer_indices: tuple[int, ...] | None = None,
     cached_experts_per_layer: int | None = None,
+    asr_max_inference_batch_size: int = 1,
+    asr_max_new_tokens: int = 512,
 ):
     shared = _shared_from_model_dir_kwargs(
         model_id=model_id,
@@ -138,6 +144,8 @@ def load_model_runtime_from_model_dir(
         resident_expert_layers=resident_expert_layers,
         resident_expert_layer_indices=resident_expert_layer_indices,
         cached_experts_per_layer=cached_experts_per_layer,
+        asr_max_inference_batch_size=asr_max_inference_batch_size,
+        asr_max_new_tokens=asr_max_new_tokens,
     )
     model_family_info = inspect_model_family(model_dir)
     if model_family_info.model_family == "qwen3_tts":

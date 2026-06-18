@@ -894,6 +894,7 @@ async def audio_transcriptions(
     file: UploadFile = File(...),
     model: str | None = Form(default=None),
     language: str | None = Form(default=None),
+    prompt: str | None = Form(default=None),
     response_format: str = Form(default="json"),
     return_timestamps: bool = Form(default=False),
 ):
@@ -901,6 +902,7 @@ async def audio_transcriptions(
         payload = TranscriptionRequest(
             model=model,
             language=language,
+            prompt=prompt,
             response_format=response_format,
             return_timestamps=return_timestamps,
         )
@@ -927,6 +929,7 @@ async def audio_transcriptions(
             filename=file.filename,
             config=Qwen3ASRTranscriptionConfig(
                 language=payload.language,
+                context=payload.prompt or "",
                 return_timestamps=payload.return_timestamps,
             ),
         )

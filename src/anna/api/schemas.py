@@ -141,5 +141,6 @@ class SpeechRequest(BaseModel):
 class TranscriptionRequest(BaseModel):
     model: str | None = None
     language: str | None = None
+    prompt: str | None = Field(default=None, validation_alias=AliasChoices("prompt", "context"))
     response_format: Literal["json", "text", "verbose_json"] = "json"
     return_timestamps: bool = Field(default=False, validation_alias=AliasChoices("return_timestamps", "timestamp_granularities"))

@@ -480,7 +480,10 @@ class AnnaQwen3_5TextEngine:
         resident_expert_layers: int | None = None,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         cached_experts_per_layer: int | None = None,
+        asr_max_inference_batch_size: int = 1,
+        asr_max_new_tokens: int = 512,
     ) -> "AnnaQwen3_5TextEngine":
+        del asr_max_inference_batch_size, asr_max_new_tokens
         model_path = Path(model_dir)
         config = load_qwen3_5_text_model_config(model_path)
         device_context = DeviceContext.resolve(

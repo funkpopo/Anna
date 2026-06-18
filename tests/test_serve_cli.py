@@ -86,6 +86,10 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "4",
             "--scheduler-prefill-interval-steps",
             "3",
+            "--asr-max-inference-batch-size",
+            "2",
+            "--asr-max-new-tokens",
+            "128",
             "--metrics-log-interval-seconds",
             "3.5",
         ]
@@ -115,6 +119,8 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.warmup_decode_steps == 8
     assert args.warmup_batch_size == 4
     assert args.scheduler_prefill_interval_steps == 3
+    assert args.asr_max_inference_batch_size == 2
+    assert args.asr_max_new_tokens == 128
     assert args.metrics_log_interval_seconds == 3.5
 
 

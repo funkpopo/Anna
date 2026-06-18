@@ -1094,6 +1094,7 @@ def test_audio_transcriptions_returns_json_and_forwards_request_fields() -> None
         data={
             "model": "fake-asr-model",
             "language": "English",
+            "prompt": "project vocabulary",
             "response_format": "verbose_json",
             "return_timestamps": "true",
         },
@@ -1110,6 +1111,7 @@ def test_audio_transcriptions_returns_json_and_forwards_request_fields() -> None
     assert engine.last_request["audio"] == b"RIFF...."
     assert engine.last_request["filename"] == "sample.wav"
     assert engine.last_request["config"].language == "English"
+    assert engine.last_request["config"].context == "project vocabulary"
     assert engine.last_request["config"].return_timestamps is True
 
 
