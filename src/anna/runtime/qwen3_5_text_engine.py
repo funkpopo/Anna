@@ -31,7 +31,7 @@ from anna.model.xpu_decode_profile import record_steady_decode_step_if_applicabl
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.memory_release import release_conversion_artifacts
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
-from anna.runtime.streaming import IncrementalTextAssembler, strip_unstable_replacement_suffix
+from anna.runtime.streaming import IncrementalTextAssembler
 from anna.sampling.sampler import sample_next_token, sample_next_token_from_candidates
 from anna.weights.qwen3_5_text_weight_loader import build_qwen3_5_text_model, estimate_qwen3_5_text_model_weight_bytes, load_qwen3_5_text_model_config, load_qwen3_5_text_model_weights
 from anna.weights.qwen3_5_text_tokenizer import Qwen3_5TextTokenizer
@@ -43,14 +43,6 @@ _REASONING_FORMAT_VALUES = frozenset({"none", "deepseek"})
 _DEFAULT_REASONING_FORMAT: ReasoningFormat = "deepseek"
 _COMPILE_MODE_VALUES = frozenset({"none", "auto", "default", "reduce-overhead", "max-autotune"})
 _KV_CACHE_QUANTIZATION_VALUES = frozenset({"none", "turboquant"})
-
-
-def _common_prefix_length(left: str, right: str) -> int:
-    limit = min(len(left), len(right))
-    index = 0
-    while index < limit and left[index] == right[index]:
-        index += 1
-    return index
 
 
 def _module_cpu_tensor_bytes(module: torch.nn.Module) -> int:
@@ -2527,34 +2519,6 @@ class AnnaQwen3_5TextEngine:
         except RuntimeError as exc:
             raise self._handle_runtime_failure(exc) from exc
 
-    def _trim_stop_strings(self, text: str, stop_strings: list[str]) -> tuple[str, bool]:
-        if not stop_strings:
-            return text, False
-        indexes = [text.find(stop) for stop in stop_strings if stop and stop in text]
-        if not indexes:
-            return text, False
-        trim_at = min(indexes)
-        return text[:trim_at], True
-
-    def _stable_decode_delta(
-        self,
-        *,
-        previous_text: str,
-        current_text: str,
-        emitted_text: str,
-    ) -> tuple[str, str]:
-        stable_length = _common_prefix_length(previous_text, current_text)
-        stable_text = strip_unstable_replacement_suffix(current_text[:stable_length])
-        if not stable_text.startswith(emitted_text):
-            return "", emitted_text
-        return stable_text[len(emitted_text) :], stable_text
-
-    def _flush_decode_tail(self, *, current_text: str, emitted_text: str) -> tuple[str, str]:
-        current_text = strip_unstable_replacement_suffix(current_text)
-        if not current_text.startswith(emitted_text):
-            return "", emitted_text
-        return current_text[len(emitted_text) :], current_text
-
     def _init_repetition_penalty_state(
         self,
         prompt_ids: list[int],
@@ -2615,157 +2579,54 @@ class AnnaQwen3_5TextEngine:
             token_ids.add(int(eos_token_id))
         return token_ids
 
-    @torch.inference_mode()
     def _generate_token_ids(
         self,
         prepared: PreparedInputs,
         config: GenerationConfig,
     ) -> tuple[list[int], str, int, int, GenerationPerfStats]:
-        prompt_ids, prompt_length, config = self._validate_generation_request(prepared, config=config)
-        prepared = self._move_prepared_for_generation(prepared, config=config)
-
         completion_ids: list[int] = []
-        stop_token_ids = self._stop_token_ids()
-        repetition_history, repetition_history_ids = self._init_repetition_penalty_state(
-            prompt_ids,
-            config.repetition_penalty,
-            config.presence_penalty,
-        )
-        started_at = time.perf_counter()
-        first_token_at = None
-        input_ids = None
-        past_key_values = None
-
+        events = self._iter_generation_events(prepared, config, with_assembler=False)
         try:
-            with steady_decode_accumulation(enabled=self.optimization_config.profile_runtime, log=logger):
-                try:
-                    prefill = self._prefill_generation_prompt(prepared)
-                except RuntimeError as exc:
-                    raise self._handle_runtime_failure(exc) from exc
-                past_key_values = prefill.past_key_values
-                current_logits = prefill.logits
-
-                for step_idx in range(config.max_new_tokens):
-                    self._raise_if_generation_cancelled(config)
-                    candidate_logits = None
-                    candidate_token_ids = None
-                    if step_idx > 0:
-                        try:
-                            with self.execution_lock:
-                                candidate_count = self._fused_lm_head_candidate_count(config)
-                                outputs = (
-                                    self._forward_generation_model_topk(
-                                        input_ids=input_ids,
-                                        attention_mask=None,
-                                        past_key_values=past_key_values,
-                                        use_cache=True,
-                                        logits_to_keep=1,
-                                        top_k=candidate_count,
-                                    )
-                                    if candidate_count is not None
-                                    else None
-                                )
-                                if outputs is None:
-                                    outputs = self._profiled_forward_generation_model(
-                                        stage=f"decode[{step_idx}]",
-                                        input_ids=input_ids,
-                                        attention_mask=None,
-                                        past_key_values=past_key_values,
-                                        use_cache=True,
-                                        logits_to_keep=1,
-                                    )
-                            if hasattr(outputs, "candidate_logits"):
-                                candidate_logits = outputs.candidate_logits[0, -1]
-                                candidate_token_ids = outputs.candidate_token_ids[0, -1]
-                            else:
-                                current_logits = outputs.logits[0, -1]
-                            past_key_values = outputs.past_key_values
-                        except RuntimeError as exc:
-                            raise self._handle_runtime_failure(exc) from exc
-
-                    if candidate_logits is not None and candidate_token_ids is not None:
-                        next_token = sample_next_token_from_candidates(
-                            candidate_logits,
-                            candidate_token_ids,
-                            temperature=config.temperature,
-                            top_p=config.top_p,
-                            min_p=config.min_p,
-                        )
-                    else:
-                        next_token = sample_next_token(
-                            current_logits,
-                            generated_ids=repetition_history,
-                            temperature=config.temperature,
-                            top_p=config.top_p,
-                            top_k=config.top_k,
-                            min_p=config.min_p,
-                            presence_penalty=config.presence_penalty,
-                            repetition_penalty=config.repetition_penalty,
-                        )
-                    token_id = self._token_id_from_tensor(next_token)
-                    if first_token_at is None:
-                        first_token_at = time.perf_counter()
-
-                    if token_id in stop_token_ids:
-                        total_seconds = time.perf_counter() - started_at
-                        prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
-                        return (
-                            completion_ids,
-                            "stop",
-                            prompt_length,
-                            len(completion_ids),
-                            self._build_generation_perf_stats(
-                                prompt_tokens=prompt_length,
-                                completion_tokens=len(completion_ids),
-                                total_seconds=total_seconds,
-                                prefill_seconds=prefill_seconds,
-                                decode_seconds=max(0.0, total_seconds - prefill_seconds),
-                            ),
-                        )
-
+            for _delta, token_id, finished, reason, prompt_length, completion_count, perf in events:
+                if token_id is not None:
                     completion_ids.append(token_id)
-                    metrics = getattr(self, "metrics", None)
-                    if metrics is not None:
-                        metrics.record_generation_tokens(1)
-                    repetition_history, repetition_history_ids = self._append_repetition_penalty_token(
-                        history_tensor=repetition_history,
-                        history_ids=repetition_history_ids,
-                        next_token=next_token,
-                        token_id=token_id,
-                    )
-
-                    input_ids = next_token.view(1, 1)
-
-                    if step_idx + 1 >= config.max_new_tokens:
-                        break
-
-                total_seconds = time.perf_counter() - started_at
-                prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
-                return (
-                    completion_ids,
-                    "length",
-                    prompt_length,
-                    len(completion_ids),
-                    self._build_generation_perf_stats(
-                        prompt_tokens=prompt_length,
-                        completion_tokens=len(completion_ids),
-                        total_seconds=total_seconds,
-                        prefill_seconds=prefill_seconds,
-                        decode_seconds=max(0.0, total_seconds - prefill_seconds),
-                    ),
-                )
+                if finished:
+                    return completion_ids, reason or "stop", prompt_length, completion_count, perf
         finally:
-            if past_key_values is not None:
-                past_key_values.release()
+            events.close()
+        raise RuntimeError("Generation ended without a finish event.")
 
-    @torch.inference_mode()
     def _iter_generation(
         self,
         prepared: PreparedInputs,
         config: GenerationConfig,
     ) -> Iterator[tuple[str, bool, str | None, int, int, GenerationPerfStats | None]]:
+        events = self._iter_generation_events(prepared, config, with_assembler=True)
+        try:
+            for delta, _token_id, finished, reason, prompt_length, completion_count, perf in events:
+                if delta or finished:
+                    yield delta, finished, reason, prompt_length, completion_count, perf
+        finally:
+            events.close()
+
+    @torch.inference_mode()
+    def _iter_generation_events(
+        self,
+        prepared: PreparedInputs,
+        config: GenerationConfig,
+        *,
+        with_assembler: bool,
+    ) -> Iterator[tuple[str, int | None, bool, str | None, int, int, GenerationPerfStats | None]]:
+        """Single-request generation loop shared by the token-ids and streaming paths.
+
+        Yields ``(delta, token_id, finished, finish_reason, prompt_length, completion_count, perf)``.
+        Token events carry ``token_id`` (with a possibly empty text delta); the final event carries
+        ``finished=True`` plus the finish reason and perf stats. ``with_assembler`` enables
+        incremental text decoding and stop-string detection.
+        """
         prompt_ids, prompt_length, config = self._validate_generation_request(prepared, config=config)
         prepared = self._move_prepared_for_generation(prepared, config=config)
+
         completion_ids: list[int] = []
         stop_token_ids = self._stop_token_ids()
         repetition_history, repetition_history_ids = self._init_repetition_penalty_state(
@@ -2773,15 +2634,41 @@ class AnnaQwen3_5TextEngine:
             config.repetition_penalty,
             config.presence_penalty,
         )
-        text_assembler = IncrementalTextAssembler(
-            tokenizer=self.tokenizer,
-            stop_strings=config.stop_strings,
+        text_assembler = (
+            IncrementalTextAssembler(tokenizer=self.tokenizer, stop_strings=config.stop_strings)
+            if with_assembler
+            else None
         )
 
         started_at = time.perf_counter()
         first_token_at = None
         input_ids = None
         past_key_values = None
+
+        def _finish_event(reason: str) -> tuple[str, int | None, bool, str | None, int, int, GenerationPerfStats]:
+            total_seconds = time.perf_counter() - started_at
+            prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
+            return (
+                "",
+                None,
+                True,
+                reason,
+                prompt_length,
+                len(completion_ids),
+                self._build_generation_perf_stats(
+                    prompt_tokens=prompt_length,
+                    completion_tokens=len(completion_ids),
+                    total_seconds=total_seconds,
+                    prefill_seconds=prefill_seconds,
+                    decode_seconds=max(0.0, total_seconds - prefill_seconds),
+                ),
+            )
+
+        def _flush_tail() -> str:
+            if text_assembler is None:
+                return ""
+            tail, _ = text_assembler.flush()
+            return tail
 
         try:
             with steady_decode_accumulation(enabled=self.optimization_config.profile_runtime, log=logger):
@@ -2854,25 +2741,10 @@ class AnnaQwen3_5TextEngine:
                         first_token_at = time.perf_counter()
 
                     if token_id in stop_token_ids:
-                        tail, _ = text_assembler.flush()
+                        tail = _flush_tail()
                         if tail:
-                            yield tail, False, None, prompt_length, len(completion_ids), None
-                        total_seconds = time.perf_counter() - started_at
-                        prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
-                        yield (
-                            "",
-                            True,
-                            "stop",
-                            prompt_length,
-                            len(completion_ids),
-                            self._build_generation_perf_stats(
-                                prompt_tokens=prompt_length,
-                                completion_tokens=len(completion_ids),
-                                total_seconds=total_seconds,
-                                prefill_seconds=prefill_seconds,
-                                decode_seconds=max(0.0, total_seconds - prefill_seconds),
-                            ),
-                        )
+                            yield tail, None, False, None, prompt_length, len(completion_ids), None
+                        yield _finish_event("stop")
                         return
 
                     completion_ids.append(token_id)
@@ -2885,54 +2757,25 @@ class AnnaQwen3_5TextEngine:
                         next_token=next_token,
                         token_id=token_id,
                     )
-                    delta, hit_stop_string = text_assembler.feed_token(token_id)
+                    delta, hit_stop_string = (
+                        text_assembler.feed_token(token_id) if text_assembler is not None else ("", False)
+                    )
 
                     input_ids = next_token.view(1, 1)
 
-                    if delta:
-                        yield delta, False, None, prompt_length, len(completion_ids), None
+                    yield delta, token_id, False, None, prompt_length, len(completion_ids), None
 
                     if hit_stop_string:
-                        total_seconds = time.perf_counter() - started_at
-                        prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
-                        yield (
-                            "",
-                            True,
-                            "stop",
-                            prompt_length,
-                            len(completion_ids),
-                            self._build_generation_perf_stats(
-                                prompt_tokens=prompt_length,
-                                completion_tokens=len(completion_ids),
-                                total_seconds=total_seconds,
-                                prefill_seconds=prefill_seconds,
-                                decode_seconds=max(0.0, total_seconds - prefill_seconds),
-                            ),
-                        )
+                        yield _finish_event("stop")
                         return
 
                     if step_idx + 1 >= config.max_new_tokens:
                         break
 
-                tail, _ = text_assembler.flush()
+                tail = _flush_tail()
                 if tail:
-                    yield tail, False, None, prompt_length, len(completion_ids), None
-                total_seconds = time.perf_counter() - started_at
-                prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
-                yield (
-                    "",
-                    True,
-                    "length",
-                    prompt_length,
-                    len(completion_ids),
-                    self._build_generation_perf_stats(
-                        prompt_tokens=prompt_length,
-                        completion_tokens=len(completion_ids),
-                        total_seconds=total_seconds,
-                        prefill_seconds=prefill_seconds,
-                        decode_seconds=max(0.0, total_seconds - prefill_seconds),
-                    ),
-                )
+                    yield tail, None, False, None, prompt_length, len(completion_ids), None
+                yield _finish_event("length")
         finally:
             if past_key_values is not None:
                 past_key_values.release()

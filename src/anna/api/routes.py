@@ -599,6 +599,33 @@ def _stream_sse_completion(
     yield "data: [DONE]\n\n"
 
 
+def _generation_config_from_payload(
+    engine: object,
+    payload: ChatCompletionRequest | CompletionRequest,
+    *,
+    max_new_tokens: int | None,
+) -> GenerationConfig:
+    return GenerationConfig(
+        max_new_tokens=max_new_tokens,
+        temperature=payload.temperature if payload.temperature is not None else _default_float(engine, "default_temperature", 0.7),
+        top_p=payload.top_p if payload.top_p is not None else _default_float(engine, "default_top_p", 0.8),
+        top_k=payload.top_k if payload.top_k is not None else _default_int(engine, "default_top_k", 20),
+        min_p=payload.min_p if payload.min_p is not None else _default_float(engine, "default_min_p", 0.0),
+        presence_penalty=(
+            payload.presence_penalty
+            if payload.presence_penalty is not None
+            else _default_float(engine, "default_presence_penalty", 1.5)
+        ),
+        repetition_penalty=(
+            payload.repetition_penalty
+            if payload.repetition_penalty is not None
+            else _default_float(engine, "default_repetition_penalty", 1.0)
+        ),
+        stop_strings=_normalize_stop(payload.stop),
+        cancellation_event=threading.Event(),
+    )
+
+
 @router.get("/healthz")
 def healthz(request: Request) -> dict:
     return _engine(request).health()
@@ -625,24 +652,10 @@ def list_models(request: Request) -> dict:
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request, payload: ChatCompletionRequest):
     engine = _engine(request)
-    config = GenerationConfig(
+    config = _generation_config_from_payload(
+        engine,
+        payload,
         max_new_tokens=payload.max_completion_tokens or payload.max_tokens or _default_max_completion_tokens(engine),
-        temperature=payload.temperature if payload.temperature is not None else _default_float(engine, "default_temperature", 0.7),
-        top_p=payload.top_p if payload.top_p is not None else _default_float(engine, "default_top_p", 0.8),
-        top_k=payload.top_k if payload.top_k is not None else _default_int(engine, "default_top_k", 20),
-        min_p=payload.min_p if payload.min_p is not None else _default_float(engine, "default_min_p", 0.0),
-        presence_penalty=(
-            payload.presence_penalty
-            if payload.presence_penalty is not None
-            else _default_float(engine, "default_presence_penalty", 1.5)
-        ),
-        repetition_penalty=(
-            payload.repetition_penalty
-            if payload.repetition_penalty is not None
-            else _default_float(engine, "default_repetition_penalty", 1.0)
-        ),
-        stop_strings=_normalize_stop(payload.stop),
-        cancellation_event=threading.Event(),
     )
     response_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -734,24 +747,10 @@ async def chat_completions(request: Request, payload: ChatCompletionRequest):
 @router.post("/v1/completions")
 async def completions(request: Request, payload: CompletionRequest):
     engine = _engine(request)
-    config = GenerationConfig(
+    config = _generation_config_from_payload(
+        engine,
+        payload,
         max_new_tokens=payload.max_tokens or _default_max_completion_tokens(engine),
-        temperature=payload.temperature if payload.temperature is not None else _default_float(engine, "default_temperature", 0.7),
-        top_p=payload.top_p if payload.top_p is not None else _default_float(engine, "default_top_p", 0.8),
-        top_k=payload.top_k if payload.top_k is not None else _default_int(engine, "default_top_k", 20),
-        min_p=payload.min_p if payload.min_p is not None else _default_float(engine, "default_min_p", 0.0),
-        presence_penalty=(
-            payload.presence_penalty
-            if payload.presence_penalty is not None
-            else _default_float(engine, "default_presence_penalty", 1.5)
-        ),
-        repetition_penalty=(
-            payload.repetition_penalty
-            if payload.repetition_penalty is not None
-            else _default_float(engine, "default_repetition_penalty", 1.0)
-        ),
-        stop_strings=_normalize_stop(payload.stop),
-        cancellation_event=threading.Event(),
     )
     response_id = f"cmpl-{uuid.uuid4().hex}"
     created = int(time.time())

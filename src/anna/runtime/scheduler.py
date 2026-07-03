@@ -370,53 +370,8 @@ class AnnaScheduler:
         total_prompt_tokens = sum(request.prompt_length for request in requests)
         if metrics is not None and group.prompt_tokens_recorded < total_prompt_tokens:
             metrics.record_prompt_tokens(total_prompt_tokens - group.prompt_tokens_recorded)
-        if outputs.past_key_values is not None:
-            split_started_at = time.perf_counter()
-            split_caches = outputs.past_key_values.split_batch()
-            if metrics is not None:
-                metrics.record_cache_split(time.perf_counter() - split_started_at)
-        else:
-            split_caches = [None] * len(requests)
-        stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
-        active: list[SchedulerRequest | SchedulerPrefillGroup] = []
-        for row_idx, request in enumerate(requests):
-            if self._is_request_cancelled(request):
-                if split_caches[row_idx] is not None:
-                    split_caches[row_idx].release()
-                self._drop_cancelled_request(request)
-                continue
-            request.past_key_values = split_caches[row_idx]
-            next_token = self._sample_next_token_from_outputs(outputs, row_idx=row_idx, request=request)
-            token_id = self.engine._token_id_from_tensor(next_token)
-            if request.first_token_at is None:
-                request.first_token_at = time.perf_counter()
-            if token_id in stop_token_ids:
-                self._finish_request(request, finish_reason="stop")
-                continue
-
-            request.completion_ids.append(token_id)
-            if metrics is not None:
-                metrics.record_generation_tokens(1)
-            request.repetition_history, request.repetition_history_ids = self.engine._append_repetition_penalty_token(
-                history_tensor=request.repetition_history,
-                history_ids=request.repetition_history_ids,
-                next_token=next_token,
-                token_id=token_id,
-            )
-            delta, hit_stop = request.assembler.feed_token(token_id) if request.assembler is not None else ("", False)
-            if delta:
-                self._emit_text(request, delta)
-            if hit_stop:
-                self._finish_request(request, finish_reason="stop")
-                continue
-
-            if len(request.completion_ids) >= request.config.max_new_tokens:
-                self._finish_request(request, finish_reason="length")
-                continue
-
-            request.input_ids = next_token.view(1, 1)
-            active.append(request)
-        return active
+        split_caches = self._split_output_caches(outputs, len(requests), avoid_turboquant_clone=False)
+        return list(self._consume_batch_outputs(requests, outputs, split_caches))
 
     def _decode_batch(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest]:
         for request in requests:
@@ -455,20 +410,34 @@ class AnnaScheduler:
         if metrics is not None:
             metrics.record_decode_step(time.perf_counter() - started_at)
 
-        if outputs.past_key_values is not None:
-            split_started_at = time.perf_counter()
-            split_kwargs = (
-                {"clone_turboquant_rows": False}
-                if type(outputs.past_key_values).__name__ == "Qwen3DynamicCache"
-                else {}
-            )
-            split_caches = outputs.past_key_values.split_batch(**split_kwargs)
-            if metrics is not None:
-                metrics.record_cache_split(time.perf_counter() - split_started_at)
-        else:
-            split_caches = [None] * len(requests)
-        next_active: list[SchedulerRequest] = []
+        split_caches = self._split_output_caches(outputs, len(requests), avoid_turboquant_clone=True)
+        return self._consume_batch_outputs(requests, outputs, split_caches)
+
+    def _split_output_caches(self, outputs, request_count: int, *, avoid_turboquant_clone: bool) -> list:
+        if outputs.past_key_values is None:
+            return [None] * request_count
+        metrics = getattr(self.engine, "metrics", None)
+        split_started_at = time.perf_counter()
+        split_kwargs = (
+            {"clone_turboquant_rows": False}
+            if avoid_turboquant_clone and type(outputs.past_key_values).__name__ == "Qwen3DynamicCache"
+            else {}
+        )
+        split_caches = outputs.past_key_values.split_batch(**split_kwargs)
+        if metrics is not None:
+            metrics.record_cache_split(time.perf_counter() - split_started_at)
+        return split_caches
+
+    def _consume_batch_outputs(
+        self,
+        requests: list[SchedulerRequest],
+        outputs,
+        split_caches: list,
+    ) -> list[SchedulerRequest]:
+        """Sample one token per request from batched outputs; return requests that stay active."""
+        metrics = getattr(self.engine, "metrics", None)
         stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
+        next_active: list[SchedulerRequest] = []
         for row_idx, request in enumerate(requests):
             if self._is_request_cancelled(request):
                 if split_caches[row_idx] is not None:
