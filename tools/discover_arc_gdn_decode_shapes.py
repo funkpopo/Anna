@@ -263,6 +263,100 @@ def _select_confirmation_rows(
     return selected_rows
 
 
+def _order_ratio(first_ms: float, second_ms: float) -> float:
+    smaller = min(first_ms, second_ms)
+    larger = max(first_ms, second_ms)
+    if smaller <= 0.0:
+        return float("inf") if larger > 0.0 else 1.0
+    return larger / smaller
+
+
+def _build_order_sensitivity_rows(
+    forward_rows: list[dict[str, object]],
+    reverse_rows: list[dict[str, object]],
+    *,
+    mode: DiscoveryMode,
+) -> list[dict[str, object]]:
+    reverse_row_map = {_discovery_row_key(row): row for row in reverse_rows}
+    observed_ms_field = f"{mode.name}_ms"
+    compared_rows: list[dict[str, object]] = []
+    for forward_row in forward_rows:
+        reverse_row = reverse_row_map.get(_discovery_row_key(forward_row))
+        if reverse_row is None:
+            continue
+        single_order_ratio = _order_ratio(float(forward_row["single_ms"]), float(reverse_row["single_ms"]))
+        tiled_order_ratio = _order_ratio(float(forward_row["tiled_ms"]), float(reverse_row["tiled_ms"]))
+        observed_order_ratio = _order_ratio(
+            float(forward_row[observed_ms_field]),
+            float(reverse_row[observed_ms_field]),
+        )
+        best_explicit_order_ratio = _order_ratio(
+            float(forward_row["best_explicit_ms"]),
+            float(reverse_row["best_explicit_ms"]),
+        )
+        max_order_ratio = max(
+            single_order_ratio,
+            tiled_order_ratio,
+            observed_order_ratio,
+            best_explicit_order_ratio,
+        )
+        compared_rows.append(
+            {
+                **forward_row,
+                "reverse_observed_strategy": reverse_row["observed_strategy"],
+                "reverse_best_explicit_strategy": reverse_row["best_explicit_strategy_str"],
+                "forward_observed_ms": float(forward_row[observed_ms_field]),
+                "reverse_observed_ms": float(reverse_row[observed_ms_field]),
+                "forward_best_explicit_ms": float(forward_row["best_explicit_ms"]),
+                "reverse_best_explicit_ms": float(reverse_row["best_explicit_ms"]),
+                "single_order_ratio": single_order_ratio,
+                "tiled_order_ratio": tiled_order_ratio,
+                "observed_order_ratio": observed_order_ratio,
+                "best_explicit_order_ratio": best_explicit_order_ratio,
+                "max_order_ratio": max_order_ratio,
+                "observed_strategy_changed": forward_row["observed_strategy"] != reverse_row["observed_strategy"],
+                "best_explicit_strategy_changed": (
+                    forward_row["best_explicit_strategy_str"] != reverse_row["best_explicit_strategy_str"]
+                ),
+            }
+        )
+    compared_rows.sort(
+        key=lambda row: (
+            -float(row["max_order_ratio"]),
+            -float(row["observed_order_ratio"]),
+            int(row["recurrent_rows"]),
+        )
+    )
+    return compared_rows
+
+
+def _collect_order_sensitive_rows(
+    rows: list[dict[str, object]],
+    *,
+    order_ratio_threshold: float,
+) -> list[dict[str, object]]:
+    sensitive_rows: list[dict[str, object]] = []
+    for row in rows:
+        strategy_changed = bool(row["observed_strategy_changed"]) or bool(row["best_explicit_strategy_changed"])
+        ratio_exceeded = float(row["max_order_ratio"]) >= order_ratio_threshold
+        if not strategy_changed and not ratio_exceeded:
+            continue
+        reasons: list[str] = []
+        if strategy_changed:
+            reasons.append("strategy_changed")
+        if ratio_exceeded:
+            reasons.append("order_ratio_threshold")
+        sensitive_rows.append({**row, "order_reasons": reasons})
+    sensitive_rows.sort(
+        key=lambda row: (
+            -float(row["max_order_ratio"]),
+            -float(row["observed_order_ratio"]),
+            int(row["recurrent_rows"]),
+        )
+    )
+    return sensitive_rows
+
+
 def _build_group_summaries(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     grouped: dict[tuple[int, int, str, str], list[dict[str, object]]] = {}
     for row in rows:
@@ -312,6 +406,20 @@ def _print_group_summary(summary: dict[str, object]) -> None:
         f"observed={summary['observed_strategy']},best={summary['best_explicit_strategy']},"
         f"row_count={summary['row_count']},sampled_rows={summary['sampled_recurrent_row_ranges']},"
         f"worst_ratio={float(summary['worst_ratio']):.4f},worst_delta_ms={float(summary['worst_delta_ms']):.4f}"
+    )
+
+
+def _print_order_sensitive_row(prefix: str, row: dict[str, object]) -> None:
+    print(
+        f"{prefix},batch={row['batch_size']},heads={row['num_heads']},rows={row['recurrent_rows']},"
+        f"value_head_dim={row['value_head_dim_int']},value_block={row['value_block_int']},"
+        f"observed={row['observed_strategy']}->{row['reverse_observed_strategy']},"
+        f"best={row['best_explicit_strategy_str']}->{row['reverse_best_explicit_strategy']},"
+        f"forward_observed_ms={float(row['forward_observed_ms']):.4f},"
+        f"reverse_observed_ms={float(row['reverse_observed_ms']):.4f},"
+        f"observed_order_ratio={float(row['observed_order_ratio']):.4f},"
+        f"max_order_ratio={float(row['max_order_ratio']):.4f},"
+        f"reasons={'+'.join(str(reason) for reason in row['order_reasons'])}"
     )
 
 
@@ -468,6 +576,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Re-run only suspicious rows with a higher-sampling confirmation pass before deciding they need a bucket change.",
     )
     parser.add_argument(
+        "--compare-reverse-order",
+        action="store_true",
+        help="Re-run the same shape cases in reverse order and report rows whose timings are sensitive to sweep order.",
+    )
+    parser.add_argument(
+        "--order-ratio-threshold",
+        type=float,
+        default=1.05,
+        help="Report rows whose forward/reverse max timing ratio reaches this threshold during reverse-order comparison.",
+    )
+    parser.add_argument(
         "--confirm-warmup",
         type=int,
         default=None,
@@ -588,6 +707,39 @@ def main() -> None:
                 f"ratio={float(row['ratio']):.4f},delta_ms={float(row['delta_ms']):.4f}"
             )
 
+    reverse_bench_args: list[str] | None = None
+    reverse_rows: list[dict[str, object]] = []
+    order_sensitive_rows: list[dict[str, object]] = []
+    if args.compare_reverse_order:
+        reverse_cases = list(reversed(cases))
+        reverse_bench_args, reverse_rows, _ = _run_discovery_scan(
+            root=root,
+            env=env,
+            mode=mode,
+            shape_cases=reverse_cases,
+            value_blocks=resolved_value_blocks,
+            head_dim=args.head_dim,
+            seeds=args.seeds,
+            dtype=args.dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+            timing_repeats=args.timing_repeats,
+            label=f"discover-reverse:{mode.name}",
+        )
+        order_rows = _build_order_sensitivity_rows(rows, reverse_rows, mode=mode)
+        order_sensitive_rows = _collect_order_sensitive_rows(
+            order_rows,
+            order_ratio_threshold=args.order_ratio_threshold,
+        )
+        print(
+            f"[reverse-order] mode={mode.name} shapes={len(reverse_rows)} "
+            f"order_sensitive_rows={len(order_sensitive_rows)} "
+            f"order_ratio_threshold={args.order_ratio_threshold:.4f}",
+            flush=True,
+        )
+        for row in order_sensitive_rows[: max(0, args.top)]:
+            _print_order_sensitive_row("gdn_decode_order_sensitive", row)
+
     confirm_bench_args: list[str] | None = None
     confirm_cases: list[tuple[int, int, int]] = []
     confirm_value_blocks: list[int] = []
@@ -654,6 +806,11 @@ def main() -> None:
             "suspicious_rows": suspicious_rows,
             "suspicious_groups": suspicious_groups,
             "top_rows": top_rows,
+            "reverse_order_comparison": {
+                "enabled": args.compare_reverse_order,
+                "bench_args": reverse_bench_args,
+                "rows": order_sensitive_rows,
+            },
             "confirmation": {
                 "enabled": args.confirm_suspicious,
                 "bench_args": confirm_bench_args,
