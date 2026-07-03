@@ -276,13 +276,14 @@ constexpr GatedDeltaDecodeValueBlockOverride kGatedDeltaDecodeValueBlockOverride
 };
 
 // Arc A770 decode sweeps show that V=256 with value_block=4 has stable
-// single-group windows at higher row counts; a plain rows threshold regresses
-// those islands, so keep them as explicit strategy overrides.
+// single-group windows at higher row counts, including the head-16 edge rows
+// immediately outside the coarser cutover bands. A plain rows threshold
+// regresses those islands, so keep them as explicit strategy overrides.
 constexpr GatedDeltaDecodeAutoStrategyOverride kGatedDeltaDecodeAutoStrategyOverrides[] = {
     {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 1, 8, GatedDeltaDecodeStrategy::SingleGroup},
     {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 16, 16, GatedDeltaDecodeStrategy::TiledValue},
-    {"arc", 128, 256, 288, 448, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
-    {"arc", 128, 256, 544, 704, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
+    {"arc", 128, 256, 272, 464, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
+    {"arc", 128, 256, 528, 720, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
 };
 
 constexpr GatedDeltaDecodeAutoCutover kGatedDeltaDecodeAutoCutovers[] = {
