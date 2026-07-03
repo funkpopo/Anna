@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -126,24 +127,18 @@ def _benchmark_flashqla_gdn_prefill(
 
 def _benchmark_gated_delta_decode_strategy(
     *,
-    batch_size: int,
-    num_heads: int,
-    key_head_dim: int,
-    value_head_dim: int,
-    dtype: torch.dtype,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
     strategy: str,
     value_block: int,
     single_min_elements: int | None,
     warmup: int,
     iters: int,
 ) -> tuple[float, float]:
-    query = torch.randn(batch_size, 1, num_heads, key_head_dim, device="xpu", dtype=dtype)
-    key = torch.randn(batch_size, 1, num_heads, key_head_dim, device="xpu", dtype=dtype)
-    value = torch.randn(batch_size, 1, num_heads, value_head_dim, device="xpu", dtype=dtype)
-    g = -0.1 * torch.rand(batch_size, 1, num_heads, device="xpu", dtype=torch.float32)
-    beta = torch.sigmoid(torch.randn(batch_size, 1, num_heads, device="xpu", dtype=torch.float32))
-    initial_state = torch.randn(batch_size, num_heads, key_head_dim, value_head_dim, device="xpu", dtype=torch.float32)
-
     previous_strategy = os.environ.get("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY")
     previous_value_block = os.environ.get("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK")
     previous_single_min_elements = os.environ.get("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS")
@@ -195,6 +190,26 @@ def _benchmark_gated_delta_decode_strategy(
         _restore_env("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY", previous_strategy)
         _restore_env("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", previous_value_block)
         _restore_env("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS", previous_single_min_elements)
+
+
+def _make_gated_delta_decode_bench_inputs(
+    *,
+    batch_size: int,
+    num_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    dtype: torch.dtype,
+    seed: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if seed is not None:
+        torch.manual_seed(seed)
+    query = torch.randn(batch_size, 1, num_heads, key_head_dim, device="xpu", dtype=dtype)
+    key = torch.randn(batch_size, 1, num_heads, key_head_dim, device="xpu", dtype=dtype)
+    value = torch.randn(batch_size, 1, num_heads, value_head_dim, device="xpu", dtype=dtype)
+    g = -0.1 * torch.rand(batch_size, 1, num_heads, device="xpu", dtype=torch.float32)
+    beta = torch.sigmoid(torch.randn(batch_size, 1, num_heads, device="xpu", dtype=torch.float32))
+    initial_state = torch.randn(batch_size, num_heads, key_head_dim, value_head_dim, device="xpu", dtype=torch.float32)
+    return query, key, value, g, beta, initial_state
 
 
 def _benchmark_xpu_int4_linear(
@@ -945,6 +960,21 @@ def main() -> None:
             "Defaults to the fused op's built-in threshold."
         ),
     )
+    parser.add_argument(
+        "--gdn-decode-seed",
+        type=int,
+        default=0,
+        help=(
+            "Seed for Gated Delta decode profile inputs. "
+            "Use a negative value to keep per-run random inputs."
+        ),
+    )
+    parser.add_argument(
+        "--gdn-decode-timing-repeats",
+        type=int,
+        default=3,
+        help="Repeated timing samples per Gated Delta decode candidate. The reported candidate_ms is the median.",
+    )
     args = parser.parse_args()
 
     if not hasattr(torch, "xpu") or not torch.xpu.is_available():
@@ -979,6 +1009,7 @@ def main() -> None:
         args.gdn_decode_profile = True
     if args.gdn_decode_profile:
         gdn_value_head_dim = args.head_dim if args.gdn_value_head_dim is None else args.gdn_value_head_dim
+        gdn_decode_seed = None if args.gdn_decode_seed < 0 else args.gdn_decode_seed
         value_blocks = [
             int(item.strip())
             for item in args.gdn_decode_value_blocks.split(",")
@@ -988,35 +1019,62 @@ def main() -> None:
             raise ValueError("--gdn-decode-value-blocks must contain at least one integer")
         print(
             "gdn_decode_profile,device_name,strategy,batch,heads,key_head_dim,value_head_dim,value_block,"
-            "single_min_elements,dtype,candidate_ms,max_abs_diff"
+            "single_min_elements,dtype,timing_repeats,candidate_ms,max_abs_diff"
         )
+        query, key, value, g, beta, initial_state = _make_gated_delta_decode_bench_inputs(
+            batch_size=args.batch_size,
+            num_heads=args.num_heads,
+            key_head_dim=args.head_dim,
+            value_head_dim=gdn_value_head_dim,
+            dtype=dtype,
+            seed=gdn_decode_seed,
+        )
+        candidates: list[dict[str, object]] = []
         for strategy in ("single", "tiled", "auto"):
             for value_block in value_blocks:
                 if strategy == "single" and value_block != value_blocks[0]:
                     continue
+                candidates.append(
+                    {
+                        "strategy": strategy,
+                        "value_block": value_block,
+                        "samples_ms": [],
+                        "max_abs_diff": 0.0,
+                    }
+                )
+        total_candidates = len(candidates)
+        for repeat_idx in range(max(1, args.gdn_decode_timing_repeats)):
+            order_start = 0 if total_candidates == 0 else repeat_idx % total_candidates
+            ordered_candidates = candidates[order_start:] + candidates[:order_start]
+            for candidate in ordered_candidates:
                 candidate_ms, diff = _benchmark_gated_delta_decode_strategy(
-                    batch_size=args.batch_size,
-                    num_heads=args.num_heads,
-                    key_head_dim=args.head_dim,
-                    value_head_dim=gdn_value_head_dim,
-                    dtype=dtype,
-                    strategy=strategy,
-                    value_block=value_block,
+                    query=query,
+                    key=key,
+                    value=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=initial_state,
+                    strategy=str(candidate["strategy"]),
+                    value_block=int(candidate["value_block"]),
                     single_min_elements=args.gdn_decode_single_min_elements,
                     warmup=args.warmup,
                     iters=args.iters,
                 )
-                device_name = "" if xpu_info is None else xpu_info.name
-                single_min_elements = (
-                    "default"
-                    if args.gdn_decode_single_min_elements is None
-                    else str(args.gdn_decode_single_min_elements)
-                )
-                print(
-                    f"gdn_decode_profile,{device_name},{strategy},{args.batch_size},{args.num_heads},"
-                    f"{args.head_dim},{gdn_value_head_dim},{value_block},{single_min_elements},"
-                    f"{dtype},{candidate_ms:.4f},{diff:.6f}"
-                )
+                candidate["samples_ms"].append(candidate_ms)
+                candidate["max_abs_diff"] = max(float(candidate["max_abs_diff"]), diff)
+        device_name = "" if xpu_info is None else xpu_info.name
+        single_min_elements = (
+            "default"
+            if args.gdn_decode_single_min_elements is None
+            else str(args.gdn_decode_single_min_elements)
+        )
+        for candidate in candidates:
+            candidate_ms = statistics.median(candidate["samples_ms"])
+            print(
+                f"gdn_decode_profile,{device_name},{candidate['strategy']},{args.batch_size},{args.num_heads},"
+                f"{args.head_dim},{gdn_value_head_dim},{candidate['value_block']},{single_min_elements},"
+                f"{dtype},{args.gdn_decode_timing_repeats},{candidate_ms:.4f},{float(candidate['max_abs_diff']):.6f}"
+            )
     if not args.arc_int4_only and not args.gdn_decode_only:
         rmsnorm_baseline_ms, rmsnorm_fused_ms, rmsnorm_diff = _benchmark_rmsnorm(
             batch_size=args.batch_size,
