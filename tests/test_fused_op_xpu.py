@@ -1852,6 +1852,7 @@ def test_gated_delta_decode_benchmark_matches_env_forced_path(
         (33, 16, 256, 4),
         (34, 16, 256, 4),
         (45, 16, 256, 4),
+        (60, 16, 256, 4),
         (5, 32, 128, 8),
         (6, 32, 128, 8),
         (5, 32, 256, 4),
@@ -1860,6 +1861,9 @@ def test_gated_delta_decode_benchmark_matches_env_forced_path(
         (15, 32, 256, 4),
         (17, 32, 256, 4),
         (24, 32, 256, 4),
+        (25, 32, 256, 4),
+        (29, 32, 256, 4),
+        (30, 32, 256, 4),
     ],
 )
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
@@ -1938,6 +1942,9 @@ def test_gated_delta_decode_xpu_auto_matches_arc_row_cutover_shapes(
         (33, 16, 256, 4, 0),
         (34, 16, 256, 4, 0),
         (45, 16, 256, 4, 0),
+        (49, 16, 256, 4, 0),
+        (59, 16, 256, 4, 0),
+        (60, 16, 256, 4, 1),
         (4, 32, 128, 8, 0),
         (5, 32, 128, 8, 1),
         (4, 32, 256, 4, 0),
@@ -1946,6 +1953,9 @@ def test_gated_delta_decode_xpu_auto_matches_arc_row_cutover_shapes(
         (15, 32, 256, 4, 1),
         (17, 32, 256, 4, 0),
         (24, 32, 256, 4, 1),
+        (25, 32, 256, 4, 0),
+        (29, 32, 256, 4, 0),
+        (30, 32, 256, 4, 1),
     ],
 )
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")

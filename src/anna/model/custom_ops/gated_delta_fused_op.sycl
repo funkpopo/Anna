@@ -278,14 +278,14 @@ constexpr GatedDeltaDecodeValueBlockOverride kGatedDeltaDecodeValueBlockOverride
 // Arc A770 decode sweeps show that some small-block shapes still need narrow
 // row-band overrides on top of the coarse cutovers. V=128/value_block=8 has a
 // tiled edge band at rows 144..152, while V=256/value_block=4 has stable
-// single-group islands at higher row counts, including the head-16 edge rows
-// immediately outside the coarser cutover bands.
+// single-group islands at rows 272..464, 528..720, and 784..944.
 constexpr GatedDeltaDecodeAutoStrategyOverride kGatedDeltaDecodeAutoStrategyOverrides[] = {
     {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 1, 8, GatedDeltaDecodeStrategy::SingleGroup},
     {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 16, 16, GatedDeltaDecodeStrategy::TiledValue},
     {"arc", 128, 128, 144, 152, 8, 8, GatedDeltaDecodeStrategy::TiledValue},
     {"arc", 128, 256, 272, 464, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
     {"arc", 128, 256, 528, 720, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
+    {"arc", 128, 256, 784, 944, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
 };
 
 constexpr GatedDeltaDecodeAutoCutover kGatedDeltaDecodeAutoCutovers[] = {
