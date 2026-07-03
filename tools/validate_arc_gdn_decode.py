@@ -12,6 +12,7 @@ from pathlib import Path
 
 ARC_DEFAULT_PRESET = "arc-default"
 ARC_V64_DEFAULT_BLOCK16_PRESET = "arc-v64-default-block16"
+ARC_LEGACY_V64_BLOCK8_PRESET = "arc-legacy-v64-block8"
 ARC_LEGACY_V128_BLOCK8_PRESET = "arc-legacy-v128-block8"
 ARC_LEGACY_V256_BLOCK4_PRESET = "arc-legacy-v256-block4"
 DEFAULT_BENCH_TIMING_REPEATS = 5
@@ -19,6 +20,7 @@ DEFAULT_BENCH_TIMING_REPEATS = 5
 DEFAULT_PRESETS = (
     ARC_DEFAULT_PRESET,
     ARC_V64_DEFAULT_BLOCK16_PRESET,
+    ARC_LEGACY_V64_BLOCK8_PRESET,
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
 )
@@ -53,6 +55,13 @@ ARC_BENCH_EXPECTATIONS = {
         max_ratio=1.03,
         default_value_block=16,
         default_strategy="tiled",
+    ),
+    ARC_LEGACY_V64_BLOCK8_PRESET: ArcBenchExpectation(
+        compare_prefix="gdn_decode_auto_compare",
+        expected_value_blocks=(8,),
+        expected_row_count=10,
+        ratio_field="auto_speed_ratio",
+        max_ratio=1.02,
     ),
     ARC_LEGACY_V128_BLOCK8_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_auto_compare",
