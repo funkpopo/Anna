@@ -234,6 +234,15 @@ python tools\bench_xpu_hotspots.py `
   --iters 100
 ```
 
+One-command Arc decode validation:
+
+```powershell
+python tools\validate_arc_gdn_decode.py `
+  --build-first `
+  --warmup 20 `
+  --iters 100
+```
+
 General hotspot suite:
 
 ```powershell
@@ -422,6 +431,13 @@ These values only apply when an API request omits the matching field.
 - `--gdn-decode-compare-only`: skip the full strategy sweep rows and print only the compare summaries.
 - `--arc-profile`: add Arc A770/A750-oriented int4 profile rows.
 - `--csv-output PATH`: save general hotspot benchmark results.
+
+`tools/validate_arc_gdn_decode.py`:
+
+- Runs the standard Arc decode benchmark presets plus targeted decode regressions in one command.
+- `--presets LIST`: choose any subset of `arc-default`, `arc-legacy-v128-block8`, `arc-legacy-v256-block4`.
+- `--build-first`: rebuild the fused-op library before validation.
+- `--skip-bench` / `--skip-pytest`: run only the benchmark portion or only the targeted regressions.
 
 ## Troubleshooting
 

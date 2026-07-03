@@ -234,6 +234,15 @@ python tools\bench_xpu_hotspots.py `
   --iters 100
 ```
 
+一条命令跑完整 Arc decode 验证：
+
+```powershell
+python tools\validate_arc_gdn_decode.py `
+  --build-first `
+  --warmup 20 `
+  --iters 100
+```
+
 完整热点套件：
 
 ```powershell
@@ -422,6 +431,13 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 - `--gdn-decode-compare-only`：跳过完整 strategy sweep 行，只输出 compare 汇总行。
 - `--arc-profile`：增加 Arc A770/A750 相关 int4 profile 行。
 - `--csv-output PATH`：保存通用热点 benchmark 结果。
+
+`tools/validate_arc_gdn_decode.py`：
+
+- 一条命令串起标准 Arc decode benchmark preset 和定向 decode 回归。
+- `--presets LIST`：选择 `arc-default`、`arc-legacy-v128-block8`、`arc-legacy-v256-block4` 的任意子集。
+- `--build-first`：验证前先重建 fused-op 动态库。
+- `--skip-bench` / `--skip-pytest`：只跑 benchmark 部分或只跑定向回归。
 
 ## 常见问题
 
