@@ -212,6 +212,63 @@ def _make_gated_delta_decode_bench_inputs(
     return query, key, value, g, beta, initial_state
 
 
+def _compare_gated_delta_decode_auto_against_explicit(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    value_block: int,
+    single_min_elements: int | None,
+    warmup: int,
+    iters: int,
+    timing_repeats: int,
+) -> dict[str, float | str]:
+    strategies = ("single", "tiled", "auto")
+    timing_samples_ms: dict[str, list[float]] = {strategy: [] for strategy in strategies}
+    max_abs_diffs: dict[str, float] = {strategy: 0.0 for strategy in strategies}
+    total_strategies = len(strategies)
+    for repeat_idx in range(max(1, timing_repeats)):
+        order_start = repeat_idx % total_strategies
+        ordered_strategies = strategies[order_start:] + strategies[:order_start]
+        for strategy in ordered_strategies:
+            candidate_ms, diff = _benchmark_gated_delta_decode_strategy(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                strategy=strategy,
+                value_block=value_block,
+                single_min_elements=single_min_elements,
+                warmup=warmup,
+                iters=iters,
+            )
+            timing_samples_ms[strategy].append(candidate_ms)
+            max_abs_diffs[strategy] = max(max_abs_diffs[strategy], diff)
+    single_ms = statistics.median(timing_samples_ms["single"])
+    tiled_ms = statistics.median(timing_samples_ms["tiled"])
+    auto_ms = statistics.median(timing_samples_ms["auto"])
+    best_explicit_strategy = "single" if single_ms <= tiled_ms else "tiled"
+    best_explicit_ms = min(single_ms, tiled_ms)
+    auto_minus_best_ms = auto_ms - best_explicit_ms
+    auto_speed_ratio = auto_ms / best_explicit_ms if best_explicit_ms > 0 else float("inf")
+    max_abs_diff = max(max_abs_diffs.values())
+    return {
+        "single_ms": single_ms,
+        "tiled_ms": tiled_ms,
+        "auto_ms": auto_ms,
+        "best_explicit_strategy": best_explicit_strategy,
+        "best_explicit_ms": best_explicit_ms,
+        "auto_minus_best_ms": auto_minus_best_ms,
+        "auto_speed_ratio": auto_speed_ratio,
+        "max_abs_diff": max_abs_diff,
+    }
+
+
 def _benchmark_xpu_int4_linear(
     *,
     tokens: int,
@@ -975,6 +1032,11 @@ def main() -> None:
         default=3,
         help="Repeated timing samples per Gated Delta decode candidate. The reported candidate_ms is the median.",
     )
+    parser.add_argument(
+        "--gdn-decode-auto-compare",
+        action="store_true",
+        help="Print per-value-block auto-vs-explicit summary rows after the decode sweep.",
+    )
     args = parser.parse_args()
 
     if not hasattr(torch, "xpu") or not torch.xpu.is_available():
@@ -1075,6 +1137,34 @@ def main() -> None:
                 f"{args.head_dim},{gdn_value_head_dim},{candidate['value_block']},{single_min_elements},"
                 f"{dtype},{args.gdn_decode_timing_repeats},{candidate_ms:.4f},{float(candidate['max_abs_diff']):.6f}"
             )
+        if args.gdn_decode_auto_compare:
+            print(
+                "gdn_decode_auto_compare,device_name,batch,heads,key_head_dim,value_head_dim,value_block,"
+                "single_ms,tiled_ms,auto_ms,best_explicit_strategy,best_explicit_ms,auto_minus_best_ms,"
+                "auto_speed_ratio,max_abs_diff"
+            )
+            for value_block in value_blocks:
+                compare_result = _compare_gated_delta_decode_auto_against_explicit(
+                    query=query,
+                    key=key,
+                    value=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=initial_state,
+                    value_block=value_block,
+                    single_min_elements=args.gdn_decode_single_min_elements,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    timing_repeats=args.gdn_decode_timing_repeats,
+                )
+                print(
+                    f"gdn_decode_auto_compare,{device_name},{args.batch_size},{args.num_heads},"
+                    f"{args.head_dim},{gdn_value_head_dim},{value_block},{float(compare_result['single_ms']):.4f},"
+                    f"{float(compare_result['tiled_ms']):.4f},{float(compare_result['auto_ms']):.4f},"
+                    f"{compare_result['best_explicit_strategy']},{float(compare_result['best_explicit_ms']):.4f},"
+                    f"{float(compare_result['auto_minus_best_ms']):.4f},{float(compare_result['auto_speed_ratio']):.4f},"
+                    f"{float(compare_result['max_abs_diff']):.6f}"
+                )
     if not args.arc_int4_only and not args.gdn_decode_only:
         rmsnorm_baseline_ms, rmsnorm_fused_ms, rmsnorm_diff = _benchmark_rmsnorm(
             batch_size=args.batch_size,

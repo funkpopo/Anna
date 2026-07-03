@@ -178,6 +178,7 @@ Gated Delta decode 策略 sweep：
 ```powershell
 python tools\bench_xpu_hotspots.py `
   --gdn-decode-only `
+  --gdn-decode-auto-compare `
   --batch-size 4 `
   --num-heads 32 `
   --head-dim 128 `
@@ -364,6 +365,9 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 - `--gdn-decode-only`：只跑 Gated Delta decode 策略 sweep。
 - `--gdn-decode-value-blocks LIST`：测试多个 value block。
 - `--gdn-decode-single-min-elements N`：覆盖 auto 策略阈值。
+- `--gdn-decode-seed N`：固定 decode profile 输入，方便做可复现的 A/B 对比；负值表示每次运行都重新随机输入。
+- `--gdn-decode-timing-repeats N`：每个候选重复计时 N 次并输出中位数。
+- `--gdn-decode-auto-compare`：在 decode sweep 之后额外输出每个 value block 上 `auto` 对比最优显式策略的汇总行。
 - `--arc-profile`：增加 Arc A770/A750 相关 int4 profile 行。
 - `--csv-output PATH`：保存通用热点 benchmark 结果。
 

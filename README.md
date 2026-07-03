@@ -178,6 +178,7 @@ Gated Delta decode strategy sweep:
 ```powershell
 python tools\bench_xpu_hotspots.py `
   --gdn-decode-only `
+  --gdn-decode-auto-compare `
   --batch-size 4 `
   --num-heads 32 `
   --head-dim 128 `
@@ -364,6 +365,9 @@ These values only apply when an API request omits the matching field.
 - `--gdn-decode-only`: only run the Gated Delta decode strategy sweep.
 - `--gdn-decode-value-blocks LIST`: test multiple value-block sizes.
 - `--gdn-decode-single-min-elements N`: override the auto-strategy threshold.
+- `--gdn-decode-seed N`: fix the decode-profile inputs for repeatable A/B comparisons; negative keeps per-run random inputs.
+- `--gdn-decode-timing-repeats N`: take N timing samples per candidate and report the median.
+- `--gdn-decode-auto-compare`: add per-value-block `auto` vs best-explicit summary rows after the decode sweep.
 - `--arc-profile`: add Arc A770/A750-oriented int4 profile rows.
 - `--csv-output PATH`: save general hotspot benchmark results.
 
