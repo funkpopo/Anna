@@ -248,6 +248,25 @@ struct GatedDeltaDecodeAutoCutover {
   int64_t tiled_min_value_block;
 };
 
+struct GatedDeltaDecodeAutoStrategyOverride {
+  const char* device_pattern;
+  int64_t key_head_dim;
+  int64_t value_head_dim;
+  int64_t min_rows;
+  int64_t max_rows;
+  int64_t min_value_block;
+  int64_t max_value_block;
+  GatedDeltaDecodeStrategy strategy;
+};
+
+// Arc A770 decode sweeps show that V=256 with value_block=4 has stable
+// single-group windows at higher row counts; a plain rows threshold regresses
+// those islands, so keep them as explicit strategy overrides.
+constexpr GatedDeltaDecodeAutoStrategyOverride kGatedDeltaDecodeAutoStrategyOverrides[] = {
+    {"arc", 128, 256, 288, 448, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
+    {"arc", 128, 256, 544, 704, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
+};
+
 constexpr GatedDeltaDecodeAutoCutover kGatedDeltaDecodeAutoCutovers[] = {
     {"arc", 128, 128, 160, 8},
     {"arc", 128, 128, 1, 16},
@@ -340,6 +359,22 @@ GatedDeltaDecodeStrategy resolve_gated_delta_decode_strategy(
   }
 
   const std::string& lower_device_name = cached_lowercase_device_name(device);
+  for (const auto& strategy_override : kGatedDeltaDecodeAutoStrategyOverrides) {
+    const bool device_matches = strategy_override.device_pattern[0] == '\0' ||
+        lower_device_name.find(strategy_override.device_pattern) != std::string::npos;
+    if (!device_matches || strategy_override.key_head_dim != key_head_dim ||
+        strategy_override.value_head_dim != value_head_dim) {
+      continue;
+    }
+    if (recurrent_rows < strategy_override.min_rows || recurrent_rows > strategy_override.max_rows) {
+      continue;
+    }
+    if (value_block < strategy_override.min_value_block || value_block > strategy_override.max_value_block) {
+      continue;
+    }
+    return strategy_override.strategy;
+  }
+
   bool matched_auto_cutover_shape = false;
   for (const auto& cutover : kGatedDeltaDecodeAutoCutovers) {
     const bool device_matches =
