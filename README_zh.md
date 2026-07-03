@@ -204,6 +204,23 @@ python tools\bench_xpu_hotspots.py `
   --iters 100
 ```
 
+带多 seed 聚合的高 rows compare-only matrix：
+
+```powershell
+python tools\bench_xpu_hotspots.py `
+  --gdn-decode-only `
+  --gdn-decode-auto-compare `
+  --gdn-decode-compare-only `
+  --gdn-decode-seeds 20260716,20260717 `
+  --gdn-decode-batch-head-cases 9x32,10x32,12x32,14x32,15x32,16x32,17x32,22x32,24x32 `
+  --gdn-value-head-dims 256 `
+  --head-dim 128 `
+  --gdn-decode-value-blocks 4 `
+  --dtype bf16 `
+  --warmup 20 `
+  --iters 100
+```
+
 完整热点套件：
 
 ```powershell
@@ -383,8 +400,10 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 - `--gdn-value-head-dims LIST`：在一次 decode profile 中跑多个 value head dim；设置后覆盖 `--gdn-value-head-dim`。
 - `--gdn-decode-single-min-elements N`：覆盖 auto 策略阈值。
 - `--gdn-decode-seed N`：固定 decode profile 输入，方便做可复现的 A/B 对比；负值表示每次运行都重新随机输入。
+- `--gdn-decode-seeds LIST`：让每个 decode profile case 跨多个固定 seed 聚合；设置后覆盖 `--gdn-decode-seed`。
 - `--gdn-decode-timing-repeats N`：每个候选重复计时 N 次并输出中位数。
 - `--gdn-decode-auto-compare`：在 decode sweep 之后额外输出每个 value block 上 `auto` 对比最优显式策略的汇总行。
+- `--gdn-decode-compare-only`：跳过完整 strategy sweep 行，只输出 compare 汇总行。
 - `--arc-profile`：增加 Arc A770/A750 相关 int4 profile 行。
 - `--csv-output PATH`：保存通用热点 benchmark 结果。
 
