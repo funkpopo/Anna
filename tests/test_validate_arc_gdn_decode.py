@@ -14,8 +14,11 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     ARC_DEFAULT_PRESET,
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
+    DEFAULT_COMPARE_RATIO_DELTA,
     _bench_args_for_preset,
+    _compare_benchmark_summary_against_baseline,
     _collect_benchmark_summary,
+    _load_json_report,
     _parse_gdn_decode_csv_rows,
     _parse_gdn_decode_value_blocks,
     _parse_preset_names,
@@ -166,3 +169,45 @@ def test_write_json_report_creates_parent_directories(tmp_path: Path) -> None:
     _write_json_report(output_path, payload)
     assert output_path.exists()
     assert json.loads(output_path.read_text(encoding="utf-8")) == payload
+
+
+def test_load_json_report_reads_written_payload(tmp_path: Path) -> None:
+    output_path = tmp_path / "arc_gdn_decode.json"
+    payload = {"schema_version": 1, "status": "ok"}
+    _write_json_report(output_path, payload)
+    assert _load_json_report(output_path) == payload
+
+
+def test_compare_benchmark_summary_against_baseline_accepts_small_drift() -> None:
+    baseline = _collect_benchmark_summary(
+        _make_benchmark_output_for_preset(ARC_DEFAULT_PRESET, ratio=1.00),
+        ARC_DEFAULT_PRESET,
+    )
+    current = _collect_benchmark_summary(
+        _make_benchmark_output_for_preset(ARC_DEFAULT_PRESET, ratio=1.01),
+        ARC_DEFAULT_PRESET,
+    )
+    comparison = _compare_benchmark_summary_against_baseline(
+        current_summary=current,
+        baseline_summary=baseline,
+        max_ratio_delta=DEFAULT_COMPARE_RATIO_DELTA,
+    )
+    assert comparison["preset"] == ARC_DEFAULT_PRESET
+    assert comparison["max_row_ratio_delta"] == pytest.approx(0.01)
+
+
+def test_compare_benchmark_summary_against_baseline_rejects_large_drift() -> None:
+    baseline = _collect_benchmark_summary(
+        _make_benchmark_output_for_preset(ARC_LEGACY_V256_BLOCK4_PRESET, ratio=1.00),
+        ARC_LEGACY_V256_BLOCK4_PRESET,
+    )
+    current = _collect_benchmark_summary(
+        _make_benchmark_output_for_preset(ARC_LEGACY_V256_BLOCK4_PRESET, ratio=1.05),
+        ARC_LEGACY_V256_BLOCK4_PRESET,
+    )
+    with pytest.raises(ValueError, match="exceeded ratio delta threshold"):
+        _compare_benchmark_summary_against_baseline(
+            current_summary=current,
+            baseline_summary=baseline,
+            max_ratio_delta=0.03,
+        )

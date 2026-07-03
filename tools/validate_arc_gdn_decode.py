@@ -67,6 +67,8 @@ DEFAULT_PYTEST_EXPR = (
     "gated_delta_decode_xpu_specialized_k128_shapes_match_reference"
 )
 
+DEFAULT_COMPARE_RATIO_DELTA = 0.03
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -258,6 +260,116 @@ def _write_json_report(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
 
 
+def _load_json_report(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _benchmark_row_key(row: dict[str, str]) -> tuple[str, str, str, str, str]:
+    value_block = row.get("value_block", row.get("default_value_block", ""))
+    return (
+        row["batch"],
+        row["heads"],
+        row["key_head_dim"],
+        row["value_head_dim"],
+        value_block,
+    )
+
+
+def _compare_benchmark_summary_against_baseline(
+    *,
+    current_summary: dict[str, object],
+    baseline_summary: dict[str, object],
+    max_ratio_delta: float,
+) -> dict[str, object]:
+    current_prefix = str(current_summary["compare_prefix"])
+    baseline_prefix = str(baseline_summary["compare_prefix"])
+    if current_prefix != baseline_prefix:
+        raise ValueError(
+            f"Preset {current_summary['preset']} compare_prefix changed from {baseline_prefix} to {current_prefix}"
+        )
+
+    current_value_blocks = tuple(int(value) for value in current_summary["resolved_value_blocks"])
+    baseline_value_blocks = tuple(int(value) for value in baseline_summary["resolved_value_blocks"])
+    if current_value_blocks != baseline_value_blocks:
+        raise ValueError(
+            f"Preset {current_summary['preset']} resolved value blocks changed from {baseline_value_blocks} "
+            f"to {current_value_blocks}"
+        )
+
+    ratio_field = str(current_summary["ratio_field"])
+    current_rows = current_summary["rows"]
+    baseline_rows = baseline_summary["rows"]
+    if not isinstance(current_rows, list) or not isinstance(baseline_rows, list):
+        raise ValueError("Benchmark summary rows must be lists")
+
+    current_map = {_benchmark_row_key(row): row for row in current_rows if isinstance(row, dict)}
+    baseline_map = {_benchmark_row_key(row): row for row in baseline_rows if isinstance(row, dict)}
+    current_keys = set(current_map)
+    baseline_keys = set(baseline_map)
+    if current_keys != baseline_keys:
+        missing = sorted(baseline_keys - current_keys)
+        extra = sorted(current_keys - baseline_keys)
+        raise ValueError(
+            f"Preset {current_summary['preset']} row keys changed; missing={missing[:3]} extra={extra[:3]}"
+        )
+
+    max_ratio_delta_observed = float("-inf")
+    worst_key: tuple[str, str, str, str, str] | None = None
+    worst_current_ratio = 0.0
+    worst_baseline_ratio = 0.0
+    per_row_deltas: list[dict[str, object]] = []
+    for key in sorted(current_keys):
+        current_row = current_map[key]
+        baseline_row = baseline_map[key]
+        current_ratio = float(current_row[ratio_field])
+        baseline_ratio = float(baseline_row[ratio_field])
+        ratio_delta = current_ratio - baseline_ratio
+        if ratio_delta > max_ratio_delta_observed:
+            max_ratio_delta_observed = ratio_delta
+            worst_key = key
+            worst_current_ratio = current_ratio
+            worst_baseline_ratio = baseline_ratio
+        per_row_deltas.append(
+            {
+                "batch": key[0],
+                "heads": key[1],
+                "key_head_dim": key[2],
+                "value_head_dim": key[3],
+                "value_block": key[4],
+                "baseline_ratio": baseline_ratio,
+                "current_ratio": current_ratio,
+                "ratio_delta": ratio_delta,
+            }
+        )
+
+    if max_ratio_delta_observed > max_ratio_delta:
+        assert worst_key is not None
+        raise ValueError(
+            f"Preset {current_summary['preset']} exceeded ratio delta threshold {max_ratio_delta:.4f}: "
+            f"baseline={worst_baseline_ratio:.4f} current={worst_current_ratio:.4f} "
+            f"delta={max_ratio_delta_observed:.4f} on batch={worst_key[0]} heads={worst_key[1]} "
+            f"value_dim={worst_key[3]} value_block={worst_key[4]}"
+        )
+
+    observed_max_ratio_delta = float(current_summary["observed_max_ratio"]) - float(baseline_summary["observed_max_ratio"])
+    summary = {
+        "preset": current_summary["preset"],
+        "ratio_field": ratio_field,
+        "max_ratio_delta_allowed": max_ratio_delta,
+        "observed_max_ratio_delta": observed_max_ratio_delta,
+        "observed_max_ratio_baseline": float(baseline_summary["observed_max_ratio"]),
+        "observed_max_ratio_current": float(current_summary["observed_max_ratio"]),
+        "max_row_ratio_delta": max_ratio_delta_observed,
+        "row_deltas": per_row_deltas,
+    }
+    print(
+        f"[compare:{current_summary['preset']}] max_row_ratio_delta={max_ratio_delta_observed:.4f} "
+        f"observed_max_ratio_delta={observed_max_ratio_delta:.4f}",
+        flush=True,
+    )
+    return summary
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the standard Arc Gated Delta decode benchmark presets and targeted regressions."
@@ -317,6 +429,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to write a structured Arc decode validation summary JSON.",
     )
+    parser.add_argument(
+        "--compare-json",
+        type=str,
+        default=None,
+        help="Optional existing Arc decode validation JSON to compare the current benchmark summaries against.",
+    )
+    parser.add_argument(
+        "--compare-ratio-delta",
+        type=float,
+        default=DEFAULT_COMPARE_RATIO_DELTA,
+        help="Maximum allowed increase in per-row speed-ratio metrics versus --compare-json.",
+    )
     return parser
 
 
@@ -341,6 +465,11 @@ def main() -> None:
             "skip_bench_gates": args.skip_bench_gates,
             "presets": {},
         },
+        "comparison": {
+            "baseline_json": args.compare_json,
+            "max_ratio_delta": args.compare_ratio_delta,
+            "presets": {},
+        },
         "pytest": {
             "skip_pytest": args.skip_pytest,
             "expression": args.pytest_k,
@@ -348,6 +477,9 @@ def main() -> None:
             "xpu_regressions": None,
         },
     }
+    baseline_report: dict[str, object] | None = None
+    if args.compare_json is not None:
+        baseline_report = _load_json_report(Path(args.compare_json).expanduser())
 
     if args.build_first:
         _run_step(
@@ -386,6 +518,23 @@ def main() -> None:
             cast_presets = cast_benchmark["presets"]
             assert isinstance(cast_presets, dict)
             cast_presets[preset_name] = benchmark_summary
+            if baseline_report is not None:
+                baseline_benchmark = baseline_report.get("benchmark")
+                if not isinstance(baseline_benchmark, dict):
+                    raise ValueError("Baseline JSON is missing benchmark section")
+                baseline_presets = baseline_benchmark.get("presets")
+                if not isinstance(baseline_presets, dict) or preset_name not in baseline_presets:
+                    raise ValueError(f"Baseline JSON does not include preset {preset_name}")
+                comparison_summary = _compare_benchmark_summary_against_baseline(
+                    current_summary=benchmark_summary,
+                    baseline_summary=baseline_presets[preset_name],
+                    max_ratio_delta=args.compare_ratio_delta,
+                )
+                cast_comparison = json_report["comparison"]
+                assert isinstance(cast_comparison, dict)
+                cast_comparison_presets = cast_comparison["presets"]
+                assert isinstance(cast_comparison_presets, dict)
+                cast_comparison_presets[preset_name] = comparison_summary
 
     if not args.skip_pytest:
         bench_pytest_args = [sys.executable, "-m", "pytest", "tests/test_bench_xpu_hotspots.py", "-q"]
