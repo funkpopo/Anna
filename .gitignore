@@ -71,3 +71,4 @@ todo_kernel.md
 test.md
 *.html
 
+bench_logs/

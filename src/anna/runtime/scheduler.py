@@ -441,25 +441,26 @@ class AnnaScheduler:
         try:
             started_at = time.perf_counter()
             with self.engine.execution_lock:
-                if is_final_chunk:
-                    outputs = self._forward_batch_maybe_topk(
-                        stage="scheduler_prefill" if start_idx == 0 else f"scheduler_prefill[{start_idx}:{end_idx}]",
-                        requests=requests,
-                        input_ids=chunk.input_ids,
-                        attention_mask=chunk.attention_mask,
-                        past_key_values=group.past_key_values,
-                        model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=start_idx == 0),
-                    )
-                else:
-                    outputs = self.engine._profiled_forward_generation_model(
-                        stage=f"scheduler_prefill[{start_idx}:{end_idx}]",
-                        input_ids=chunk.input_ids,
-                        attention_mask=chunk.attention_mask,
-                        past_key_values=group.past_key_values,
-                        model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=start_idx == 0),
-                        use_cache=True,
-                        logits_to_keep=1,
-                    )
+                with torch.inference_mode():
+                    if is_final_chunk:
+                        outputs = self._forward_batch_maybe_topk(
+                            stage="scheduler_prefill" if start_idx == 0 else f"scheduler_prefill[{start_idx}:{end_idx}]",
+                            requests=requests,
+                            input_ids=chunk.input_ids,
+                            attention_mask=chunk.attention_mask,
+                            past_key_values=group.past_key_values,
+                            model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=start_idx == 0),
+                        )
+                    else:
+                        outputs = self.engine._profiled_forward_generation_model(
+                            stage=f"scheduler_prefill[{start_idx}:{end_idx}]",
+                            input_ids=chunk.input_ids,
+                            attention_mask=chunk.attention_mask,
+                            past_key_values=group.past_key_values,
+                            model_kwargs=self.engine._build_prefill_model_kwargs(chunk, include_media=start_idx == 0),
+                            use_cache=True,
+                            logits_to_keep=1,
+                        )
         except RuntimeError as exc:
             release = getattr(group.past_key_values, "release", None)
             if callable(release):
@@ -527,12 +528,13 @@ class AnnaScheduler:
         try:
             started_at = time.perf_counter()
             with self.engine.execution_lock:
-                outputs = self._forward_batch_maybe_topk(
-                    stage="scheduler_decode",
-                    requests=requests,
-                    input_ids=input_ids,
-                    past_key_values=batch_cache,
-                )
+                with torch.inference_mode():
+                    outputs = self._forward_batch_maybe_topk(
+                        stage="scheduler_decode",
+                        requests=requests,
+                        input_ids=input_ids,
+                        past_key_values=batch_cache,
+                    )
         except RuntimeError as exc:
             release = getattr(batch_cache, "release", None)
             if callable(release):
@@ -558,12 +560,13 @@ class AnnaScheduler:
         try:
             started_at = time.perf_counter()
             with self.engine.execution_lock:
-                outputs = self._forward_batch_maybe_topk(
-                    stage="scheduler_decode",
-                    requests=[request],
-                    input_ids=request.input_ids,
-                    past_key_values=request.past_key_values,
-                )
+                with torch.inference_mode():
+                    outputs = self._forward_batch_maybe_topk(
+                        stage="scheduler_decode",
+                        requests=[request],
+                        input_ids=request.input_ids,
+                        past_key_values=request.past_key_values,
+                    )
         except RuntimeError as exc:
             raise self.engine._handle_runtime_failure(exc) from exc
 
@@ -604,12 +607,13 @@ class AnnaScheduler:
         try:
             started_at = time.perf_counter()
             with self.engine.execution_lock:
-                outputs = self._forward_batch_maybe_topk(
-                    stage="scheduler_decode",
-                    requests=group.requests,
-                    input_ids=group.input_ids,
-                    past_key_values=group.past_key_values,
-                )
+                with torch.inference_mode():
+                    outputs = self._forward_batch_maybe_topk(
+                        stage="scheduler_decode",
+                        requests=group.requests,
+                        input_ids=group.input_ids,
+                        past_key_values=group.past_key_values,
+                    )
         except RuntimeError as exc:
             raise self.engine._handle_runtime_failure(exc) from exc
 

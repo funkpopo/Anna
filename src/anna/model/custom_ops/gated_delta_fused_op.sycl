@@ -8,6 +8,7 @@
 #include <torch/library.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -219,6 +220,50 @@ int64_t resolve_power_of_two_env_local_size(const char* env_name, int64_t fallba
 bool env_equals(const char* env_name, const char* expected) {
   const char* raw = std::getenv(env_name);
   return raw != nullptr && std::string(raw) == expected;
+}
+
+enum class GatedDeltaDecodeStrategy {
+  SingleGroup,
+  TiledValue,
+};
+
+GatedDeltaDecodeStrategy resolve_gated_delta_decode_strategy(
+    int64_t batch_size,
+    int64_t num_heads,
+    int64_t key_head_dim,
+    int64_t value_head_dim,
+    int64_t value_block,
+    int64_t local_size) {
+  const char* raw = std::getenv("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY");
+  if (raw != nullptr && raw[0] != '\0') {
+    std::string strategy(raw);
+    std::transform(strategy.begin(), strategy.end(), strategy.begin(), [](unsigned char value) {
+      return static_cast<char>(std::tolower(value));
+    });
+    if (strategy == "single" || strategy == "single_group" || strategy == "untiled") {
+      return GatedDeltaDecodeStrategy::SingleGroup;
+    }
+    if (strategy == "tiled" || strategy == "tiled_value") {
+      return GatedDeltaDecodeStrategy::TiledValue;
+    }
+    TORCH_CHECK(
+        strategy == "auto",
+        "ANNA_XPU_GATED_DELTA_DECODE_STRATEGY must be one of auto, single, single_group, untiled, tiled, tiled_value");
+  }
+
+  const int64_t recurrent_rows = batch_size * num_heads;
+  const int64_t value_block_count = (value_head_dim + value_block - 1) / value_block;
+  const bool full_value_dim_fits_one_group = value_head_dim <= local_size;
+  const int64_t single_group_min_elements = std::max<int64_t>(
+      1,
+      resolve_env_int64("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS", 16384));
+  const int64_t single_group_parallel_elements = recurrent_rows * value_head_dim;
+
+  if (full_value_dim_fits_one_group && value_block_count > 1 &&
+      single_group_parallel_elements >= single_group_min_elements) {
+    return GatedDeltaDecodeStrategy::SingleGroup;
+  }
+  return GatedDeltaDecodeStrategy::TiledValue;
 }
 
 int64_t default_bounded_local_size(int64_t dimension, int64_t max_value) {
@@ -6461,6 +6506,13 @@ at::Tensor gated_delta_decode_xpu(
   const int64_t value_block = std::max<int64_t>(
       1,
       std::min<int64_t>(32, resolve_env_int64("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", 4)));
+  const auto decode_strategy = resolve_gated_delta_decode_strategy(
+      batch_size,
+      num_heads,
+      key_head_dim,
+      value_head_dim,
+      value_block,
+      local_size);
 
   const float* beta_ptr = beta_in.const_data_ptr<float>();
   const float* g_ptr = g_in.const_data_ptr<float>();
@@ -6479,24 +6531,44 @@ at::Tensor gated_delta_decode_xpu(
         const scalar_t* key_ptr = key_in.const_data_ptr<scalar_t>();
         const scalar_t* value_ptr = value_in.const_data_ptr<scalar_t>();
         scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
-        launch_gated_delta_decode_tiled_kernel(
-            stream.queue(),
-            query_ptr,
-            key_ptr,
-            value_ptr,
-            g_ptr,
-            beta_ptr,
-            state_read_ptr,
-            state_write_ptr,
-            output_ptr,
-            batch_size,
-            num_heads,
-            key_head_dim,
-            value_head_dim,
-            value_block,
-            local_size,
-            l2_eps_f,
-            query_scale_base);
+        if (decode_strategy == GatedDeltaDecodeStrategy::SingleGroup) {
+          launch_gated_delta_decode_kernel(
+              stream.queue(),
+              query_ptr,
+              key_ptr,
+              value_ptr,
+              g_ptr,
+              beta_ptr,
+              state_read_ptr,
+              state_write_ptr,
+              output_ptr,
+              batch_size,
+              num_heads,
+              key_head_dim,
+              value_head_dim,
+              local_size,
+              l2_eps_f,
+              query_scale_base);
+        } else {
+          launch_gated_delta_decode_tiled_kernel(
+              stream.queue(),
+              query_ptr,
+              key_ptr,
+              value_ptr,
+              g_ptr,
+              beta_ptr,
+              state_read_ptr,
+              state_write_ptr,
+              output_ptr,
+              batch_size,
+              num_heads,
+              key_head_dim,
+              value_head_dim,
+              value_block,
+              local_size,
+              l2_eps_f,
+              query_scale_base);
+        }
       });
 
   return output;
@@ -6809,6 +6881,39 @@ TORCH_LIBRARY_IMPL(anna, Meta, m) {
   m.impl("flashqla_solve_wu_build", anna::flashqla_solve_wu_build_meta);
   m.impl("flashqla_chunk_gdr_fwd", anna::flashqla_chunk_gdr_fwd_meta);
   m.impl("gated_delta_decode", anna::gated_delta_decode_meta);
+}
+
+TORCH_LIBRARY_IMPL(anna, Autograd, m) {
+  m.impl("gqa_decode_fused", torch::CppFunction::makeFallthrough());
+  m.impl("gqa_decode_splitkv_fused", torch::CppFunction::makeFallthrough());
+  m.impl("gqa_decode_splitkv_fused_out", torch::CppFunction::makeFallthrough());
+  m.impl("gqa_decode_splitkv_turboquant_fused_out", torch::CppFunction::makeFallthrough());
+  m.impl("paged_gqa_decode_fused", torch::CppFunction::makeFallthrough());
+  m.impl("moe_router_fused", torch::CppFunction::makeFallthrough());
+  m.impl("moe_dispatch_fused", torch::CppFunction::makeFallthrough());
+  m.impl("moe_scatter_fused", torch::CppFunction::makeFallthrough());
+  m.impl("moe_grouped_int4_mlp_fused", torch::CppFunction::makeFallthrough());
+  m.impl("lm_head_topk_fused", torch::CppFunction::makeFallthrough());
+  m.impl("lm_head_int4_topk_fused", torch::CppFunction::makeFallthrough());
+  m.impl("xpu_int4_gemv", torch::CppFunction::makeFallthrough());
+  m.impl("xpu_int4_gemv_tiled", torch::CppFunction::makeFallthrough());
+  m.impl("rmsnorm_fused", torch::CppFunction::makeFallthrough());
+  m.impl("rmsnorm_fused_ex", torch::CppFunction::makeFallthrough());
+  m.impl("rmsnorm_gated_fused", torch::CppFunction::makeFallthrough());
+  m.impl("qk_norm_rotary_fused", torch::CppFunction::makeFallthrough());
+  m.impl("qk_norm_rotary_fused_ex", torch::CppFunction::makeFallthrough());
+  m.impl("causal_conv1d_prefill", torch::CppFunction::makeFallthrough());
+  m.impl("causal_conv1d_decode", torch::CppFunction::makeFallthrough());
+  m.impl("gated_delta_prefill", torch::CppFunction::makeFallthrough());
+  m.impl("flashqla_gated_delta_prefill", torch::CppFunction::makeFallthrough());
+  m.impl("flashqla_chunk_local_cumsum", torch::CppFunction::makeFallthrough());
+  m.impl("flashqla_cumsum_kkt_build", torch::CppFunction::makeFallthrough());
+  m.impl("flashqla_kkt_build", torch::CppFunction::makeFallthrough());
+  m.impl("flashqla_kkt_solve_64", torch::CppFunction::makeFallthrough());
+  m.impl("flashqla_wu_build", torch::CppFunction::makeFallthrough());
+  m.impl("flashqla_solve_wu_build", torch::CppFunction::makeFallthrough());
+  m.impl("flashqla_chunk_gdr_fwd", torch::CppFunction::makeFallthrough());
+  m.impl("gated_delta_decode", torch::CppFunction::makeFallthrough());
 }
 
 TORCH_LIBRARY_IMPL(anna, XPU, m) {

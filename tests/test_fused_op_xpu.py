@@ -1,6 +1,7 @@
 import pytest
 import torch
 import os
+import warnings
 
 import anna.model.ops as model_ops
 import anna.model.fused_ops as fused_ops
@@ -930,6 +931,23 @@ def test_rmsnorm_fused_xpu_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_fused_ops_register_autograd_fallthrough_for_inference() -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "rmsnorm_fused"):
+        pytest.skip("Anna fused-op library is not built")
+
+    assert torch._C._dispatch_has_kernel_for_dispatch_key("anna::rmsnorm_fused", "Autograd")
+
+    hidden_states = torch.randn(2, 3, 32, device="xpu", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(32, device="xpu", dtype=torch.float32)
+    with warnings.catch_warnings(record=True) as caught:
+        output = torch.ops.anna.rmsnorm_fused(hidden_states, weight, 1e-6)
+        torch.xpu.synchronize()
+
+    assert output.requires_grad is False
+    assert not any("autograd kernel was not registered" in str(item.message) for item in caught)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
 def test_qk_norm_rotary_fused_xpu_matches_reference() -> None:
     if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "qk_norm_rotary_fused"):
         pytest.skip("Anna fused-op library is not built")
@@ -1398,3 +1416,104 @@ def test_gated_delta_decode_xpu_updates_explicit_state_buffer() -> None:
     torch.xpu.synchronize()
     assert torch.allclose(output.float().cpu(), ref_core.float().cpu(), atol=2e-2, rtol=2e-2)
     assert torch.allclose(state_buffer.float().cpu(), ref_state.float().cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("strategy", ["single", "tiled", "auto"])
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gated_delta_decode_xpu_strategy_matches_qwen35_shape(
+    strategy: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not maybe_load_gated_delta_library():
+        pytest.skip("Anna fused-op library is not built")
+
+    monkeypatch.setenv("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY", strategy)
+    torch.manual_seed(0)
+    device = "xpu"
+    batch_size = 1
+    num_heads = 32
+    head_dim = 128
+    query = torch.randn(batch_size, 1, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(batch_size, 1, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    value = torch.randn(batch_size, 1, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    g = torch.randn(batch_size, 1, num_heads, device=device, dtype=torch.float32)
+    beta = torch.sigmoid(torch.randn(batch_size, 1, num_heads, device=device, dtype=torch.float32))
+    initial_state = torch.randn(batch_size, num_heads, head_dim, head_dim, device=device, dtype=torch.float32)
+    state_buffer = initial_state.clone()
+
+    output = torch.ops.anna.gated_delta_decode(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        state_buffer,
+    )
+
+    ref_core, ref_state = torch_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+    torch.xpu.synchronize()
+    assert torch.allclose(output.float().cpu(), ref_core.float().cpu(), atol=5e-2, rtol=5e-2)
+    assert torch.allclose(state_buffer.float().cpu(), ref_state.float().cpu(), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "num_heads", "head_dim"),
+    [
+        (1, 16, 64),
+        (4, 16, 64),
+        (1, 32, 128),
+        (4, 32, 128),
+        (1, 16, 256),
+        (4, 16, 256),
+    ],
+)
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gated_delta_decode_xpu_auto_matches_qwen35_family_shapes(
+    batch_size: int,
+    num_heads: int,
+    head_dim: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not maybe_load_gated_delta_library():
+        pytest.skip("Anna fused-op library is not built")
+
+    monkeypatch.setenv("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY", "auto")
+    torch.manual_seed(batch_size * 1000 + num_heads * 10 + head_dim)
+    device = "xpu"
+    query = torch.randn(batch_size, 1, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(batch_size, 1, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    value = torch.randn(batch_size, 1, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    g = torch.randn(batch_size, 1, num_heads, device=device, dtype=torch.float32)
+    beta = torch.sigmoid(torch.randn(batch_size, 1, num_heads, device=device, dtype=torch.float32))
+    initial_state = torch.randn(batch_size, num_heads, head_dim, head_dim, device=device, dtype=torch.float32)
+    state_buffer = initial_state.clone()
+
+    output = torch.ops.anna.gated_delta_decode(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        state_buffer,
+    )
+
+    ref_core, ref_state = torch_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+    torch.xpu.synchronize()
+    assert torch.allclose(output.float().cpu(), ref_core.float().cpu(), atol=5e-2, rtol=5e-2)
+    assert torch.allclose(state_buffer.float().cpu(), ref_state.float().cpu(), atol=5e-2, rtol=5e-2)

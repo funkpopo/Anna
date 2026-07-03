@@ -124,6 +124,79 @@ def _benchmark_flashqla_gdn_prefill(
     return current_ms, flashqla_ms, reference_ms, max(output_diff, current_diff, state_diff)
 
 
+def _benchmark_gated_delta_decode_strategy(
+    *,
+    batch_size: int,
+    num_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    dtype: torch.dtype,
+    strategy: str,
+    value_block: int,
+    single_min_elements: int | None,
+    warmup: int,
+    iters: int,
+) -> tuple[float, float]:
+    query = torch.randn(batch_size, 1, num_heads, key_head_dim, device="xpu", dtype=dtype)
+    key = torch.randn(batch_size, 1, num_heads, key_head_dim, device="xpu", dtype=dtype)
+    value = torch.randn(batch_size, 1, num_heads, value_head_dim, device="xpu", dtype=dtype)
+    g = -0.1 * torch.rand(batch_size, 1, num_heads, device="xpu", dtype=torch.float32)
+    beta = torch.sigmoid(torch.randn(batch_size, 1, num_heads, device="xpu", dtype=torch.float32))
+    initial_state = torch.randn(batch_size, num_heads, key_head_dim, value_head_dim, device="xpu", dtype=torch.float32)
+
+    previous_strategy = os.environ.get("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY")
+    previous_value_block = os.environ.get("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK")
+    previous_single_min_elements = os.environ.get("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS")
+    os.environ["ANNA_XPU_GATED_DELTA_DECODE_STRATEGY"] = strategy
+    os.environ["ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK"] = str(value_block)
+    if single_min_elements is None:
+        os.environ.pop("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS", None)
+    else:
+        os.environ["ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS"] = str(single_min_elements)
+    try:
+        state_for_correctness = initial_state.clone()
+        candidate_output = torch.ops.anna.gated_delta_decode(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            state_for_correctness,
+        )
+        reference_output, reference_state = torch_recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_state=initial_state,
+            output_final_state=True,
+        )
+        torch.xpu.synchronize()
+        max_abs_diff = float((candidate_output.float() - reference_output.float()).abs().max().item())
+        if reference_state is not None:
+            max_abs_diff = max(max_abs_diff, float((state_for_correctness.float() - reference_state.float()).abs().max().item()))
+
+        state_for_timing = initial_state.clone()
+
+        def candidate() -> torch.Tensor:
+            return torch.ops.anna.gated_delta_decode(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                state_for_timing,
+            )
+
+        candidate_ms = _time_op(candidate, warmup=warmup, iters=iters)
+        return candidate_ms, max_abs_diff
+    finally:
+        _restore_env("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY", previous_strategy)
+        _restore_env("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", previous_value_block)
+        _restore_env("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS", previous_single_min_elements)
+
+
 def _benchmark_xpu_int4_linear(
     *,
     tokens: int,
@@ -841,6 +914,37 @@ def main() -> None:
         default=None,
         help="Write the general hotspot benchmark rows to this CSV file.",
     )
+    parser.add_argument(
+        "--gdn-decode-profile",
+        action="store_true",
+        help="Run Gated Delta single-token decode strategy sweep rows for Qwen3.5 recurrent shapes.",
+    )
+    parser.add_argument(
+        "--gdn-decode-only",
+        action="store_true",
+        help="Only run the Gated Delta decode strategy sweep.",
+    )
+    parser.add_argument(
+        "--gdn-value-head-dim",
+        type=int,
+        default=None,
+        help="Value head dim for Gated Delta decode profiling. Defaults to --head-dim.",
+    )
+    parser.add_argument(
+        "--gdn-decode-value-blocks",
+        type=str,
+        default="1,2,4,8,16,32",
+        help="Comma-separated ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK values for the Gated Delta decode sweep.",
+    )
+    parser.add_argument(
+        "--gdn-decode-single-min-elements",
+        type=int,
+        default=None,
+        help=(
+            "Override ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS for auto strategy profiling. "
+            "Defaults to the fused op's built-in threshold."
+        ),
+    )
     args = parser.parse_args()
 
     if not hasattr(torch, "xpu") or not torch.xpu.is_available():
@@ -871,7 +975,49 @@ def main() -> None:
         print(f"device_index={xpu_info.device_index}")
     if args.arc_int4_only and not args.arc_profile:
         raise ValueError("--arc-int4-only requires --arc-profile")
-    if not args.arc_int4_only:
+    if args.gdn_decode_only:
+        args.gdn_decode_profile = True
+    if args.gdn_decode_profile:
+        gdn_value_head_dim = args.head_dim if args.gdn_value_head_dim is None else args.gdn_value_head_dim
+        value_blocks = [
+            int(item.strip())
+            for item in args.gdn_decode_value_blocks.split(",")
+            if item.strip()
+        ]
+        if not value_blocks:
+            raise ValueError("--gdn-decode-value-blocks must contain at least one integer")
+        print(
+            "gdn_decode_profile,device_name,strategy,batch,heads,key_head_dim,value_head_dim,value_block,"
+            "single_min_elements,dtype,candidate_ms,max_abs_diff"
+        )
+        for strategy in ("single", "tiled", "auto"):
+            for value_block in value_blocks:
+                if strategy == "single" and value_block != value_blocks[0]:
+                    continue
+                candidate_ms, diff = _benchmark_gated_delta_decode_strategy(
+                    batch_size=args.batch_size,
+                    num_heads=args.num_heads,
+                    key_head_dim=args.head_dim,
+                    value_head_dim=gdn_value_head_dim,
+                    dtype=dtype,
+                    strategy=strategy,
+                    value_block=value_block,
+                    single_min_elements=args.gdn_decode_single_min_elements,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                )
+                device_name = "" if xpu_info is None else xpu_info.name
+                single_min_elements = (
+                    "default"
+                    if args.gdn_decode_single_min_elements is None
+                    else str(args.gdn_decode_single_min_elements)
+                )
+                print(
+                    f"gdn_decode_profile,{device_name},{strategy},{args.batch_size},{args.num_heads},"
+                    f"{args.head_dim},{gdn_value_head_dim},{value_block},{single_min_elements},"
+                    f"{dtype},{candidate_ms:.4f},{diff:.6f}"
+                )
+    if not args.arc_int4_only and not args.gdn_decode_only:
         rmsnorm_baseline_ms, rmsnorm_fused_ms, rmsnorm_diff = _benchmark_rmsnorm(
             batch_size=args.batch_size,
             seq_len=args.seq_len,
