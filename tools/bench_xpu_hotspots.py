@@ -438,7 +438,10 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (8, 32, 128),
     ),
     "arc-legacy-v256-block4": (
+        (33, 8, 256),
+        (65, 8, 256),
         (91, 8, 256),
+        (97, 8, 256),
         (10, 16, 256),
         (17, 16, 256),
         (18, 16, 256),
