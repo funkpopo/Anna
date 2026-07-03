@@ -1945,6 +1945,10 @@ def test_gated_delta_decode_xpu_auto_matches_arc_row_cutover_shapes(
         (49, 16, 256, 4, 0),
         (59, 16, 256, 4, 0),
         (60, 16, 256, 4, 1),
+        (64, 16, 256, 4, 1),
+        (65, 16, 256, 4, 0),
+        (71, 16, 256, 4, 0),
+        (72, 16, 256, 4, 1),
         (4, 32, 128, 8, 0),
         (5, 32, 128, 8, 1),
         (4, 32, 256, 4, 0),
@@ -1956,6 +1960,10 @@ def test_gated_delta_decode_xpu_auto_matches_arc_row_cutover_shapes(
         (25, 32, 256, 4, 0),
         (29, 32, 256, 4, 0),
         (30, 32, 256, 4, 1),
+        (32, 32, 256, 4, 1),
+        (33, 32, 256, 4, 0),
+        (35, 32, 256, 4, 0),
+        (36, 32, 256, 4, 1),
     ],
 )
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
