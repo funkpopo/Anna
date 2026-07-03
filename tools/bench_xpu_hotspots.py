@@ -247,6 +247,24 @@ def _parse_gdn_decode_seeds(seed: int | None, seeds_csv: str | None) -> list[int
     return [None if parsed_seed < 0 else parsed_seed for parsed_seed in parsed_seeds]
 
 
+def _resolve_gated_delta_decode_auto_strategy(
+    query: torch.Tensor,
+    *,
+    value_head_dim: int,
+    value_block: int,
+) -> str:
+    anna_ops = getattr(torch.ops, "anna", None)
+    if anna_ops is None or not hasattr(anna_ops, "gated_delta_decode_strategy_debug"):
+        return "unknown"
+
+    strategy_code = int(anna_ops.gated_delta_decode_strategy_debug(query, value_head_dim, value_block))
+    if strategy_code == 0:
+        return "single"
+    if strategy_code == 1:
+        return "tiled"
+    return f"unknown({strategy_code})"
+
+
 def _compare_gated_delta_decode_auto_against_explicit(
     *,
     query: torch.Tensor,
@@ -287,12 +305,18 @@ def _compare_gated_delta_decode_auto_against_explicit(
     single_ms = statistics.median(timing_samples_ms["single"])
     tiled_ms = statistics.median(timing_samples_ms["tiled"])
     auto_ms = statistics.median(timing_samples_ms["auto"])
+    auto_strategy = _resolve_gated_delta_decode_auto_strategy(
+        query,
+        value_head_dim=int(value.shape[-1]),
+        value_block=value_block,
+    )
     best_explicit_strategy = "single" if single_ms <= tiled_ms else "tiled"
     best_explicit_ms = min(single_ms, tiled_ms)
     auto_minus_best_ms = auto_ms - best_explicit_ms
     auto_speed_ratio = auto_ms / best_explicit_ms if best_explicit_ms > 0 else float("inf")
     max_abs_diff = max(max_abs_diffs.values())
     return {
+        "auto_strategy": auto_strategy,
         "single_ms": single_ms,
         "tiled_ms": tiled_ms,
         "auto_ms": auto_ms,
@@ -402,6 +426,8 @@ def _run_gated_delta_decode_profile_case(
             single_ms = statistics.median(float(result["single_ms"]) for result in compare_results)
             tiled_ms = statistics.median(float(result["tiled_ms"]) for result in compare_results)
             auto_ms = statistics.median(float(result["auto_ms"]) for result in compare_results)
+            auto_strategy_labels = {str(result["auto_strategy"]) for result in compare_results}
+            auto_strategy = auto_strategy_labels.pop() if len(auto_strategy_labels) == 1 else "inconsistent"
             best_explicit_strategy = "single" if single_ms <= tiled_ms else "tiled"
             best_explicit_ms = min(single_ms, tiled_ms)
             auto_minus_best_ms = auto_ms - best_explicit_ms
@@ -409,7 +435,7 @@ def _run_gated_delta_decode_profile_case(
             max_abs_diff = max(float(result["max_abs_diff"]) for result in compare_results)
             print(
                 f"gdn_decode_auto_compare,{device_name},{batch_size},{num_heads},"
-                f"{key_head_dim},{value_head_dim},{value_block},{single_ms:.4f},"
+                f"{key_head_dim},{value_head_dim},{value_block},{auto_strategy},{single_ms:.4f},"
                 f"{tiled_ms:.4f},{auto_ms:.4f},{best_explicit_strategy},{best_explicit_ms:.4f},"
                 f"{auto_minus_best_ms:.4f},{auto_speed_ratio:.4f},{max_abs_diff:.6f}"
             )
@@ -1282,7 +1308,7 @@ def main() -> None:
         if args.gdn_decode_auto_compare:
             print(
                 "gdn_decode_auto_compare,device_name,batch,heads,key_head_dim,value_head_dim,value_block,"
-                "single_ms,tiled_ms,auto_ms,best_explicit_strategy,best_explicit_ms,auto_minus_best_ms,"
+                "auto_strategy,single_ms,tiled_ms,auto_ms,best_explicit_strategy,best_explicit_ms,auto_minus_best_ms,"
                 "auto_speed_ratio,max_abs_diff"
             )
         for case_idx, (batch_size, num_heads) in enumerate(batch_head_cases):
