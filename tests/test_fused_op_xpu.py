@@ -1464,6 +1464,59 @@ def test_gated_delta_decode_xpu_strategy_matches_qwen35_shape(
     assert torch.allclose(state_buffer.float().cpu(), ref_state.float().cpu(), atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.parametrize("value_head_dim", [64, 256])
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gated_delta_decode_xpu_single_strategy_matches_mixed_kv_widths(
+    value_head_dim: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not maybe_load_gated_delta_library():
+        pytest.skip("Anna fused-op library is not built")
+
+    monkeypatch.setenv("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY", "single")
+    torch.manual_seed(1200 + value_head_dim)
+    device = "xpu"
+    batch_size = 2
+    num_heads = 16
+    key_head_dim = 128
+    query = torch.randn(batch_size, 1, num_heads, key_head_dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(batch_size, 1, num_heads, key_head_dim, device=device, dtype=torch.bfloat16)
+    value = torch.randn(batch_size, 1, num_heads, value_head_dim, device=device, dtype=torch.bfloat16)
+    g = torch.randn(batch_size, 1, num_heads, device=device, dtype=torch.float32)
+    beta = torch.sigmoid(torch.randn(batch_size, 1, num_heads, device=device, dtype=torch.float32))
+    initial_state = torch.randn(
+        batch_size,
+        num_heads,
+        key_head_dim,
+        value_head_dim,
+        device=device,
+        dtype=torch.float32,
+    )
+    state_buffer = initial_state.clone()
+
+    output = torch.ops.anna.gated_delta_decode(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        state_buffer,
+    )
+
+    ref_core, ref_state = torch_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+    torch.xpu.synchronize()
+    assert torch.allclose(output.float().cpu(), ref_core.float().cpu(), atol=5e-2, rtol=5e-2)
+    assert torch.allclose(state_buffer.float().cpu(), ref_state.float().cpu(), atol=5e-2, rtol=5e-2)
+
+
 @pytest.mark.parametrize(
     ("batch_size", "num_heads", "head_dim"),
     [
