@@ -1686,6 +1686,9 @@ def test_gated_delta_decode_xpu_auto_matches_qwen35_family_shapes(
 @pytest.mark.parametrize(
     ("batch_size", "num_heads", "value_head_dim", "value_block"),
     [
+        (1, 32, 64, 4),
+        (4, 32, 64, 8),
+        (8, 32, 64, 16),
         (5, 32, 128, 8),
         (6, 32, 128, 8),
         (5, 32, 256, 4),
@@ -1753,6 +1756,9 @@ def test_gated_delta_decode_xpu_auto_matches_arc_row_cutover_shapes(
 @pytest.mark.parametrize(
     ("batch_size", "num_heads", "value_head_dim", "value_block", "expected_strategy_code"),
     [
+        (1, 32, 64, 4, 0),
+        (4, 32, 64, 8, 0),
+        (8, 32, 64, 16, 1),
         (4, 32, 128, 8, 0),
         (5, 32, 128, 8, 1),
         (4, 32, 256, 4, 0),

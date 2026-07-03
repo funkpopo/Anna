@@ -263,6 +263,8 @@ struct GatedDeltaDecodeAutoStrategyOverride {
 // single-group windows at higher row counts; a plain rows threshold regresses
 // those islands, so keep them as explicit strategy overrides.
 constexpr GatedDeltaDecodeAutoStrategyOverride kGatedDeltaDecodeAutoStrategyOverrides[] = {
+    {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 1, 8, GatedDeltaDecodeStrategy::SingleGroup},
+    {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 16, 16, GatedDeltaDecodeStrategy::TiledValue},
     {"arc", 128, 256, 288, 448, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
     {"arc", 128, 256, 544, 704, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
 };
