@@ -338,7 +338,7 @@ These values only apply when an API request omits the matching field.
 - `--xpu-int4-matmul auto|torch|dequant`: XPU int4 dense linear execution strategy.
 - `ANNA_GATED_DELTA_OP_LIB`: explicitly point to a fused-op `.pyd` / `.so`.
 - `ANNA_XPU_GATED_DELTA_DECODE_STRATEGY=auto|single|single_group|untiled|tiled|tiled_value`: Gated Delta decode kernel strategy.
-- `ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK=N`: value block size for tiled decode.
+- `ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK=N`: override the tiled decode value block size. When unset, Anna uses a device/shape default; current Arc K=128 V={64,128,256} decode shapes default to `16`.
 - `ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS=N`: optional override for `auto`; when set, bypass the device/shape lookup and use this single-group element threshold.
 
 ### Continuous Batching and Token Budgets

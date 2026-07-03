@@ -1714,6 +1714,54 @@ def test_gated_delta_decode_strategy_debug_matches_qwen35_family_lookup(
 
 
 @pytest.mark.parametrize(
+    ("batch_size", "num_heads", "value_head_dim", "expected_value_block", "expected_strategy_code"),
+    [
+        (1, 16, 64, 16, 1),
+        (4, 16, 64, 16, 1),
+        (1, 32, 128, 16, 1),
+        (4, 32, 128, 16, 1),
+        (1, 16, 256, 16, 1),
+        (4, 16, 256, 16, 1),
+    ],
+)
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gated_delta_decode_value_block_debug_matches_arc_default_lookup(
+    batch_size: int,
+    num_heads: int,
+    value_head_dim: int,
+    expected_value_block: int,
+    expected_strategy_code: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if (
+        not maybe_load_gated_delta_library()
+        or not hasattr(torch.ops.anna, "gated_delta_decode_value_block_debug")
+        or not hasattr(torch.ops.anna, "gated_delta_decode_strategy_debug")
+    ):
+        pytest.skip("Anna fused-op library is not built")
+
+    monkeypatch.delenv("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", raising=False)
+    query = torch.empty(batch_size, 1, num_heads, 128, device="xpu", dtype=torch.bfloat16)
+    value_block = torch.ops.anna.gated_delta_decode_value_block_debug(query, value_head_dim)
+    strategy_code = torch.ops.anna.gated_delta_decode_strategy_debug(query, value_head_dim, value_block)
+    assert value_block == expected_value_block
+    assert strategy_code == expected_strategy_code
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gated_delta_decode_value_block_debug_respects_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gated_delta_decode_value_block_debug"):
+        pytest.skip("Anna fused-op library is not built")
+
+    monkeypatch.setenv("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", "8")
+    query = torch.empty(1, 1, 16, 128, device="xpu", dtype=torch.bfloat16)
+    value_block = torch.ops.anna.gated_delta_decode_value_block_debug(query, 256)
+    assert value_block == 8
+
+
+@pytest.mark.parametrize(
     ("batch_size", "num_heads", "value_head_dim", "value_block"),
     [
         (1, 32, 64, 4),

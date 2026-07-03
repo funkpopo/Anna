@@ -338,7 +338,7 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 - `--xpu-int4-matmul auto|torch|dequant`：XPU int4 dense linear 执行策略。
 - `ANNA_GATED_DELTA_OP_LIB`：显式指定 fused op `.pyd` / `.so` 路径。
 - `ANNA_XPU_GATED_DELTA_DECODE_STRATEGY=auto|single|single_group|untiled|tiled|tiled_value`：Gated Delta decode kernel 策略。
-- `ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK=N`：tiled decode 的 value block 大小。
+- `ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK=N`：覆盖 tiled decode 的 value block 大小。不设置时，Anna 会使用 device/shape 默认值；当前 Arc 上 K=128、V={64,128,256} 的 decode shape 默认走 `16`。
 - `ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS=N`：`auto` 的可选覆盖项；设置后会跳过设备/shape 查表，改用这个 single-group 元素阈值。
 
 ### 连续批处理和 token budget

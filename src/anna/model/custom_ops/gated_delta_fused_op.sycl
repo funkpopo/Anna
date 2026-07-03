@@ -240,6 +240,13 @@ struct GatedDeltaDecodeAutoBucket {
   int64_t single_group_min_rows;
 };
 
+struct GatedDeltaDecodeValueBlockOverride {
+  const char* device_pattern;
+  int64_t key_head_dim;
+  int64_t value_head_dim;
+  int64_t value_block;
+};
+
 struct GatedDeltaDecodeAutoCutover {
   const char* device_pattern;
   int64_t key_head_dim;
@@ -257,6 +264,15 @@ struct GatedDeltaDecodeAutoStrategyOverride {
   int64_t min_value_block;
   int64_t max_value_block;
   GatedDeltaDecodeStrategy strategy;
+};
+
+// Arc A770 decode sweeps show that K=128 recurrent decode shapes consistently
+// prefer value_block=16 for V={64,128,256}; smaller tiles leave the tiled
+// subgroup kernel underutilized while 32 does not recover enough to win.
+constexpr GatedDeltaDecodeValueBlockOverride kGatedDeltaDecodeValueBlockOverrides[] = {
+    {"arc", 128, 64, 16},
+    {"arc", 128, 128, 16},
+    {"arc", 128, 256, 16},
 };
 
 // Arc A770 decode sweeps show that V=256 with value_block=4 has stable
@@ -310,6 +326,33 @@ const std::string& cached_lowercase_device_name(const sycl::device& device) {
     cached_lower_name = lowercase_ascii(device.get_info<sycl::info::device::name>());
   }
   return cached_lower_name;
+}
+
+int64_t clamp_gated_delta_decode_value_block(int64_t value_block) {
+  return std::max<int64_t>(1, std::min<int64_t>(32, value_block));
+}
+
+int64_t resolve_gated_delta_decode_value_block(
+    const sycl::device& device,
+    int64_t key_head_dim,
+    int64_t value_head_dim) {
+  const int64_t env_value_block = resolve_env_int64("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", 0);
+  if (env_value_block > 0) {
+    return clamp_gated_delta_decode_value_block(env_value_block);
+  }
+
+  const std::string& lower_device_name = cached_lowercase_device_name(device);
+  for (const auto& value_block_override : kGatedDeltaDecodeValueBlockOverrides) {
+    const bool device_matches = value_block_override.device_pattern[0] == '\0' ||
+        lower_device_name.find(value_block_override.device_pattern) != std::string::npos;
+    if (!device_matches || value_block_override.key_head_dim != key_head_dim ||
+        value_block_override.value_head_dim != value_head_dim) {
+      continue;
+    }
+    return clamp_gated_delta_decode_value_block(value_block_override.value_block);
+  }
+
+  return std::max<int64_t>(1, std::min<int64_t>(4, value_head_dim));
 }
 
 GatedDeltaDecodeStrategy resolve_gated_delta_decode_strategy(
@@ -7089,9 +7132,8 @@ at::Tensor gated_delta_decode_xpu(
   auto stream = c10::xpu::getCurrentXPUStream(query_in.device().index());
   const int64_t local_size = std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, value_head_dim)), 256);
   validate_gated_delta_local_memory_requirements(stream.queue().get_device(), key_head_dim, local_size);
-  const int64_t value_block = std::max<int64_t>(
-      1,
-      std::min<int64_t>(32, resolve_env_int64("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", 4)));
+  const int64_t value_block =
+      resolve_gated_delta_decode_value_block(stream.queue().get_device(), key_head_dim, value_head_dim);
   const auto decode_strategy = resolve_gated_delta_decode_strategy(
       stream.queue().get_device(),
       batch_size,
@@ -7162,6 +7204,18 @@ at::Tensor gated_delta_decode_xpu(
       });
 
   return output;
+}
+
+int64_t gated_delta_decode_value_block_debug_xpu(
+    const at::Tensor& query_in,
+    int64_t value_head_dim) {
+  TORCH_CHECK(query_in.dim() == 4, "query must be [batch, seq, heads, head_dim]");
+  TORCH_CHECK(query_in.device().type() == c10::DeviceType::XPU, "query must be an XPU tensor");
+  TORCH_CHECK(query_in.size(1) == 1, "gated_delta_decode_value_block_debug expects seq_len == 1");
+  TORCH_CHECK(value_head_dim > 0, "value_head_dim must be positive");
+  auto stream = c10::xpu::getCurrentXPUStream(query_in.device().index());
+  const int64_t key_head_dim = query_in.size(3);
+  return resolve_gated_delta_decode_value_block(stream.queue().get_device(), key_head_dim, value_head_dim);
 }
 
 int64_t gated_delta_decode_strategy_debug_xpu(
@@ -7463,6 +7517,11 @@ TORCH_LIBRARY(anna, m) {
       "Tensor(a!) state"
       ") -> Tensor");
   m.def(
+      "gated_delta_decode_value_block_debug("
+      "Tensor query, "
+      "int value_head_dim"
+      ") -> int");
+  m.def(
       "gated_delta_decode_strategy_debug("
       "Tensor query, "
       "int value_head_dim, "
@@ -7534,6 +7593,7 @@ TORCH_LIBRARY_IMPL(anna, Autograd, m) {
   m.impl("flashqla_solve_wu_build", torch::CppFunction::makeFallthrough());
   m.impl("flashqla_chunk_gdr_fwd", torch::CppFunction::makeFallthrough());
   m.impl("gated_delta_decode", torch::CppFunction::makeFallthrough());
+  m.impl("gated_delta_decode_value_block_debug", torch::CppFunction::makeFallthrough());
   m.impl("gated_delta_decode_strategy_debug", torch::CppFunction::makeFallthrough());
 }
 
@@ -7568,5 +7628,6 @@ TORCH_LIBRARY_IMPL(anna, XPU, m) {
   m.impl("flashqla_solve_wu_build", anna::flashqla_solve_wu_build_xpu);
   m.impl("flashqla_chunk_gdr_fwd", anna::flashqla_chunk_gdr_fwd_xpu);
   m.impl("gated_delta_decode", anna::gated_delta_decode_xpu);
+  m.impl("gated_delta_decode_value_block_debug", anna::gated_delta_decode_value_block_debug_xpu);
   m.impl("gated_delta_decode_strategy_debug", anna::gated_delta_decode_strategy_debug_xpu);
 }
