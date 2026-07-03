@@ -204,7 +204,22 @@ python tools\bench_xpu_hotspots.py `
   --iters 100
 ```
 
-High-row compare-only matrix with multi-seed aggregation:
+Arc default-path preset with explicit compare:
+
+```powershell
+python tools\bench_xpu_hotspots.py `
+  --gdn-decode-only `
+  --gdn-decode-default-compare `
+  --gdn-decode-compare-only `
+  --gdn-decode-seeds 20260716,20260717 `
+  --gdn-decode-shape-presets arc-default `
+  --head-dim 128 `
+  --dtype bf16 `
+  --warmup 20 `
+  --iters 100
+```
+
+Arc legacy row-band preset with multi-seed aggregation:
 
 ```powershell
 python tools\bench_xpu_hotspots.py `
@@ -212,10 +227,8 @@ python tools\bench_xpu_hotspots.py `
   --gdn-decode-auto-compare `
   --gdn-decode-compare-only `
   --gdn-decode-seeds 20260716,20260717 `
-  --gdn-decode-batch-head-cases 9x32,10x32,12x32,14x32,15x32,16x32,17x32,22x32,24x32 `
-  --gdn-value-head-dims 256 `
+  --gdn-decode-shape-presets arc-legacy-v256-block4 `
   --head-dim 128 `
-  --gdn-decode-value-blocks 4 `
   --dtype bf16 `
   --warmup 20 `
   --iters 100
@@ -396,13 +409,16 @@ These values only apply when an API request omits the matching field.
 - `--warmup N`, `--iters N`: warmup and measured iterations.
 - `--gdn-decode-only`: only run the Gated Delta decode strategy sweep.
 - `--gdn-decode-batch-head-cases LIST`: run multiple `batch x heads` cases in one decode-profile sweep, for example `1x16,1x32,4x32`.
-- `--gdn-decode-value-blocks LIST`: test multiple value-block sizes.
+- `--gdn-decode-shape-presets LIST`: run named Arc decode preset matrices such as `arc-default`, `arc-legacy-v128-block8`, and `arc-legacy-v256-block4`.
+- `--gdn-decode-value-blocks LIST`: test multiple value-block sizes; when omitted with `--gdn-decode-shape-presets`, Anna uses the preset-recommended blocks.
 - `--gdn-value-head-dims LIST`: run multiple value-head dims in one decode-profile sweep; overrides `--gdn-value-head-dim`.
 - `--gdn-decode-single-min-elements N`: override the auto-strategy threshold.
 - `--gdn-decode-seed N`: fix the decode-profile inputs for repeatable A/B comparisons; negative keeps per-run random inputs.
 - `--gdn-decode-seeds LIST`: aggregate each decode-profile case across multiple fixed seeds; overrides `--gdn-decode-seed`.
 - `--gdn-decode-timing-repeats N`: take N timing samples per candidate and report the median.
 - `--gdn-decode-auto-compare`: add per-value-block `auto` vs best-explicit summary rows after the decode sweep.
+- `--gdn-decode-default-compare`: compare the default decode path against explicit `single` and `tiled`.
+- `--gdn-decode-default-block-compare`: compare the default decode path against forced value-block overrides.
 - `--gdn-decode-compare-only`: skip the full strategy sweep rows and print only the compare summaries.
 - `--arc-profile`: add Arc A770/A750-oriented int4 profile rows.
 - `--csv-output PATH`: save general hotspot benchmark results.

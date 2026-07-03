@@ -303,6 +303,12 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
     ),
 }
 
+GDN_DECODE_PRESET_VALUE_BLOCKS: dict[str, tuple[int, ...]] = {
+    "arc-default": (16,),
+    "arc-legacy-v128-block8": (8,),
+    "arc-legacy-v256-block4": (4,),
+}
+
 
 def _parse_gdn_decode_shape_presets(raw: str) -> list[str]:
     preset_names = [item.strip().lower() for item in raw.split(",") if item.strip()]
@@ -327,6 +333,25 @@ def _dedupe_gdn_decode_shape_cases(cases: list[tuple[int, int, int]]) -> list[tu
         seen.add(case)
         deduped_cases.append(case)
     return deduped_cases
+
+
+def _resolve_gdn_decode_value_blocks(
+    raw: str | None,
+    preset_names: list[str],
+) -> list[int]:
+    if raw is not None:
+        return _parse_int_csv("--gdn-decode-value-blocks", raw)
+
+    if preset_names:
+        value_blocks: list[int] = []
+        for preset_name in preset_names:
+            for value_block in GDN_DECODE_PRESET_VALUE_BLOCKS[preset_name]:
+                if value_block not in value_blocks:
+                    value_blocks.append(value_block)
+        if value_blocks:
+            return value_blocks
+
+    return [1, 2, 4, 8, 16, 32]
 
 
 def _parse_gdn_decode_seeds(seed: int | None, seeds_csv: str | None) -> list[int | None]:
@@ -1527,8 +1552,12 @@ def main() -> None:
     parser.add_argument(
         "--gdn-decode-value-blocks",
         type=str,
-        default="1,2,4,8,16,32",
-        help="Comma-separated ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK values for the Gated Delta decode sweep.",
+        default=None,
+        help=(
+            "Comma-separated ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK values for the Gated Delta decode sweep. "
+            "Defaults to preset-specific recommended blocks when --gdn-decode-shape-presets is set, "
+            "otherwise 1,2,4,8,16,32."
+        ),
     )
     parser.add_argument(
         "--gdn-decode-single-min-elements",
@@ -1671,11 +1700,13 @@ def main() -> None:
     if args.arc_int4_only and not args.arc_profile:
         raise ValueError("--arc-int4-only requires --arc-profile")
     if args.gdn_decode_profile:
+        gdn_decode_shape_preset_names: list[str] = []
         gdn_decode_shape_cases: list[tuple[int, int, int]]
         if args.gdn_decode_shape_presets is not None or args.gdn_decode_shape_cases is not None:
             gdn_decode_shape_cases = []
             if args.gdn_decode_shape_presets is not None:
-                for preset_name in _parse_gdn_decode_shape_presets(args.gdn_decode_shape_presets):
+                gdn_decode_shape_preset_names = _parse_gdn_decode_shape_presets(args.gdn_decode_shape_presets)
+                for preset_name in gdn_decode_shape_preset_names:
                     gdn_decode_shape_cases.extend(GDN_DECODE_SHAPE_PRESETS[preset_name])
             if args.gdn_decode_shape_cases is not None:
                 gdn_decode_shape_cases.extend(_parse_gdn_decode_shape_cases(args.gdn_decode_shape_cases))
@@ -1698,7 +1729,8 @@ def main() -> None:
             ]
         gdn_decode_seed = None if args.gdn_decode_seed < 0 else args.gdn_decode_seed
         gdn_decode_seeds = _parse_gdn_decode_seeds(gdn_decode_seed, args.gdn_decode_seeds)
-        value_blocks = _parse_int_csv("--gdn-decode-value-blocks", args.gdn_decode_value_blocks)
+        value_blocks = _resolve_gdn_decode_value_blocks(args.gdn_decode_value_blocks, gdn_decode_shape_preset_names)
+        print(f"gdn_decode_value_blocks={','.join(str(value_block) for value_block in value_blocks)}")
         if not args.gdn_decode_compare_only:
             print(
                 "gdn_decode_profile,device_name,strategy,batch,heads,key_head_dim,value_head_dim,value_block,"
