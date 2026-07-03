@@ -46,7 +46,7 @@ ARC_BENCH_EXPECTATIONS = {
     ARC_LEGACY_V128_BLOCK8_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_auto_compare",
         expected_value_blocks=(8,),
-        expected_row_count=9,
+        expected_row_count=12,
         ratio_field="auto_speed_ratio",
         max_ratio=1.08,
     ),
