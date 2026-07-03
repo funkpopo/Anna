@@ -102,6 +102,8 @@ void validate_gated_delta_inputs(
       "gated_delta XPU kernel supports float16, bfloat16, and float32 query/key/value inputs");
   TORCH_CHECK(g_in.scalar_type() == at::kFloat, "g must be float32");
   TORCH_CHECK(beta_in.scalar_type() == at::kFloat, "beta must be float32");
+  // Keep recurrent state in float32 for now; BF16 shadow-state / XMX paths need
+  // separate numerical validation before changing update/storage semantics.
   TORCH_CHECK(state_in.scalar_type() == at::kFloat, "state must be float32");
 }
 
