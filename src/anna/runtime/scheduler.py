@@ -286,10 +286,16 @@ class AnnaScheduler:
         requests, deferred = self._select_prefill_admission(requests)
         if deferred:
             self._requeue_front(deferred)
+        metrics = getattr(self.engine, "metrics", None)
+        if metrics is not None:
+            metrics.record_prefill_admission(
+                admitted_requests=len(requests),
+                deferred_requests=len(deferred),
+                admitted_tokens=sum(max(1, int(request.prompt_length)) for request in requests),
+            )
         if not requests:
             return []
 
-        metrics = getattr(self.engine, "metrics", None)
         if metrics is not None:
             metrics.record_requests_started_from_queue(len(requests))
         for request in requests:
@@ -493,6 +499,12 @@ class AnnaScheduler:
         requests = [request for request in requests if not self._is_request_cancelled(request)]
         if not requests:
             return []
+        metrics = getattr(self.engine, "metrics", None)
+        if metrics is not None:
+            metrics.record_decode_batch(
+                requests=len(requests),
+                token_cost=sum(self._decode_request_token_cost(request) for request in requests),
+            )
         if len(requests) == 1:
             return self._decode_single(requests[0])
         input_ids = torch.cat([request.input_ids for request in requests if request.input_ids is not None], dim=0)
@@ -584,6 +596,11 @@ class AnnaScheduler:
             return [self._make_decode_group_from_requests(remaining)]
 
         metrics = getattr(self.engine, "metrics", None)
+        if metrics is not None:
+            metrics.record_decode_batch(
+                requests=len(group.requests),
+                token_cost=self._decode_group_token_cost(group),
+            )
         try:
             started_at = time.perf_counter()
             with self.engine.execution_lock:
@@ -772,11 +789,34 @@ class AnnaScheduler:
         input_ids = request.input_ids
         return 1 if input_ids is None else max(1, int(input_ids.numel()))
 
+    @staticmethod
+    def _decode_group_token_cost(group: SchedulerDecodeGroup) -> int:
+        cache = group.past_key_values
+        get_seq_lengths = getattr(cache, "get_seq_lengths", None)
+        if callable(get_seq_lengths):
+            try:
+                lengths = get_seq_lengths()
+                return sum(max(1, int(length)) for length in lengths.tolist())
+            except Exception:
+                pass
+        get_seq_length = getattr(cache, "get_seq_length", None)
+        if callable(get_seq_length):
+            try:
+                return max(1, int(get_seq_length())) * len(group.requests)
+            except Exception:
+                pass
+        return max(1, int(group.input_ids.numel()))
+
     def _compact_cache_rows(self, cache: object, row_indices: list[int]) -> object | None:
         compact = getattr(cache, "compact_batch_rows", None)
         if not callable(compact):
             return None
-        return compact(row_indices, release_unselected=True)
+        metrics = getattr(self.engine, "metrics", None)
+        started_at = time.perf_counter()
+        compacted = compact(row_indices, release_unselected=True)
+        if metrics is not None:
+            metrics.record_cache_compact(time.perf_counter() - started_at)
+        return compacted
 
     def _make_decode_group_from_requests(self, requests: list[SchedulerRequest]) -> SchedulerDecodeGroup:
         if len(requests) <= 1:

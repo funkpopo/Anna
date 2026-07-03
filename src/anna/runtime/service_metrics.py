@@ -52,6 +52,19 @@ class ServiceMetricsSnapshot:
     cache_split_seconds_total: float = 0.0
     cache_split_count: int = 0
     cache_split_seconds_max: float = 0.0
+    cache_compact_seconds_total: float = 0.0
+    cache_compact_count: int = 0
+    cache_compact_seconds_max: float = 0.0
+    scheduler_prefill_admitted_requests_total: int = 0
+    scheduler_prefill_deferred_requests_total: int = 0
+    scheduler_prefill_admitted_tokens_total: int = 0
+    scheduler_prefill_admission_count: int = 0
+    scheduler_prefill_admitted_tokens_max: int = 0
+    scheduler_decode_batch_count: int = 0
+    scheduler_decode_batch_requests_total: int = 0
+    scheduler_decode_batch_requests_max: int = 0
+    scheduler_decode_batch_tokens_total: int = 0
+    scheduler_decode_batch_tokens_max: int = 0
 
     @property
     def kv_cache_usage_ratio(self) -> float:
@@ -90,6 +103,19 @@ class AnnaServiceMetrics:
         self._cache_split_seconds_total = 0.0
         self._cache_split_count = 0
         self._cache_split_seconds_max = 0.0
+        self._cache_compact_seconds_total = 0.0
+        self._cache_compact_count = 0
+        self._cache_compact_seconds_max = 0.0
+        self._scheduler_prefill_admitted_requests_total = 0
+        self._scheduler_prefill_deferred_requests_total = 0
+        self._scheduler_prefill_admitted_tokens_total = 0
+        self._scheduler_prefill_admission_count = 0
+        self._scheduler_prefill_admitted_tokens_max = 0
+        self._scheduler_decode_batch_count = 0
+        self._scheduler_decode_batch_requests_total = 0
+        self._scheduler_decode_batch_requests_max = 0
+        self._scheduler_decode_batch_tokens_total = 0
+        self._scheduler_decode_batch_tokens_max = 0
 
     def record_request_submitted(self, *, waiting: bool) -> None:
         with self._lock:
@@ -149,6 +175,42 @@ class AnnaServiceMetrics:
             self._cache_split_seconds_total += normalized
             self._cache_split_count += 1
             self._cache_split_seconds_max = max(self._cache_split_seconds_max, normalized)
+        self._activity_event.set()
+
+    def record_cache_compact(self, seconds: float) -> None:
+        normalized = max(0.0, float(seconds))
+        with self._lock:
+            self._cache_compact_seconds_total += normalized
+            self._cache_compact_count += 1
+            self._cache_compact_seconds_max = max(self._cache_compact_seconds_max, normalized)
+        self._activity_event.set()
+
+    def record_prefill_admission(self, *, admitted_requests: int, deferred_requests: int, admitted_tokens: int) -> None:
+        admitted = max(0, int(admitted_requests))
+        deferred = max(0, int(deferred_requests))
+        tokens = max(0, int(admitted_tokens))
+        with self._lock:
+            self._scheduler_prefill_admitted_requests_total += admitted
+            self._scheduler_prefill_deferred_requests_total += deferred
+            self._scheduler_prefill_admitted_tokens_total += tokens
+            self._scheduler_prefill_admission_count += 1
+            self._scheduler_prefill_admitted_tokens_max = max(self._scheduler_prefill_admitted_tokens_max, tokens)
+        self._activity_event.set()
+
+    def record_decode_batch(self, *, requests: int, token_cost: int) -> None:
+        normalized_requests = max(0, int(requests))
+        normalized_tokens = max(0, int(token_cost))
+        if normalized_requests <= 0:
+            return
+        with self._lock:
+            self._scheduler_decode_batch_count += 1
+            self._scheduler_decode_batch_requests_total += normalized_requests
+            self._scheduler_decode_batch_requests_max = max(
+                self._scheduler_decode_batch_requests_max,
+                normalized_requests,
+            )
+            self._scheduler_decode_batch_tokens_total += normalized_tokens
+            self._scheduler_decode_batch_tokens_max = max(self._scheduler_decode_batch_tokens_max, normalized_tokens)
         self._activity_event.set()
 
     def record_request_finished(self, *, success: bool) -> None:
@@ -217,6 +279,19 @@ class AnnaServiceMetrics:
                 cache_split_seconds_total=self._cache_split_seconds_total,
                 cache_split_count=self._cache_split_count,
                 cache_split_seconds_max=self._cache_split_seconds_max,
+                cache_compact_seconds_total=self._cache_compact_seconds_total,
+                cache_compact_count=self._cache_compact_count,
+                cache_compact_seconds_max=self._cache_compact_seconds_max,
+                scheduler_prefill_admitted_requests_total=self._scheduler_prefill_admitted_requests_total,
+                scheduler_prefill_deferred_requests_total=self._scheduler_prefill_deferred_requests_total,
+                scheduler_prefill_admitted_tokens_total=self._scheduler_prefill_admitted_tokens_total,
+                scheduler_prefill_admission_count=self._scheduler_prefill_admission_count,
+                scheduler_prefill_admitted_tokens_max=self._scheduler_prefill_admitted_tokens_max,
+                scheduler_decode_batch_count=self._scheduler_decode_batch_count,
+                scheduler_decode_batch_requests_total=self._scheduler_decode_batch_requests_total,
+                scheduler_decode_batch_requests_max=self._scheduler_decode_batch_requests_max,
+                scheduler_decode_batch_tokens_total=self._scheduler_decode_batch_tokens_total,
+                scheduler_decode_batch_tokens_max=self._scheduler_decode_batch_tokens_max,
             )
 
 
@@ -268,6 +343,35 @@ class AnnaServiceMetricsLogger:
         cache_stack_count = max(0, current.cache_stack_count - previous.cache_stack_count)
         cache_split_total = max(0.0, current.cache_split_seconds_total - previous.cache_split_seconds_total)
         cache_split_count = max(0, current.cache_split_count - previous.cache_split_count)
+        cache_compact_total = max(0.0, current.cache_compact_seconds_total - previous.cache_compact_seconds_total)
+        cache_compact_count = max(0, current.cache_compact_count - previous.cache_compact_count)
+        prefill_admitted_requests = max(
+            0,
+            current.scheduler_prefill_admitted_requests_total
+            - previous.scheduler_prefill_admitted_requests_total,
+        )
+        prefill_deferred_requests = max(
+            0,
+            current.scheduler_prefill_deferred_requests_total
+            - previous.scheduler_prefill_deferred_requests_total,
+        )
+        prefill_admitted_tokens = max(
+            0,
+            current.scheduler_prefill_admitted_tokens_total - previous.scheduler_prefill_admitted_tokens_total,
+        )
+        prefill_admission_count = max(
+            0,
+            current.scheduler_prefill_admission_count - previous.scheduler_prefill_admission_count,
+        )
+        decode_batch_count = max(0, current.scheduler_decode_batch_count - previous.scheduler_decode_batch_count)
+        decode_batch_requests = max(
+            0,
+            current.scheduler_decode_batch_requests_total - previous.scheduler_decode_batch_requests_total,
+        )
+        decode_batch_tokens = max(
+            0,
+            current.scheduler_decode_batch_tokens_total - previous.scheduler_decode_batch_tokens_total,
+        )
         prompt_tokens_per_second = prompt_tokens / elapsed
         generation_tokens_per_second = generation_tokens / elapsed
         prompt_cache_hit_rate = 0.0 if cache_queries <= 0 else (cache_hits / cache_queries) * 100.0
@@ -277,6 +381,12 @@ class AnnaServiceMetricsLogger:
         decode_step_avg_ms = 0.0 if decode_step_count <= 0 else (decode_step_total / decode_step_count) * 1000.0
         cache_stack_avg_ms = 0.0 if cache_stack_count <= 0 else (cache_stack_total / cache_stack_count) * 1000.0
         cache_split_avg_ms = 0.0 if cache_split_count <= 0 else (cache_split_total / cache_split_count) * 1000.0
+        cache_compact_avg_ms = 0.0 if cache_compact_count <= 0 else (cache_compact_total / cache_compact_count) * 1000.0
+        prefill_admitted_tokens_avg = (
+            0.0 if prefill_admission_count <= 0 else prefill_admitted_tokens / prefill_admission_count
+        )
+        decode_batch_requests_avg = 0.0 if decode_batch_count <= 0 else decode_batch_requests / decode_batch_count
+        decode_batch_tokens_avg = 0.0 if decode_batch_count <= 0 else decode_batch_tokens / decode_batch_count
         prefill_recent = current.prefill_step_recent_seconds
         decode_recent = current.decode_step_recent_seconds
         prefill_p50_ms = _quantile(prefill_recent, 0.50) * 1000.0
@@ -296,6 +406,11 @@ class AnnaServiceMetricsLogger:
             f"Decode step p50/p95/p99: {decode_p50_ms:.1f}/{decode_p95_ms:.1f}/{decode_p99_ms:.1f} ms, "
             f"Cache stack avg/max: {cache_stack_avg_ms:.1f}/{current.cache_stack_seconds_max * 1000.0:.1f} ms, "
             f"Cache split avg/max: {cache_split_avg_ms:.1f}/{current.cache_split_seconds_max * 1000.0:.1f} ms, "
+            f"Cache compact avg/max: {cache_compact_avg_ms:.1f}/{current.cache_compact_seconds_max * 1000.0:.1f} ms, "
+            f"Prefill admission reqs admitted/deferred: {prefill_admitted_requests}/{prefill_deferred_requests}, "
+            f"Prefill admission tokens avg/max: {prefill_admitted_tokens_avg:.1f}/{current.scheduler_prefill_admitted_tokens_max}, "
+            f"Decode batch reqs avg/max: {decode_batch_requests_avg:.1f}/{current.scheduler_decode_batch_requests_max}, "
+            f"Decode batch tokens avg/max: {decode_batch_tokens_avg:.1f}/{current.scheduler_decode_batch_tokens_max}, "
             f"Waiting: {current.waiting_requests} reqs, GPU KV cache usage: {kv_cache_usage:.1f}% "
             f"({current.kv_cache_used_pages}/{current.kv_cache_total_pages} pages), "
             f"Prompt cache hit rate: {prompt_cache_hit_rate:.1f}%"
@@ -321,6 +436,14 @@ class AnnaServiceMetricsLogger:
             current.decode_step_count - previous.decode_step_count,
             current.cache_stack_count - previous.cache_stack_count,
             current.cache_split_count - previous.cache_split_count,
+            current.cache_compact_count - previous.cache_compact_count,
+            current.scheduler_prefill_admitted_requests_total - previous.scheduler_prefill_admitted_requests_total,
+            current.scheduler_prefill_deferred_requests_total - previous.scheduler_prefill_deferred_requests_total,
+            current.scheduler_prefill_admitted_tokens_total - previous.scheduler_prefill_admitted_tokens_total,
+            current.scheduler_prefill_admission_count - previous.scheduler_prefill_admission_count,
+            current.scheduler_decode_batch_count - previous.scheduler_decode_batch_count,
+            current.scheduler_decode_batch_requests_total - previous.scheduler_decode_batch_requests_total,
+            current.scheduler_decode_batch_tokens_total - previous.scheduler_decode_batch_tokens_total,
         )
         return any(delta != 0 for delta in deltas)
 

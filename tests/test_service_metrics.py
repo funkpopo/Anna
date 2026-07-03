@@ -15,6 +15,9 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     metrics.record_decode_step(0.125)
     metrics.record_cache_stack(0.03125)
     metrics.record_cache_split(0.0625)
+    metrics.record_cache_compact(0.015625)
+    metrics.record_prefill_admission(admitted_requests=2, deferred_requests=1, admitted_tokens=9)
+    metrics.record_decode_batch(requests=3, token_cost=21)
     metrics.record_prompt_tokens(12)
     metrics.record_generation_tokens(5)
     metrics.record_prompt_cache_lookup(hit=True)
@@ -50,6 +53,19 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     assert snapshot.cache_split_count == 1
     assert snapshot.cache_split_seconds_total == 0.0625
     assert snapshot.cache_split_seconds_max == 0.0625
+    assert snapshot.cache_compact_count == 1
+    assert snapshot.cache_compact_seconds_total == 0.015625
+    assert snapshot.cache_compact_seconds_max == 0.015625
+    assert snapshot.scheduler_prefill_admitted_requests_total == 2
+    assert snapshot.scheduler_prefill_deferred_requests_total == 1
+    assert snapshot.scheduler_prefill_admitted_tokens_total == 9
+    assert snapshot.scheduler_prefill_admission_count == 1
+    assert snapshot.scheduler_prefill_admitted_tokens_max == 9
+    assert snapshot.scheduler_decode_batch_count == 1
+    assert snapshot.scheduler_decode_batch_requests_total == 3
+    assert snapshot.scheduler_decode_batch_requests_max == 3
+    assert snapshot.scheduler_decode_batch_tokens_total == 21
+    assert snapshot.scheduler_decode_batch_tokens_max == 21
     assert metrics.activity_event.is_set() is True
 
 
@@ -88,6 +104,19 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
         cache_split_seconds_total=0.08,
         cache_split_count=4,
         cache_split_seconds_max=0.04,
+        cache_compact_seconds_total=0.06,
+        cache_compact_count=2,
+        cache_compact_seconds_max=0.05,
+        scheduler_prefill_admitted_requests_total=4,
+        scheduler_prefill_deferred_requests_total=2,
+        scheduler_prefill_admitted_tokens_total=18,
+        scheduler_prefill_admission_count=2,
+        scheduler_prefill_admitted_tokens_max=12,
+        scheduler_decode_batch_count=3,
+        scheduler_decode_batch_requests_total=7,
+        scheduler_decode_batch_requests_max=3,
+        scheduler_decode_batch_tokens_total=42,
+        scheduler_decode_batch_tokens_max=18,
     )
 
     line = AnnaServiceMetricsLogger.format_interval(previous, current)
@@ -102,6 +131,11 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
     assert "Decode step p50/p95/p99: 20.0/50.0/50.0 ms" in line
     assert "Cache stack avg/max: 20.0/30.0 ms" in line
     assert "Cache split avg/max: 20.0/40.0 ms" in line
+    assert "Cache compact avg/max: 30.0/50.0 ms" in line
+    assert "Prefill admission reqs admitted/deferred: 4/2" in line
+    assert "Prefill admission tokens avg/max: 9.0/12" in line
+    assert "Decode batch reqs avg/max: 2.3/3" in line
+    assert "Decode batch tokens avg/max: 14.0/18" in line
     assert "Waiting: 1 reqs" in line
     assert "GPU KV cache usage: 50.0% (6/12 pages)" in line
     assert "Prompt cache hit rate: 75.0%" in line

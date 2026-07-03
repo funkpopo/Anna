@@ -1442,6 +1442,22 @@ class AnnaQwen3_5TextEngine:
                 "waiting_requests": service_metrics.waiting_requests,
                 "kv_cache_used_pages": service_metrics.kv_cache_used_pages,
                 "kv_cache_total_pages": service_metrics.kv_cache_total_pages,
+                "cache_compact_count": service_metrics.cache_compact_count,
+                "cache_compact_seconds_total": service_metrics.cache_compact_seconds_total,
+                "scheduler_prefill_admitted_requests_total": (
+                    service_metrics.scheduler_prefill_admitted_requests_total
+                ),
+                "scheduler_prefill_deferred_requests_total": (
+                    service_metrics.scheduler_prefill_deferred_requests_total
+                ),
+                "scheduler_prefill_admitted_tokens_total": service_metrics.scheduler_prefill_admitted_tokens_total,
+                "scheduler_prefill_admission_count": service_metrics.scheduler_prefill_admission_count,
+                "scheduler_prefill_admitted_tokens_max": service_metrics.scheduler_prefill_admitted_tokens_max,
+                "scheduler_decode_batch_count": service_metrics.scheduler_decode_batch_count,
+                "scheduler_decode_batch_requests_total": service_metrics.scheduler_decode_batch_requests_total,
+                "scheduler_decode_batch_requests_max": service_metrics.scheduler_decode_batch_requests_max,
+                "scheduler_decode_batch_tokens_total": service_metrics.scheduler_decode_batch_tokens_total,
+                "scheduler_decode_batch_tokens_max": service_metrics.scheduler_decode_batch_tokens_max,
             },
         }
 

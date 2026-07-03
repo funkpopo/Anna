@@ -509,6 +509,9 @@ def test_scheduler_keeps_stable_decode_batches_without_cache_resplit() -> None:
         snapshot = engine.service_metrics_snapshot()
         assert snapshot.cache_stack_count == 0
         assert snapshot.cache_split_count == 0
+        assert snapshot.scheduler_decode_batch_count == 3
+        assert snapshot.scheduler_decode_batch_requests_total == 6
+        assert snapshot.scheduler_decode_batch_requests_max == 2
     finally:
         scheduler.shutdown()
 
@@ -568,6 +571,8 @@ def test_scheduler_compacts_decode_group_when_some_rows_finish() -> None:
         snapshot = engine.service_metrics_snapshot()
         assert snapshot.cache_stack_count == 0
         assert snapshot.cache_split_count == 0
+        assert snapshot.cache_compact_count >= 1
+        assert snapshot.scheduler_decode_batch_requests_max == 2
     finally:
         scheduler.shutdown()
 
@@ -617,6 +622,12 @@ def test_scheduler_prefill_admission_respects_token_budget() -> None:
             assert request.done.wait(timeout=2.0)
             assert request.error is None
         assert fake_model.text_prefill_batch_sizes[:2] == [2, 1]
+        snapshot = engine.service_metrics_snapshot()
+        assert snapshot.scheduler_prefill_admitted_requests_total == 3
+        assert snapshot.scheduler_prefill_deferred_requests_total in (0, 1)
+        assert snapshot.scheduler_prefill_admitted_tokens_total == 6
+        assert snapshot.scheduler_prefill_admission_count >= 2
+        assert snapshot.scheduler_prefill_admitted_tokens_max == 4
     finally:
         scheduler.shutdown()
 
@@ -669,6 +680,12 @@ def test_scheduler_decode_packing_respects_token_budget() -> None:
         assert request_a.error is None
         assert request_b.error is None
         assert fake_model.text_decode_batch_sizes == [1, 1]
+        snapshot = engine.service_metrics_snapshot()
+        assert snapshot.scheduler_decode_batch_count == 2
+        assert snapshot.scheduler_decode_batch_requests_total == 2
+        assert snapshot.scheduler_decode_batch_requests_max == 1
+        assert snapshot.scheduler_decode_batch_tokens_total == 5
+        assert snapshot.scheduler_decode_batch_tokens_max == 3
     finally:
         scheduler.shutdown()
 
