@@ -240,6 +240,26 @@ def _parse_gdn_decode_batch_head_cases(raw: str) -> list[tuple[int, int]]:
     return cases
 
 
+def _parse_gdn_decode_shape_cases(raw: str) -> list[tuple[int, int, int]]:
+    cases: list[tuple[int, int, int]] = []
+    for item in raw.split(","):
+        token = item.strip().lower()
+        if not token:
+            continue
+        parts = token.split("x")
+        if len(parts) != 3:
+            raise ValueError(
+                "--gdn-decode-shape-cases entries must use the form BxHxV, for example 1x16x64 or 4x32x128"
+            )
+        batch_size, num_heads, value_head_dim = (int(part) for part in parts)
+        if batch_size <= 0 or num_heads <= 0 or value_head_dim <= 0:
+            raise ValueError("--gdn-decode-shape-cases entries must have positive batch, head, and value-dim counts")
+        cases.append((batch_size, num_heads, value_head_dim))
+    if not cases:
+        raise ValueError("--gdn-decode-shape-cases must contain at least one BxHxV case")
+    return cases
+
+
 def _parse_gdn_decode_seeds(seed: int | None, seeds_csv: str | None) -> list[int | None]:
     if seeds_csv is None:
         return [seed]
@@ -1235,6 +1255,15 @@ def main() -> None:
         default=None,
         help="Comma-separated batch/head cases for multi-shape Gated Delta decode profiling, for example 1x16,1x32,4x32.",
     )
+    parser.add_argument(
+        "--gdn-decode-shape-cases",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated exact Gated Delta decode shape cases in BxHxV form, for example "
+            "1x16x64,4x16x64,1x32x128. Overrides --gdn-decode-batch-head-cases and --gdn-value-head-dims."
+        ),
+    )
     args = parser.parse_args()
     if args.gdn_decode_only:
         args.gdn_decode_profile = True
@@ -1258,14 +1287,19 @@ def main() -> None:
     lm_head_vocab_size = int4_n if args.lm_head_vocab_size is None else args.lm_head_vocab_size
 
     multi_shape_gdn_profile = args.gdn_decode_profile and (
-        args.gdn_decode_batch_head_cases is not None or args.gdn_value_head_dims is not None
+        args.gdn_decode_shape_cases is not None
+        or args.gdn_decode_batch_head_cases is not None
+        or args.gdn_value_head_dims is not None
     )
     if multi_shape_gdn_profile:
+        shape_label = "<gdn-shapes>" if args.gdn_decode_shape_cases is not None else "<gdn-matrix>"
         print(
-            f"shape batch=<gdn-matrix> seq=1 hidden={args.hidden_size} "
-            f"heads=<gdn-matrix>/{args.num_kv_heads} head_dim={args.head_dim} rotary_dim={rotary_dim} kv_len=1 "
+            f"shape batch={shape_label} seq=1 hidden={args.hidden_size} "
+            f"heads={shape_label}/{args.num_kv_heads} head_dim={args.head_dim} rotary_dim={rotary_dim} kv_len=1 "
             f"dtype={dtype}"
         )
+        if args.gdn_decode_shape_cases is not None:
+            print(f"gdn_decode_shape_cases={args.gdn_decode_shape_cases}")
         if args.gdn_decode_batch_head_cases is not None:
             print(f"gdn_decode_batch_head_cases={args.gdn_decode_batch_head_cases}")
         if args.gdn_value_head_dims is not None:
@@ -1286,16 +1320,24 @@ def main() -> None:
     if args.arc_int4_only and not args.arc_profile:
         raise ValueError("--arc-int4-only requires --arc-profile")
     if args.gdn_decode_profile:
-        gdn_value_head_dims = (
-            _parse_int_csv("--gdn-value-head-dims", args.gdn_value_head_dims)
-            if args.gdn_value_head_dims is not None
-            else [args.head_dim if args.gdn_value_head_dim is None else args.gdn_value_head_dim]
-        )
-        batch_head_cases = (
-            _parse_gdn_decode_batch_head_cases(args.gdn_decode_batch_head_cases)
-            if args.gdn_decode_batch_head_cases is not None
-            else [(args.batch_size, args.num_heads)]
-        )
+        if args.gdn_decode_shape_cases is not None:
+            gdn_decode_shape_cases = _parse_gdn_decode_shape_cases(args.gdn_decode_shape_cases)
+        else:
+            gdn_value_head_dims = (
+                _parse_int_csv("--gdn-value-head-dims", args.gdn_value_head_dims)
+                if args.gdn_value_head_dims is not None
+                else [args.head_dim if args.gdn_value_head_dim is None else args.gdn_value_head_dim]
+            )
+            batch_head_cases = (
+                _parse_gdn_decode_batch_head_cases(args.gdn_decode_batch_head_cases)
+                if args.gdn_decode_batch_head_cases is not None
+                else [(args.batch_size, args.num_heads)]
+            )
+            gdn_decode_shape_cases = [
+                (batch_size, num_heads, value_head_dim)
+                for batch_size, num_heads in batch_head_cases
+                for value_head_dim in gdn_value_head_dims
+            ]
         gdn_decode_seed = None if args.gdn_decode_seed < 0 else args.gdn_decode_seed
         gdn_decode_seeds = _parse_gdn_decode_seeds(gdn_decode_seed, args.gdn_decode_seeds)
         value_blocks = _parse_int_csv("--gdn-decode-value-blocks", args.gdn_decode_value_blocks)
@@ -1311,28 +1353,27 @@ def main() -> None:
                 "auto_strategy,single_ms,tiled_ms,auto_ms,best_explicit_strategy,best_explicit_ms,auto_minus_best_ms,"
                 "auto_speed_ratio,max_abs_diff"
             )
-        for case_idx, (batch_size, num_heads) in enumerate(batch_head_cases):
-            for value_dim_idx, value_head_dim in enumerate(gdn_value_head_dims):
-                case_seeds = [
-                    None if seed is None else seed + case_idx * 1000 + value_dim_idx * 100
-                    for seed in gdn_decode_seeds
-                ]
-                _run_gated_delta_decode_profile_case(
-                    device_name=device_name,
-                    batch_size=batch_size,
-                    num_heads=num_heads,
-                    key_head_dim=args.head_dim,
-                    value_head_dim=value_head_dim,
-                    dtype=dtype,
-                    value_blocks=value_blocks,
-                    single_min_elements=args.gdn_decode_single_min_elements,
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    timing_repeats=args.gdn_decode_timing_repeats,
-                    seeds=case_seeds,
-                    auto_compare=args.gdn_decode_auto_compare,
-                    compare_only=args.gdn_decode_compare_only,
-                )
+        for case_idx, (batch_size, num_heads, value_head_dim) in enumerate(gdn_decode_shape_cases):
+            case_seeds = [
+                None if seed is None else seed + case_idx * 1000
+                for seed in gdn_decode_seeds
+            ]
+            _run_gated_delta_decode_profile_case(
+                device_name=device_name,
+                batch_size=batch_size,
+                num_heads=num_heads,
+                key_head_dim=args.head_dim,
+                value_head_dim=value_head_dim,
+                dtype=dtype,
+                value_blocks=value_blocks,
+                single_min_elements=args.gdn_decode_single_min_elements,
+                warmup=args.warmup,
+                iters=args.iters,
+                timing_repeats=args.gdn_decode_timing_repeats,
+                seeds=case_seeds,
+                auto_compare=args.gdn_decode_auto_compare,
+                compare_only=args.gdn_decode_compare_only,
+            )
     if not args.arc_int4_only and not args.gdn_decode_only:
         rmsnorm_baseline_ms, rmsnorm_fused_ms, rmsnorm_diff = _benchmark_rmsnorm(
             batch_size=args.batch_size,
