@@ -241,7 +241,7 @@ struct GatedDeltaDecodeAutoBucket {
 };
 
 constexpr GatedDeltaDecodeAutoBucket kGatedDeltaDecodeAutoBuckets[] = {
-    {"arc", 128, 128, 64},
+    {"arc", 128, 128, 16},
     {"arc", 128, 256, 64},
     {"", 128, 128, 32},
     {"", 128, 256, 96},
