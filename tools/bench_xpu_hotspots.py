@@ -212,6 +212,34 @@ def _make_gated_delta_decode_bench_inputs(
     return query, key, value, g, beta, initial_state
 
 
+def _parse_int_csv(arg_name: str, raw: str) -> list[int]:
+    values = [int(item.strip()) for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError(f"{arg_name} must contain at least one integer")
+    return values
+
+
+def _parse_gdn_decode_batch_head_cases(raw: str) -> list[tuple[int, int]]:
+    cases: list[tuple[int, int]] = []
+    for item in raw.split(","):
+        token = item.strip().lower()
+        if not token:
+            continue
+        if "x" not in token:
+            raise ValueError(
+                "--gdn-decode-batch-head-cases entries must use the form BxH, for example 1x16 or 4x32"
+            )
+        batch_size_raw, num_heads_raw = token.split("x", maxsplit=1)
+        batch_size = int(batch_size_raw)
+        num_heads = int(num_heads_raw)
+        if batch_size <= 0 or num_heads <= 0:
+            raise ValueError("--gdn-decode-batch-head-cases entries must have positive batch and head counts")
+        cases.append((batch_size, num_heads))
+    if not cases:
+        raise ValueError("--gdn-decode-batch-head-cases must contain at least one BxH case")
+    return cases
+
+
 def _compare_gated_delta_decode_auto_against_explicit(
     *,
     query: torch.Tensor,
@@ -267,6 +295,96 @@ def _compare_gated_delta_decode_auto_against_explicit(
         "auto_speed_ratio": auto_speed_ratio,
         "max_abs_diff": max_abs_diff,
     }
+
+
+def _run_gated_delta_decode_profile_case(
+    *,
+    device_name: str,
+    batch_size: int,
+    num_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    dtype: torch.dtype,
+    value_blocks: list[int],
+    single_min_elements: int | None,
+    warmup: int,
+    iters: int,
+    timing_repeats: int,
+    seed: int | None,
+    auto_compare: bool,
+) -> None:
+    query, key, value, g, beta, initial_state = _make_gated_delta_decode_bench_inputs(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        key_head_dim=key_head_dim,
+        value_head_dim=value_head_dim,
+        dtype=dtype,
+        seed=seed,
+    )
+    candidates: list[dict[str, object]] = []
+    for strategy in ("single", "tiled", "auto"):
+        for value_block in value_blocks:
+            if strategy == "single" and value_block != value_blocks[0]:
+                continue
+            candidates.append(
+                {
+                    "strategy": strategy,
+                    "value_block": value_block,
+                    "samples_ms": [],
+                    "max_abs_diff": 0.0,
+                }
+            )
+    total_candidates = len(candidates)
+    for repeat_idx in range(max(1, timing_repeats)):
+        order_start = 0 if total_candidates == 0 else repeat_idx % total_candidates
+        ordered_candidates = candidates[order_start:] + candidates[:order_start]
+        for candidate in ordered_candidates:
+            candidate_ms, diff = _benchmark_gated_delta_decode_strategy(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                strategy=str(candidate["strategy"]),
+                value_block=int(candidate["value_block"]),
+                single_min_elements=single_min_elements,
+                warmup=warmup,
+                iters=iters,
+            )
+            candidate["samples_ms"].append(candidate_ms)
+            candidate["max_abs_diff"] = max(float(candidate["max_abs_diff"]), diff)
+    single_min_elements_label = "default" if single_min_elements is None else str(single_min_elements)
+    for candidate in candidates:
+        candidate_ms = statistics.median(candidate["samples_ms"])
+        print(
+            f"gdn_decode_profile,{device_name},{candidate['strategy']},{batch_size},{num_heads},"
+            f"{key_head_dim},{value_head_dim},{candidate['value_block']},{single_min_elements_label},"
+            f"{dtype},{timing_repeats},{candidate_ms:.4f},{float(candidate['max_abs_diff']):.6f}"
+        )
+    if auto_compare:
+        for value_block in value_blocks:
+            compare_result = _compare_gated_delta_decode_auto_against_explicit(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                value_block=value_block,
+                single_min_elements=single_min_elements,
+                warmup=warmup,
+                iters=iters,
+                timing_repeats=timing_repeats,
+            )
+            print(
+                f"gdn_decode_auto_compare,{device_name},{batch_size},{num_heads},"
+                f"{key_head_dim},{value_head_dim},{value_block},{float(compare_result['single_ms']):.4f},"
+                f"{float(compare_result['tiled_ms']):.4f},{float(compare_result['auto_ms']):.4f},"
+                f"{compare_result['best_explicit_strategy']},{float(compare_result['best_explicit_ms']):.4f},"
+                f"{float(compare_result['auto_minus_best_ms']):.4f},{float(compare_result['auto_speed_ratio']):.4f},"
+                f"{float(compare_result['max_abs_diff']):.6f}"
+            )
 
 
 def _benchmark_xpu_int4_linear(
@@ -1003,6 +1121,12 @@ def main() -> None:
         help="Value head dim for Gated Delta decode profiling. Defaults to --head-dim.",
     )
     parser.add_argument(
+        "--gdn-value-head-dims",
+        type=str,
+        default=None,
+        help="Comma-separated value head dims for multi-shape Gated Delta decode profiling. Overrides --gdn-value-head-dim.",
+    )
+    parser.add_argument(
         "--gdn-decode-value-blocks",
         type=str,
         default="1,2,4,8,16,32",
@@ -1037,7 +1161,15 @@ def main() -> None:
         action="store_true",
         help="Print per-value-block auto-vs-explicit summary rows after the decode sweep.",
     )
+    parser.add_argument(
+        "--gdn-decode-batch-head-cases",
+        type=str,
+        default=None,
+        help="Comma-separated batch/head cases for multi-shape Gated Delta decode profiling, for example 1x16,1x32,4x32.",
+    )
     args = parser.parse_args()
+    if args.gdn_decode_only:
+        args.gdn_decode_profile = True
 
     if not hasattr(torch, "xpu") or not torch.xpu.is_available():
         raise RuntimeError("torch.xpu is unavailable in the active environment.")
@@ -1057,113 +1189,75 @@ def main() -> None:
     int4_n = args.hidden_size if args.int4_n is None else args.int4_n
     lm_head_vocab_size = int4_n if args.lm_head_vocab_size is None else args.lm_head_vocab_size
 
-    print(
-        f"shape batch={args.batch_size} seq={args.seq_len} hidden={args.hidden_size} "
-        f"heads={args.num_heads}/{args.num_kv_heads} head_dim={args.head_dim} rotary_dim={rotary_dim} kv_len={kv_len} "
-        f"dtype={dtype}"
+    multi_shape_gdn_profile = args.gdn_decode_profile and (
+        args.gdn_decode_batch_head_cases is not None or args.gdn_value_head_dims is not None
     )
+    if multi_shape_gdn_profile:
+        print(
+            f"shape batch=<gdn-matrix> seq=1 hidden={args.hidden_size} "
+            f"heads=<gdn-matrix>/{args.num_kv_heads} head_dim={args.head_dim} rotary_dim={rotary_dim} kv_len=1 "
+            f"dtype={dtype}"
+        )
+        if args.gdn_decode_batch_head_cases is not None:
+            print(f"gdn_decode_batch_head_cases={args.gdn_decode_batch_head_cases}")
+        if args.gdn_value_head_dims is not None:
+            print(f"gdn_value_head_dims={args.gdn_value_head_dims}")
+    else:
+        print(
+            f"shape batch={args.batch_size} seq={args.seq_len} hidden={args.hidden_size} "
+            f"heads={args.num_heads}/{args.num_kv_heads} head_dim={args.head_dim} rotary_dim={rotary_dim} kv_len={kv_len} "
+            f"dtype={dtype}"
+        )
     if xpu_info is not None:
         print(f"device_name={xpu_info.name}")
         print(f"device_index={xpu_info.device_index}")
     if args.arc_int4_only and not args.arc_profile:
         raise ValueError("--arc-int4-only requires --arc-profile")
-    if args.gdn_decode_only:
-        args.gdn_decode_profile = True
     if args.gdn_decode_profile:
-        gdn_value_head_dim = args.head_dim if args.gdn_value_head_dim is None else args.gdn_value_head_dim
+        gdn_value_head_dims = (
+            _parse_int_csv("--gdn-value-head-dims", args.gdn_value_head_dims)
+            if args.gdn_value_head_dims is not None
+            else [args.head_dim if args.gdn_value_head_dim is None else args.gdn_value_head_dim]
+        )
+        batch_head_cases = (
+            _parse_gdn_decode_batch_head_cases(args.gdn_decode_batch_head_cases)
+            if args.gdn_decode_batch_head_cases is not None
+            else [(args.batch_size, args.num_heads)]
+        )
         gdn_decode_seed = None if args.gdn_decode_seed < 0 else args.gdn_decode_seed
-        value_blocks = [
-            int(item.strip())
-            for item in args.gdn_decode_value_blocks.split(",")
-            if item.strip()
-        ]
-        if not value_blocks:
-            raise ValueError("--gdn-decode-value-blocks must contain at least one integer")
+        value_blocks = _parse_int_csv("--gdn-decode-value-blocks", args.gdn_decode_value_blocks)
         print(
             "gdn_decode_profile,device_name,strategy,batch,heads,key_head_dim,value_head_dim,value_block,"
             "single_min_elements,dtype,timing_repeats,candidate_ms,max_abs_diff"
         )
-        query, key, value, g, beta, initial_state = _make_gated_delta_decode_bench_inputs(
-            batch_size=args.batch_size,
-            num_heads=args.num_heads,
-            key_head_dim=args.head_dim,
-            value_head_dim=gdn_value_head_dim,
-            dtype=dtype,
-            seed=gdn_decode_seed,
-        )
-        candidates: list[dict[str, object]] = []
-        for strategy in ("single", "tiled", "auto"):
-            for value_block in value_blocks:
-                if strategy == "single" and value_block != value_blocks[0]:
-                    continue
-                candidates.append(
-                    {
-                        "strategy": strategy,
-                        "value_block": value_block,
-                        "samples_ms": [],
-                        "max_abs_diff": 0.0,
-                    }
-                )
-        total_candidates = len(candidates)
-        for repeat_idx in range(max(1, args.gdn_decode_timing_repeats)):
-            order_start = 0 if total_candidates == 0 else repeat_idx % total_candidates
-            ordered_candidates = candidates[order_start:] + candidates[:order_start]
-            for candidate in ordered_candidates:
-                candidate_ms, diff = _benchmark_gated_delta_decode_strategy(
-                    query=query,
-                    key=key,
-                    value=value,
-                    g=g,
-                    beta=beta,
-                    initial_state=initial_state,
-                    strategy=str(candidate["strategy"]),
-                    value_block=int(candidate["value_block"]),
-                    single_min_elements=args.gdn_decode_single_min_elements,
-                    warmup=args.warmup,
-                    iters=args.iters,
-                )
-                candidate["samples_ms"].append(candidate_ms)
-                candidate["max_abs_diff"] = max(float(candidate["max_abs_diff"]), diff)
         device_name = "" if xpu_info is None else xpu_info.name
-        single_min_elements = (
-            "default"
-            if args.gdn_decode_single_min_elements is None
-            else str(args.gdn_decode_single_min_elements)
-        )
-        for candidate in candidates:
-            candidate_ms = statistics.median(candidate["samples_ms"])
-            print(
-                f"gdn_decode_profile,{device_name},{candidate['strategy']},{args.batch_size},{args.num_heads},"
-                f"{args.head_dim},{gdn_value_head_dim},{candidate['value_block']},{single_min_elements},"
-                f"{dtype},{args.gdn_decode_timing_repeats},{candidate_ms:.4f},{float(candidate['max_abs_diff']):.6f}"
-            )
         if args.gdn_decode_auto_compare:
             print(
                 "gdn_decode_auto_compare,device_name,batch,heads,key_head_dim,value_head_dim,value_block,"
                 "single_ms,tiled_ms,auto_ms,best_explicit_strategy,best_explicit_ms,auto_minus_best_ms,"
                 "auto_speed_ratio,max_abs_diff"
             )
-            for value_block in value_blocks:
-                compare_result = _compare_gated_delta_decode_auto_against_explicit(
-                    query=query,
-                    key=key,
-                    value=value,
-                    g=g,
-                    beta=beta,
-                    initial_state=initial_state,
-                    value_block=value_block,
+        for case_idx, (batch_size, num_heads) in enumerate(batch_head_cases):
+            for value_dim_idx, value_head_dim in enumerate(gdn_value_head_dims):
+                case_seed = (
+                    None
+                    if gdn_decode_seed is None
+                    else gdn_decode_seed + case_idx * 1000 + value_dim_idx * 100
+                )
+                _run_gated_delta_decode_profile_case(
+                    device_name=device_name,
+                    batch_size=batch_size,
+                    num_heads=num_heads,
+                    key_head_dim=args.head_dim,
+                    value_head_dim=value_head_dim,
+                    dtype=dtype,
+                    value_blocks=value_blocks,
                     single_min_elements=args.gdn_decode_single_min_elements,
                     warmup=args.warmup,
                     iters=args.iters,
                     timing_repeats=args.gdn_decode_timing_repeats,
-                )
-                print(
-                    f"gdn_decode_auto_compare,{device_name},{args.batch_size},{args.num_heads},"
-                    f"{args.head_dim},{gdn_value_head_dim},{value_block},{float(compare_result['single_ms']):.4f},"
-                    f"{float(compare_result['tiled_ms']):.4f},{float(compare_result['auto_ms']):.4f},"
-                    f"{compare_result['best_explicit_strategy']},{float(compare_result['best_explicit_ms']):.4f},"
-                    f"{float(compare_result['auto_minus_best_ms']):.4f},{float(compare_result['auto_speed_ratio']):.4f},"
-                    f"{float(compare_result['max_abs_diff']):.6f}"
+                    seed=case_seed,
+                    auto_compare=args.gdn_decode_auto_compare,
                 )
     if not args.arc_int4_only and not args.gdn_decode_only:
         rmsnorm_baseline_ms, rmsnorm_fused_ms, rmsnorm_diff = _benchmark_rmsnorm(

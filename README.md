@@ -189,6 +189,21 @@ python tools\bench_xpu_hotspots.py `
   --gdn-decode-value-blocks 1,2,4,8,16,32
 ```
 
+Multi-shape Gated Delta decode compare matrix:
+
+```powershell
+python tools\bench_xpu_hotspots.py `
+  --gdn-decode-only `
+  --gdn-decode-auto-compare `
+  --gdn-decode-batch-head-cases 1x16,1x32,2x32,4x32 `
+  --gdn-value-head-dims 128,256 `
+  --head-dim 128 `
+  --gdn-decode-value-blocks 4,8,16,32 `
+  --dtype bf16 `
+  --warmup 20 `
+  --iters 100
+```
+
 General hotspot suite:
 
 ```powershell
@@ -363,7 +378,9 @@ These values only apply when an API request omits the matching field.
 - `--dtype fp16|bf16|fp32`: benchmark dtype.
 - `--warmup N`, `--iters N`: warmup and measured iterations.
 - `--gdn-decode-only`: only run the Gated Delta decode strategy sweep.
+- `--gdn-decode-batch-head-cases LIST`: run multiple `batch x heads` cases in one decode-profile sweep, for example `1x16,1x32,4x32`.
 - `--gdn-decode-value-blocks LIST`: test multiple value-block sizes.
+- `--gdn-value-head-dims LIST`: run multiple value-head dims in one decode-profile sweep; overrides `--gdn-value-head-dim`.
 - `--gdn-decode-single-min-elements N`: override the auto-strategy threshold.
 - `--gdn-decode-seed N`: fix the decode-profile inputs for repeatable A/B comparisons; negative keeps per-run random inputs.
 - `--gdn-decode-timing-repeats N`: take N timing samples per candidate and report the median.

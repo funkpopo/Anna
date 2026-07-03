@@ -189,6 +189,21 @@ python tools\bench_xpu_hotspots.py `
   --gdn-decode-value-blocks 1,2,4,8,16,32
 ```
 
+多 shape 的 Gated Delta decode compare matrix：
+
+```powershell
+python tools\bench_xpu_hotspots.py `
+  --gdn-decode-only `
+  --gdn-decode-auto-compare `
+  --gdn-decode-batch-head-cases 1x16,1x32,2x32,4x32 `
+  --gdn-value-head-dims 128,256 `
+  --head-dim 128 `
+  --gdn-decode-value-blocks 4,8,16,32 `
+  --dtype bf16 `
+  --warmup 20 `
+  --iters 100
+```
+
 完整热点套件：
 
 ```powershell
@@ -363,7 +378,9 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 - `--dtype fp16|bf16|fp32`：benchmark dtype。
 - `--warmup N`、`--iters N`：预热和计时次数。
 - `--gdn-decode-only`：只跑 Gated Delta decode 策略 sweep。
+- `--gdn-decode-batch-head-cases LIST`：在一次 decode profile 中跑多个 `batch x heads` case，例如 `1x16,1x32,4x32`。
 - `--gdn-decode-value-blocks LIST`：测试多个 value block。
+- `--gdn-value-head-dims LIST`：在一次 decode profile 中跑多个 value head dim；设置后覆盖 `--gdn-value-head-dim`。
 - `--gdn-decode-single-min-elements N`：覆盖 auto 策略阈值。
 - `--gdn-decode-seed N`：固定 decode profile 输入，方便做可复现的 A/B 对比；负值表示每次运行都重新随机输入。
 - `--gdn-decode-timing-repeats N`：每个候选重复计时 N 次并输出中位数。
