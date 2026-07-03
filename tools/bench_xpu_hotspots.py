@@ -139,6 +139,72 @@ def _benchmark_gated_delta_decode_strategy(
     warmup: int,
     iters: int,
 ) -> tuple[float, float]:
+    anna_ops = getattr(torch.ops, "anna", None)
+    if anna_ops is not None and hasattr(anna_ops, "gated_delta_decode_benchmark"):
+        strategy_codes = {"auto": -1, "single": 0, "tiled": 1}
+        if strategy not in strategy_codes:
+            raise ValueError(f"Unsupported Gated Delta decode strategy benchmark mode: {strategy}")
+
+        benchmark_strategy = strategy
+        benchmark_value_block = value_block
+        if benchmark_value_block is None:
+            benchmark_value_block = _resolve_gated_delta_decode_default_value_block(
+                query,
+                value_head_dim=int(value.shape[-1]),
+            )
+        if strategy == "auto" and single_min_elements is None and benchmark_value_block is not None:
+            resolved_auto_strategy = _resolve_gated_delta_decode_auto_strategy(
+                query,
+                value_head_dim=int(value.shape[-1]),
+                value_block=benchmark_value_block,
+            )
+            if resolved_auto_strategy in {"single", "tiled"}:
+                benchmark_strategy = resolved_auto_strategy
+
+        state_for_correctness = initial_state.clone()
+        candidate_output = anna_ops.gated_delta_decode_benchmark(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            state_for_correctness,
+            strategy_codes[benchmark_strategy],
+            0 if benchmark_value_block is None else benchmark_value_block,
+            0 if single_min_elements is None else single_min_elements,
+        )
+        reference_output, reference_state = torch_recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_state=initial_state,
+            output_final_state=True,
+        )
+        torch.xpu.synchronize()
+        max_abs_diff = float((candidate_output.float() - reference_output.float()).abs().max().item())
+        if reference_state is not None:
+            max_abs_diff = max(max_abs_diff, float((state_for_correctness.float() - reference_state.float()).abs().max().item()))
+
+        state_for_timing = initial_state.clone()
+
+        def candidate() -> torch.Tensor:
+            return anna_ops.gated_delta_decode_benchmark(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                state_for_timing,
+                strategy_codes[benchmark_strategy],
+                0 if benchmark_value_block is None else benchmark_value_block,
+                0 if single_min_elements is None else single_min_elements,
+            )
+
+        candidate_ms = _time_op(candidate, warmup=warmup, iters=iters)
+        return candidate_ms, max_abs_diff
+
     previous_strategy = os.environ.get("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY")
     previous_value_block = os.environ.get("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK")
     previous_single_min_elements = os.environ.get("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS")
@@ -193,6 +259,59 @@ def _benchmark_gated_delta_decode_strategy(
         _restore_env("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY", previous_strategy)
         _restore_env("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", previous_value_block)
         _restore_env("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS", previous_single_min_elements)
+
+
+def _gated_delta_decode_candidate_id(strategy: str, value_block: int | None) -> str:
+    return f"{strategy}@{'default' if value_block is None else value_block}"
+
+
+def _collect_gated_delta_decode_candidate_timings(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    candidates: list[tuple[str, str, int | None]],
+    single_min_elements: int | None,
+    warmup: int,
+    iters: int,
+    timing_repeats: int,
+) -> dict[str, dict[str, float]]:
+    timing_samples_ms: dict[str, list[float]] = {name: [] for name, _, _ in candidates}
+    max_abs_diffs: dict[str, float] = {name: 0.0 for name, _, _ in candidates}
+    total_candidates = len(candidates)
+    if total_candidates == 0:
+        return {}
+
+    for repeat_idx in range(max(1, timing_repeats)):
+        order_start = repeat_idx % total_candidates
+        ordered_candidates = candidates[order_start:] + candidates[:order_start]
+        for candidate_name, candidate_strategy, candidate_value_block in ordered_candidates:
+            candidate_ms, diff = _benchmark_gated_delta_decode_strategy(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                strategy=candidate_strategy,
+                value_block=candidate_value_block,
+                single_min_elements=single_min_elements,
+                warmup=warmup,
+                iters=iters,
+            )
+            timing_samples_ms[candidate_name].append(candidate_ms)
+            max_abs_diffs[candidate_name] = max(max_abs_diffs[candidate_name], diff)
+
+    return {
+        candidate_name: {
+            "candidate_ms": statistics.median(samples_ms),
+            "max_abs_diff": max_abs_diffs[candidate_name],
+        }
+        for candidate_name, samples_ms in timing_samples_ms.items()
+    }
 
 
 def _make_gated_delta_decode_bench_inputs(
@@ -404,32 +523,26 @@ def _compare_gated_delta_decode_auto_against_explicit(
     iters: int,
     timing_repeats: int,
 ) -> dict[str, float | str]:
-    strategies = ("single", "tiled", "auto")
-    timing_samples_ms: dict[str, list[float]] = {strategy: [] for strategy in strategies}
-    max_abs_diffs: dict[str, float] = {strategy: 0.0 for strategy in strategies}
-    total_strategies = len(strategies)
-    for repeat_idx in range(max(1, timing_repeats)):
-        order_start = repeat_idx % total_strategies
-        ordered_strategies = strategies[order_start:] + strategies[:order_start]
-        for strategy in ordered_strategies:
-            candidate_ms, diff = _benchmark_gated_delta_decode_strategy(
-                query=query,
-                key=key,
-                value=value,
-                g=g,
-                beta=beta,
-                initial_state=initial_state,
-                strategy=strategy,
-                value_block=value_block,
-                single_min_elements=single_min_elements,
-                warmup=warmup,
-                iters=iters,
-            )
-            timing_samples_ms[strategy].append(candidate_ms)
-            max_abs_diffs[strategy] = max(max_abs_diffs[strategy], diff)
-    single_ms = statistics.median(timing_samples_ms["single"])
-    tiled_ms = statistics.median(timing_samples_ms["tiled"])
-    auto_ms = statistics.median(timing_samples_ms["auto"])
+    candidate_measurements = _collect_gated_delta_decode_candidate_timings(
+        query=query,
+        key=key,
+        value=value,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        candidates=[
+            ("single", "single", value_block),
+            ("tiled", "tiled", value_block),
+            ("auto", "auto", value_block),
+        ],
+        single_min_elements=single_min_elements,
+        warmup=warmup,
+        iters=iters,
+        timing_repeats=timing_repeats,
+    )
+    single_ms = float(candidate_measurements["single"]["candidate_ms"])
+    tiled_ms = float(candidate_measurements["tiled"]["candidate_ms"])
+    auto_ms = float(candidate_measurements["auto"]["candidate_ms"])
     auto_strategy = _resolve_gated_delta_decode_auto_strategy(
         query,
         value_head_dim=int(value.shape[-1]),
@@ -439,7 +552,7 @@ def _compare_gated_delta_decode_auto_against_explicit(
     best_explicit_ms = min(single_ms, tiled_ms)
     auto_minus_best_ms = auto_ms - best_explicit_ms
     auto_speed_ratio = auto_ms / best_explicit_ms if best_explicit_ms > 0 else float("inf")
-    max_abs_diff = max(max_abs_diffs.values())
+    max_abs_diff = max(float(candidate["max_abs_diff"]) for candidate in candidate_measurements.values())
     return {
         "auto_strategy": auto_strategy,
         "single_ms": single_ms,
@@ -486,38 +599,27 @@ def _compare_gated_delta_decode_default_against_forced_block(
         value_block=forced_value_block,
     )
 
-    candidates = (
-        ("default", None),
-        ("forced", forced_value_block),
+    candidate_measurements = _collect_gated_delta_decode_candidate_timings(
+        query=query,
+        key=key,
+        value=value,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        candidates=[
+            ("default", "auto", None),
+            ("forced", "auto", forced_value_block),
+        ],
+        single_min_elements=single_min_elements,
+        warmup=warmup,
+        iters=iters,
+        timing_repeats=timing_repeats,
     )
-    timing_samples_ms: dict[str, list[float]] = {name: [] for name, _ in candidates}
-    max_abs_diffs: dict[str, float] = {name: 0.0 for name, _ in candidates}
-    total_candidates = len(candidates)
-    for repeat_idx in range(max(1, timing_repeats)):
-        order_start = repeat_idx % total_candidates
-        ordered_candidates = candidates[order_start:] + candidates[:order_start]
-        for candidate_name, candidate_value_block in ordered_candidates:
-            candidate_ms, diff = _benchmark_gated_delta_decode_strategy(
-                query=query,
-                key=key,
-                value=value,
-                g=g,
-                beta=beta,
-                initial_state=initial_state,
-                strategy="auto",
-                value_block=candidate_value_block,
-                single_min_elements=single_min_elements,
-                warmup=warmup,
-                iters=iters,
-            )
-            timing_samples_ms[candidate_name].append(candidate_ms)
-            max_abs_diffs[candidate_name] = max(max_abs_diffs[candidate_name], diff)
-
-    default_ms = statistics.median(timing_samples_ms["default"])
-    forced_ms = statistics.median(timing_samples_ms["forced"])
+    default_ms = float(candidate_measurements["default"]["candidate_ms"])
+    forced_ms = float(candidate_measurements["forced"]["candidate_ms"])
     forced_minus_default_ms = forced_ms - default_ms
     forced_over_default_ratio = forced_ms / default_ms if default_ms > 0 else float("inf")
-    max_abs_diff = max(max_abs_diffs.values())
+    max_abs_diff = max(float(candidate["max_abs_diff"]) for candidate in candidate_measurements.values())
     return {
         "default_value_block": -1 if default_value_block is None else default_value_block,
         "default_strategy": default_strategy,
@@ -558,42 +660,31 @@ def _compare_gated_delta_decode_default_against_explicit(
         )
     )
 
-    candidates = (
-        ("default", "auto", None),
-        ("single", "single", default_value_block),
-        ("tiled", "tiled", default_value_block),
+    candidate_measurements = _collect_gated_delta_decode_candidate_timings(
+        query=query,
+        key=key,
+        value=value,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        candidates=[
+            ("default", "auto", None),
+            ("single", "single", default_value_block),
+            ("tiled", "tiled", default_value_block),
+        ],
+        single_min_elements=single_min_elements,
+        warmup=warmup,
+        iters=iters,
+        timing_repeats=timing_repeats,
     )
-    timing_samples_ms: dict[str, list[float]] = {name: [] for name, _, _ in candidates}
-    max_abs_diffs: dict[str, float] = {name: 0.0 for name, _, _ in candidates}
-    total_candidates = len(candidates)
-    for repeat_idx in range(max(1, timing_repeats)):
-        order_start = repeat_idx % total_candidates
-        ordered_candidates = candidates[order_start:] + candidates[:order_start]
-        for candidate_name, candidate_strategy, candidate_value_block in ordered_candidates:
-            candidate_ms, diff = _benchmark_gated_delta_decode_strategy(
-                query=query,
-                key=key,
-                value=value,
-                g=g,
-                beta=beta,
-                initial_state=initial_state,
-                strategy=candidate_strategy,
-                value_block=candidate_value_block,
-                single_min_elements=single_min_elements,
-                warmup=warmup,
-                iters=iters,
-            )
-            timing_samples_ms[candidate_name].append(candidate_ms)
-            max_abs_diffs[candidate_name] = max(max_abs_diffs[candidate_name], diff)
-
-    default_ms = statistics.median(timing_samples_ms["default"])
-    single_ms = statistics.median(timing_samples_ms["single"])
-    tiled_ms = statistics.median(timing_samples_ms["tiled"])
+    default_ms = float(candidate_measurements["default"]["candidate_ms"])
+    single_ms = float(candidate_measurements["single"]["candidate_ms"])
+    tiled_ms = float(candidate_measurements["tiled"]["candidate_ms"])
     best_explicit_strategy = "single" if single_ms <= tiled_ms else "tiled"
     best_explicit_ms = min(single_ms, tiled_ms)
     default_minus_best_ms = default_ms - best_explicit_ms
     default_speed_ratio = default_ms / best_explicit_ms if best_explicit_ms > 0 else float("inf")
-    max_abs_diff = max(max_abs_diffs.values())
+    max_abs_diff = max(float(candidate["max_abs_diff"]) for candidate in candidate_measurements.values())
     return {
         "default_value_block": -1 if default_value_block is None else default_value_block,
         "default_strategy": default_strategy,
@@ -627,6 +718,8 @@ def _run_gated_delta_decode_profile_case(
     default_block_compare: bool,
     compare_only: bool,
 ) -> None:
+    profile_measurements_by_seed: list[dict[str, dict[str, float]]] = []
+    single_profile_value_block = value_blocks[0] if value_blocks else None
     if not compare_only:
         candidates: list[dict[str, object]] = []
         for strategy in ("single", "tiled", "auto"):
@@ -635,6 +728,7 @@ def _run_gated_delta_decode_profile_case(
                     continue
                 candidates.append(
                     {
+                        "candidate_id": _gated_delta_decode_candidate_id(strategy, value_block),
                         "strategy": strategy,
                         "value_block": value_block,
                         "samples_ms": [],
@@ -650,26 +744,31 @@ def _run_gated_delta_decode_profile_case(
                 dtype=dtype,
                 seed=seed,
             )
-            total_candidates = len(candidates)
-            for repeat_idx in range(max(1, timing_repeats)):
-                order_start = 0 if total_candidates == 0 else repeat_idx % total_candidates
-                ordered_candidates = candidates[order_start:] + candidates[:order_start]
-                for candidate in ordered_candidates:
-                    candidate_ms, diff = _benchmark_gated_delta_decode_strategy(
-                        query=query,
-                        key=key,
-                        value=value,
-                        g=g,
-                        beta=beta,
-                        initial_state=initial_state,
-                        strategy=str(candidate["strategy"]),
-                        value_block=int(candidate["value_block"]),
-                        single_min_elements=single_min_elements,
-                        warmup=warmup,
-                        iters=iters,
+            seed_measurements = _collect_gated_delta_decode_candidate_timings(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                candidates=[
+                    (
+                        str(candidate["candidate_id"]),
+                        str(candidate["strategy"]),
+                        int(candidate["value_block"]),
                     )
-                    candidate["samples_ms"].append(candidate_ms)
-                    candidate["max_abs_diff"] = max(float(candidate["max_abs_diff"]), diff)
+                    for candidate in candidates
+                ],
+                single_min_elements=single_min_elements,
+                warmup=warmup,
+                iters=iters,
+                timing_repeats=timing_repeats,
+            )
+            profile_measurements_by_seed.append(seed_measurements)
+            for candidate in candidates:
+                measurement = seed_measurements[str(candidate["candidate_id"])]
+                candidate["samples_ms"].append(float(measurement["candidate_ms"]))
+                candidate["max_abs_diff"] = max(float(candidate["max_abs_diff"]), float(measurement["max_abs_diff"]))
         single_min_elements_label = "default" if single_min_elements is None else str(single_min_elements)
         for candidate in candidates:
             candidate_ms = statistics.median(candidate["samples_ms"])
@@ -681,30 +780,64 @@ def _run_gated_delta_decode_profile_case(
     if auto_compare:
         for value_block in value_blocks:
             compare_results: list[dict[str, float | str]] = []
-            for seed in seeds:
-                query, key, value, g, beta, initial_state = _make_gated_delta_decode_bench_inputs(
-                    batch_size=batch_size,
-                    num_heads=num_heads,
-                    key_head_dim=key_head_dim,
+            if profile_measurements_by_seed:
+                debug_query = torch.empty(batch_size, 1, num_heads, key_head_dim, device="xpu", dtype=dtype)
+                auto_strategy = _resolve_gated_delta_decode_auto_strategy(
+                    debug_query,
                     value_head_dim=value_head_dim,
-                    dtype=dtype,
-                    seed=seed,
+                    value_block=value_block,
                 )
-                compare_results.append(
-                    _compare_gated_delta_decode_auto_against_explicit(
-                        query=query,
-                        key=key,
-                        value=value,
-                        g=g,
-                        beta=beta,
-                        initial_state=initial_state,
-                        value_block=value_block,
-                        single_min_elements=single_min_elements,
-                        warmup=warmup,
-                        iters=iters,
-                        timing_repeats=timing_repeats,
+                single_candidate_id = _gated_delta_decode_candidate_id("single", single_profile_value_block)
+                tiled_candidate_id = _gated_delta_decode_candidate_id("tiled", value_block)
+                auto_candidate_id = _gated_delta_decode_candidate_id("auto", value_block)
+                for seed_measurements in profile_measurements_by_seed:
+                    single_ms = float(seed_measurements[single_candidate_id]["candidate_ms"])
+                    tiled_ms = float(seed_measurements[tiled_candidate_id]["candidate_ms"])
+                    auto_ms = float(seed_measurements[auto_candidate_id]["candidate_ms"])
+                    best_explicit_strategy = "single" if single_ms <= tiled_ms else "tiled"
+                    best_explicit_ms = min(single_ms, tiled_ms)
+                    compare_results.append(
+                        {
+                            "auto_strategy": auto_strategy,
+                            "single_ms": single_ms,
+                            "tiled_ms": tiled_ms,
+                            "auto_ms": auto_ms,
+                            "best_explicit_strategy": best_explicit_strategy,
+                            "best_explicit_ms": best_explicit_ms,
+                            "auto_minus_best_ms": auto_ms - best_explicit_ms,
+                            "auto_speed_ratio": auto_ms / best_explicit_ms if best_explicit_ms > 0 else float("inf"),
+                            "max_abs_diff": max(
+                                float(seed_measurements[single_candidate_id]["max_abs_diff"]),
+                                float(seed_measurements[tiled_candidate_id]["max_abs_diff"]),
+                                float(seed_measurements[auto_candidate_id]["max_abs_diff"]),
+                            ),
+                        }
                     )
-                )
+            else:
+                for seed in seeds:
+                    query, key, value, g, beta, initial_state = _make_gated_delta_decode_bench_inputs(
+                        batch_size=batch_size,
+                        num_heads=num_heads,
+                        key_head_dim=key_head_dim,
+                        value_head_dim=value_head_dim,
+                        dtype=dtype,
+                        seed=seed,
+                    )
+                    compare_results.append(
+                        _compare_gated_delta_decode_auto_against_explicit(
+                            query=query,
+                            key=key,
+                            value=value,
+                            g=g,
+                            beta=beta,
+                            initial_state=initial_state,
+                            value_block=value_block,
+                            single_min_elements=single_min_elements,
+                            warmup=warmup,
+                            iters=iters,
+                            timing_repeats=timing_repeats,
+                        )
+                    )
             single_ms = statistics.median(float(result["single_ms"]) for result in compare_results)
             tiled_ms = statistics.median(float(result["tiled_ms"]) for result in compare_results)
             auto_ms = statistics.median(float(result["auto_ms"]) for result in compare_results)

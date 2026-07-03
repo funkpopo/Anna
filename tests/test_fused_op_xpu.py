@@ -1767,6 +1767,70 @@ def test_gated_delta_decode_value_block_debug_respects_env_override(
 
 
 @pytest.mark.parametrize(
+    ("strategy", "strategy_code", "value_block"),
+    [
+        ("auto", -1, 0),
+        ("single", 0, 8),
+        ("tiled", 1, 8),
+    ],
+)
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gated_delta_decode_benchmark_matches_env_forced_path(
+    strategy: str,
+    strategy_code: int,
+    value_block: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gated_delta_decode_benchmark"):
+        pytest.skip("Anna fused-op library is not built")
+
+    monkeypatch.setenv("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY", strategy)
+    if value_block > 0:
+        monkeypatch.setenv("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", str(value_block))
+    else:
+        monkeypatch.delenv("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", raising=False)
+
+    torch.manual_seed(9100 + strategy_code + max(0, value_block))
+    batch_size = 2
+    num_heads = 16
+    key_head_dim = 128
+    value_head_dim = 128
+    query = torch.randn(batch_size, 1, num_heads, key_head_dim, device="xpu", dtype=torch.bfloat16)
+    key = torch.randn(batch_size, 1, num_heads, key_head_dim, device="xpu", dtype=torch.bfloat16)
+    value = torch.randn(batch_size, 1, num_heads, value_head_dim, device="xpu", dtype=torch.bfloat16)
+    g = torch.randn(batch_size, 1, num_heads, device="xpu", dtype=torch.float32)
+    beta = torch.sigmoid(torch.randn(batch_size, 1, num_heads, device="xpu", dtype=torch.float32))
+    initial_state = torch.randn(batch_size, num_heads, key_head_dim, value_head_dim, device="xpu", dtype=torch.float32)
+
+    state_env = initial_state.clone()
+    output_env = torch.ops.anna.gated_delta_decode(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        state_env,
+    )
+
+    state_bench = initial_state.clone()
+    output_bench = torch.ops.anna.gated_delta_decode_benchmark(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        state_bench,
+        strategy_code,
+        value_block,
+        0,
+    )
+
+    torch.xpu.synchronize()
+    assert torch.allclose(output_bench.float().cpu(), output_env.float().cpu(), atol=5e-2, rtol=5e-2)
+    assert torch.allclose(state_bench.float().cpu(), state_env.float().cpu(), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize(
     ("batch_size", "num_heads", "value_head_dim", "value_block"),
     [
         (1, 32, 64, 4),

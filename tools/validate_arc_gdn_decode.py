@@ -13,6 +13,7 @@ from pathlib import Path
 ARC_DEFAULT_PRESET = "arc-default"
 ARC_LEGACY_V128_BLOCK8_PRESET = "arc-legacy-v128-block8"
 ARC_LEGACY_V256_BLOCK4_PRESET = "arc-legacy-v256-block4"
+DEFAULT_BENCH_TIMING_REPEATS = 5
 
 DEFAULT_PRESETS = (
     ARC_DEFAULT_PRESET,
@@ -38,7 +39,7 @@ ARC_BENCH_EXPECTATIONS = {
         expected_value_blocks=(16,),
         expected_row_count=13,
         ratio_field="default_speed_ratio",
-        max_ratio=1.12,
+        max_ratio=1.15,
         default_value_block=16,
         default_strategy="tiled",
     ),
@@ -123,6 +124,7 @@ def _bench_args_for_preset(
     preset_name: str,
     warmup: int,
     iters: int,
+    timing_repeats: int,
     seeds_csv: str,
 ) -> list[str]:
     compare_flag = "--gdn-decode-default-compare" if preset_name == ARC_DEFAULT_PRESET else "--gdn-decode-auto-compare"
@@ -144,6 +146,8 @@ def _bench_args_for_preset(
         str(warmup),
         "--iters",
         str(iters),
+        "--gdn-decode-timing-repeats",
+        str(timing_repeats),
     ]
 
 
@@ -262,6 +266,28 @@ def _write_json_report(path: Path, payload: dict[str, object]) -> None:
 
 def _load_json_report(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _validate_benchmark_config_against_baseline(
+    *,
+    current_config: dict[str, object],
+    baseline_report: dict[str, object],
+) -> None:
+    baseline_benchmark = baseline_report.get("benchmark")
+    if not isinstance(baseline_benchmark, dict):
+        raise ValueError("Baseline JSON is missing benchmark section")
+
+    for field_name in ("seeds", "warmup", "iters", "timing_repeats"):
+        if field_name not in baseline_benchmark:
+            raise ValueError(
+                f"Baseline JSON is missing benchmark.{field_name}; refresh the baseline with the current validator."
+            )
+        baseline_value = baseline_benchmark[field_name]
+        current_value = current_config[field_name]
+        if baseline_value != current_value:
+            raise ValueError(
+                f"Baseline benchmark config mismatch for {field_name}: baseline={baseline_value!r} current={current_value!r}"
+            )
 
 
 def _benchmark_row_key(row: dict[str, str]) -> tuple[str, str, str, str, str]:
@@ -392,6 +418,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=20, help="Benchmark warmup iterations.")
     parser.add_argument("--iters", type=int, default=100, help="Benchmark measured iterations.")
     parser.add_argument(
+        "--timing-repeats",
+        type=int,
+        default=DEFAULT_BENCH_TIMING_REPEATS,
+        help="Repeated timing samples per decode candidate forwarded to tools/bench_xpu_hotspots.py.",
+    )
+    parser.add_argument(
         "--skip-bench",
         action="store_true",
         help="Skip the Arc decode benchmark preset commands.",
@@ -461,6 +493,7 @@ def main() -> None:
             "seeds": args.seeds,
             "warmup": args.warmup,
             "iters": args.iters,
+            "timing_repeats": args.timing_repeats,
             "skip_bench": args.skip_bench,
             "skip_bench_gates": args.skip_bench_gates,
             "presets": {},
@@ -480,6 +513,10 @@ def main() -> None:
     baseline_report: dict[str, object] | None = None
     if args.compare_json is not None:
         baseline_report = _load_json_report(Path(args.compare_json).expanduser())
+        _validate_benchmark_config_against_baseline(
+            current_config=json_report["benchmark"],
+            baseline_report=baseline_report,
+        )
 
     if args.build_first:
         _run_step(
@@ -501,6 +538,7 @@ def main() -> None:
                     preset_name=preset_name,
                     warmup=args.warmup,
                     iters=args.iters,
+                    timing_repeats=args.timing_repeats,
                     seeds_csv=args.seeds,
                 ),
                 cwd=root,

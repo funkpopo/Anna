@@ -14,6 +14,7 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     ARC_DEFAULT_PRESET,
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
+    DEFAULT_BENCH_TIMING_REPEATS,
     DEFAULT_COMPARE_RATIO_DELTA,
     _bench_args_for_preset,
     _compare_benchmark_summary_against_baseline,
@@ -22,6 +23,7 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     _parse_gdn_decode_csv_rows,
     _parse_gdn_decode_value_blocks,
     _parse_preset_names,
+    _validate_benchmark_config_against_baseline,
     _validate_benchmark_output,
     _write_json_report,
 )
@@ -60,6 +62,7 @@ def test_bench_args_for_preset_uses_expected_compare_flag(
         preset_name=preset_name,
         warmup=7,
         iters=11,
+        timing_repeats=DEFAULT_BENCH_TIMING_REPEATS,
         seeds_csv="20260960,20260961",
     )
     assert expected_compare_flag in args
@@ -67,6 +70,7 @@ def test_bench_args_for_preset_uses_expected_compare_flag(
     assert args[args.index("--gdn-decode-shape-presets") + 1] == preset_name
     assert args[args.index("--warmup") + 1] == "7"
     assert args[args.index("--iters") + 1] == "11"
+    assert args[args.index("--gdn-decode-timing-repeats") + 1] == str(DEFAULT_BENCH_TIMING_REPEATS)
 
 
 def test_parse_gdn_decode_value_blocks_extracts_csv() -> None:
@@ -176,6 +180,42 @@ def test_load_json_report_reads_written_payload(tmp_path: Path) -> None:
     payload = {"schema_version": 1, "status": "ok"}
     _write_json_report(output_path, payload)
     assert _load_json_report(output_path) == payload
+
+
+def test_validate_benchmark_config_against_baseline_accepts_matching_settings() -> None:
+    current_config = {
+        "seeds": "20260960,20260961",
+        "warmup": 20,
+        "iters": 100,
+        "timing_repeats": DEFAULT_BENCH_TIMING_REPEATS,
+    }
+    baseline_report = {
+        "benchmark": {
+            "seeds": "20260960,20260961",
+            "warmup": 20,
+            "iters": 100,
+            "timing_repeats": DEFAULT_BENCH_TIMING_REPEATS,
+        }
+    }
+    _validate_benchmark_config_against_baseline(current_config=current_config, baseline_report=baseline_report)
+
+
+def test_validate_benchmark_config_against_baseline_rejects_missing_timing_repeats() -> None:
+    current_config = {
+        "seeds": "20260960,20260961",
+        "warmup": 20,
+        "iters": 100,
+        "timing_repeats": DEFAULT_BENCH_TIMING_REPEATS,
+    }
+    baseline_report = {
+        "benchmark": {
+            "seeds": "20260960,20260961",
+            "warmup": 20,
+            "iters": 100,
+        }
+    }
+    with pytest.raises(ValueError, match="missing benchmark.timing_repeats"):
+        _validate_benchmark_config_against_baseline(current_config=current_config, baseline_report=baseline_report)
 
 
 def test_compare_benchmark_summary_against_baseline_accepts_small_drift() -> None:

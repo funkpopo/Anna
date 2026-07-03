@@ -362,7 +362,8 @@ GatedDeltaDecodeStrategy resolve_gated_delta_decode_strategy(
     int64_t key_head_dim,
     int64_t value_head_dim,
     int64_t value_block,
-    int64_t local_size) {
+    int64_t local_size,
+    int64_t single_min_elements_override = 0) {
   const char* raw = std::getenv("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY");
   if (raw != nullptr && raw[0] != '\0') {
     std::string strategy(raw);
@@ -391,16 +392,22 @@ GatedDeltaDecodeStrategy resolve_gated_delta_decode_strategy(
     return GatedDeltaDecodeStrategy::SingleGroup;
   }
 
-  const char* threshold_override_raw = std::getenv("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS");
-  if (threshold_override_raw != nullptr && threshold_override_raw[0] != '\0') {
-    char* end = nullptr;
-    const long parsed = std::strtol(threshold_override_raw, &end, 10);
-    if (end != threshold_override_raw && parsed > 0) {
-      const int64_t single_group_parallel_elements = recurrent_rows * value_head_dim;
-      return single_group_parallel_elements >= static_cast<int64_t>(parsed)
-          ? GatedDeltaDecodeStrategy::SingleGroup
-          : GatedDeltaDecodeStrategy::TiledValue;
+  int64_t resolved_single_min_elements = single_min_elements_override;
+  if (resolved_single_min_elements <= 0) {
+    const char* threshold_override_raw = std::getenv("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS");
+    if (threshold_override_raw != nullptr && threshold_override_raw[0] != '\0') {
+      char* end = nullptr;
+      const long parsed = std::strtol(threshold_override_raw, &end, 10);
+      if (end != threshold_override_raw && parsed > 0) {
+        resolved_single_min_elements = static_cast<int64_t>(parsed);
+      }
     }
+  }
+  if (resolved_single_min_elements > 0) {
+    const int64_t single_group_parallel_elements = recurrent_rows * value_head_dim;
+    return single_group_parallel_elements >= resolved_single_min_elements
+        ? GatedDeltaDecodeStrategy::SingleGroup
+        : GatedDeltaDecodeStrategy::TiledValue;
   }
 
   const std::string& lower_device_name = cached_lowercase_device_name(device);
@@ -7206,6 +7213,118 @@ at::Tensor gated_delta_decode_xpu(
   return output;
 }
 
+at::Tensor gated_delta_decode_benchmark_xpu(
+    const at::Tensor& query_in,
+    const at::Tensor& key_in,
+    const at::Tensor& value_in,
+    const at::Tensor& g_in,
+    const at::Tensor& beta_in,
+    const at::Tensor& state_in,
+    int64_t strategy_code,
+    int64_t value_block_override,
+    int64_t single_min_elements_override) {
+  validate_gated_delta_inputs(query_in, key_in, value_in, g_in, beta_in, state_in);
+  validate_gated_delta_xpu_inputs(query_in, key_in, value_in, g_in, beta_in, state_in);
+  TORCH_CHECK(query_in.size(1) == 1, "gated_delta_decode_benchmark expects seq_len == 1");
+  TORCH_CHECK(
+      strategy_code == -1 || strategy_code == 0 || strategy_code == 1,
+      "strategy_code must be -1 (auto), 0 (single), or 1 (tiled)");
+  TORCH_CHECK(value_block_override >= 0, "value_block_override must be non-negative");
+  TORCH_CHECK(single_min_elements_override >= 0, "single_min_elements_override must be non-negative");
+  const auto initial_dtype = query_in.scalar_type();
+  const auto batch_size = query_in.size(0);
+  const auto num_heads = query_in.size(2);
+  const auto key_head_dim = query_in.size(3);
+  const auto value_head_dim = value_in.size(3);
+  auto output = at::empty({batch_size, 1, num_heads, value_head_dim}, query_in.options());
+
+  auto stream = c10::xpu::getCurrentXPUStream(query_in.device().index());
+  const int64_t local_size = std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, value_head_dim)), 256);
+  validate_gated_delta_local_memory_requirements(stream.queue().get_device(), key_head_dim, local_size);
+  const int64_t value_block = value_block_override > 0
+      ? clamp_gated_delta_decode_value_block(value_block_override)
+      : resolve_gated_delta_decode_value_block(stream.queue().get_device(), key_head_dim, value_head_dim);
+
+  GatedDeltaDecodeStrategy decode_strategy = GatedDeltaDecodeStrategy::SingleGroup;
+  if (strategy_code == 0) {
+    decode_strategy = GatedDeltaDecodeStrategy::SingleGroup;
+  } else if (strategy_code == 1) {
+    decode_strategy = GatedDeltaDecodeStrategy::TiledValue;
+  } else {
+    decode_strategy = resolve_gated_delta_decode_strategy(
+        stream.queue().get_device(),
+        batch_size,
+        num_heads,
+        key_head_dim,
+        value_head_dim,
+        value_block,
+        local_size,
+        single_min_elements_override);
+  }
+  const int64_t single_decode_values_per_lane = resolve_gated_delta_decode_values_per_lane(value_head_dim);
+  const int64_t tiled_decode_values_per_lane = resolve_gated_delta_decode_values_per_lane(value_block);
+
+  const float* beta_ptr = beta_in.const_data_ptr<float>();
+  const float* g_ptr = g_in.const_data_ptr<float>();
+  const float* state_read_ptr = state_in.const_data_ptr<float>();
+  float* state_write_ptr = state_in.mutable_data_ptr<float>();
+  const float l2_eps_f = 1e-6f;
+  const float query_scale_base = 1.0f / std::sqrt(static_cast<float>(key_head_dim));
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      initial_dtype,
+      "gated_delta_decode_xpu",
+      [&] {
+        const scalar_t* query_ptr = query_in.const_data_ptr<scalar_t>();
+        const scalar_t* key_ptr = key_in.const_data_ptr<scalar_t>();
+        const scalar_t* value_ptr = value_in.const_data_ptr<scalar_t>();
+        scalar_t* output_ptr = output.mutable_data_ptr<scalar_t>();
+        if (decode_strategy == GatedDeltaDecodeStrategy::SingleGroup) {
+          launch_gated_delta_decode_kernel(
+              stream.queue(),
+              query_ptr,
+              key_ptr,
+              value_ptr,
+              g_ptr,
+              beta_ptr,
+              state_read_ptr,
+              state_write_ptr,
+              output_ptr,
+              batch_size,
+              num_heads,
+              key_head_dim,
+              value_head_dim,
+              single_decode_values_per_lane,
+              l2_eps_f,
+              query_scale_base);
+        } else {
+          launch_gated_delta_decode_tiled_kernel(
+              stream.queue(),
+              query_ptr,
+              key_ptr,
+              value_ptr,
+              g_ptr,
+              beta_ptr,
+              state_read_ptr,
+              state_write_ptr,
+              output_ptr,
+              batch_size,
+              num_heads,
+              key_head_dim,
+              value_head_dim,
+              value_block,
+              local_size,
+              tiled_decode_values_per_lane,
+              l2_eps_f,
+              query_scale_base);
+        }
+      });
+
+  return output;
+}
+
 int64_t gated_delta_decode_value_block_debug_xpu(
     const at::Tensor& query_in,
     int64_t value_head_dim) {
@@ -7527,6 +7646,18 @@ TORCH_LIBRARY(anna, m) {
       "int value_head_dim, "
       "int value_block"
       ") -> int");
+  m.def(
+      "gated_delta_decode_benchmark("
+      "Tensor query, "
+      "Tensor key, "
+      "Tensor value, "
+      "Tensor g, "
+      "Tensor beta, "
+      "Tensor(a!) state, "
+      "int strategy_code=-1, "
+      "int value_block_override=0, "
+      "int single_min_elements_override=0"
+      ") -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(anna, Meta, m) {
@@ -7595,6 +7726,7 @@ TORCH_LIBRARY_IMPL(anna, Autograd, m) {
   m.impl("gated_delta_decode", torch::CppFunction::makeFallthrough());
   m.impl("gated_delta_decode_value_block_debug", torch::CppFunction::makeFallthrough());
   m.impl("gated_delta_decode_strategy_debug", torch::CppFunction::makeFallthrough());
+  m.impl("gated_delta_decode_benchmark", torch::CppFunction::makeFallthrough());
 }
 
 TORCH_LIBRARY_IMPL(anna, XPU, m) {
@@ -7630,4 +7762,5 @@ TORCH_LIBRARY_IMPL(anna, XPU, m) {
   m.impl("gated_delta_decode", anna::gated_delta_decode_xpu);
   m.impl("gated_delta_decode_value_block_debug", anna::gated_delta_decode_value_block_debug_xpu);
   m.impl("gated_delta_decode_strategy_debug", anna::gated_delta_decode_strategy_debug_xpu);
+  m.impl("gated_delta_decode_benchmark", anna::gated_delta_decode_benchmark_xpu);
 }
