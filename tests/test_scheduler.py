@@ -94,6 +94,7 @@ class _FakeModel:
         self.text_prefill_topk_batch_sizes: list[int] = []
         self.text_decode_topk_batch_sizes: list[int] = []
         self.text_prefill_chunk_lengths: list[int] = []
+        self.decode_non_eos_steps = 0
         self.model = _FakePrefillRunner(self)
         self.lm_head = _FakeLMHead(self)
 
@@ -156,7 +157,12 @@ class _FakeModel:
 
         self.text_decode_batch_sizes.append(batch_size)
         logits = torch.full((batch_size, 1, self.config.text_config.vocab_size), -1000.0)
-        logits[:, 0, 9] = 1000.0
+        if len(self.text_decode_batch_sizes) <= self.decode_non_eos_steps:
+            planned = [1, 2]
+            for idx in range(batch_size):
+                logits[idx, 0, planned[idx]] = 1000.0
+        else:
+            logits[:, 0, 9] = 1000.0
         return type(
             "TextDecodeOutput",
             (),
@@ -442,6 +448,67 @@ def test_scheduler_uses_topk_forward_for_eligible_batches() -> None:
         assert fake_model.text_decode_topk_batch_sizes == [2]
         assert fake_model.text_prefill_batch_sizes == []
         assert fake_model.text_decode_batch_sizes == []
+    finally:
+        scheduler.shutdown()
+
+
+def test_scheduler_keeps_stable_decode_batches_without_cache_resplit() -> None:
+    config = Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            vocab_size=16,
+            eos_token_id=9,
+            pad_token_id=0,
+            cache_block_size=2,
+            layer_types=["full_attention"],
+        )
+    )
+    fake_model = _FakeModel(config)
+    fake_model.decode_non_eos_steps = 2
+    engine = AnnaQwen3_5TextEngine(
+        model=fake_model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="fake",
+        device_context=_FakeDeviceContext(),
+    )
+    scheduler = AnnaScheduler(engine, max_batch_size=4, batch_wait_ms=20.0)
+    engine.set_scheduler(scheduler)
+
+    try:
+        request_a = scheduler._submit(
+            _prepared([4, 5]),
+            config=GenerationConfig(max_new_tokens=4, temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.1),
+            stream=False,
+        )
+        request_b = scheduler._submit(
+            _prepared([6, 7]),
+            config=GenerationConfig(max_new_tokens=4, temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.1),
+            stream=False,
+        )
+
+        assert request_a.done.wait(timeout=2.0)
+        assert request_b.done.wait(timeout=2.0)
+        assert request_a.error is None
+        assert request_b.error is None
+        assert request_a.result is not None
+        assert request_b.result is not None
+        assert request_a.result.completion_tokens == 3
+        assert request_b.result.completion_tokens == 3
+        assert fake_model.text_prefill_batch_sizes == [2]
+        assert fake_model.text_decode_batch_sizes == [2, 2, 2]
+        snapshot = engine.service_metrics_snapshot()
+        assert snapshot.cache_stack_count == 0
+        assert snapshot.cache_split_count == 0
     finally:
         scheduler.shutdown()
 

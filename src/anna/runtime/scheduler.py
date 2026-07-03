@@ -59,6 +59,13 @@ class SchedulerPrefillGroup:
     prompt_tokens_recorded: int = 0
 
 
+@dataclass(slots=True)
+class SchedulerDecodeGroup:
+    requests: list[SchedulerRequest]
+    input_ids: torch.Tensor
+    past_key_values: object
+
+
 class AnnaScheduler:
     def __init__(
         self,
@@ -139,7 +146,7 @@ class AnnaScheduler:
         return request
 
     def _run_loop(self) -> None:
-        active: list[SchedulerRequest | SchedulerPrefillGroup] = []
+        active: list[SchedulerRequest | SchedulerPrefillGroup | SchedulerDecodeGroup] = []
         try:
             while True:
                 with self._condition:
@@ -169,9 +176,10 @@ class AnnaScheduler:
                 if not active:
                     continue
 
-                next_active: list[SchedulerRequest | SchedulerPrefillGroup] = []
+                next_active: list[SchedulerRequest | SchedulerPrefillGroup | SchedulerDecodeGroup] = []
                 active_requests = [item for item in active if isinstance(item, SchedulerRequest)]
                 prefill_groups = [item for item in active if isinstance(item, SchedulerPrefillGroup)]
+                decode_groups = [item for item in active if isinstance(item, SchedulerDecodeGroup)]
                 active_requests = [request for request in active_requests if not self._drop_cancelled_request(request)]
                 prefill_groups = [group for group in prefill_groups if self._filter_prefill_group(group)]
                 ready = [
@@ -187,14 +195,37 @@ class AnnaScheduler:
                 for request in pending_decode:
                     self._fail_request(request, RuntimeError("Missing decode cache for active request."))
 
+                decoded_any = False
+                if decode_groups:
+                    for group in decode_groups:
+                        try:
+                            next_active.extend(self._decode_group(group))
+                            self._decode_steps_since_prefill += 1
+                            decoded_any = True
+                        except Exception as exc:  # pragma: no cover - worker-level best effort
+                            self._release_decode_group_cache(group)
+                            self._fail_requests(group.requests, self._normalize_error(exc))
+
                 if ready:
                     for chunk_start in range(0, len(ready), self.max_batch_size):
                         chunk = ready[chunk_start : chunk_start + self.max_batch_size]
                         try:
                             next_active.extend(self._decode_batch(chunk))
                             self._decode_steps_since_prefill += 1
+                            decoded_any = True
                         except Exception as exc:  # pragma: no cover - worker-level best effort
                             self._fail_requests(chunk, self._normalize_error(exc))
+                    if prefill_groups and self._should_run_prefill_step():
+                        group = prefill_groups[0]
+                        try:
+                            next_active.extend(self._prefill_group_step(group))
+                            self._decode_steps_since_prefill = 0
+                        except Exception as exc:  # pragma: no cover - worker-level best effort
+                            self._fail_requests(group.requests, self._normalize_error(exc))
+                        next_active.extend(prefill_groups[1:])
+                    else:
+                        next_active.extend(prefill_groups)
+                elif decoded_any:
                     if prefill_groups and self._should_run_prefill_step():
                         group = prefill_groups[0]
                         try:
@@ -229,11 +260,17 @@ class AnnaScheduler:
                     release = getattr(item.past_key_values, "release", None)
                     if callable(release):
                         release()
+                elif isinstance(item, SchedulerDecodeGroup):
+                    failed_active.extend(item.requests)
+                    self._release_decode_group_cache(item)
                 else:
                     failed_active.append(item)
             self._fail_requests(failed_active + pending, fatal)
 
-    def _prefill_batch(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest | SchedulerPrefillGroup]:
+    def _prefill_batch(
+        self,
+        requests: list[SchedulerRequest],
+    ) -> list[SchedulerRequest | SchedulerPrefillGroup | SchedulerDecodeGroup]:
         for request in requests:
             if self._is_request_cancelled(request):
                 self._drop_cancelled_request(request)
@@ -261,7 +298,7 @@ class AnnaScheduler:
                 stop_strings=request.config.stop_strings,
             )
 
-        active: list[SchedulerRequest] = []
+        active: list[SchedulerRequest | SchedulerPrefillGroup | SchedulerDecodeGroup] = []
         groups: dict[int, list[SchedulerRequest]] = defaultdict(list)
         for request in requests:
             groups[request.prompt_length].append(request)
@@ -270,7 +307,10 @@ class AnnaScheduler:
             active.extend(self._prefill_same_length_group(group))
         return active
 
-    def _should_admit_prefill(self, active: list[SchedulerRequest | SchedulerPrefillGroup]) -> bool:
+    def _should_admit_prefill(
+        self,
+        active: list[SchedulerRequest | SchedulerPrefillGroup | SchedulerDecodeGroup],
+    ) -> bool:
         if not self._pending:
             return False
         if any(isinstance(item, SchedulerPrefillGroup) for item in active):
@@ -280,7 +320,10 @@ class AnnaScheduler:
     def _should_run_prefill_step(self) -> bool:
         return self._decode_steps_since_prefill >= self.prefill_interval_steps
 
-    def _prefill_same_length_group(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest | SchedulerPrefillGroup]:
+    def _prefill_same_length_group(
+        self,
+        requests: list[SchedulerRequest],
+    ) -> list[SchedulerRequest | SchedulerPrefillGroup | SchedulerDecodeGroup]:
         for request in requests:
             if self._is_request_cancelled(request):
                 self._drop_cancelled_request(request)
@@ -305,7 +348,10 @@ class AnnaScheduler:
             )
         )
 
-    def _prefill_group_step(self, group: SchedulerPrefillGroup) -> list[SchedulerRequest | SchedulerPrefillGroup]:
+    def _prefill_group_step(
+        self,
+        group: SchedulerPrefillGroup,
+    ) -> list[SchedulerRequest | SchedulerPrefillGroup | SchedulerDecodeGroup]:
         requests = [request for request in group.requests if not self._drop_cancelled_request(request)]
         group.requests = requests
         if not requests:
@@ -370,10 +416,17 @@ class AnnaScheduler:
         total_prompt_tokens = sum(request.prompt_length for request in requests)
         if metrics is not None and group.prompt_tokens_recorded < total_prompt_tokens:
             metrics.record_prompt_tokens(total_prompt_tokens - group.prompt_tokens_recorded)
-        split_caches = self._split_output_caches(outputs, len(requests), avoid_turboquant_clone=False)
-        return list(self._consume_batch_outputs(requests, outputs, split_caches))
+        return list(
+            self._consume_batch_outputs(
+                requests,
+                outputs,
+                batch_cache=outputs.past_key_values,
+                keep_batched_cache=len(requests) > 1,
+                avoid_turboquant_clone=False,
+            )
+        )
 
-    def _decode_batch(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest]:
+    def _decode_batch(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest | SchedulerDecodeGroup]:
         for request in requests:
             if self._is_request_cancelled(request):
                 self._drop_cancelled_request(request)
@@ -392,6 +445,8 @@ class AnnaScheduler:
         stack_started_at = time.perf_counter()
         stack_kwargs = {"clone_turboquant_rows": False} if cache_type.__name__ == "Qwen3DynamicCache" else {}
         batch_cache = stack(caches, self.engine.config.text_config, **stack_kwargs)
+        for request in requests:
+            request.past_key_values = None
         if metrics is not None:
             metrics.record_cache_stack(time.perf_counter() - stack_started_at)
 
@@ -405,46 +460,110 @@ class AnnaScheduler:
                     past_key_values=batch_cache,
                 )
         except RuntimeError as exc:
+            release = getattr(batch_cache, "release", None)
+            if callable(release):
+                release()
             raise self.engine._handle_runtime_failure(exc) from exc
 
         if metrics is not None:
             metrics.record_decode_step(time.perf_counter() - started_at)
 
-        split_caches = self._split_output_caches(outputs, len(requests), avoid_turboquant_clone=True)
-        return self._consume_batch_outputs(requests, outputs, split_caches)
+        batch_cache = outputs.past_key_values if outputs.past_key_values is not None else batch_cache
+        return self._consume_batch_outputs(
+            requests,
+            outputs,
+            batch_cache=batch_cache,
+            keep_batched_cache=len(requests) > 1,
+            avoid_turboquant_clone=True,
+        )
+
+    def _decode_group(self, group: SchedulerDecodeGroup) -> list[SchedulerRequest | SchedulerDecodeGroup]:
+        if not group.requests:
+            self._release_decode_group_cache(group)
+            return []
+
+        if any(self._is_request_cancelled(request) for request in group.requests):
+            remaining = self._split_decode_group_for_membership_change(group)
+            if not remaining:
+                return []
+            if len(remaining) == 1:
+                return remaining
+            return self._decode_batch(remaining)
+
+        metrics = getattr(self.engine, "metrics", None)
+        try:
+            started_at = time.perf_counter()
+            with self.engine.execution_lock:
+                outputs = self._forward_batch_maybe_topk(
+                    stage="scheduler_decode",
+                    requests=group.requests,
+                    input_ids=group.input_ids,
+                    past_key_values=group.past_key_values,
+                )
+        except RuntimeError as exc:
+            raise self.engine._handle_runtime_failure(exc) from exc
+
+        if metrics is not None:
+            metrics.record_decode_step(time.perf_counter() - started_at)
+
+        batch_cache = outputs.past_key_values if outputs.past_key_values is not None else group.past_key_values
+        return self._consume_batch_outputs(
+            group.requests,
+            outputs,
+            batch_cache=batch_cache,
+            keep_batched_cache=len(group.requests) > 1,
+            avoid_turboquant_clone=True,
+        )
 
     def _split_output_caches(self, outputs, request_count: int, *, avoid_turboquant_clone: bool) -> list:
         if outputs.past_key_values is None:
             return [None] * request_count
+        return self._split_cache(outputs.past_key_values, request_count, avoid_turboquant_clone=avoid_turboquant_clone)
+
+    def _split_cache(self, cache: object, request_count: int, *, avoid_turboquant_clone: bool) -> list:
         metrics = getattr(self.engine, "metrics", None)
         split_started_at = time.perf_counter()
         split_kwargs = (
             {"clone_turboquant_rows": False}
-            if avoid_turboquant_clone and type(outputs.past_key_values).__name__ == "Qwen3DynamicCache"
+            if avoid_turboquant_clone and type(cache).__name__ == "Qwen3DynamicCache"
             else {}
         )
-        split_caches = outputs.past_key_values.split_batch(**split_kwargs)
+        split_batch = getattr(cache, "split_batch", None)
+        if not callable(split_batch):
+            raise RuntimeError(f"Cache type {type(cache).__name__} does not support scheduler split.")
+        split_caches = split_batch(**split_kwargs)
         if metrics is not None:
             metrics.record_cache_split(time.perf_counter() - split_started_at)
+        if len(split_caches) != request_count:
+            raise RuntimeError(
+                f"Scheduler cache split returned {len(split_caches)} rows for {request_count} requests."
+            )
         return split_caches
 
     def _consume_batch_outputs(
         self,
         requests: list[SchedulerRequest],
         outputs,
-        split_caches: list,
-    ) -> list[SchedulerRequest]:
-        """Sample one token per request from batched outputs; return requests that stay active."""
+        *,
+        batch_cache: object | None,
+        keep_batched_cache: bool,
+        avoid_turboquant_clone: bool,
+    ) -> list[SchedulerRequest | SchedulerDecodeGroup]:
+        """Sample one token per request from batched outputs; return requests that stay active.
+
+        When every row remains active, the returned SchedulerDecodeGroup keeps the batched
+        KV cache intact across decode steps. This avoids the stack/split churn that otherwise
+        dominates small-token continuous batches.
+        """
         metrics = getattr(self.engine, "metrics", None)
-        stop_token_ids = set(self.engine.tokenizer.eos_token_ids)
+        stop_token_ids = self.engine._stop_token_ids()
         next_active: list[SchedulerRequest] = []
+        next_input_ids: list[torch.Tensor] = []
+        continuing_by_row: dict[int, SchedulerRequest] = {}
         for row_idx, request in enumerate(requests):
             if self._is_request_cancelled(request):
-                if split_caches[row_idx] is not None:
-                    split_caches[row_idx].release()
                 self._drop_cancelled_request(request)
                 continue
-            request.past_key_values = split_caches[row_idx]
             next_token = self._sample_next_token_from_outputs(outputs, row_idx=row_idx, request=request)
             token_id = self.engine._token_id_from_tensor(next_token)
             if request.first_token_at is None:
@@ -474,8 +593,93 @@ class AnnaScheduler:
                 continue
 
             request.input_ids = next_token.view(1, 1)
+            next_input_ids.append(request.input_ids)
+            continuing_by_row[row_idx] = request
             next_active.append(request)
+
+        if batch_cache is None:
+            return next_active
+
+        if keep_batched_cache and next_active and len(next_active) == len(requests):
+            for request in next_active:
+                request.past_key_values = None
+            return [
+                SchedulerDecodeGroup(
+                    requests=next_active,
+                    input_ids=torch.cat(next_input_ids, dim=0),
+                    past_key_values=batch_cache,
+                )
+            ]
+
+        if not next_active:
+            release = getattr(batch_cache, "release", None)
+            if callable(release):
+                release()
+            return []
+
+        split_caches = self._split_cache(
+            batch_cache,
+            len(requests),
+            avoid_turboquant_clone=avoid_turboquant_clone,
+        )
+        for row_idx, cache in enumerate(split_caches):
+            request = continuing_by_row.get(row_idx)
+            if request is None:
+                release = getattr(cache, "release", None)
+                if callable(release):
+                    release()
+                continue
+            request.past_key_values = cache
+
+        if keep_batched_cache and len(next_active) > 1:
+            return [self._make_decode_group_from_requests(next_active)]
         return next_active
+
+    def _make_decode_group_from_requests(self, requests: list[SchedulerRequest]) -> SchedulerDecodeGroup:
+        if len(requests) <= 1:
+            raise ValueError("A decode group requires at least two requests.")
+        input_rows = [request.input_ids for request in requests if request.input_ids is not None]
+        caches = [request.past_key_values for request in requests if request.past_key_values is not None]
+        if len(input_rows) != len(requests) or len(caches) != len(requests):
+            raise RuntimeError("Cannot create decode group from requests with missing input ids or caches.")
+        input_ids = torch.cat(input_rows, dim=0)
+        cache_type = type(caches[0])
+        stack = getattr(cache_type, "stack", None)
+        if not callable(stack):
+            raise RuntimeError(f"Cache type {cache_type.__name__} does not support scheduler batching.")
+        metrics = getattr(self.engine, "metrics", None)
+        stack_started_at = time.perf_counter()
+        stack_kwargs = {"clone_turboquant_rows": False} if cache_type.__name__ == "Qwen3DynamicCache" else {}
+        batch_cache = stack(caches, self.engine.config.text_config, **stack_kwargs)
+        if metrics is not None:
+            metrics.record_cache_stack(time.perf_counter() - stack_started_at)
+        for request in requests:
+            request.past_key_values = None
+        return SchedulerDecodeGroup(requests=list(requests), input_ids=input_ids, past_key_values=batch_cache)
+
+    def _split_decode_group_for_membership_change(self, group: SchedulerDecodeGroup) -> list[SchedulerRequest]:
+        split_caches = self._split_cache(
+            group.past_key_values,
+            len(group.requests),
+            avoid_turboquant_clone=True,
+        )
+        remaining: list[SchedulerRequest] = []
+        for request, cache in zip(group.requests, split_caches):
+            if self._is_request_cancelled(request):
+                release = getattr(cache, "release", None)
+                if callable(release):
+                    release()
+                self._drop_cancelled_request(request)
+                continue
+            request.past_key_values = cache
+            remaining.append(request)
+        return remaining
+
+    @staticmethod
+    def _release_decode_group_cache(group: SchedulerDecodeGroup) -> None:
+        release = getattr(group.past_key_values, "release", None)
+        if callable(release):
+            release()
 
     def _shared_fused_lm_head_candidate_count(self, requests: list[SchedulerRequest]) -> int | None:
         candidate_counts = [self.engine._fused_lm_head_candidate_count(request.config) for request in requests]
