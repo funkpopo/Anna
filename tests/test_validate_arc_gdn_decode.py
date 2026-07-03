@@ -12,6 +12,7 @@ from tools.bench_xpu_hotspots import GDN_DECODE_SHAPE_PRESETS  # noqa: E402
 from tools.validate_arc_gdn_decode import (  # noqa: E402
     ARC_BENCH_EXPECTATIONS,
     ARC_DEFAULT_PRESET,
+    ARC_V64_DEFAULT_BLOCK16_PRESET,
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
     DEFAULT_BENCH_TIMING_REPEATS,
@@ -50,6 +51,7 @@ def test_parse_preset_names_rejects_unknown_values() -> None:
     ("preset_name", "expected_compare_flag"),
     [
         (ARC_DEFAULT_PRESET, "--gdn-decode-default-compare"),
+        (ARC_V64_DEFAULT_BLOCK16_PRESET, "--gdn-decode-default-compare"),
         (ARC_LEGACY_V128_BLOCK8_PRESET, "--gdn-decode-auto-compare"),
         (ARC_LEGACY_V256_BLOCK4_PRESET, "--gdn-decode-auto-compare"),
     ],

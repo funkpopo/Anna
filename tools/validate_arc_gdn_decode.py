@@ -11,12 +11,14 @@ from pathlib import Path
 
 
 ARC_DEFAULT_PRESET = "arc-default"
+ARC_V64_DEFAULT_BLOCK16_PRESET = "arc-v64-default-block16"
 ARC_LEGACY_V128_BLOCK8_PRESET = "arc-legacy-v128-block8"
 ARC_LEGACY_V256_BLOCK4_PRESET = "arc-legacy-v256-block4"
 DEFAULT_BENCH_TIMING_REPEATS = 5
 
 DEFAULT_PRESETS = (
     ARC_DEFAULT_PRESET,
+    ARC_V64_DEFAULT_BLOCK16_PRESET,
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
 )
@@ -40,6 +42,15 @@ ARC_BENCH_EXPECTATIONS = {
         expected_row_count=13,
         ratio_field="default_speed_ratio",
         max_ratio=1.15,
+        default_value_block=16,
+        default_strategy="tiled",
+    ),
+    ARC_V64_DEFAULT_BLOCK16_PRESET: ArcBenchExpectation(
+        compare_prefix="gdn_decode_default_compare",
+        expected_value_blocks=(16,),
+        expected_row_count=11,
+        ratio_field="default_speed_ratio",
+        max_ratio=1.03,
         default_value_block=16,
         default_strategy="tiled",
     ),
@@ -127,7 +138,12 @@ def _bench_args_for_preset(
     timing_repeats: int,
     seeds_csv: str,
 ) -> list[str]:
-    compare_flag = "--gdn-decode-default-compare" if preset_name == ARC_DEFAULT_PRESET else "--gdn-decode-auto-compare"
+    expectation = ARC_BENCH_EXPECTATIONS[preset_name]
+    compare_flag = (
+        "--gdn-decode-default-compare"
+        if expectation.compare_prefix == "gdn_decode_default_compare"
+        else "--gdn-decode-auto-compare"
+    )
     return [
         sys.executable,
         "tools/bench_xpu_hotspots.py",
