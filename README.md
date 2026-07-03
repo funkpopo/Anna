@@ -306,7 +306,7 @@ These values only apply when an API request omits the matching field.
 - `ANNA_GATED_DELTA_OP_LIB`: explicitly point to a fused-op `.pyd` / `.so`.
 - `ANNA_XPU_GATED_DELTA_DECODE_STRATEGY=auto|single|single_group|untiled|tiled|tiled_value`: Gated Delta decode kernel strategy.
 - `ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK=N`: value block size for tiled decode.
-- `ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS=N`: `auto` threshold for switching to the single-group decode strategy.
+- `ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS=N`: optional override for `auto`; when set, bypass the device/shape lookup and use this single-group element threshold.
 
 ### Continuous Batching and Token Budgets
 

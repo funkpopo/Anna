@@ -231,6 +231,20 @@ constexpr int64_t kGatedDeltaDecodeSubgroupSize = 16;
 constexpr int64_t kGatedDeltaDecodeValuesPerLaneSmall = 4;
 constexpr int64_t kGatedDeltaDecodeValuesPerLaneWide = 8;
 
+struct GatedDeltaDecodeAutoBucket {
+  const char* device_pattern;
+  int64_t key_head_dim;
+  int64_t value_head_dim;
+  int64_t single_group_min_rows;
+};
+
+constexpr GatedDeltaDecodeAutoBucket kGatedDeltaDecodeAutoBuckets[] = {
+    {"arc", 128, 128, 16},
+    {"arc", 128, 256, 64},
+    {"", 128, 128, 32},
+    {"", 128, 256, 96},
+};
+
 int64_t resolve_gated_delta_decode_values_per_lane(int64_t value_head_dim) {
   return value_head_dim <= kGatedDeltaDecodeSubgroupSize * kGatedDeltaDecodeValuesPerLaneSmall
       ? kGatedDeltaDecodeValuesPerLaneSmall
@@ -245,7 +259,15 @@ constexpr int64_t resolve_gated_delta_static_dim(int64_t runtime_dim) {
   return runtime_dim;
 }
 
+std::string lowercase_ascii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  return value;
+}
+
 GatedDeltaDecodeStrategy resolve_gated_delta_decode_strategy(
+    const sycl::device& device,
     int64_t batch_size,
     int64_t num_heads,
     int64_t key_head_dim,
@@ -272,16 +294,42 @@ GatedDeltaDecodeStrategy resolve_gated_delta_decode_strategy(
   const int64_t recurrent_rows = batch_size * num_heads;
   const int64_t value_block_count = (value_head_dim + value_block - 1) / value_block;
   const bool full_value_dim_fits_one_group = value_head_dim <= local_size;
-  const int64_t single_group_min_elements = std::max<int64_t>(
-      1,
-      resolve_env_int64("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS", 16384));
-  const int64_t single_group_parallel_elements = recurrent_rows * value_head_dim;
+  if (!full_value_dim_fits_one_group) {
+    return GatedDeltaDecodeStrategy::TiledValue;
+  }
 
-  if (full_value_dim_fits_one_group && value_block_count > 1 &&
-      single_group_parallel_elements >= single_group_min_elements) {
+  if (value_block_count <= 1) {
     return GatedDeltaDecodeStrategy::SingleGroup;
   }
-  return GatedDeltaDecodeStrategy::TiledValue;
+
+  const char* threshold_override_raw = std::getenv("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS");
+  if (threshold_override_raw != nullptr && threshold_override_raw[0] != '\0') {
+    char* end = nullptr;
+    const long parsed = std::strtol(threshold_override_raw, &end, 10);
+    if (end != threshold_override_raw && parsed > 0) {
+      const int64_t single_group_parallel_elements = recurrent_rows * value_head_dim;
+      return single_group_parallel_elements >= static_cast<int64_t>(parsed)
+          ? GatedDeltaDecodeStrategy::SingleGroup
+          : GatedDeltaDecodeStrategy::TiledValue;
+    }
+  }
+
+  const std::string lower_device_name = lowercase_ascii(device.get_info<sycl::info::device::name>());
+  for (const auto& bucket : kGatedDeltaDecodeAutoBuckets) {
+    const bool device_matches =
+        bucket.device_pattern[0] == '\0' || lower_device_name.find(bucket.device_pattern) != std::string::npos;
+    if (!device_matches || bucket.key_head_dim != key_head_dim || bucket.value_head_dim != value_head_dim) {
+      continue;
+    }
+    return recurrent_rows >= bucket.single_group_min_rows
+        ? GatedDeltaDecodeStrategy::SingleGroup
+        : GatedDeltaDecodeStrategy::TiledValue;
+  }
+
+  const int64_t single_group_parallel_elements = recurrent_rows * value_head_dim;
+  return single_group_parallel_elements >= 16384
+      ? GatedDeltaDecodeStrategy::SingleGroup
+      : GatedDeltaDecodeStrategy::TiledValue;
 }
 
 int64_t default_bounded_local_size(int64_t dimension, int64_t max_value) {
@@ -6967,6 +7015,7 @@ at::Tensor gated_delta_decode_xpu(
       1,
       std::min<int64_t>(32, resolve_env_int64("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", 4)));
   const auto decode_strategy = resolve_gated_delta_decode_strategy(
+      stream.queue().get_device(),
       batch_size,
       num_heads,
       key_head_dim,
