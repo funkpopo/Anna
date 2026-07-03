@@ -278,6 +278,16 @@ std::string lowercase_ascii(std::string value) {
   return value;
 }
 
+const std::string& cached_lowercase_device_name(const sycl::device& device) {
+  static thread_local c10::optional<sycl::device> cached_device;
+  static thread_local std::string cached_lower_name;
+  if (!cached_device.has_value() || cached_device.value() != device) {
+    cached_device = device;
+    cached_lower_name = lowercase_ascii(device.get_info<sycl::info::device::name>());
+  }
+  return cached_lower_name;
+}
+
 GatedDeltaDecodeStrategy resolve_gated_delta_decode_strategy(
     const sycl::device& device,
     int64_t batch_size,
@@ -326,7 +336,7 @@ GatedDeltaDecodeStrategy resolve_gated_delta_decode_strategy(
     }
   }
 
-  const std::string lower_device_name = lowercase_ascii(device.get_info<sycl::info::device::name>());
+  const std::string& lower_device_name = cached_lowercase_device_name(device);
   for (const auto& cutover : kGatedDeltaDecodeAutoValueBlockCutovers) {
     const bool device_matches =
         cutover.device_pattern[0] == '\0' || lower_device_name.find(cutover.device_pattern) != std::string::npos;
