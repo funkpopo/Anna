@@ -1748,3 +1748,32 @@ def test_gated_delta_decode_xpu_auto_matches_arc_row_cutover_shapes(
     torch.xpu.synchronize()
     assert torch.allclose(output.float().cpu(), ref_core.float().cpu(), atol=5e-2, rtol=5e-2)
     assert torch.allclose(state_buffer.float().cpu(), ref_state.float().cpu(), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "num_heads", "value_head_dim", "value_block", "expected_strategy_code"),
+    [
+        (4, 32, 128, 8, 0),
+        (5, 32, 128, 8, 1),
+        (4, 32, 256, 4, 0),
+        (5, 32, 256, 4, 1),
+        (9, 32, 256, 4, 0),
+        (15, 32, 256, 4, 1),
+        (17, 32, 256, 4, 0),
+        (24, 32, 256, 4, 1),
+    ],
+)
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gated_delta_decode_strategy_debug_matches_arc_lookup(
+    batch_size: int,
+    num_heads: int,
+    value_head_dim: int,
+    value_block: int,
+    expected_strategy_code: int,
+) -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gated_delta_decode_strategy_debug"):
+        pytest.skip("Anna fused-op library is not built")
+
+    query = torch.empty(batch_size, 1, num_heads, 128, device="xpu", dtype=torch.bfloat16)
+    strategy_code = torch.ops.anna.gated_delta_decode_strategy_debug(query, value_head_dim, value_block)
+    assert strategy_code == expected_strategy_code
