@@ -1684,6 +1684,36 @@ def test_gated_delta_decode_xpu_auto_matches_qwen35_family_shapes(
 
 
 @pytest.mark.parametrize(
+    ("batch_size", "num_heads", "value_head_dim", "value_block", "expected_strategy_code"),
+    [
+        (1, 16, 64, 4, 0),
+        (4, 16, 64, 4, 0),
+        (1, 32, 128, 4, 0),
+        (4, 32, 128, 4, 0),
+        (1, 16, 256, 4, 0),
+        (4, 16, 256, 4, 0),
+        (2, 16, 64, 16, 1),
+        (2, 16, 128, 16, 1),
+        (2, 16, 256, 16, 1),
+    ],
+)
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_gated_delta_decode_strategy_debug_matches_qwen35_family_lookup(
+    batch_size: int,
+    num_heads: int,
+    value_head_dim: int,
+    value_block: int,
+    expected_strategy_code: int,
+) -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "gated_delta_decode_strategy_debug"):
+        pytest.skip("Anna fused-op library is not built")
+
+    query = torch.empty(batch_size, 1, num_heads, 128, device="xpu", dtype=torch.bfloat16)
+    strategy_code = torch.ops.anna.gated_delta_decode_strategy_debug(query, value_head_dim, value_block)
+    assert strategy_code == expected_strategy_code
+
+
+@pytest.mark.parametrize(
     ("batch_size", "num_heads", "value_head_dim", "value_block"),
     [
         (1, 32, 64, 4),
