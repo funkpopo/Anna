@@ -437,6 +437,7 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 - 一条命令串起标准 Arc decode benchmark preset 和定向 decode 回归。
 - `--presets LIST`：选择 `arc-default`、`arc-legacy-v128-block8`、`arc-legacy-v256-block4` 的任意子集。
 - `--build-first`：验证前先重建 fused-op 动态库。
+- 默认会按 preset 专属的 speed-ratio 门槛校验 benchmark 输出；若只是想快速 smoke run 并降低 warmup/iters，可加 `--skip-bench-gates`。
 - `--skip-bench` / `--skip-pytest`：只跑 benchmark 部分或只跑定向回归。
 
 ## 常见问题

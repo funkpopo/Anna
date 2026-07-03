@@ -437,6 +437,7 @@ These values only apply when an API request omits the matching field.
 - Runs the standard Arc decode benchmark presets plus targeted decode regressions in one command.
 - `--presets LIST`: choose any subset of `arc-default`, `arc-legacy-v128-block8`, `arc-legacy-v256-block4`.
 - `--build-first`: rebuild the fused-op library before validation.
+- By default, benchmark output is checked against preset-specific speed-ratio gates; use `--skip-bench-gates` for quick smoke runs with reduced warmup/iters.
 - `--skip-bench` / `--skip-pytest`: run only the benchmark portion or only the targeted regressions.
 
 ## Troubleshooting

@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -16,6 +17,44 @@ DEFAULT_PRESETS = (
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
 )
+
+
+@dataclass(frozen=True)
+class ArcBenchExpectation:
+    compare_prefix: str
+    expected_value_blocks: tuple[int, ...]
+    expected_row_count: int
+    ratio_field: str
+    max_ratio: float
+    default_value_block: int | None = None
+    default_strategy: str | None = None
+
+
+ARC_BENCH_EXPECTATIONS = {
+    ARC_DEFAULT_PRESET: ArcBenchExpectation(
+        compare_prefix="gdn_decode_default_compare",
+        expected_value_blocks=(16,),
+        expected_row_count=13,
+        ratio_field="default_speed_ratio",
+        max_ratio=1.12,
+        default_value_block=16,
+        default_strategy="tiled",
+    ),
+    ARC_LEGACY_V128_BLOCK8_PRESET: ArcBenchExpectation(
+        compare_prefix="gdn_decode_auto_compare",
+        expected_value_blocks=(8,),
+        expected_row_count=9,
+        ratio_field="auto_speed_ratio",
+        max_ratio=1.08,
+    ),
+    ARC_LEGACY_V256_BLOCK4_PRESET: ArcBenchExpectation(
+        compare_prefix="gdn_decode_auto_compare",
+        expected_value_blocks=(4,),
+        expected_row_count=9,
+        ratio_field="auto_speed_ratio",
+        max_ratio=1.10,
+    ),
+}
 
 DEFAULT_PYTEST_EXPR = (
     "gated_delta_decode_value_block_debug or "
@@ -40,11 +79,39 @@ def _pythonpath_value(root: Path) -> str:
     return os.pathsep.join((str(root / "src"), str(root)))
 
 
-def _run_step(*, args: list[str], cwd: Path, env: dict[str, str], label: str) -> None:
+def _run_step(
+    *,
+    args: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    label: str,
+    capture_output: bool = False,
+) -> str | None:
     print(f"[{label}] {' '.join(args)}", flush=True)
-    completed = subprocess.run(args, cwd=cwd, env=env, check=False)
-    if completed.returncode != 0:
-        raise SystemExit(completed.returncode)
+    if not capture_output:
+        completed = subprocess.run(args, cwd=cwd, env=env, check=False)
+        if completed.returncode != 0:
+            raise SystemExit(completed.returncode)
+        return None
+
+    process = subprocess.Popen(
+        args,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    output_lines: list[str] = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line, end="")
+        output_lines.append(line)
+    return_code = process.wait()
+    if return_code != 0:
+        raise SystemExit(return_code)
+    return "".join(output_lines)
 
 
 def _bench_args_for_preset(
@@ -88,6 +155,82 @@ def _parse_preset_names(raw: str) -> list[str]:
     return preset_names
 
 
+def _parse_gdn_decode_value_blocks(output: str) -> tuple[int, ...]:
+    for line in output.splitlines():
+        if not line.startswith("gdn_decode_value_blocks="):
+            continue
+        return tuple(int(part) for part in line.split("=", maxsplit=1)[1].split(",") if part.strip())
+    raise ValueError("Benchmark output did not include gdn_decode_value_blocks=...")
+
+
+def _parse_gdn_decode_csv_rows(output: str, prefix: str) -> list[dict[str, str]]:
+    header: list[str] | None = None
+    rows: list[dict[str, str]] = []
+    for line in output.splitlines():
+        if not line.startswith(prefix + ","):
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) > 1 and parts[1] == "device_name":
+            header = parts
+            continue
+        if header is None:
+            raise ValueError(f"Encountered {prefix} row before header")
+        if len(parts) != len(header):
+            raise ValueError(f"{prefix} row had {len(parts)} columns, expected {len(header)}")
+        rows.append(dict(zip(header, parts)))
+    if not rows:
+        raise ValueError(f"Benchmark output did not include any {prefix} rows")
+    return rows
+
+
+def _validate_benchmark_output(output: str, preset_name: str) -> None:
+    expectation = ARC_BENCH_EXPECTATIONS[preset_name]
+    value_blocks = _parse_gdn_decode_value_blocks(output)
+    if value_blocks != expectation.expected_value_blocks:
+        raise ValueError(
+            f"{preset_name} resolved value blocks {value_blocks}, expected {expectation.expected_value_blocks}"
+        )
+
+    rows = _parse_gdn_decode_csv_rows(output, expectation.compare_prefix)
+    if len(rows) != expectation.expected_row_count:
+        raise ValueError(f"{preset_name} produced {len(rows)} compare rows, expected {expectation.expected_row_count}")
+
+    if expectation.default_value_block is not None:
+        bad_rows = [
+            row for row in rows if int(row["default_value_block"]) != expectation.default_value_block
+        ]
+        if bad_rows:
+            raise ValueError(
+                f"{preset_name} emitted default_value_block values outside {expectation.default_value_block}: {bad_rows[0]}"
+            )
+    if expectation.default_strategy is not None:
+        bad_rows = [row for row in rows if row["default_strategy"] != expectation.default_strategy]
+        if bad_rows:
+            raise ValueError(
+                f"{preset_name} emitted default_strategy values outside {expectation.default_strategy}: {bad_rows[0]}"
+            )
+    if "value_block" in rows[0]:
+        bad_rows = [row for row in rows if int(row["value_block"]) not in expectation.expected_value_blocks]
+        if bad_rows:
+            raise ValueError(
+                f"{preset_name} emitted unexpected value_block outside {expectation.expected_value_blocks}: {bad_rows[0]}"
+            )
+
+    worst_row = max(rows, key=lambda row: float(row[expectation.ratio_field]))
+    worst_ratio = float(worst_row[expectation.ratio_field])
+    if worst_ratio > expectation.max_ratio:
+        raise ValueError(
+            f"{preset_name} exceeded {expectation.ratio_field} threshold {expectation.max_ratio:.3f}: "
+            f"observed {worst_ratio:.4f} on batch={worst_row['batch']} heads={worst_row['heads']} "
+            f"value_dim={worst_row['value_head_dim']}"
+        )
+    print(
+        f"[validate:{preset_name}] max_{expectation.ratio_field}={worst_ratio:.4f} "
+        f"rows={len(rows)} value_blocks={value_blocks}",
+        flush=True,
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the standard Arc Gated Delta decode benchmark presets and targeted regressions."
@@ -113,6 +256,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--skip-bench",
         action="store_true",
         help="Skip the Arc decode benchmark preset commands.",
+    )
+    parser.add_argument(
+        "--skip-bench-gates",
+        action="store_true",
+        help="Skip parsing benchmark output against Arc preset performance thresholds.",
     )
     parser.add_argument(
         "--skip-pytest",
@@ -163,7 +311,7 @@ def main() -> None:
 
     if not args.skip_bench:
         for preset_name in preset_names:
-            _run_step(
+            output = _run_step(
                 args=_bench_args_for_preset(
                     preset_name=preset_name,
                     warmup=args.warmup,
@@ -173,7 +321,11 @@ def main() -> None:
                 cwd=root,
                 env=env,
                 label=f"bench:{preset_name}",
+                capture_output=True,
             )
+            if not args.skip_bench_gates:
+                assert output is not None
+                _validate_benchmark_output(output, preset_name)
 
     if not args.skip_pytest:
         _run_step(
