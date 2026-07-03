@@ -1,0 +1,490 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tools.bench_xpu_hotspots import (  # noqa: E402
+    GDN_DECODE_SHAPE_PRESETS,
+    _dedupe_gdn_decode_shape_cases,
+    _parse_gdn_decode_shape_cases,
+    _parse_gdn_decode_shape_presets,
+    _resolve_gdn_decode_value_blocks,
+)
+from tools.validate_arc_gdn_decode import (  # noqa: E402
+    DEFAULT_BENCH_TIMING_REPEATS,
+    _default_op_lib_path,
+    _parse_gdn_decode_csv_rows,
+    _parse_gdn_decode_value_blocks,
+    _pythonpath_value,
+    _repo_root,
+    _run_step,
+)
+
+
+@dataclass(frozen=True)
+class DiscoveryMode:
+    name: str
+    compare_flag: str
+    compare_prefix: str
+    strategy_field: str
+    ratio_field: str
+    delta_field: str
+
+
+DISCOVERY_MODES: dict[str, DiscoveryMode] = {
+    "auto": DiscoveryMode(
+        name="auto",
+        compare_flag="--gdn-decode-auto-compare",
+        compare_prefix="gdn_decode_auto_compare",
+        strategy_field="auto_strategy",
+        ratio_field="auto_speed_ratio",
+        delta_field="auto_minus_best_ms",
+    ),
+    "default": DiscoveryMode(
+        name="default",
+        compare_flag="--gdn-decode-default-compare",
+        compare_prefix="gdn_decode_default_compare",
+        strategy_field="default_strategy",
+        ratio_field="default_speed_ratio",
+        delta_field="default_minus_best_ms",
+    ),
+}
+
+
+def _parse_int_spans(raw: str) -> list[int]:
+    values: list[int] = []
+    for token in (item.strip() for item in raw.split(",")):
+        if not token:
+            continue
+        if "-" not in token:
+            values.append(int(token))
+            continue
+        range_part, _, step_part = token.partition(":")
+        start_raw, _, stop_raw = range_part.partition("-")
+        if not start_raw or not stop_raw:
+            raise ValueError(f"Invalid integer span {token!r}; expected N, A-B, or A-B:S")
+        start = int(start_raw)
+        stop = int(stop_raw)
+        step = int(step_part) if step_part else 1
+        if step <= 0:
+            raise ValueError(f"Invalid integer span {token!r}; step must be positive")
+        if stop < start:
+            raise ValueError(f"Invalid integer span {token!r}; stop must be >= start")
+        values.extend(range(start, stop + 1, step))
+    if not values:
+        raise ValueError("Expected at least one integer span")
+    return values
+
+
+def _resolve_shape_cases(
+    *,
+    shape_presets: str | None,
+    shape_cases: str | None,
+    batches: str | None,
+    heads: str | None,
+    value_head_dims: str | None,
+) -> tuple[list[tuple[int, int, int]], list[str]]:
+    cases: list[tuple[int, int, int]] = []
+    preset_names: list[str] = []
+    if shape_presets is not None:
+        preset_names = _parse_gdn_decode_shape_presets(shape_presets)
+    if preset_names:
+        for preset_name in preset_names:
+            cases.extend(GDN_DECODE_SHAPE_PRESETS[preset_name])
+    if shape_cases is not None:
+        cases.extend(_parse_gdn_decode_shape_cases(shape_cases))
+    if any(value is not None for value in (batches, heads, value_head_dims)):
+        if not all(value is not None for value in (batches, heads, value_head_dims)):
+            raise ValueError("--batches, --heads, and --value-head-dims must be provided together")
+        batch_values = _parse_int_spans(str(batches))
+        head_values = _parse_int_spans(str(heads))
+        value_dim_values = _parse_int_spans(str(value_head_dims))
+        for batch_size in batch_values:
+            for num_heads in head_values:
+                for value_head_dim in value_dim_values:
+                    cases.append((batch_size, num_heads, value_head_dim))
+    if not cases:
+        raise ValueError(
+            "Provide at least one of --shape-presets, --shape-cases, or the --batches/--heads/--value-head-dims grid"
+        )
+    return _dedupe_gdn_decode_shape_cases(cases), preset_names
+
+
+def _shape_cases_csv(cases: list[tuple[int, int, int]]) -> str:
+    return ",".join(f"{batch_size}x{num_heads}x{value_head_dim}" for batch_size, num_heads, value_head_dim in cases)
+
+
+def _format_sampled_int_ranges(values: list[int]) -> str:
+    if not values:
+        return ""
+    if len(values) == 1:
+        return str(values[0])
+
+    ranges: list[str] = []
+    start = values[0]
+    prev = values[0]
+    step: int | None = None
+    for value in values[1:]:
+        diff = value - prev
+        if step is None:
+            step = diff
+            prev = value
+            continue
+        if diff == step:
+            prev = value
+            continue
+        ranges.append(_format_single_range(start, prev, step))
+        start = value
+        prev = value
+        step = None
+    ranges.append(_format_single_range(start, prev, step))
+    return ",".join(ranges)
+
+
+def _format_single_range(start: int, stop: int, step: int | None) -> str:
+    if start == stop:
+        return str(start)
+    effective_step = 1 if step is None else step
+    if effective_step == 1:
+        return f"{start}..{stop}"
+    return f"{start}..{stop}/{effective_step}"
+
+
+def _annotate_rows(rows: list[dict[str, str]], mode: DiscoveryMode) -> list[dict[str, object]]:
+    annotated_rows: list[dict[str, object]] = []
+    for row in rows:
+        batch_size = int(row["batch"])
+        num_heads = int(row["heads"])
+        value_block = int(row.get("value_block", row.get("default_value_block", "0")))
+        observed_strategy = row[mode.strategy_field]
+        best_explicit_strategy = row["best_explicit_strategy"]
+        ratio = float(row[mode.ratio_field])
+        delta_ms = float(row[mode.delta_field])
+        annotated_rows.append(
+            {
+                **row,
+                "batch_size": batch_size,
+                "num_heads": num_heads,
+                "key_head_dim_int": int(row["key_head_dim"]),
+                "value_head_dim_int": int(row["value_head_dim"]),
+                "value_block_int": value_block,
+                "recurrent_rows": batch_size * num_heads,
+                "observed_strategy": observed_strategy,
+                "best_explicit_strategy_str": best_explicit_strategy,
+                "ratio": ratio,
+                "delta_ms": delta_ms,
+                "strategy_mismatch": observed_strategy != best_explicit_strategy,
+            }
+        )
+    return annotated_rows
+
+
+def _collect_suspicious_rows(
+    rows: list[dict[str, object]],
+    *,
+    ratio_threshold: float,
+    require_strategy_mismatch: bool,
+) -> list[dict[str, object]]:
+    suspicious_rows: list[dict[str, object]] = []
+    for row in rows:
+        strategy_mismatch = bool(row["strategy_mismatch"])
+        ratio_exceeded = float(row["ratio"]) >= ratio_threshold
+        if require_strategy_mismatch:
+            keep = strategy_mismatch
+        else:
+            keep = strategy_mismatch or ratio_exceeded
+        if not keep:
+            continue
+        reasons: list[str] = []
+        if strategy_mismatch:
+            reasons.append("strategy_mismatch")
+        if ratio_exceeded:
+            reasons.append("ratio_threshold")
+        suspicious_rows.append({**row, "reasons": reasons})
+    suspicious_rows.sort(
+        key=lambda row: (
+            -float(row["ratio"]),
+            -abs(float(row["delta_ms"])),
+            int(row["recurrent_rows"]),
+            int(row["value_block_int"]),
+        )
+    )
+    return suspicious_rows
+
+
+def _build_group_summaries(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    grouped: dict[tuple[int, int, str, str], list[dict[str, object]]] = {}
+    for row in rows:
+        key = (
+            int(row["value_head_dim_int"]),
+            int(row["value_block_int"]),
+            str(row["observed_strategy"]),
+            str(row["best_explicit_strategy_str"]),
+        )
+        grouped.setdefault(key, []).append(row)
+
+    summaries: list[dict[str, object]] = []
+    for key, group_rows in grouped.items():
+        recurrent_rows = sorted({int(row["recurrent_rows"]) for row in group_rows})
+        worst_row = max(group_rows, key=lambda row: float(row["ratio"]))
+        summaries.append(
+            {
+                "value_head_dim": key[0],
+                "value_block": key[1],
+                "observed_strategy": key[2],
+                "best_explicit_strategy": key[3],
+                "row_count": len(group_rows),
+                "sampled_recurrent_rows": recurrent_rows,
+                "sampled_recurrent_row_ranges": _format_sampled_int_ranges(recurrent_rows),
+                "worst_ratio": float(worst_row["ratio"]),
+                "worst_delta_ms": float(worst_row["delta_ms"]),
+            }
+        )
+    summaries.sort(key=lambda summary: (-float(summary["worst_ratio"]), int(summary["value_head_dim"])))
+    return summaries
+
+
+def _print_row(prefix: str, row: dict[str, object]) -> None:
+    print(
+        f"{prefix},batch={row['batch_size']},heads={row['num_heads']},rows={row['recurrent_rows']},"
+        f"key_head_dim={row['key_head_dim_int']},value_head_dim={row['value_head_dim_int']},"
+        f"value_block={row['value_block_int']},observed={row['observed_strategy']},"
+        f"best={row['best_explicit_strategy_str']},ratio={float(row['ratio']):.4f},"
+        f"delta_ms={float(row['delta_ms']):.4f},reasons={'+'.join(str(reason) for reason in row['reasons'])}"
+    )
+
+
+def _print_group_summary(summary: dict[str, object]) -> None:
+    print(
+        "gdn_decode_suspicious_group,"
+        f"value_head_dim={summary['value_head_dim']},value_block={summary['value_block']},"
+        f"observed={summary['observed_strategy']},best={summary['best_explicit_strategy']},"
+        f"row_count={summary['row_count']},sampled_rows={summary['sampled_recurrent_row_ranges']},"
+        f"worst_ratio={float(summary['worst_ratio']):.4f},worst_delta_ms={float(summary['worst_delta_ms']):.4f}"
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run Gated Delta decode compare sweeps and surface suspicious Arc shape buckets."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=sorted(DISCOVERY_MODES),
+        default="auto",
+        help="Compare mode: auto checks resolver-selected strategy for an explicit value_block; default checks built-in defaults.",
+    )
+    parser.add_argument(
+        "--shape-presets",
+        type=str,
+        default=None,
+        help="Comma-separated Gated Delta decode shape presets from tools/bench_xpu_hotspots.py.",
+    )
+    parser.add_argument(
+        "--shape-cases",
+        type=str,
+        default=None,
+        help="Comma-separated explicit BxHxV cases, for example 1x16x64,4x32x256.",
+    )
+    parser.add_argument(
+        "--batches",
+        type=str,
+        default=None,
+        help="Batch span list for grid generation, for example 1-8,16,24-32:2.",
+    )
+    parser.add_argument(
+        "--heads",
+        type=str,
+        default=None,
+        help="Head-count span list for grid generation, for example 8,16,32.",
+    )
+    parser.add_argument(
+        "--value-head-dims",
+        type=str,
+        default=None,
+        help="Value-head-dim span list for grid generation, for example 64,128,256.",
+    )
+    parser.add_argument("--head-dim", type=int, default=128, help="Key head dim forwarded to the benchmark.")
+    parser.add_argument(
+        "--value-blocks",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated value blocks forwarded to the benchmark. "
+            "Defaults to preset recommendations when presets are provided, otherwise the full bench sweep."
+        ),
+    )
+    parser.add_argument("--seeds", type=str, default="20260960,20260961", help="Fixed benchmark seeds.")
+    parser.add_argument("--warmup", type=int, default=20, help="Benchmark warmup iterations.")
+    parser.add_argument("--iters", type=int, default=100, help="Benchmark measured iterations.")
+    parser.add_argument(
+        "--timing-repeats",
+        type=int,
+        default=DEFAULT_BENCH_TIMING_REPEATS,
+        help="Repeated timing samples per candidate.",
+    )
+    parser.add_argument("--dtype", type=str, default="bf16", help="Input dtype forwarded to the benchmark.")
+    parser.add_argument(
+        "--ratio-threshold",
+        type=float,
+        default=1.03,
+        help="Report rows whose speed ratio is at or above this threshold, even if the observed strategy matches best_explicit.",
+    )
+    parser.add_argument(
+        "--require-strategy-mismatch",
+        action="store_true",
+        help="Only report rows where the observed strategy differs from best_explicit_strategy.",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=10,
+        help="Always print the top-N worst rows by speed ratio for inspection.",
+    )
+    parser.add_argument(
+        "--build-first",
+        action="store_true",
+        help="Rebuild the fused op before scanning by running tools/build_gated_delta_fused_op.py.",
+    )
+    parser.add_argument(
+        "--op-lib",
+        type=str,
+        default=None,
+        help="Explicit fused-op library path. Defaults to the local .build output.",
+    )
+    parser.add_argument(
+        "--json-output",
+        type=str,
+        default=None,
+        help="Optional path to write the structured suspicious-shape report as JSON.",
+    )
+    return parser
+
+
+def main() -> None:
+    args = _build_parser().parse_args()
+    mode = DISCOVERY_MODES[args.mode]
+    cases, preset_names = _resolve_shape_cases(
+        shape_presets=args.shape_presets,
+        shape_cases=args.shape_cases,
+        batches=args.batches,
+        heads=args.heads,
+        value_head_dims=args.value_head_dims,
+    )
+    shape_cases_csv = _shape_cases_csv(cases)
+    resolved_value_blocks = _resolve_gdn_decode_value_blocks(args.value_blocks, preset_names)
+
+    root = _repo_root()
+    op_lib_path = Path(args.op_lib).expanduser() if args.op_lib is not None else _default_op_lib_path(root)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = _pythonpath_value(root)
+    env["ANNA_GATED_DELTA_OP_LIB"] = str(op_lib_path)
+
+    if args.build_first:
+        _run_step(
+            args=[sys.executable, "tools/build_gated_delta_fused_op.py"],
+            cwd=root,
+            env=env,
+            label="build",
+        )
+
+    if not op_lib_path.exists():
+        raise SystemExit(
+            f"Fused-op library not found at {op_lib_path}. Build it first or pass --op-lib explicitly."
+        )
+
+    bench_args = [
+        sys.executable,
+        "tools/bench_xpu_hotspots.py",
+        "--gdn-decode-only",
+        mode.compare_flag,
+        "--gdn-decode-compare-only",
+        "--head-dim",
+        str(args.head_dim),
+        "--gdn-decode-shape-cases",
+        shape_cases_csv,
+        "--gdn-decode-value-blocks",
+        ",".join(str(value_block) for value_block in resolved_value_blocks),
+        "--gdn-decode-seeds",
+        args.seeds,
+        "--dtype",
+        args.dtype,
+        "--warmup",
+        str(args.warmup),
+        "--iters",
+        str(args.iters),
+        "--gdn-decode-timing-repeats",
+        str(args.timing_repeats),
+    ]
+    output = _run_step(
+        args=bench_args,
+        cwd=root,
+        env=env,
+        label=f"discover:{mode.name}",
+        capture_output=True,
+    )
+    assert output is not None
+
+    rows = _annotate_rows(_parse_gdn_decode_csv_rows(output, mode.compare_prefix), mode)
+    suspicious_rows = _collect_suspicious_rows(
+        rows,
+        ratio_threshold=args.ratio_threshold,
+        require_strategy_mismatch=args.require_strategy_mismatch,
+    )
+    suspicious_groups = _build_group_summaries(suspicious_rows)
+    top_rows = sorted(
+        rows,
+        key=lambda row: (-float(row["ratio"]), -abs(float(row["delta_ms"])), int(row["recurrent_rows"])),
+    )[: max(0, args.top)]
+    resolved_blocks_from_output = _parse_gdn_decode_value_blocks(output)
+
+    print(
+        f"[discover] mode={mode.name} shapes={len(cases)} compare_rows={len(rows)} "
+        f"value_blocks={resolved_blocks_from_output} suspicious_rows={len(suspicious_rows)} "
+        f"ratio_threshold={args.ratio_threshold:.4f}",
+        flush=True,
+    )
+    for row in suspicious_rows:
+        _print_row("gdn_decode_suspicious", row)
+    for summary in suspicious_groups:
+        _print_group_summary(summary)
+    if top_rows:
+        print(f"[top] showing {len(top_rows)} worst rows by {mode.ratio_field}", flush=True)
+        for row in top_rows:
+            print(
+                "gdn_decode_top_row,"
+                f"batch={row['batch_size']},heads={row['num_heads']},rows={row['recurrent_rows']},"
+                f"value_head_dim={row['value_head_dim_int']},value_block={row['value_block_int']},"
+                f"observed={row['observed_strategy']},best={row['best_explicit_strategy_str']},"
+                f"ratio={float(row['ratio']):.4f},delta_ms={float(row['delta_ms']):.4f}"
+            )
+
+    if args.json_output is not None:
+        report = {
+            "schema_version": 1,
+            "mode": mode.name,
+            "bench_args": bench_args,
+            "shape_count": len(cases),
+            "shape_cases": cases,
+            "resolved_value_blocks": list(resolved_blocks_from_output),
+            "ratio_threshold": args.ratio_threshold,
+            "require_strategy_mismatch": args.require_strategy_mismatch,
+            "suspicious_rows": suspicious_rows,
+            "suspicious_groups": suspicious_groups,
+            "top_rows": top_rows,
+        }
+        output_path = Path(args.json_output).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+        print(f"[json] wrote {output_path}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
