@@ -240,16 +240,19 @@ struct GatedDeltaDecodeAutoBucket {
   int64_t single_group_min_rows;
 };
 
-struct GatedDeltaDecodeAutoValueBlockCutover {
+struct GatedDeltaDecodeAutoCutover {
   const char* device_pattern;
   int64_t key_head_dim;
   int64_t value_head_dim;
+  int64_t tiled_min_rows;
   int64_t tiled_min_value_block;
 };
 
-constexpr GatedDeltaDecodeAutoValueBlockCutover kGatedDeltaDecodeAutoValueBlockCutovers[] = {
-    {"arc", 128, 128, 16},
-    {"arc", 128, 256, 8},
+constexpr GatedDeltaDecodeAutoCutover kGatedDeltaDecodeAutoCutovers[] = {
+    {"arc", 128, 128, 160, 8},
+    {"arc", 128, 128, 1, 16},
+    {"arc", 128, 256, 160, 4},
+    {"arc", 128, 256, 1, 8},
 };
 
 constexpr GatedDeltaDecodeAutoBucket kGatedDeltaDecodeAutoBuckets[] = {
@@ -337,15 +340,20 @@ GatedDeltaDecodeStrategy resolve_gated_delta_decode_strategy(
   }
 
   const std::string& lower_device_name = cached_lowercase_device_name(device);
-  for (const auto& cutover : kGatedDeltaDecodeAutoValueBlockCutovers) {
+  bool matched_auto_cutover_shape = false;
+  for (const auto& cutover : kGatedDeltaDecodeAutoCutovers) {
     const bool device_matches =
         cutover.device_pattern[0] == '\0' || lower_device_name.find(cutover.device_pattern) != std::string::npos;
     if (!device_matches || cutover.key_head_dim != key_head_dim || cutover.value_head_dim != value_head_dim) {
       continue;
     }
-    return value_block >= cutover.tiled_min_value_block
-        ? GatedDeltaDecodeStrategy::TiledValue
-        : GatedDeltaDecodeStrategy::SingleGroup;
+    matched_auto_cutover_shape = true;
+    if (recurrent_rows >= cutover.tiled_min_rows && value_block >= cutover.tiled_min_value_block) {
+      return GatedDeltaDecodeStrategy::TiledValue;
+    }
+  }
+  if (matched_auto_cutover_shape) {
+    return GatedDeltaDecodeStrategy::SingleGroup;
   }
 
   for (const auto& bucket : kGatedDeltaDecodeAutoBuckets) {
