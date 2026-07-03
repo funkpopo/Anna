@@ -440,6 +440,83 @@ def _compare_gated_delta_decode_default_against_forced_block(
     }
 
 
+def _compare_gated_delta_decode_default_against_explicit(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    single_min_elements: int | None,
+    warmup: int,
+    iters: int,
+    timing_repeats: int,
+) -> dict[str, float | str | int]:
+    default_value_block = _resolve_gated_delta_decode_default_value_block(
+        query,
+        value_head_dim=int(value.shape[-1]),
+    )
+    default_strategy = (
+        "unknown"
+        if default_value_block is None
+        else _resolve_gated_delta_decode_auto_strategy(
+            query,
+            value_head_dim=int(value.shape[-1]),
+            value_block=default_value_block,
+        )
+    )
+
+    candidates = (
+        ("default", "auto", None),
+        ("single", "single", default_value_block),
+        ("tiled", "tiled", default_value_block),
+    )
+    timing_samples_ms: dict[str, list[float]] = {name: [] for name, _, _ in candidates}
+    max_abs_diffs: dict[str, float] = {name: 0.0 for name, _, _ in candidates}
+    total_candidates = len(candidates)
+    for repeat_idx in range(max(1, timing_repeats)):
+        order_start = repeat_idx % total_candidates
+        ordered_candidates = candidates[order_start:] + candidates[:order_start]
+        for candidate_name, candidate_strategy, candidate_value_block in ordered_candidates:
+            candidate_ms, diff = _benchmark_gated_delta_decode_strategy(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                strategy=candidate_strategy,
+                value_block=candidate_value_block,
+                single_min_elements=single_min_elements,
+                warmup=warmup,
+                iters=iters,
+            )
+            timing_samples_ms[candidate_name].append(candidate_ms)
+            max_abs_diffs[candidate_name] = max(max_abs_diffs[candidate_name], diff)
+
+    default_ms = statistics.median(timing_samples_ms["default"])
+    single_ms = statistics.median(timing_samples_ms["single"])
+    tiled_ms = statistics.median(timing_samples_ms["tiled"])
+    best_explicit_strategy = "single" if single_ms <= tiled_ms else "tiled"
+    best_explicit_ms = min(single_ms, tiled_ms)
+    default_minus_best_ms = default_ms - best_explicit_ms
+    default_speed_ratio = default_ms / best_explicit_ms if best_explicit_ms > 0 else float("inf")
+    max_abs_diff = max(max_abs_diffs.values())
+    return {
+        "default_value_block": -1 if default_value_block is None else default_value_block,
+        "default_strategy": default_strategy,
+        "single_ms": single_ms,
+        "tiled_ms": tiled_ms,
+        "default_ms": default_ms,
+        "best_explicit_strategy": best_explicit_strategy,
+        "best_explicit_ms": best_explicit_ms,
+        "default_minus_best_ms": default_minus_best_ms,
+        "default_speed_ratio": default_speed_ratio,
+        "max_abs_diff": max_abs_diff,
+    }
+
+
 def _run_gated_delta_decode_profile_case(
     *,
     device_name: str,
@@ -455,6 +532,7 @@ def _run_gated_delta_decode_profile_case(
     timing_repeats: int,
     seeds: list[int | None],
     auto_compare: bool,
+    default_compare: bool,
     default_block_compare: bool,
     compare_only: bool,
 ) -> None:
@@ -552,6 +630,49 @@ def _run_gated_delta_decode_profile_case(
                 f"{tiled_ms:.4f},{auto_ms:.4f},{best_explicit_strategy},{best_explicit_ms:.4f},"
                 f"{auto_minus_best_ms:.4f},{auto_speed_ratio:.4f},{max_abs_diff:.6f}"
             )
+    if default_compare:
+        compare_results: list[dict[str, float | str | int]] = []
+        for seed in seeds:
+            query, key, value, g, beta, initial_state = _make_gated_delta_decode_bench_inputs(
+                batch_size=batch_size,
+                num_heads=num_heads,
+                key_head_dim=key_head_dim,
+                value_head_dim=value_head_dim,
+                dtype=dtype,
+                seed=seed,
+            )
+            compare_results.append(
+                _compare_gated_delta_decode_default_against_explicit(
+                    query=query,
+                    key=key,
+                    value=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=initial_state,
+                    single_min_elements=single_min_elements,
+                    warmup=warmup,
+                    iters=iters,
+                    timing_repeats=timing_repeats,
+                )
+            )
+        default_value_block_labels = {int(result["default_value_block"]) for result in compare_results}
+        default_value_block = default_value_block_labels.pop() if len(default_value_block_labels) == 1 else -1
+        default_strategy_labels = {str(result["default_strategy"]) for result in compare_results}
+        default_strategy = default_strategy_labels.pop() if len(default_strategy_labels) == 1 else "inconsistent"
+        single_ms = statistics.median(float(result["single_ms"]) for result in compare_results)
+        tiled_ms = statistics.median(float(result["tiled_ms"]) for result in compare_results)
+        default_ms = statistics.median(float(result["default_ms"]) for result in compare_results)
+        best_explicit_strategy = "single" if single_ms <= tiled_ms else "tiled"
+        best_explicit_ms = min(single_ms, tiled_ms)
+        default_minus_best_ms = default_ms - best_explicit_ms
+        default_speed_ratio = default_ms / best_explicit_ms if best_explicit_ms > 0 else float("inf")
+        max_abs_diff = max(float(result["max_abs_diff"]) for result in compare_results)
+        print(
+            f"gdn_decode_default_compare,{device_name},{batch_size},{num_heads},"
+            f"{key_head_dim},{value_head_dim},{default_value_block},{default_strategy},{single_ms:.4f},"
+            f"{tiled_ms:.4f},{default_ms:.4f},{best_explicit_strategy},{best_explicit_ms:.4f},"
+            f"{default_minus_best_ms:.4f},{default_speed_ratio:.4f},{max_abs_diff:.6f}"
+        )
     if default_block_compare:
         for forced_value_block in value_blocks:
             compare_results: list[dict[str, float | str | int]] = []
@@ -1382,6 +1503,11 @@ def main() -> None:
         help="Print per-value-block auto-vs-explicit summary rows after the decode sweep.",
     )
     parser.add_argument(
+        "--gdn-decode-default-compare",
+        action="store_true",
+        help="Print default-path vs explicit single/tiled summary rows after the decode sweep.",
+    )
+    parser.add_argument(
         "--gdn-decode-default-block-compare",
         action="store_true",
         help="Print default-path vs forced-value-block summary rows after the decode sweep.",
@@ -1495,6 +1621,12 @@ def main() -> None:
                 "auto_strategy,single_ms,tiled_ms,auto_ms,best_explicit_strategy,best_explicit_ms,auto_minus_best_ms,"
                 "auto_speed_ratio,max_abs_diff"
             )
+        if args.gdn_decode_default_compare:
+            print(
+                "gdn_decode_default_compare,device_name,batch,heads,key_head_dim,value_head_dim,default_value_block,"
+                "default_strategy,single_ms,tiled_ms,default_ms,best_explicit_strategy,best_explicit_ms,"
+                "default_minus_best_ms,default_speed_ratio,max_abs_diff"
+            )
         if args.gdn_decode_default_block_compare:
             print(
                 "gdn_decode_default_block_compare,device_name,batch,heads,key_head_dim,value_head_dim,"
@@ -1520,6 +1652,7 @@ def main() -> None:
                 timing_repeats=args.gdn_decode_timing_repeats,
                 seeds=case_seeds,
                 auto_compare=args.gdn_decode_auto_compare,
+                default_compare=args.gdn_decode_default_compare,
                 default_block_compare=args.gdn_decode_default_block_compare,
                 compare_only=args.gdn_decode_compare_only,
             )
