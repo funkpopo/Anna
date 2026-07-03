@@ -59,6 +59,8 @@ class ServeSettings:
     scheduler_max_batch_size: int = 1
     scheduler_batch_wait_ms: float = 2.0
     scheduler_prefill_interval_steps: int = 1
+    scheduler_max_prefill_tokens: int = 0
+    scheduler_max_decode_tokens: int = 0
     asr_max_inference_batch_size: int = 1
     asr_max_new_tokens: int = 512
     warmup_prefill_tokens: int = 2

@@ -341,6 +341,8 @@ XPU and server runtime options:
 | `--scheduler-max-batch-size N` | `1` | Enable continuous batching when greater than `1`. |
 | `--scheduler-batch-wait-ms MS` | `2.0` | Wait time used to coalesce requests when batching is enabled. |
 | `--scheduler-prefill-interval-steps N` | `1` | Prefill scheduling interval while continuous batching is active. |
+| `--scheduler-max-prefill-tokens N` | `0` | Prompt-token budget for each scheduler prefill admission wave. `0` disables this budget. |
+| `--scheduler-max-decode-tokens N` | `0` | Cached-sequence-token budget for each scheduler decode batch. `0` disables this budget. |
 | `--metrics-log-interval-seconds S` | `10.0` | Emit aggregated runtime metrics every S seconds. `0` disables metrics logging. |
 
 For the full option list, run:

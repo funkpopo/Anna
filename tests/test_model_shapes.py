@@ -83,6 +83,7 @@ def _stub_run_gated_delta_fused(
 
 @pytest.fixture(autouse=True)
 def _stub_gated_delta_fused(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("ANNA_XPU_FLASHQLA_GDN_PREFILL", raising=False)
     monkeypatch.setattr(model_ops, "run_gated_delta_fused", _stub_run_gated_delta_fused, raising=False)
 
 
@@ -113,6 +114,34 @@ def _tiny_config() -> Qwen3_5TextConfig:
             mrope_section=(1, 1, 0),
         ),
     )
+
+
+def test_qwen3_dynamic_cache_compacts_batch_rows_without_resplitting() -> None:
+    config = _tiny_config()
+    allocator = Qwen3PageAllocator(config)
+    cache = Qwen3DynamicCache(config, allocator=allocator, batch_size=3)
+    layer_idx = 1
+    key = torch.randn(3, config.num_key_value_heads, 2, config.head_dim)
+    value = torch.randn_like(key)
+
+    cache.update(key, value, layer_idx=layer_idx)
+    used_before = allocator.layers[layer_idx].used_pages()
+
+    compacted = cache.compact_batch_rows([0, 2])
+
+    assert cache.release() is None
+    assert compacted.get_batch_size() == 2
+    assert compacted.get_seq_lengths().tolist() == [2, 2]
+    assert allocator.layers[layer_idx].used_pages() < used_before
+    assert allocator.layers[layer_idx].used_pages() > 0
+
+    next_key = torch.randn(2, config.num_key_value_heads, 1, config.head_dim)
+    next_value = torch.randn_like(next_key)
+    compacted.update(next_key, next_value, layer_idx=layer_idx)
+
+    assert compacted.get_seq_lengths().tolist() == [3, 3]
+    compacted.release()
+    assert allocator.layers[layer_idx].used_pages() == 0
 
 
 def _tiny_moe_config() -> Qwen3_5TextConfig:

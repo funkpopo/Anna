@@ -341,6 +341,8 @@ XPU 和服务运行参数：
 | `--scheduler-max-batch-size N` | `1` | 大于 `1` 时启用连续批处理。 |
 | `--scheduler-batch-wait-ms MS` | `2.0` | 启用批处理时，为合并请求等待的毫秒数。 |
 | `--scheduler-prefill-interval-steps N` | `1` | 连续批处理启用时的 prefill 调度间隔。 |
+| `--scheduler-max-prefill-tokens N` | `0` | 每轮 scheduler prefill 准入的 prompt token 预算。`0` 表示关闭该预算。 |
+| `--scheduler-max-decode-tokens N` | `0` | 每个 scheduler decode batch 的缓存序列 token 预算。`0` 表示关闭该预算。 |
 | `--metrics-log-interval-seconds S` | `10.0` | 每 S 秒输出一次聚合运行指标。`0` 表示关闭。 |
 
 查看完整参数：

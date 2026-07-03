@@ -4,6 +4,8 @@ import logging
 import os
 from pathlib import Path
 
+import pytest
+
 from anna.api.app import create_app
 from anna.cli.serve import (
     _build_metrics_logger,
@@ -16,6 +18,13 @@ from anna.cli.serve import (
 )
 from anna.core.config import ServeSettings
 from anna.runtime.service_metrics import AnnaServiceMetrics, AnnaServiceMetricsLogger
+
+
+@pytest.fixture(autouse=True)
+def _isolate_flashqla_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("ANNA_XPU_FLASHQLA_GDN_PREFILL", raising=False)
+    yield
+    monkeypatch.delenv("ANNA_XPU_FLASHQLA_GDN_PREFILL", raising=False)
 
 
 def test_build_safety_policy_uses_custom_serve_overrides() -> None:
@@ -86,6 +95,10 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "4",
             "--scheduler-prefill-interval-steps",
             "3",
+            "--scheduler-max-prefill-tokens",
+            "2048",
+            "--scheduler-max-decode-tokens",
+            "8192",
             "--asr-max-inference-batch-size",
             "2",
             "--asr-max-new-tokens",
@@ -119,6 +132,8 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.warmup_decode_steps == 8
     assert args.warmup_batch_size == 4
     assert args.scheduler_prefill_interval_steps == 3
+    assert args.scheduler_max_prefill_tokens == 2048
+    assert args.scheduler_max_decode_tokens == 8192
     assert args.asr_max_inference_batch_size == 2
     assert args.asr_max_new_tokens == 128
     assert args.metrics_log_interval_seconds == 3.5
@@ -161,6 +176,7 @@ def test_configure_flashqla_environment_applies_cli_override(monkeypatch) -> Non
     configure_flashqla_environment(args)
 
     assert os.environ["ANNA_XPU_FLASHQLA_GDN_PREFILL"] == "1"
+    monkeypatch.delenv("ANNA_XPU_FLASHQLA_GDN_PREFILL", raising=False)
 
 
 def test_configure_flashqla_environment_preserves_existing_env_when_cli_omitted(monkeypatch) -> None:
@@ -180,6 +196,8 @@ def test_serve_parser_defaults_to_direct_generation() -> None:
 
     assert args.scheduler_max_batch_size == 1
     assert args.scheduler_prefill_interval_steps == 1
+    assert args.scheduler_max_prefill_tokens == 0
+    assert args.scheduler_max_decode_tokens == 0
     assert args.metrics_log_interval_seconds == 10.0
 
 
@@ -222,6 +240,8 @@ def test_build_scheduler_passes_prefill_interval_to_scheduler() -> None:
         model_dir=Path("dummy"),
         scheduler_max_batch_size=4,
         scheduler_prefill_interval_steps=3,
+        scheduler_max_prefill_tokens=1024,
+        scheduler_max_decode_tokens=4096,
     )
 
     scheduler = _build_scheduler(engine, settings)
@@ -229,6 +249,8 @@ def test_build_scheduler_passes_prefill_interval_to_scheduler() -> None:
     try:
         assert scheduler is not None
         assert scheduler.prefill_interval_steps == 3
+        assert scheduler.max_prefill_tokens == 1024
+        assert scheduler.max_decode_tokens == 4096
         assert engine.scheduler is scheduler
     finally:
         if scheduler is not None:

@@ -135,6 +135,8 @@ def _build_scheduler(engine, settings: ServeSettings) -> AnnaScheduler | None:
         max_batch_size=settings.scheduler_max_batch_size,
         batch_wait_ms=settings.scheduler_batch_wait_ms,
         prefill_interval_steps=settings.scheduler_prefill_interval_steps,
+        max_prefill_tokens=settings.scheduler_max_prefill_tokens,
+        max_decode_tokens=settings.scheduler_max_decode_tokens,
     )
     engine.set_scheduler(scheduler)
     return scheduler
@@ -398,6 +400,20 @@ def build_parser() -> argparse.ArgumentParser:
         "inter-token latency for active decodes.",
     )
     parser.add_argument(
+        "--scheduler-max-prefill-tokens",
+        type=_non_negative_int,
+        default=0,
+        help="Maximum prompt tokens admitted into one scheduler prefill wave. Set 0 to disable token-budget "
+        "packing and rely only on max batch size.",
+    )
+    parser.add_argument(
+        "--scheduler-max-decode-tokens",
+        type=_non_negative_int,
+        default=0,
+        help="Maximum cached sequence tokens packed into one scheduler decode batch. Set 0 to disable this "
+        "token budget and rely only on max batch size.",
+    )
+    parser.add_argument(
         "--asr-max-inference-batch-size",
         type=_positive_int,
         default=1,
@@ -470,6 +486,8 @@ def main() -> None:
         scheduler_max_batch_size=args.scheduler_max_batch_size,
         scheduler_batch_wait_ms=args.scheduler_batch_wait_ms,
         scheduler_prefill_interval_steps=args.scheduler_prefill_interval_steps,
+        scheduler_max_prefill_tokens=args.scheduler_max_prefill_tokens,
+        scheduler_max_decode_tokens=args.scheduler_max_decode_tokens,
         asr_max_inference_batch_size=args.asr_max_inference_batch_size,
         asr_max_new_tokens=args.asr_max_new_tokens,
         warmup_prefill_tokens=args.warmup_prefill_tokens,

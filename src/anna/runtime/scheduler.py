@@ -74,11 +74,15 @@ class AnnaScheduler:
         max_batch_size: int = 4,
         batch_wait_ms: float = 2.0,
         prefill_interval_steps: int = 1,
+        max_prefill_tokens: int = 0,
+        max_decode_tokens: int = 0,
     ) -> None:
         self.engine = engine
         self.max_batch_size = max(1, max_batch_size)
         self.batch_wait_seconds = max(0.0, batch_wait_ms) / 1000.0
         self.prefill_interval_steps = max(1, int(prefill_interval_steps))
+        self.max_prefill_tokens = max(0, int(max_prefill_tokens))
+        self.max_decode_tokens = max(0, int(max_decode_tokens))
         self._decode_steps_since_prefill = 0
         self._pending: deque[SchedulerRequest] = deque()
         self._condition = threading.Condition()
@@ -207,8 +211,7 @@ class AnnaScheduler:
                             self._fail_requests(group.requests, self._normalize_error(exc))
 
                 if ready:
-                    for chunk_start in range(0, len(ready), self.max_batch_size):
-                        chunk = ready[chunk_start : chunk_start + self.max_batch_size]
+                    for chunk in self._iter_decode_chunks(ready):
                         try:
                             next_active.extend(self._decode_batch(chunk))
                             self._decode_steps_since_prefill += 1
@@ -277,6 +280,15 @@ class AnnaScheduler:
         requests = [request for request in requests if not self._is_request_cancelled(request)]
         if not requests:
             return []
+        for request in requests:
+            self._ensure_request_initialized(request)
+
+        requests, deferred = self._select_prefill_admission(requests)
+        if deferred:
+            self._requeue_front(deferred)
+        if not requests:
+            return []
+
         metrics = getattr(self.engine, "metrics", None)
         if metrics is not None:
             metrics.record_requests_started_from_queue(len(requests))
@@ -284,19 +296,6 @@ class AnnaScheduler:
             request.generation_started_at = time.perf_counter()
             if metrics is not None:
                 metrics.record_queue_wait(request.generation_started_at - request.queued_at)
-            request.prompt_ids, request.prompt_length, request.config = self.engine._validate_generation_request(
-                request.prepared,
-                config=request.config,
-            )
-            request.repetition_history, request.repetition_history_ids = self.engine._init_repetition_penalty_state(
-                request.prompt_ids,
-                request.config.repetition_penalty,
-                request.config.presence_penalty,
-            )
-            request.assembler = IncrementalTextAssembler(
-                tokenizer=self.engine.tokenizer,
-                stop_strings=request.config.stop_strings,
-            )
 
         active: list[SchedulerRequest | SchedulerPrefillGroup | SchedulerDecodeGroup] = []
         groups: dict[int, list[SchedulerRequest]] = defaultdict(list)
@@ -304,8 +303,69 @@ class AnnaScheduler:
             groups[request.prompt_length].append(request)
 
         for _, group in sorted(groups.items()):
-            active.extend(self._prefill_same_length_group(group))
+            for chunk in self._iter_prefill_group_chunks(group):
+                active.extend(self._prefill_same_length_group(chunk))
         return active
+
+    def _ensure_request_initialized(self, request: SchedulerRequest) -> None:
+        if request.prompt_length > 0:
+            return
+        request.prompt_ids, request.prompt_length, request.config = self.engine._validate_generation_request(
+            request.prepared,
+            config=request.config,
+        )
+        request.repetition_history, request.repetition_history_ids = self.engine._init_repetition_penalty_state(
+            request.prompt_ids,
+            request.config.repetition_penalty,
+            request.config.presence_penalty,
+        )
+        request.assembler = IncrementalTextAssembler(
+            tokenizer=self.engine.tokenizer,
+            stop_strings=request.config.stop_strings,
+        )
+
+    def _select_prefill_admission(
+        self,
+        requests: list[SchedulerRequest],
+    ) -> tuple[list[SchedulerRequest], list[SchedulerRequest]]:
+        if self.max_prefill_tokens <= 0:
+            return requests, []
+        accepted: list[SchedulerRequest] = []
+        deferred: list[SchedulerRequest] = []
+        used_tokens = 0
+        for request in requests:
+            prompt_tokens = max(1, int(request.prompt_length))
+            if accepted and used_tokens + prompt_tokens > self.max_prefill_tokens:
+                deferred.append(request)
+                continue
+            accepted.append(request)
+            used_tokens += prompt_tokens
+        return accepted, deferred
+
+    def _requeue_front(self, requests: list[SchedulerRequest]) -> None:
+        if not requests:
+            return
+        with self._condition:
+            for request in reversed(requests):
+                self._pending.appendleft(request)
+            self._condition.notify_all()
+
+    def _iter_prefill_group_chunks(self, requests: list[SchedulerRequest]) -> Iterator[list[SchedulerRequest]]:
+        if self.max_prefill_tokens <= 0:
+            yield requests
+            return
+        chunk: list[SchedulerRequest] = []
+        chunk_tokens = 0
+        for request in requests:
+            prompt_tokens = max(1, int(request.prompt_length))
+            if chunk and chunk_tokens + prompt_tokens > self.max_prefill_tokens:
+                yield chunk
+                chunk = []
+                chunk_tokens = 0
+            chunk.append(request)
+            chunk_tokens += prompt_tokens
+        if chunk:
+            yield chunk
 
     def _should_admit_prefill(
         self,
@@ -433,6 +493,8 @@ class AnnaScheduler:
         requests = [request for request in requests if not self._is_request_cancelled(request)]
         if not requests:
             return []
+        if len(requests) == 1:
+            return self._decode_single(requests[0])
         input_ids = torch.cat([request.input_ids for request in requests if request.input_ids is not None], dim=0)
         caches = [request.past_key_values for request in requests if request.past_key_values is not None]
         if not caches:
@@ -477,18 +539,49 @@ class AnnaScheduler:
             avoid_turboquant_clone=True,
         )
 
+    def _decode_single(self, request: SchedulerRequest) -> list[SchedulerRequest | SchedulerDecodeGroup]:
+        if request.input_ids is None or request.past_key_values is None:
+            raise RuntimeError("Scheduler single decode is missing input ids or cache state.")
+        metrics = getattr(self.engine, "metrics", None)
+        try:
+            started_at = time.perf_counter()
+            with self.engine.execution_lock:
+                outputs = self._forward_batch_maybe_topk(
+                    stage="scheduler_decode",
+                    requests=[request],
+                    input_ids=request.input_ids,
+                    past_key_values=request.past_key_values,
+                )
+        except RuntimeError as exc:
+            raise self.engine._handle_runtime_failure(exc) from exc
+
+        if metrics is not None:
+            metrics.record_decode_step(time.perf_counter() - started_at)
+
+        batch_cache = outputs.past_key_values if outputs.past_key_values is not None else request.past_key_values
+        request.past_key_values = None
+        return self._consume_batch_outputs(
+            [request],
+            outputs,
+            batch_cache=batch_cache,
+            keep_batched_cache=False,
+            avoid_turboquant_clone=True,
+        )
+
     def _decode_group(self, group: SchedulerDecodeGroup) -> list[SchedulerRequest | SchedulerDecodeGroup]:
         if not group.requests:
             self._release_decode_group_cache(group)
             return []
 
         if any(self._is_request_cancelled(request) for request in group.requests):
-            remaining = self._split_decode_group_for_membership_change(group)
+            remaining = self._compact_decode_group_for_membership_change(group)
             if not remaining:
                 return []
             if len(remaining) == 1:
                 return remaining
-            return self._decode_batch(remaining)
+            if all(request.past_key_values is None for request in remaining):
+                return [self._make_decode_group_from_batched_cache(remaining, group.past_key_values)]
+            return [self._make_decode_group_from_requests(remaining)]
 
         metrics = getattr(self.engine, "metrics", None)
         try:
@@ -617,6 +710,22 @@ class AnnaScheduler:
                 release()
             return []
 
+        selected_rows = list(continuing_by_row)
+        compacted_cache = self._compact_cache_rows(batch_cache, selected_rows)
+        if compacted_cache is not None:
+            if keep_batched_cache and len(next_active) > 1:
+                for request in next_active:
+                    request.past_key_values = None
+                return [
+                    SchedulerDecodeGroup(
+                        requests=next_active,
+                        input_ids=torch.cat(next_input_ids, dim=0),
+                        past_key_values=compacted_cache,
+                    )
+                ]
+            next_active[0].past_key_values = compacted_cache
+            return next_active
+
         split_caches = self._split_cache(
             batch_cache,
             len(requests),
@@ -634,6 +743,40 @@ class AnnaScheduler:
         if keep_batched_cache and len(next_active) > 1:
             return [self._make_decode_group_from_requests(next_active)]
         return next_active
+
+    def _iter_decode_chunks(self, requests: list[SchedulerRequest]) -> Iterator[list[SchedulerRequest]]:
+        chunk: list[SchedulerRequest] = []
+        chunk_tokens = 0
+        for request in requests:
+            cost = self._decode_request_token_cost(request)
+            batch_full = len(chunk) >= self.max_batch_size
+            token_full = self.max_decode_tokens > 0 and chunk and chunk_tokens + cost > self.max_decode_tokens
+            if batch_full or token_full:
+                yield chunk
+                chunk = []
+                chunk_tokens = 0
+            chunk.append(request)
+            chunk_tokens += cost
+        if chunk:
+            yield chunk
+
+    @staticmethod
+    def _decode_request_token_cost(request: SchedulerRequest) -> int:
+        cache = request.past_key_values
+        get_seq_length = getattr(cache, "get_seq_length", None)
+        if callable(get_seq_length):
+            try:
+                return max(1, int(get_seq_length()))
+            except Exception:
+                pass
+        input_ids = request.input_ids
+        return 1 if input_ids is None else max(1, int(input_ids.numel()))
+
+    def _compact_cache_rows(self, cache: object, row_indices: list[int]) -> object | None:
+        compact = getattr(cache, "compact_batch_rows", None)
+        if not callable(compact):
+            return None
+        return compact(row_indices, release_unselected=True)
 
     def _make_decode_group_from_requests(self, requests: list[SchedulerRequest]) -> SchedulerDecodeGroup:
         if len(requests) <= 1:
@@ -657,19 +800,59 @@ class AnnaScheduler:
             request.past_key_values = None
         return SchedulerDecodeGroup(requests=list(requests), input_ids=input_ids, past_key_values=batch_cache)
 
-    def _split_decode_group_for_membership_change(self, group: SchedulerDecodeGroup) -> list[SchedulerRequest]:
+    @staticmethod
+    def _make_decode_group_from_batched_cache(
+        requests: list[SchedulerRequest],
+        batch_cache: object,
+    ) -> SchedulerDecodeGroup:
+        if len(requests) <= 1:
+            raise ValueError("A decode group requires at least two requests.")
+        input_rows = [request.input_ids for request in requests if request.input_ids is not None]
+        if len(input_rows) != len(requests):
+            raise RuntimeError("Cannot create decode group from requests with missing input ids.")
+        for request in requests:
+            request.past_key_values = None
+        return SchedulerDecodeGroup(
+            requests=list(requests),
+            input_ids=torch.cat(input_rows, dim=0),
+            past_key_values=batch_cache,
+        )
+
+    def _compact_decode_group_for_membership_change(self, group: SchedulerDecodeGroup) -> list[SchedulerRequest]:
+        remaining: list[SchedulerRequest] = []
+        selected_rows: list[int] = []
+        for row_idx, request in enumerate(group.requests):
+            if self._is_request_cancelled(request):
+                self._drop_cancelled_request(request)
+                continue
+            selected_rows.append(row_idx)
+            remaining.append(request)
+
+        if not remaining:
+            self._release_decode_group_cache(group)
+            return []
+
+        compacted_cache = self._compact_cache_rows(group.past_key_values, selected_rows)
+        if compacted_cache is not None:
+            if len(remaining) == 1:
+                remaining[0].past_key_values = compacted_cache
+            else:
+                for request in remaining:
+                    request.past_key_values = None
+                group.past_key_values = compacted_cache
+            return remaining
+
         split_caches = self._split_cache(
             group.past_key_values,
             len(group.requests),
             avoid_turboquant_clone=True,
         )
-        remaining: list[SchedulerRequest] = []
+        remaining = []
         for request, cache in zip(group.requests, split_caches):
             if self._is_request_cancelled(request):
                 release = getattr(cache, "release", None)
                 if callable(release):
                     release()
-                self._drop_cancelled_request(request)
                 continue
             request.past_key_values = cache
             remaining.append(request)

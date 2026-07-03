@@ -1217,6 +1217,109 @@ class Qwen3DynamicCache:
                     cache.visible_cache_capacities[layer_idx] = self.visible_cache_capacities[layer_idx]
         return outputs
 
+    def compact_batch_rows(
+        self,
+        row_indices: list[int] | tuple[int, ...],
+        *,
+        release_unselected: bool = True,
+    ) -> "Qwen3DynamicCache":
+        """Transfer selected batch rows into a smaller cache and release dropped rows.
+
+        This is a scheduler fast path for continuous batching: when some rows finish, the
+        remaining rows keep their page-table ownership without splitting every row into
+        separate caches and stacking them again.
+        """
+        batch_size = self.get_batch_size()
+        rows = [int(row_idx) for row_idx in row_indices]
+        if not rows:
+            self.release()
+            return Qwen3DynamicCache(
+                self.config,
+                allocator=self.allocator,
+                batch_size=0,
+                kv_cache_quantization=self.kv_cache_quantization,
+                kv_cache_quant_bits=self.kv_cache_quant_bits,
+                kv_cache_residual_len=self.kv_cache_residual_len,
+            )
+        if len(set(rows)) != len(rows):
+            raise ValueError("compact_batch_rows requires unique row indices.")
+        if any(row_idx < 0 or row_idx >= batch_size for row_idx in rows):
+            raise IndexError(f"compact_batch_rows row indices out of range for batch size {batch_size}: {rows}")
+        if rows == list(range(batch_size)):
+            return self
+
+        selected = set(rows)
+        compacted = Qwen3DynamicCache(
+            self.config,
+            allocator=self.allocator,
+            batch_size=len(rows),
+            kv_cache_quantization=self.kv_cache_quantization,
+            kv_cache_quant_bits=self.kv_cache_quant_bits,
+            kv_cache_residual_len=self.kv_cache_residual_len,
+        )
+        compacted.reserved_seq_capacity = self.reserved_seq_capacity
+        if self.rope_deltas is not None:
+            index = torch.tensor(rows, device=self.rope_deltas.device, dtype=torch.long)
+            compacted.rope_deltas = self.rope_deltas.index_select(0, index)
+
+        for layer_idx in range(self.config.num_hidden_layers):
+            compacted.layer_lengths[layer_idx] = [self.layer_lengths[layer_idx][row_idx] for row_idx in rows]
+            compacted.visible_cache_capacities[layer_idx] = self.visible_cache_capacities[layer_idx]
+
+            if self.uses_turboquant_for_layer(layer_idx):
+                for new_idx, old_idx in enumerate(rows):
+                    compacted.turboquant_rows[layer_idx][new_idx] = self.turboquant_rows[layer_idx][old_idx]
+                if release_unselected:
+                    for old_idx in range(batch_size):
+                        if old_idx not in selected:
+                            self.turboquant_rows[layer_idx][old_idx] = None
+            else:
+                for new_idx, old_idx in enumerate(rows):
+                    compacted.page_tables[layer_idx][new_idx] = list(self.page_tables[layer_idx][old_idx])
+                if release_unselected:
+                    for old_idx, page_ids in enumerate(self.page_tables[layer_idx]):
+                        if old_idx not in selected:
+                            self.allocator.release_pages(layer_idx, page_ids)
+
+            conv_state = self.conv_states[layer_idx]
+            if conv_state is not None:
+                index = torch.tensor(rows, device=conv_state.device, dtype=torch.long)
+                compacted.conv_states[layer_idx] = conv_state.index_select(0, index)
+            recurrent_state = self.recurrent_states[layer_idx]
+            if recurrent_state is not None:
+                index = torch.tensor(rows, device=recurrent_state.device, dtype=torch.long)
+                compacted.recurrent_states[layer_idx] = recurrent_state.index_select(0, index)
+            key_cache = self.visible_key_caches[layer_idx]
+            value_cache = self.visible_value_caches[layer_idx]
+            if key_cache is not None and value_cache is not None:
+                key_index = torch.tensor(rows, device=key_cache.device, dtype=torch.long)
+                value_index = torch.tensor(rows, device=value_cache.device, dtype=torch.long)
+                compacted.visible_key_caches[layer_idx] = key_cache.index_select(0, key_index)
+                compacted.visible_value_caches[layer_idx] = value_cache.index_select(0, value_index)
+
+        compacted.seen_tokens = max(compacted.get_seq_lengths().tolist(), default=0)
+        compacted._prefill_input_ids = None
+        compacted._prompt_token_ids = None
+
+        self._prefill_input_ids = None
+        self._prompt_token_ids = None
+        for layer_idx in range(self.config.num_hidden_layers):
+            self.layer_lengths[layer_idx] = [0 for _ in range(batch_size)]
+            self.page_tables[layer_idx] = [[] for _ in range(batch_size)]
+            self.turboquant_rows[layer_idx] = [None for _ in range(batch_size)]
+            self.conv_states[layer_idx] = None
+            self.recurrent_states[layer_idx] = None
+            self.visible_key_caches[layer_idx] = None
+            self.visible_value_caches[layer_idx] = None
+            self.visible_cache_capacities[layer_idx] = 0
+            self.page_table_caches[layer_idx] = None
+            self.page_table_capacities[layer_idx] = 0
+        self.seen_tokens = 0
+        self.rope_deltas = None
+        self.reserved_seq_capacity = 0
+        self._released = True
+        return compacted
+
     def clone(self) -> "Qwen3DynamicCache":
         batch_size = self.get_batch_size()
         cloned = Qwen3DynamicCache(
