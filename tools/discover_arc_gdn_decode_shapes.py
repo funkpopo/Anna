@@ -219,6 +219,50 @@ def _collect_suspicious_rows(
     return suspicious_rows
 
 
+def _discovery_row_key(row: dict[str, object]) -> tuple[int, int, int, int, int]:
+    return (
+        int(row["batch_size"]),
+        int(row["num_heads"]),
+        int(row["key_head_dim_int"]),
+        int(row["value_head_dim_int"]),
+        int(row["value_block_int"]),
+    )
+
+
+def _select_confirmation_shape_cases(rows: list[dict[str, object]]) -> list[tuple[int, int, int]]:
+    return _dedupe_gdn_decode_shape_cases(
+        [
+            (
+                int(row["batch_size"]),
+                int(row["num_heads"]),
+                int(row["value_head_dim_int"]),
+            )
+            for row in rows
+        ]
+    )
+
+
+def _select_confirmation_value_blocks(
+    rows: list[dict[str, object]],
+    fallback_value_blocks: list[int],
+) -> list[int]:
+    unique_value_blocks = sorted({int(row["value_block_int"]) for row in rows})
+    return unique_value_blocks if unique_value_blocks else list(fallback_value_blocks)
+
+
+def _select_confirmation_rows(
+    suspicious_rows: list[dict[str, object]],
+    confirmed_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    confirmed_row_map = {_discovery_row_key(row): row for row in confirmed_rows}
+    selected_rows: list[dict[str, object]] = []
+    for row in suspicious_rows:
+        confirmed_row = confirmed_row_map.get(_discovery_row_key(row))
+        if confirmed_row is not None:
+            selected_rows.append(confirmed_row)
+    return selected_rows
+
+
 def _build_group_summaries(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     grouped: dict[tuple[int, int, str, str], list[dict[str, object]]] = {}
     for row in rows:
@@ -269,6 +313,82 @@ def _print_group_summary(summary: dict[str, object]) -> None:
         f"row_count={summary['row_count']},sampled_rows={summary['sampled_recurrent_row_ranges']},"
         f"worst_ratio={float(summary['worst_ratio']):.4f},worst_delta_ms={float(summary['worst_delta_ms']):.4f}"
     )
+
+
+def _build_discovery_bench_args(
+    *,
+    mode: DiscoveryMode,
+    shape_cases: list[tuple[int, int, int]],
+    value_blocks: list[int],
+    head_dim: int,
+    seeds: str,
+    dtype: str,
+    warmup: int,
+    iters: int,
+    timing_repeats: int,
+) -> list[str]:
+    return [
+        sys.executable,
+        "tools/bench_xpu_hotspots.py",
+        "--gdn-decode-only",
+        mode.compare_flag,
+        "--gdn-decode-compare-only",
+        "--head-dim",
+        str(head_dim),
+        "--gdn-decode-shape-cases",
+        _shape_cases_csv(shape_cases),
+        "--gdn-decode-value-blocks",
+        ",".join(str(value_block) for value_block in value_blocks),
+        "--gdn-decode-seeds",
+        seeds,
+        "--dtype",
+        dtype,
+        "--warmup",
+        str(warmup),
+        "--iters",
+        str(iters),
+        "--gdn-decode-timing-repeats",
+        str(timing_repeats),
+    ]
+
+
+def _run_discovery_scan(
+    *,
+    root: Path,
+    env: dict[str, str],
+    mode: DiscoveryMode,
+    shape_cases: list[tuple[int, int, int]],
+    value_blocks: list[int],
+    head_dim: int,
+    seeds: str,
+    dtype: str,
+    warmup: int,
+    iters: int,
+    timing_repeats: int,
+    label: str,
+) -> tuple[list[str], list[dict[str, object]], tuple[int, ...]]:
+    bench_args = _build_discovery_bench_args(
+        mode=mode,
+        shape_cases=shape_cases,
+        value_blocks=value_blocks,
+        head_dim=head_dim,
+        seeds=seeds,
+        dtype=dtype,
+        warmup=warmup,
+        iters=iters,
+        timing_repeats=timing_repeats,
+    )
+    output = _run_step(
+        args=bench_args,
+        cwd=root,
+        env=env,
+        label=label,
+        capture_output=True,
+    )
+    assert output is not None
+    rows = _annotate_rows(_parse_gdn_decode_csv_rows(output, mode.compare_prefix), mode)
+    resolved_value_blocks = _parse_gdn_decode_value_blocks(output)
+    return bench_args, rows, resolved_value_blocks
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -343,6 +463,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Only report rows where the observed strategy differs from best_explicit_strategy.",
     )
     parser.add_argument(
+        "--confirm-suspicious",
+        action="store_true",
+        help="Re-run only suspicious rows with a higher-sampling confirmation pass before deciding they need a bucket change.",
+    )
+    parser.add_argument(
+        "--confirm-warmup",
+        type=int,
+        default=None,
+        help="Warmup iterations for the confirmation pass. Defaults to max(--warmup, 40).",
+    )
+    parser.add_argument(
+        "--confirm-iters",
+        type=int,
+        default=None,
+        help="Measured iterations for the confirmation pass. Defaults to max(--iters, 300).",
+    )
+    parser.add_argument(
+        "--confirm-timing-repeats",
+        type=int,
+        default=None,
+        help="Timing repeats for the confirmation pass. Defaults to max(--timing-repeats, 9).",
+    )
+    parser.add_argument(
         "--top",
         type=int,
         default=10,
@@ -378,7 +521,6 @@ def main() -> None:
         heads=args.heads,
         value_head_dims=args.value_head_dims,
     )
-    shape_cases_csv = _shape_cases_csv(cases)
     resolved_value_blocks = _resolve_gdn_decode_value_blocks(args.value_blocks, preset_names)
 
     root = _repo_root()
@@ -400,39 +542,20 @@ def main() -> None:
             f"Fused-op library not found at {op_lib_path}. Build it first or pass --op-lib explicitly."
         )
 
-    bench_args = [
-        sys.executable,
-        "tools/bench_xpu_hotspots.py",
-        "--gdn-decode-only",
-        mode.compare_flag,
-        "--gdn-decode-compare-only",
-        "--head-dim",
-        str(args.head_dim),
-        "--gdn-decode-shape-cases",
-        shape_cases_csv,
-        "--gdn-decode-value-blocks",
-        ",".join(str(value_block) for value_block in resolved_value_blocks),
-        "--gdn-decode-seeds",
-        args.seeds,
-        "--dtype",
-        args.dtype,
-        "--warmup",
-        str(args.warmup),
-        "--iters",
-        str(args.iters),
-        "--gdn-decode-timing-repeats",
-        str(args.timing_repeats),
-    ]
-    output = _run_step(
-        args=bench_args,
-        cwd=root,
+    bench_args, rows, resolved_blocks_from_output = _run_discovery_scan(
+        root=root,
         env=env,
+        mode=mode,
+        shape_cases=cases,
+        value_blocks=resolved_value_blocks,
+        head_dim=args.head_dim,
+        seeds=args.seeds,
+        dtype=args.dtype,
+        warmup=args.warmup,
+        iters=args.iters,
+        timing_repeats=args.timing_repeats,
         label=f"discover:{mode.name}",
-        capture_output=True,
     )
-    assert output is not None
-
-    rows = _annotate_rows(_parse_gdn_decode_csv_rows(output, mode.compare_prefix), mode)
     suspicious_rows = _collect_suspicious_rows(
         rows,
         ratio_threshold=args.ratio_threshold,
@@ -443,7 +566,6 @@ def main() -> None:
         rows,
         key=lambda row: (-float(row["ratio"]), -abs(float(row["delta_ms"])), int(row["recurrent_rows"])),
     )[: max(0, args.top)]
-    resolved_blocks_from_output = _parse_gdn_decode_value_blocks(output)
 
     print(
         f"[discover] mode={mode.name} shapes={len(cases)} compare_rows={len(rows)} "
@@ -466,6 +588,59 @@ def main() -> None:
                 f"ratio={float(row['ratio']):.4f},delta_ms={float(row['delta_ms']):.4f}"
             )
 
+    confirm_bench_args: list[str] | None = None
+    confirm_cases: list[tuple[int, int, int]] = []
+    confirm_value_blocks: list[int] = []
+    confirm_rows: list[dict[str, object]] = []
+    confirmed_suspicious_rows: list[dict[str, object]] = []
+    confirmed_groups: list[dict[str, object]] = []
+    if args.confirm_suspicious and suspicious_rows:
+        confirm_cases = _select_confirmation_shape_cases(suspicious_rows)
+        confirm_value_blocks = _select_confirmation_value_blocks(suspicious_rows, resolved_value_blocks)
+        confirm_warmup = args.confirm_warmup if args.confirm_warmup is not None else max(args.warmup, 40)
+        confirm_iters = args.confirm_iters if args.confirm_iters is not None else max(args.iters, 300)
+        confirm_timing_repeats = (
+            args.confirm_timing_repeats if args.confirm_timing_repeats is not None else max(args.timing_repeats, 9)
+        )
+        confirm_bench_args, raw_confirm_rows, _ = _run_discovery_scan(
+            root=root,
+            env=env,
+            mode=mode,
+            shape_cases=confirm_cases,
+            value_blocks=confirm_value_blocks,
+            head_dim=args.head_dim,
+            seeds=args.seeds,
+            dtype=args.dtype,
+            warmup=confirm_warmup,
+            iters=confirm_iters,
+            timing_repeats=confirm_timing_repeats,
+            label=f"confirm:{mode.name}",
+        )
+        confirm_rows = _select_confirmation_rows(suspicious_rows, raw_confirm_rows)
+        confirmed_suspicious_rows = _collect_suspicious_rows(
+            confirm_rows,
+            ratio_threshold=args.ratio_threshold,
+            require_strategy_mismatch=args.require_strategy_mismatch,
+        )
+        confirmed_groups = _build_group_summaries(confirmed_suspicious_rows)
+        print(
+            f"[confirm] mode={mode.name} candidate_shapes={len(confirm_cases)} compare_rows={len(confirm_rows)} "
+            f"confirmed_suspicious_rows={len(confirmed_suspicious_rows)} "
+            f"cleared_candidates={len(suspicious_rows) - len(confirmed_suspicious_rows)} "
+            f"warmup={confirm_warmup} iters={confirm_iters} timing_repeats={confirm_timing_repeats}",
+            flush=True,
+        )
+        for row in confirmed_suspicious_rows:
+            _print_row("gdn_decode_confirmed_suspicious", row)
+        for summary in confirmed_groups:
+            print(
+                "gdn_decode_confirmed_suspicious_group,"
+                f"value_head_dim={summary['value_head_dim']},value_block={summary['value_block']},"
+                f"observed={summary['observed_strategy']},best={summary['best_explicit_strategy']},"
+                f"row_count={summary['row_count']},sampled_rows={summary['sampled_recurrent_row_ranges']},"
+                f"worst_ratio={float(summary['worst_ratio']):.4f},worst_delta_ms={float(summary['worst_delta_ms']):.4f}"
+            )
+
     if args.json_output is not None:
         report = {
             "schema_version": 1,
@@ -479,6 +654,15 @@ def main() -> None:
             "suspicious_rows": suspicious_rows,
             "suspicious_groups": suspicious_groups,
             "top_rows": top_rows,
+            "confirmation": {
+                "enabled": args.confirm_suspicious,
+                "bench_args": confirm_bench_args,
+                "shape_cases": confirm_cases,
+                "value_blocks": confirm_value_blocks,
+                "candidate_rows": confirm_rows,
+                "confirmed_suspicious_rows": confirmed_suspicious_rows,
+                "confirmed_suspicious_groups": confirmed_groups,
+            },
         }
         output_path = Path(args.json_output).expanduser()
         output_path.parent.mkdir(parents=True, exist_ok=True)

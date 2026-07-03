@@ -13,9 +13,13 @@ from tools.discover_arc_gdn_decode_shapes import (  # noqa: E402
     _annotate_rows,
     _build_group_summaries,
     _collect_suspicious_rows,
+    _discovery_row_key,
     _format_sampled_int_ranges,
     _parse_int_spans,
     _resolve_shape_cases,
+    _select_confirmation_rows,
+    _select_confirmation_shape_cases,
+    _select_confirmation_value_blocks,
 )
 
 
@@ -162,3 +166,131 @@ def test_build_group_summaries_collapses_rows_into_sampled_row_ranges() -> None:
     assert summaries[0]["value_head_dim"] == 256
     assert summaries[0]["sampled_recurrent_row_ranges"] == "784..816/16"
     assert summaries[0]["worst_ratio"] == pytest.approx(1.17)
+
+
+def test_select_confirmation_shape_cases_and_value_blocks_dedupe_candidates() -> None:
+    suspicious_rows = [
+        {
+            "batch_size": 25,
+            "num_heads": 32,
+            "value_head_dim_int": 256,
+            "value_block_int": 4,
+        },
+        {
+            "batch_size": 25,
+            "num_heads": 32,
+            "value_head_dim_int": 256,
+            "value_block_int": 4,
+        },
+        {
+            "batch_size": 49,
+            "num_heads": 16,
+            "value_head_dim_int": 256,
+            "value_block_int": 4,
+        },
+        {
+            "batch_size": 9,
+            "num_heads": 16,
+            "value_head_dim_int": 128,
+            "value_block_int": 8,
+        },
+    ]
+
+    assert _select_confirmation_shape_cases(suspicious_rows) == [
+        (25, 32, 256),
+        (49, 16, 256),
+        (9, 16, 128),
+    ]
+    assert _select_confirmation_value_blocks(suspicious_rows, [16]) == [4, 8]
+    assert _select_confirmation_value_blocks([], [8, 16]) == [8, 16]
+
+
+def test_select_confirmation_rows_and_reconfirm_suspicious_candidates() -> None:
+    initial_suspicious_rows = _annotate_rows(
+        [
+            {
+                "batch": "25",
+                "heads": "32",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_strategy": "tiled",
+                "single_ms": "1.9500",
+                "tiled_ms": "2.2900",
+                "auto_ms": "2.2890",
+                "best_explicit_strategy": "single",
+                "best_explicit_ms": "1.9500",
+                "auto_minus_best_ms": "0.3390",
+                "auto_speed_ratio": "1.1738",
+                "max_abs_diff": "0.009323",
+            },
+            {
+                "batch": "17",
+                "heads": "8",
+                "key_head_dim": "128",
+                "value_head_dim": "128",
+                "value_block": "8",
+                "auto_strategy": "single",
+                "single_ms": "0.3260",
+                "tiled_ms": "0.3259",
+                "auto_ms": "0.3267",
+                "best_explicit_strategy": "tiled",
+                "best_explicit_ms": "0.3259",
+                "auto_minus_best_ms": "0.0009",
+                "auto_speed_ratio": "1.0026",
+                "max_abs_diff": "0.007109",
+            },
+        ],
+        DISCOVERY_MODES["auto"],
+    )
+
+    confirmed_rows = _annotate_rows(
+        [
+            {
+                "batch": "17",
+                "heads": "8",
+                "key_head_dim": "128",
+                "value_head_dim": "128",
+                "value_block": "8",
+                "auto_strategy": "single",
+                "single_ms": "0.3184",
+                "tiled_ms": "0.3198",
+                "auto_ms": "0.3178",
+                "best_explicit_strategy": "single",
+                "best_explicit_ms": "0.3184",
+                "auto_minus_best_ms": "-0.0006",
+                "auto_speed_ratio": "0.9982",
+                "max_abs_diff": "0.007109",
+            },
+            {
+                "batch": "25",
+                "heads": "32",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_strategy": "single",
+                "single_ms": "1.9546",
+                "tiled_ms": "2.2960",
+                "auto_ms": "1.9499",
+                "best_explicit_strategy": "single",
+                "best_explicit_ms": "1.9546",
+                "auto_minus_best_ms": "-0.0046",
+                "auto_speed_ratio": "0.9976",
+                "max_abs_diff": "0.009395",
+            },
+        ],
+        DISCOVERY_MODES["auto"],
+    )
+
+    selected_rows = _select_confirmation_rows(initial_suspicious_rows, confirmed_rows)
+    assert [_discovery_row_key(row) for row in selected_rows] == [
+        _discovery_row_key(initial_suspicious_rows[0]),
+        _discovery_row_key(initial_suspicious_rows[1]),
+    ]
+
+    confirmed_suspicious_rows = _collect_suspicious_rows(
+        selected_rows,
+        ratio_threshold=1.03,
+        require_strategy_mismatch=False,
+    )
+    assert confirmed_suspicious_rows == []
