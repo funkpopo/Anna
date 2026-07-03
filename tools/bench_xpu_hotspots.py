@@ -263,6 +263,72 @@ def _parse_gdn_decode_shape_cases(raw: str) -> list[tuple[int, int, int]]:
     return cases
 
 
+GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
+    "arc-default": (
+        (1, 8, 128),
+        (4, 8, 128),
+        (1, 16, 64),
+        (4, 16, 64),
+        (1, 16, 128),
+        (4, 16, 128),
+        (1, 16, 256),
+        (4, 16, 256),
+        (18, 16, 256),
+        (1, 32, 128),
+        (4, 32, 128),
+        (1, 32, 256),
+        (4, 32, 256),
+    ),
+    "arc-legacy-v128-block8": (
+        (4, 8, 128),
+        (8, 8, 128),
+        (16, 8, 128),
+        (4, 16, 128),
+        (8, 16, 128),
+        (10, 16, 128),
+        (4, 32, 128),
+        (5, 32, 128),
+        (8, 32, 128),
+    ),
+    "arc-legacy-v256-block4": (
+        (10, 16, 256),
+        (18, 16, 256),
+        (30, 16, 256),
+        (34, 16, 256),
+        (5, 32, 256),
+        (9, 32, 256),
+        (15, 32, 256),
+        (17, 32, 256),
+        (24, 32, 256),
+    ),
+}
+
+
+def _parse_gdn_decode_shape_presets(raw: str) -> list[str]:
+    preset_names = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    if not preset_names:
+        raise ValueError("--gdn-decode-shape-presets must contain at least one preset name")
+    unknown_presets = [preset_name for preset_name in preset_names if preset_name not in GDN_DECODE_SHAPE_PRESETS]
+    if unknown_presets:
+        available = ", ".join(sorted(GDN_DECODE_SHAPE_PRESETS))
+        raise ValueError(
+            f"Unknown --gdn-decode-shape-presets entry(s): {', '.join(unknown_presets)}. "
+            f"Available presets: {available}"
+        )
+    return preset_names
+
+
+def _dedupe_gdn_decode_shape_cases(cases: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
+    deduped_cases: list[tuple[int, int, int]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for case in cases:
+        if case in seen:
+            continue
+        seen.add(case)
+        deduped_cases.append(case)
+    return deduped_cases
+
+
 def _parse_gdn_decode_seeds(seed: int | None, seeds_csv: str | None) -> list[int | None]:
     if seeds_csv is None:
         return [seed]
@@ -1532,6 +1598,16 @@ def main() -> None:
             "1x16x64,4x16x64,1x32x128. Overrides --gdn-decode-batch-head-cases and --gdn-value-head-dims."
         ),
     )
+    parser.add_argument(
+        "--gdn-decode-shape-presets",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated named Gated Delta decode shape presets. Available presets: "
+            + ", ".join(sorted(GDN_DECODE_SHAPE_PRESETS))
+            + ". Presets append to --gdn-decode-shape-cases when both are set."
+        ),
+    )
     args = parser.parse_args()
     if args.gdn_decode_only:
         args.gdn_decode_profile = True
@@ -1555,17 +1631,24 @@ def main() -> None:
     lm_head_vocab_size = int4_n if args.lm_head_vocab_size is None else args.lm_head_vocab_size
 
     multi_shape_gdn_profile = args.gdn_decode_profile and (
-        args.gdn_decode_shape_cases is not None
+        args.gdn_decode_shape_presets is not None
+        or args.gdn_decode_shape_cases is not None
         or args.gdn_decode_batch_head_cases is not None
         or args.gdn_value_head_dims is not None
     )
     if multi_shape_gdn_profile:
-        shape_label = "<gdn-shapes>" if args.gdn_decode_shape_cases is not None else "<gdn-matrix>"
+        shape_label = (
+            "<gdn-shapes>"
+            if args.gdn_decode_shape_cases is not None or args.gdn_decode_shape_presets is not None
+            else "<gdn-matrix>"
+        )
         print(
             f"shape batch={shape_label} seq=1 hidden={args.hidden_size} "
             f"heads={shape_label}/{args.num_kv_heads} head_dim={args.head_dim} rotary_dim={rotary_dim} kv_len=1 "
             f"dtype={dtype}"
         )
+        if args.gdn_decode_shape_presets is not None:
+            print(f"gdn_decode_shape_presets={args.gdn_decode_shape_presets}")
         if args.gdn_decode_shape_cases is not None:
             print(f"gdn_decode_shape_cases={args.gdn_decode_shape_cases}")
         if args.gdn_decode_batch_head_cases is not None:
@@ -1588,8 +1671,15 @@ def main() -> None:
     if args.arc_int4_only and not args.arc_profile:
         raise ValueError("--arc-int4-only requires --arc-profile")
     if args.gdn_decode_profile:
-        if args.gdn_decode_shape_cases is not None:
-            gdn_decode_shape_cases = _parse_gdn_decode_shape_cases(args.gdn_decode_shape_cases)
+        gdn_decode_shape_cases: list[tuple[int, int, int]]
+        if args.gdn_decode_shape_presets is not None or args.gdn_decode_shape_cases is not None:
+            gdn_decode_shape_cases = []
+            if args.gdn_decode_shape_presets is not None:
+                for preset_name in _parse_gdn_decode_shape_presets(args.gdn_decode_shape_presets):
+                    gdn_decode_shape_cases.extend(GDN_DECODE_SHAPE_PRESETS[preset_name])
+            if args.gdn_decode_shape_cases is not None:
+                gdn_decode_shape_cases.extend(_parse_gdn_decode_shape_cases(args.gdn_decode_shape_cases))
+            gdn_decode_shape_cases = _dedupe_gdn_decode_shape_cases(gdn_decode_shape_cases)
         else:
             gdn_value_head_dims = (
                 _parse_int_csv("--gdn-value-head-dims", args.gdn_value_head_dims)
