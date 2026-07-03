@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -14,10 +15,12 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
     _bench_args_for_preset,
+    _collect_benchmark_summary,
     _parse_gdn_decode_csv_rows,
     _parse_gdn_decode_value_blocks,
     _parse_preset_names,
     _validate_benchmark_output,
+    _write_json_report,
 )
 
 
@@ -144,3 +147,22 @@ def test_validate_benchmark_output_accepts_in_threshold_output() -> None:
 def test_validate_benchmark_output_rejects_ratio_regression() -> None:
     with pytest.raises(ValueError, match="exceeded default_speed_ratio threshold"):
         _validate_benchmark_output(_make_benchmark_output_for_preset(ARC_DEFAULT_PRESET, ratio=1.20), ARC_DEFAULT_PRESET)
+
+
+def test_collect_benchmark_summary_reports_worst_ratio() -> None:
+    summary = _collect_benchmark_summary(
+        _make_benchmark_output_for_preset(ARC_LEGACY_V256_BLOCK4_PRESET, ratio=1.03),
+        ARC_LEGACY_V256_BLOCK4_PRESET,
+    )
+    assert summary["preset"] == ARC_LEGACY_V256_BLOCK4_PRESET
+    assert summary["resolved_value_blocks"] == [4]
+    assert summary["observed_max_ratio"] == pytest.approx(1.03)
+    assert summary["row_count"] == len(GDN_DECODE_SHAPE_PRESETS[ARC_LEGACY_V256_BLOCK4_PRESET])
+
+
+def test_write_json_report_creates_parent_directories(tmp_path: Path) -> None:
+    output_path = tmp_path / "nested" / "arc_gdn_decode.json"
+    payload = {"schema_version": 1, "status": "ok"}
+    _write_json_report(output_path, payload)
+    assert output_path.exists()
+    assert json.loads(output_path.read_text(encoding="utf-8")) == payload

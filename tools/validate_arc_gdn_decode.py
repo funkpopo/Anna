@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -231,6 +233,31 @@ def _validate_benchmark_output(output: str, preset_name: str) -> None:
     )
 
 
+def _collect_benchmark_summary(output: str, preset_name: str) -> dict[str, object]:
+    expectation = ARC_BENCH_EXPECTATIONS[preset_name]
+    value_blocks = _parse_gdn_decode_value_blocks(output)
+    rows = _parse_gdn_decode_csv_rows(output, expectation.compare_prefix)
+    worst_row = max(rows, key=lambda row: float(row[expectation.ratio_field]))
+    worst_ratio = float(worst_row[expectation.ratio_field])
+    return {
+        "preset": preset_name,
+        "compare_prefix": expectation.compare_prefix,
+        "expected_value_blocks": list(expectation.expected_value_blocks),
+        "resolved_value_blocks": list(value_blocks),
+        "ratio_field": expectation.ratio_field,
+        "max_ratio_allowed": expectation.max_ratio,
+        "observed_max_ratio": worst_ratio,
+        "row_count": len(rows),
+        "rows": rows,
+        "worst_row": worst_row,
+    }
+
+
+def _write_json_report(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the standard Arc Gated Delta decode benchmark presets and targeted regressions."
@@ -284,6 +311,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PYTEST_EXPR,
         help="Expression forwarded to pytest -k for the XPU decode regression subset.",
     )
+    parser.add_argument(
+        "--json-output",
+        type=str,
+        default=None,
+        help="Optional path to write a structured Arc decode validation summary JSON.",
+    )
     return parser
 
 
@@ -295,6 +328,26 @@ def main() -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = _pythonpath_value(root)
     env["ANNA_GATED_DELTA_OP_LIB"] = str(op_lib_path)
+    json_report: dict[str, object] = {
+        "schema_version": 1,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "op_lib_path": str(op_lib_path),
+        "presets": preset_names,
+        "benchmark": {
+            "seeds": args.seeds,
+            "warmup": args.warmup,
+            "iters": args.iters,
+            "skip_bench": args.skip_bench,
+            "skip_bench_gates": args.skip_bench_gates,
+            "presets": {},
+        },
+        "pytest": {
+            "skip_pytest": args.skip_pytest,
+            "expression": args.pytest_k,
+            "bench_unit_tests": None,
+            "xpu_regressions": None,
+        },
+    }
 
     if args.build_first:
         _run_step(
@@ -326,20 +379,43 @@ def main() -> None:
             if not args.skip_bench_gates:
                 assert output is not None
                 _validate_benchmark_output(output, preset_name)
+            assert output is not None
+            benchmark_summary = _collect_benchmark_summary(output, preset_name)
+            cast_benchmark = json_report["benchmark"]
+            assert isinstance(cast_benchmark, dict)
+            cast_presets = cast_benchmark["presets"]
+            assert isinstance(cast_presets, dict)
+            cast_presets[preset_name] = benchmark_summary
 
     if not args.skip_pytest:
+        bench_pytest_args = [sys.executable, "-m", "pytest", "tests/test_bench_xpu_hotspots.py", "-q"]
         _run_step(
-            args=[sys.executable, "-m", "pytest", "tests/test_bench_xpu_hotspots.py", "-q"],
+            args=bench_pytest_args,
             cwd=root,
             env=env,
             label="pytest:bench",
         )
+        bench_pytest = json_report["pytest"]
+        assert isinstance(bench_pytest, dict)
+        bench_pytest["bench_unit_tests"] = {
+            "args": bench_pytest_args,
+            "status": "passed",
+        }
+        xpu_pytest_args = [sys.executable, "-m", "pytest", "tests/test_fused_op_xpu.py", "-k", args.pytest_k, "-q"]
         _run_step(
-            args=[sys.executable, "-m", "pytest", "tests/test_fused_op_xpu.py", "-k", args.pytest_k, "-q"],
+            args=xpu_pytest_args,
             cwd=root,
             env=env,
             label="pytest:xpu",
         )
+        bench_pytest["xpu_regressions"] = {
+            "args": xpu_pytest_args,
+            "status": "passed",
+        }
+
+    if args.json_output is not None:
+        _write_json_report(Path(args.json_output).expanduser(), json_report)
+        print(f"[json] wrote {Path(args.json_output).expanduser()}", flush=True)
 
 
 if __name__ == "__main__":
