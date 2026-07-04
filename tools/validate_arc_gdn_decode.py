@@ -112,6 +112,7 @@ ARC_BENCH_EXPECTATIONS = {
         expected_row_count=39,
         ratio_field="auto_speed_ratio",
         max_ratio=1.03,
+        default_compare_ratio_delta=0.015,
     ),
     ARC_WATCH_V256_BLOCK4_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_auto_compare",

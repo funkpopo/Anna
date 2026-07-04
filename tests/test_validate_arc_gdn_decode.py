@@ -260,17 +260,15 @@ def test_resolve_compare_ratio_delta_uses_watch_default_when_omitted() -> None:
     assert _resolve_compare_ratio_delta(None, preset_name="arc-watch-v256-block4") == pytest.approx(0.005)
 
 
-def test_resolve_compare_ratio_delta_falls_back_to_global_default_for_non_watch_presets() -> None:
-    assert _resolve_compare_ratio_delta(None, preset_name="arc-legacy-v256-block4") == pytest.approx(
-        DEFAULT_COMPARE_RATIO_DELTA
-    )
+def test_resolve_compare_ratio_delta_uses_legacy_v256_preset_default() -> None:
+    assert _resolve_compare_ratio_delta(None, preset_name="arc-legacy-v256-block4") == pytest.approx(0.015)
 
 
 def test_resolve_compare_ratio_delta_prefers_explicit_override() -> None:
     assert _resolve_compare_ratio_delta(0.0125, preset_name="arc-watch-v256-block4") == pytest.approx(0.0125)
 
 
-def test_resolve_compare_ratio_delta_keeps_non_watch_quick_presets_on_global_default() -> None:
+def test_resolve_compare_ratio_delta_uses_non_watch_quick_preset_defaults() -> None:
     assert _resolve_compare_ratio_delta(None, preset_name="arc-default") == pytest.approx(0.025)
     assert _resolve_compare_ratio_delta(None, preset_name="arc-v64-default-block16") == pytest.approx(0.015)
     assert _resolve_compare_ratio_delta(None, preset_name="arc-legacy-v64-block8") == pytest.approx(0.02)
