@@ -20,10 +20,13 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     DEFAULT_COMPARE_RATIO_DELTA,
     _bench_args_for_preset,
     _chunk_shape_cases,
+    _confirm_benchmark_ratio_failures,
     _compare_benchmark_summary_against_baseline,
     _collect_benchmark_summary,
     _collect_benchmark_summary_from_rows,
+    _find_benchmark_ratio_failure_rows,
     _load_json_report,
+    _merge_benchmark_rows,
     _parse_gdn_decode_csv_rows,
     _parse_benchmark_output_rows_and_value_blocks,
     _parse_gdn_decode_value_blocks,
@@ -256,6 +259,151 @@ def test_run_benchmark_for_preset_chunks_large_preset_and_merges_rows(
     assert effective_max_shapes_per_scan == 16
     assert value_blocks == (4,)
     assert len(rows) == len(GDN_DECODE_SHAPE_PRESETS[ARC_LEGACY_V256_BLOCK4_PRESET])
+
+
+def test_find_benchmark_ratio_failure_rows_returns_only_over_threshold_rows() -> None:
+    rows = [
+        {
+            "batch": "33",
+            "heads": "8",
+            "key_head_dim": "128",
+            "value_head_dim": "256",
+            "value_block": "4",
+            "auto_speed_ratio": "1.0200",
+        },
+        {
+            "batch": "65",
+            "heads": "8",
+            "key_head_dim": "128",
+            "value_head_dim": "256",
+            "value_block": "4",
+            "auto_speed_ratio": "1.0400",
+        },
+    ]
+
+    failing_rows = _find_benchmark_ratio_failure_rows(
+        preset_name=ARC_LEGACY_V256_BLOCK4_PRESET,
+        rows=rows,
+    )
+
+    assert failing_rows == [rows[1]]
+
+
+def test_merge_benchmark_rows_replaces_matching_row_keys() -> None:
+    base_rows = [
+        {
+            "batch": "33",
+            "heads": "8",
+            "key_head_dim": "128",
+            "value_head_dim": "256",
+            "value_block": "4",
+            "auto_speed_ratio": "1.0400",
+        },
+        {
+            "batch": "65",
+            "heads": "8",
+            "key_head_dim": "128",
+            "value_head_dim": "256",
+            "value_block": "4",
+            "auto_speed_ratio": "1.0000",
+        },
+    ]
+    override_rows = [
+        {
+            "batch": "33",
+            "heads": "8",
+            "key_head_dim": "128",
+            "value_head_dim": "256",
+            "value_block": "4",
+            "auto_speed_ratio": "1.0050",
+        }
+    ]
+
+    merged_rows = _merge_benchmark_rows(base_rows=base_rows, override_rows=override_rows)
+
+    assert merged_rows[0]["auto_speed_ratio"] == "1.0050"
+    assert merged_rows[1] == base_rows[1]
+
+
+def test_confirm_benchmark_ratio_failures_reruns_only_failing_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run_step(*, args, cwd, env, label, capture_output):
+        assert capture_output is True
+        calls.append(args)
+        assert args[args.index("--gdn-decode-shape-cases") + 1] == "33x8x256"
+        lines = [
+            "gdn_decode_value_blocks=4",
+            "gdn_decode_auto_compare,device_name,batch,heads,key_head_dim,value_head_dim,value_block,auto_strategy,"
+            "single_ms,tiled_ms,auto_ms,best_explicit_strategy,best_explicit_ms,auto_minus_best_ms,"
+            "auto_speed_ratio,max_abs_diff",
+            "gdn_decode_auto_compare,Intel Arc,33,8,128,256,4,single,0.3000,0.2000,0.2010,tiled,0.2000,0.0010,1.0050,0.000100",
+        ]
+        return "\n".join(lines)
+
+    monkeypatch.setattr("tools.validate_arc_gdn_decode._run_step", fake_run_step)
+
+    rows = [
+        {
+            "batch": "33",
+            "heads": "8",
+            "key_head_dim": "128",
+            "value_head_dim": "256",
+            "value_block": "4",
+            "auto_speed_ratio": "1.0400",
+        },
+        {
+            "batch": "65",
+            "heads": "8",
+            "key_head_dim": "128",
+            "value_head_dim": "256",
+            "value_block": "4",
+            "auto_speed_ratio": "1.0000",
+        },
+    ]
+
+    summary, merged_rows = _confirm_benchmark_ratio_failures(
+        preset_name=ARC_LEGACY_V256_BLOCK4_PRESET,
+        rows=rows,
+        seeds_csv="20260960,20260961",
+        cwd=Path.cwd(),
+        env={},
+    )
+
+    assert summary is not None
+    assert summary["shape_cases"] == [(33, 8, 256)]
+    assert summary["cleared_row_count"] == 1
+    assert summary["remaining_failure_rows"] == []
+    assert len(calls) == 1
+    assert merged_rows[0]["auto_speed_ratio"] == "1.0050"
+    assert merged_rows[1] == rows[1]
+
+
+def test_confirm_benchmark_ratio_failures_skips_when_no_rows_exceed_threshold() -> None:
+    rows = [
+        {
+            "batch": "33",
+            "heads": "8",
+            "key_head_dim": "128",
+            "value_head_dim": "256",
+            "value_block": "4",
+            "auto_speed_ratio": "1.0200",
+        }
+    ]
+
+    summary, merged_rows = _confirm_benchmark_ratio_failures(
+        preset_name=ARC_LEGACY_V256_BLOCK4_PRESET,
+        rows=rows,
+        seeds_csv="20260960,20260961",
+        cwd=Path.cwd(),
+        env={},
+    )
+
+    assert summary is None
+    assert merged_rows == rows
+
 
 def test_write_json_report_creates_parent_directories(tmp_path: Path) -> None:
     output_path = tmp_path / "nested" / "arc_gdn_decode.json"

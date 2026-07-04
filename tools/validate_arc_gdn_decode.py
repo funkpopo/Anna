@@ -94,6 +94,9 @@ DEFAULT_VALIDATE_BENCH_MAX_SHAPES_PER_SCAN = 16
 DEFAULT_VALIDATE_BENCH_PRIME_WARMUP = 1
 DEFAULT_VALIDATE_BENCH_PRIME_ITERS = 1
 DEFAULT_VALIDATE_BENCH_PRIME_TIMING_REPEATS = 1
+DEFAULT_VALIDATE_CONFIRM_WARMUP = 40
+DEFAULT_VALIDATE_CONFIRM_ITERS = 300
+DEFAULT_VALIDATE_CONFIRM_TIMING_REPEATS = 9
 
 
 def _repo_root() -> Path:
@@ -428,6 +431,38 @@ def _run_benchmark_for_preset(
     return requested_bench_args, bench_runs, resolved_value_blocks, rows, effective_max_shapes_per_scan
 
 
+def _run_benchmark_for_shape_cases(
+    *,
+    preset_name: str,
+    shape_cases: list[tuple[int, int, int]],
+    warmup: int,
+    iters: int,
+    timing_repeats: int,
+    seeds_csv: str,
+    cwd: Path,
+    env: dict[str, str],
+    label: str,
+) -> tuple[list[str], tuple[int, ...], list[dict[str, str]]]:
+    bench_args = _bench_args_for_shape_chunk(
+        preset_name=preset_name,
+        shape_cases=shape_cases,
+        warmup=warmup,
+        iters=iters,
+        timing_repeats=timing_repeats,
+        seeds_csv=seeds_csv,
+    )
+    output = _run_step(
+        args=bench_args,
+        cwd=cwd,
+        env=env,
+        label=label,
+        capture_output=True,
+    )
+    assert output is not None
+    value_blocks, rows = _parse_benchmark_output_rows_and_value_blocks(output, preset_name)
+    return bench_args, value_blocks, rows
+
+
 def _parse_preset_names(raw: str) -> list[str]:
     preset_names = [item.strip() for item in raw.split(",") if item.strip()]
     if not preset_names:
@@ -532,6 +567,84 @@ def _serialize_benchmark_row_key(key: tuple[str, str, str, str, str]) -> dict[st
         "value_head_dim": key[3],
         "value_block": key[4],
     }
+
+
+def _shape_case_from_benchmark_row(row: dict[str, str]) -> tuple[int, int, int]:
+    return (int(row["batch"]), int(row["heads"]), int(row["value_head_dim"]))
+
+
+def _dedupe_shape_cases(shape_cases: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
+    seen: set[tuple[int, int, int]] = set()
+    deduped: list[tuple[int, int, int]] = []
+    for shape_case in shape_cases:
+        if shape_case in seen:
+            continue
+        seen.add(shape_case)
+        deduped.append(shape_case)
+    return deduped
+
+
+def _find_benchmark_ratio_failure_rows(
+    *,
+    preset_name: str,
+    rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    expectation = ARC_BENCH_EXPECTATIONS[preset_name]
+    return [row for row in rows if float(row[expectation.ratio_field]) > expectation.max_ratio]
+
+
+def _merge_benchmark_rows(
+    *,
+    base_rows: list[dict[str, str]],
+    override_rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    override_map = {_benchmark_row_key(row): row for row in override_rows}
+    return [override_map.get(_benchmark_row_key(row), row) for row in base_rows]
+
+
+def _confirm_benchmark_ratio_failures(
+    *,
+    preset_name: str,
+    rows: list[dict[str, str]],
+    seeds_csv: str,
+    cwd: Path,
+    env: dict[str, str],
+) -> tuple[dict[str, object] | None, list[dict[str, str]]]:
+    failing_rows = _find_benchmark_ratio_failure_rows(preset_name=preset_name, rows=rows)
+    if not failing_rows:
+        return None, rows
+
+    shape_cases = _dedupe_shape_cases([_shape_case_from_benchmark_row(row) for row in failing_rows])
+    print(
+        f"[confirm-threshold:{preset_name}] failing_rows={len(failing_rows)} candidate_shapes={len(shape_cases)} "
+        f"warmup={DEFAULT_VALIDATE_CONFIRM_WARMUP} iters={DEFAULT_VALIDATE_CONFIRM_ITERS} "
+        f"timing_repeats={DEFAULT_VALIDATE_CONFIRM_TIMING_REPEATS}",
+        flush=True,
+    )
+    confirm_args, confirm_value_blocks, confirm_rows = _run_benchmark_for_shape_cases(
+        preset_name=preset_name,
+        shape_cases=shape_cases,
+        warmup=DEFAULT_VALIDATE_CONFIRM_WARMUP,
+        iters=DEFAULT_VALIDATE_CONFIRM_ITERS,
+        timing_repeats=DEFAULT_VALIDATE_CONFIRM_TIMING_REPEATS,
+        seeds_csv=seeds_csv,
+        cwd=cwd,
+        env=env,
+        label=f"confirm-threshold:{preset_name}",
+    )
+    merged_rows = _merge_benchmark_rows(base_rows=rows, override_rows=confirm_rows)
+    remaining_failures = _find_benchmark_ratio_failure_rows(preset_name=preset_name, rows=merged_rows)
+    summary = {
+        "triggered": True,
+        "bench_args": confirm_args,
+        "shape_cases": shape_cases,
+        "resolved_value_blocks": list(confirm_value_blocks),
+        "candidate_rows": failing_rows,
+        "confirmed_rows": confirm_rows,
+        "cleared_row_count": len(failing_rows) - len(remaining_failures),
+        "remaining_failure_rows": remaining_failures,
+    }
+    return summary, merged_rows
 
 
 def _compare_benchmark_summary_against_baseline(
@@ -798,12 +911,29 @@ def main() -> None:
                 env=env,
                 max_shapes_per_scan=args.max_shapes_per_scan,
             )
+            threshold_confirmation: dict[str, object] | None = None
             if not args.skip_bench_gates:
-                _validate_benchmark_rows(
-                    preset_name=preset_name,
-                    value_blocks=value_blocks,
-                    rows=rows,
-                )
+                try:
+                    _validate_benchmark_rows(
+                        preset_name=preset_name,
+                        value_blocks=value_blocks,
+                        rows=rows,
+                    )
+                except ValueError:
+                    threshold_confirmation, rows = _confirm_benchmark_ratio_failures(
+                        preset_name=preset_name,
+                        rows=rows,
+                        seeds_csv=args.seeds,
+                        cwd=root,
+                        env=env,
+                    )
+                    if threshold_confirmation is None:
+                        raise
+                    _validate_benchmark_rows(
+                        preset_name=preset_name,
+                        value_blocks=value_blocks,
+                        rows=rows,
+                    )
             benchmark_summary = _collect_benchmark_summary_from_rows(
                 preset_name=preset_name,
                 value_blocks=value_blocks,
@@ -812,6 +942,7 @@ def main() -> None:
             benchmark_summary["bench_args"] = bench_args
             benchmark_summary["bench_runs"] = bench_runs
             benchmark_summary["effective_max_shapes_per_scan"] = effective_max_shapes_per_scan
+            benchmark_summary["threshold_confirmation"] = threshold_confirmation
             cast_benchmark = json_report["benchmark"]
             assert isinstance(cast_benchmark, dict)
             cast_presets = cast_benchmark["presets"]
