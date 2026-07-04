@@ -68,6 +68,7 @@ ARC_BENCH_EXPECTATIONS = {
         expected_row_count=13,
         ratio_field="default_speed_ratio",
         max_ratio=1.15,
+        default_compare_ratio_delta=0.025,
         default_value_block=16,
         default_strategy="tiled",
     ),
@@ -77,6 +78,7 @@ ARC_BENCH_EXPECTATIONS = {
         expected_row_count=11,
         ratio_field="default_speed_ratio",
         max_ratio=1.03,
+        default_compare_ratio_delta=0.015,
         default_value_block=16,
         default_strategy="tiled",
     ),
@@ -86,6 +88,7 @@ ARC_BENCH_EXPECTATIONS = {
         expected_row_count=10,
         ratio_field="auto_speed_ratio",
         max_ratio=1.02,
+        default_compare_ratio_delta=0.02,
     ),
     ARC_LEGACY_V128_BLOCK8_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_auto_compare",
@@ -93,6 +96,7 @@ ARC_BENCH_EXPECTATIONS = {
         expected_row_count=12,
         ratio_field="auto_speed_ratio",
         max_ratio=1.08,
+        default_compare_ratio_delta=0.01,
     ),
     ARC_WATCH_V128_BLOCK8_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_auto_compare",
