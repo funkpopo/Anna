@@ -425,6 +425,20 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (2, 32, 64),
         (4, 32, 64),
     ),
+    # Fast A770 regression watchlist for the forced V=64/value_block=16 path,
+    # which now also prefers the single-group decode strategy.
+    "arc-watch-v64-block16": (
+        (1, 8, 64),
+        (8, 8, 64),
+        (32, 8, 64),
+        (128, 8, 64),
+        (2, 16, 64),
+        (8, 16, 64),
+        (32, 16, 64),
+        (2, 32, 64),
+        (8, 32, 64),
+        (32, 32, 64),
+    ),
     "arc-legacy-v128-block8": (
         (4, 8, 128),
         (8, 8, 128),
@@ -567,6 +581,7 @@ GDN_DECODE_PRESET_VALUE_BLOCKS: dict[str, tuple[int, ...]] = {
     "arc-default": (4, 8),
     "arc-v64-default-block16": (8,),
     "arc-legacy-v64-block8": (8,),
+    "arc-watch-v64-block16": (16,),
     "arc-legacy-v128-block8": (8,),
     "arc-watch-v128-block8": (8,),
     "arc-watch-v128-default8-vs-block16": (16,),

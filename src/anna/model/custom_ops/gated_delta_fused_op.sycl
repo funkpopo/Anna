@@ -296,11 +296,13 @@ constexpr GatedDeltaDecodeValueBlockRowOverride kGatedDeltaDecodeValueBlockRowOv
     {"arc", 128, 256, 264, 304, 8},
 };
 
-// Arc A770 decode sweeps keep V=64 special-cased, while V=128/value_block>=8
-// and V=256/value_block>=4 now stay tiled after the tiled subgroup-span remap.
+// Arc A770 decode sweeps keep V=64 on the single-group path for the common
+// block widths {8,16}, while V=128/value_block>=8 and V=256/value_block>=4
+// stay tiled after the tiled subgroup-span remap and the static full-tile
+// specialization.
 constexpr GatedDeltaDecodeAutoStrategyOverride kGatedDeltaDecodeAutoStrategyOverrides[] = {
     {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 1, 8, GatedDeltaDecodeStrategy::SingleGroup},
-    {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 16, 16, GatedDeltaDecodeStrategy::TiledValue},
+    {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 16, 16, GatedDeltaDecodeStrategy::SingleGroup},
 };
 
 constexpr GatedDeltaDecodeAutoCutover kGatedDeltaDecodeAutoCutovers[] = {

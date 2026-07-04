@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 ARC_DEFAULT_PRESET = "arc-default"
 ARC_V64_DEFAULT_BLOCK16_PRESET = "arc-v64-default-block16"
 ARC_LEGACY_V64_BLOCK8_PRESET = "arc-legacy-v64-block8"
+ARC_WATCH_V64_BLOCK16_PRESET = "arc-watch-v64-block16"
 ARC_LEGACY_V128_BLOCK8_PRESET = "arc-legacy-v128-block8"
 ARC_WATCH_V128_BLOCK8_PRESET = "arc-watch-v128-block8"
 ARC_WATCH_V128_DEFAULT8_VS_BLOCK16_PRESET = "arc-watch-v128-default8-vs-block16"
@@ -37,6 +38,7 @@ DEFAULT_PRESETS = (
     ARC_LEGACY_V256_BLOCK4_PRESET,
 )
 ALL_PRESETS = DEFAULT_PRESETS + (
+    ARC_WATCH_V64_BLOCK16_PRESET,
     ARC_WATCH_V128_BLOCK8_PRESET,
     ARC_WATCH_V128_DEFAULT8_VS_BLOCK16_PRESET,
     ARC_WATCH_V256_BLOCK4_PRESET,
@@ -54,6 +56,7 @@ PRESET_ALIASES: dict[str, tuple[str, ...]] = {
     FULL_PRESET_ALIAS: DEFAULT_PRESETS,
     QUICK_PRESET_ALIAS: QUICK_PRESETS,
     WATCH_PRESET_ALIAS: (
+        ARC_WATCH_V64_BLOCK16_PRESET,
         ARC_WATCH_V128_BLOCK8_PRESET,
         ARC_WATCH_V128_DEFAULT8_VS_BLOCK16_PRESET,
         ARC_WATCH_V256_BLOCK4_PRESET,
@@ -102,6 +105,14 @@ ARC_BENCH_EXPECTATIONS = {
         ratio_field="auto_speed_ratio",
         max_ratio=1.02,
         default_compare_ratio_delta=0.02,
+    ),
+    ARC_WATCH_V64_BLOCK16_PRESET: ArcBenchExpectation(
+        compare_prefix="gdn_decode_auto_compare",
+        expected_value_blocks=(16,),
+        expected_row_count=10,
+        ratio_field="auto_speed_ratio",
+        max_ratio=1.02,
+        default_compare_ratio_delta=0.01,
     ),
     ARC_LEGACY_V128_BLOCK8_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_auto_compare",
