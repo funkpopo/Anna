@@ -56,6 +56,7 @@ class ArcBenchExpectation:
     expected_row_count: int
     ratio_field: str
     max_ratio: float
+    default_compare_ratio_delta: float | None = None
     default_value_block: int | None = None
     default_strategy: str | None = None
 
@@ -99,6 +100,7 @@ ARC_BENCH_EXPECTATIONS = {
         expected_row_count=8,
         ratio_field="auto_speed_ratio",
         max_ratio=1.02,
+        default_compare_ratio_delta=0.005,
     ),
     ARC_LEGACY_V256_BLOCK4_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_auto_compare",
@@ -113,6 +115,7 @@ ARC_BENCH_EXPECTATIONS = {
         expected_row_count=13,
         ratio_field="auto_speed_ratio",
         max_ratio=1.02,
+        default_compare_ratio_delta=0.005,
     ),
 }
 
@@ -535,6 +538,24 @@ def _preset_help_text() -> str:
         f"Preset names: {', '.join(ALL_PRESETS)}. "
         f"Aliases: {'; '.join(alias_parts)}."
     )
+
+
+def _resolve_compare_ratio_delta(
+    requested_compare_ratio_delta: float | None,
+    *,
+    preset_names: list[str],
+) -> float:
+    if requested_compare_ratio_delta is not None:
+        return requested_compare_ratio_delta
+
+    preset_defaults = [
+        expectation.default_compare_ratio_delta
+        for preset_name, expectation in ARC_BENCH_EXPECTATIONS.items()
+        if preset_name in preset_names and expectation.default_compare_ratio_delta is not None
+    ]
+    if preset_defaults:
+        return max(float(value) for value in preset_defaults)
+    return DEFAULT_COMPARE_RATIO_DELTA
 
 
 def _parse_gdn_decode_value_blocks(output: str) -> tuple[int, ...]:
@@ -1012,8 +1033,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--compare-ratio-delta",
         type=float,
-        default=DEFAULT_COMPARE_RATIO_DELTA,
-        help="Maximum allowed increase in per-row speed-ratio metrics versus --compare-json.",
+        default=None,
+        help=(
+            "Maximum allowed increase in per-row speed-ratio metrics versus --compare-json. "
+            "When omitted, watch presets use tighter preset-aware defaults and other presets use 0.03."
+        ),
     )
     return parser
 
@@ -1021,6 +1045,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_parser().parse_args()
     preset_names = _parse_preset_names(args.presets)
+    compare_ratio_delta = _resolve_compare_ratio_delta(
+        args.compare_ratio_delta,
+        preset_names=preset_names,
+    )
     root = _repo_root()
     op_lib_path = Path(args.op_lib).expanduser() if args.op_lib is not None else _default_op_lib_path(root)
     env = os.environ.copy()
@@ -1043,7 +1071,7 @@ def main() -> None:
         },
         "comparison": {
             "baseline_json": args.compare_json,
-            "max_ratio_delta": args.compare_ratio_delta,
+            "max_ratio_delta": compare_ratio_delta,
             "presets": {},
         },
         "pytest": {
@@ -1135,14 +1163,14 @@ def main() -> None:
                     comparison_summary = _compare_benchmark_summary_against_baseline(
                         current_summary=benchmark_summary,
                         baseline_summary=baseline_presets[preset_name],
-                        max_ratio_delta=args.compare_ratio_delta,
+                        max_ratio_delta=compare_ratio_delta,
                     )
                 except ValueError:
                     comparison_confirmation, benchmark_summary = _confirm_benchmark_compare_ratio_failures(
                         preset_name=preset_name,
                         current_summary=benchmark_summary,
                         baseline_summary=baseline_presets[preset_name],
-                        max_ratio_delta=args.compare_ratio_delta,
+                        max_ratio_delta=compare_ratio_delta,
                         seeds_csv=args.seeds,
                         cwd=root,
                         env=env,
@@ -1153,7 +1181,7 @@ def main() -> None:
                     comparison_summary = _compare_benchmark_summary_against_baseline(
                         current_summary=benchmark_summary,
                         baseline_summary=baseline_presets[preset_name],
-                        max_ratio_delta=args.compare_ratio_delta,
+                        max_ratio_delta=compare_ratio_delta,
                     )
                 comparison_summary["delta_confirmation"] = comparison_confirmation
                 cast_comparison = json_report["comparison"]

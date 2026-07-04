@@ -41,6 +41,7 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     _parse_benchmark_output_rows_and_value_blocks,
     _parse_gdn_decode_value_blocks,
     _parse_preset_names,
+    _resolve_compare_ratio_delta,
     _resolve_validate_bench_max_shapes_per_scan,
     _run_benchmark_for_preset,
     _validate_benchmark_config_against_baseline,
@@ -246,10 +247,34 @@ def test_validate_script_help_runs_without_preseeded_pythonpath() -> None:
     assert "watch" in normalized_stdout
     assert "watch-v128-block8" in normalized_stdout
     assert "watch-v256-block4" in normalized_stdout
+    assert "preset-aware defaults" in normalized_stdout
 
 
 def test_build_parser_defaults_to_full_alias() -> None:
     assert _build_parser().parse_args([]).presets == "full"
+    assert _build_parser().parse_args([]).compare_ratio_delta is None
+
+
+def test_resolve_compare_ratio_delta_uses_watch_default_when_omitted() -> None:
+    assert _resolve_compare_ratio_delta(None, preset_names=["arc-watch-v128-block8"]) == pytest.approx(0.005)
+    assert _resolve_compare_ratio_delta(None, preset_names=["arc-watch-v256-block4"]) == pytest.approx(0.005)
+    assert _resolve_compare_ratio_delta(
+        None,
+        preset_names=["arc-watch-v128-block8", "arc-watch-v256-block4"],
+    ) == pytest.approx(0.005)
+
+
+def test_resolve_compare_ratio_delta_falls_back_to_global_default_for_non_watch_presets() -> None:
+    assert _resolve_compare_ratio_delta(None, preset_names=["arc-default"]) == pytest.approx(
+        DEFAULT_COMPARE_RATIO_DELTA
+    )
+    assert _resolve_compare_ratio_delta(None, preset_names=["arc-legacy-v128-block8"]) == pytest.approx(
+        DEFAULT_COMPARE_RATIO_DELTA
+    )
+
+
+def test_resolve_compare_ratio_delta_prefers_explicit_override() -> None:
+    assert _resolve_compare_ratio_delta(0.0125, preset_names=["arc-watch-v256-block4"]) == pytest.approx(0.0125)
 
 
 def test_validate_and_collect_benchmark_rows_match_output_wrappers() -> None:
