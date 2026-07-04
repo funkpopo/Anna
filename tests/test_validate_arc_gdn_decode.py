@@ -19,9 +19,12 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
     ARC_WATCH_V256_BLOCK4_PRESET,
+    DEFAULT_PRESETS,
+    QUICK_PRESETS,
     DEFAULT_BENCH_TIMING_REPEATS,
     DEFAULT_COMPARE_RATIO_DELTA,
     _bench_args_for_preset,
+    _build_parser,
     _chunk_shape_cases,
     _confirm_benchmark_ratio_failures,
     _compare_benchmark_summary_against_baseline,
@@ -55,8 +58,15 @@ def test_parse_preset_names_preserves_order() -> None:
     ]
 
 
+def test_parse_preset_names_expands_aliases_and_dedupes() -> None:
+    assert _parse_preset_names("quick,arc-legacy-v256-block4,watch,ARC-DEFAULT") == [
+        *QUICK_PRESETS,
+        ARC_LEGACY_V256_BLOCK4_PRESET,
+    ]
+
+
 def test_parse_preset_names_rejects_unknown_values() -> None:
-    with pytest.raises(ValueError, match="Unknown preset"):
+    with pytest.raises(ValueError, match="Unknown preset token"):
         _parse_preset_names("arc-default,unknown-preset")
 
 
@@ -199,6 +209,10 @@ def test_parse_preset_names_accepts_watch_preset() -> None:
     assert _parse_preset_names("arc-watch-v256-block4") == [ARC_WATCH_V256_BLOCK4_PRESET]
 
 
+def test_parse_preset_names_accepts_full_alias() -> None:
+    assert _parse_preset_names("full") == list(DEFAULT_PRESETS)
+
+
 def test_validate_script_help_runs_without_preseeded_pythonpath() -> None:
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
@@ -214,7 +228,13 @@ def test_validate_script_help_runs_without_preseeded_pythonpath() -> None:
     )
     assert completed.returncode == 0, completed.stderr
     normalized_stdout = " ".join(completed.stdout.split())
+    assert "quick" in normalized_stdout
+    assert "watch" in normalized_stdout
     assert "watch-v256-block4" in normalized_stdout
+
+
+def test_build_parser_defaults_to_full_alias() -> None:
+    assert _build_parser().parse_args([]).presets == "full"
 
 
 def test_validate_and_collect_benchmark_rows_match_output_wrappers() -> None:

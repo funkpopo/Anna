@@ -20,6 +20,9 @@ ARC_LEGACY_V64_BLOCK8_PRESET = "arc-legacy-v64-block8"
 ARC_LEGACY_V128_BLOCK8_PRESET = "arc-legacy-v128-block8"
 ARC_LEGACY_V256_BLOCK4_PRESET = "arc-legacy-v256-block4"
 ARC_WATCH_V256_BLOCK4_PRESET = "arc-watch-v256-block4"
+FULL_PRESET_ALIAS = "full"
+QUICK_PRESET_ALIAS = "quick"
+WATCH_PRESET_ALIAS = "watch"
 DEFAULT_BENCH_TIMING_REPEATS = 5
 
 DEFAULT_PRESETS = (
@@ -30,6 +33,19 @@ DEFAULT_PRESETS = (
     ARC_LEGACY_V256_BLOCK4_PRESET,
 )
 ALL_PRESETS = DEFAULT_PRESETS + (ARC_WATCH_V256_BLOCK4_PRESET,)
+QUICK_PRESETS = (
+    ARC_DEFAULT_PRESET,
+    ARC_V64_DEFAULT_BLOCK16_PRESET,
+    ARC_LEGACY_V64_BLOCK8_PRESET,
+    ARC_LEGACY_V128_BLOCK8_PRESET,
+    ARC_WATCH_V256_BLOCK4_PRESET,
+)
+PRESET_ALIASES: dict[str, tuple[str, ...]] = {
+    FULL_PRESET_ALIAS: DEFAULT_PRESETS,
+    QUICK_PRESET_ALIAS: QUICK_PRESETS,
+    WATCH_PRESET_ALIAS: (ARC_WATCH_V256_BLOCK4_PRESET,),
+}
+ALL_PRESET_TOKENS = tuple(PRESET_ALIASES) + ALL_PRESETS
 
 
 @dataclass(frozen=True)
@@ -477,15 +493,40 @@ def _run_benchmark_for_shape_cases(
 
 
 def _parse_preset_names(raw: str) -> list[str]:
-    preset_names = [item.strip() for item in raw.split(",") if item.strip()]
-    if not preset_names:
+    preset_tokens = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    if not preset_tokens:
         raise ValueError("--presets must contain at least one preset name")
-    unknown = [preset_name for preset_name in preset_names if preset_name not in ALL_PRESETS]
+    resolved_preset_names: list[str] = []
+    seen: set[str] = set()
+    unknown: list[str] = []
+    for preset_token in preset_tokens:
+        if preset_token in PRESET_ALIASES:
+            expanded_preset_names = PRESET_ALIASES[preset_token]
+        elif preset_token in ALL_PRESETS:
+            expanded_preset_names = (preset_token,)
+        else:
+            unknown.append(preset_token)
+            continue
+        for preset_name in expanded_preset_names:
+            if preset_name in seen:
+                continue
+            seen.add(preset_name)
+            resolved_preset_names.append(preset_name)
     if unknown:
         raise ValueError(
-            f"Unknown preset(s): {', '.join(unknown)}. Available presets: {', '.join(ALL_PRESETS)}"
+            f"Unknown preset token(s): {', '.join(unknown)}. "
+            f"Available preset names and aliases: {', '.join(ALL_PRESET_TOKENS)}"
         )
-    return preset_names
+    return resolved_preset_names
+
+
+def _preset_help_text() -> str:
+    alias_parts = [f"{alias}=[{', '.join(preset_names)}]" for alias, preset_names in PRESET_ALIASES.items()]
+    return (
+        "Comma-separated Arc decode presets or aliases to benchmark. "
+        f"Preset names: {', '.join(ALL_PRESETS)}. "
+        f"Aliases: {'; '.join(alias_parts)}."
+    )
 
 
 def _parse_gdn_decode_value_blocks(output: str) -> tuple[int, ...]:
@@ -773,11 +814,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--presets",
         type=str,
-        default=",".join(DEFAULT_PRESETS),
-        help=(
-            "Comma-separated Arc decode presets to benchmark. "
-            f"Available presets: {', '.join(ALL_PRESETS)}."
-        ),
+        default=FULL_PRESET_ALIAS,
+        help=_preset_help_text(),
     )
     parser.add_argument(
         "--seeds",
