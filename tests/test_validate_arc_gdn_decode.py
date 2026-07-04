@@ -19,14 +19,20 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     DEFAULT_BENCH_TIMING_REPEATS,
     DEFAULT_COMPARE_RATIO_DELTA,
     _bench_args_for_preset,
+    _chunk_shape_cases,
     _compare_benchmark_summary_against_baseline,
     _collect_benchmark_summary,
+    _collect_benchmark_summary_from_rows,
     _load_json_report,
     _parse_gdn_decode_csv_rows,
+    _parse_benchmark_output_rows_and_value_blocks,
     _parse_gdn_decode_value_blocks,
     _parse_preset_names,
+    _resolve_validate_bench_max_shapes_per_scan,
+    _run_benchmark_for_preset,
     _validate_benchmark_config_against_baseline,
     _validate_benchmark_output,
+    _validate_benchmark_rows,
     _write_json_report,
 )
 
@@ -80,6 +86,17 @@ def test_bench_args_for_preset_uses_expected_compare_flag(
 def test_parse_gdn_decode_value_blocks_extracts_csv() -> None:
     output = "shape ...\ngdn_decode_value_blocks=16\n"
     assert _parse_gdn_decode_value_blocks(output) == (16,)
+
+
+def test_validate_bench_chunk_helpers_auto_chunk_only_large_presets() -> None:
+    assert _resolve_validate_bench_max_shapes_per_scan(None, shape_count=32) is None
+    assert _resolve_validate_bench_max_shapes_per_scan(None, shape_count=33) == 16
+    assert _resolve_validate_bench_max_shapes_per_scan(24, shape_count=64) == 24
+    assert _chunk_shape_cases([(idx, 8, 256) for idx in range(1, 6)], max_shapes_per_scan=2) == [
+        [(1, 8, 256), (2, 8, 256)],
+        [(3, 8, 256), (4, 8, 256)],
+        [(5, 8, 256)],
+    ]
 
 
 def test_parse_gdn_decode_csv_rows_extracts_header_and_rows() -> None:
@@ -170,6 +187,75 @@ def test_collect_benchmark_summary_reports_worst_ratio() -> None:
     assert summary["observed_max_ratio"] == pytest.approx(1.03)
     assert summary["row_count"] == len(GDN_DECODE_SHAPE_PRESETS[ARC_LEGACY_V256_BLOCK4_PRESET])
 
+
+def test_validate_and_collect_benchmark_rows_match_output_wrappers() -> None:
+    output = _make_benchmark_output_for_preset(ARC_LEGACY_V256_BLOCK4_PRESET, ratio=1.02)
+    value_blocks, rows = _parse_benchmark_output_rows_and_value_blocks(output, ARC_LEGACY_V256_BLOCK4_PRESET)
+    _validate_benchmark_rows(
+        preset_name=ARC_LEGACY_V256_BLOCK4_PRESET,
+        value_blocks=value_blocks,
+        rows=rows,
+    )
+    summary = _collect_benchmark_summary_from_rows(
+        preset_name=ARC_LEGACY_V256_BLOCK4_PRESET,
+        value_blocks=value_blocks,
+        rows=rows,
+    )
+    assert summary == _collect_benchmark_summary(output, ARC_LEGACY_V256_BLOCK4_PRESET)
+
+
+def test_run_benchmark_for_preset_chunks_large_preset_and_merges_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], bool]] = []
+
+    def fake_run_step(*, args, cwd, env, label, capture_output):
+        calls.append((args, capture_output))
+        if not capture_output:
+            return None
+        shape_cases = args[args.index("--gdn-decode-shape-cases") + 1].split(",")
+        lines = [
+            "gdn_decode_value_blocks=4",
+            "gdn_decode_auto_compare,device_name,batch,heads,key_head_dim,value_head_dim,value_block,auto_strategy,"
+            "single_ms,tiled_ms,auto_ms,best_explicit_strategy,best_explicit_ms,auto_minus_best_ms,"
+            "auto_speed_ratio,max_abs_diff",
+        ]
+        for shape_case in shape_cases:
+            batch_size, num_heads, value_head_dim = shape_case.split("x")
+            lines.append(
+                "gdn_decode_auto_compare,Intel Arc,"
+                f"{batch_size},{num_heads},128,{value_head_dim},4,tiled,0.3000,0.2000,0.2010,tiled,0.2000,0.0010,1.0050,0.000100"
+            )
+        return "\n".join(lines)
+
+    monkeypatch.setattr("tools.validate_arc_gdn_decode._run_step", fake_run_step)
+
+    requested_args, bench_runs, value_blocks, rows, effective_max_shapes_per_scan = _run_benchmark_for_preset(
+        preset_name=ARC_LEGACY_V256_BLOCK4_PRESET,
+        warmup=7,
+        iters=11,
+        timing_repeats=DEFAULT_BENCH_TIMING_REPEATS,
+        seeds_csv="20260960,20260961",
+        cwd=Path.cwd(),
+        env={},
+        max_shapes_per_scan=None,
+    )
+
+    assert requested_args[requested_args.index("--gdn-decode-shape-presets") + 1] == ARC_LEGACY_V256_BLOCK4_PRESET
+    assert len(bench_runs) == 3
+    assert len(calls) == 6
+    assert sum(1 for _, capture_output in calls if not capture_output) == 3
+    assert sum(1 for _, capture_output in calls if capture_output) == 3
+    prime_calls = [args for args, capture_output in calls if not capture_output]
+    assert all(prime_args[prime_args.index("--warmup") + 1] == "1" for prime_args in prime_calls)
+    assert all(prime_args[prime_args.index("--iters") + 1] == "1" for prime_args in prime_calls)
+    assert all(
+        prime_args[prime_args.index("--gdn-decode-timing-repeats") + 1] == "1"
+        for prime_args in prime_calls
+    )
+    assert effective_max_shapes_per_scan == 16
+    assert value_blocks == (4,)
+    assert len(rows) == len(GDN_DECODE_SHAPE_PRESETS[ARC_LEGACY_V256_BLOCK4_PRESET])
 
 def test_write_json_report_creates_parent_directories(tmp_path: Path) -> None:
     output_path = tmp_path / "nested" / "arc_gdn_decode.json"

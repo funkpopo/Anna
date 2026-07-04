@@ -89,6 +89,11 @@ DEFAULT_PYTEST_EXPR = (
 )
 
 DEFAULT_COMPARE_RATIO_DELTA = 0.03
+DEFAULT_VALIDATE_BENCH_CHUNK_THRESHOLD = 32
+DEFAULT_VALIDATE_BENCH_MAX_SHAPES_PER_SCAN = 16
+DEFAULT_VALIDATE_BENCH_PRIME_WARMUP = 1
+DEFAULT_VALIDATE_BENCH_PRIME_ITERS = 1
+DEFAULT_VALIDATE_BENCH_PRIME_TIMING_REPEATS = 1
 
 
 def _repo_root() -> Path:
@@ -176,6 +181,253 @@ def _bench_args_for_preset(
     ]
 
 
+def _bench_args_for_shape_chunk(
+    *,
+    preset_name: str,
+    shape_cases: list[tuple[int, int, int]],
+    warmup: int,
+    iters: int,
+    timing_repeats: int,
+    seeds_csv: str,
+) -> list[str]:
+    expectation = ARC_BENCH_EXPECTATIONS[preset_name]
+    compare_flag = (
+        "--gdn-decode-default-compare"
+        if expectation.compare_prefix == "gdn_decode_default_compare"
+        else "--gdn-decode-auto-compare"
+    )
+    shape_cases_csv = ",".join(f"{batch_size}x{num_heads}x{value_head_dim}" for batch_size, num_heads, value_head_dim in shape_cases)
+    args = [
+        sys.executable,
+        "tools/bench_xpu_hotspots.py",
+        "--gdn-decode-only",
+        compare_flag,
+        "--gdn-decode-compare-only",
+        "--head-dim",
+        "128",
+        "--gdn-decode-shape-cases",
+        shape_cases_csv,
+        "--gdn-decode-seeds",
+        seeds_csv,
+        "--dtype",
+        "bf16",
+        "--warmup",
+        str(warmup),
+        "--iters",
+        str(iters),
+        "--gdn-decode-timing-repeats",
+        str(timing_repeats),
+    ]
+    if expectation.expected_value_blocks and expectation.compare_prefix == "gdn_decode_auto_compare":
+        args.extend(
+            [
+                "--gdn-decode-value-blocks",
+                ",".join(str(value_block) for value_block in expectation.expected_value_blocks),
+            ]
+        )
+    return args
+
+
+def _resolve_validate_bench_max_shapes_per_scan(
+    requested_max_shapes_per_scan: int | None,
+    *,
+    shape_count: int,
+) -> int | None:
+    if requested_max_shapes_per_scan is not None:
+        return requested_max_shapes_per_scan
+    if shape_count > DEFAULT_VALIDATE_BENCH_CHUNK_THRESHOLD:
+        return DEFAULT_VALIDATE_BENCH_MAX_SHAPES_PER_SCAN
+    return None
+
+
+def _chunk_shape_cases(
+    shape_cases: list[tuple[int, int, int]],
+    *,
+    max_shapes_per_scan: int | None,
+) -> list[list[tuple[int, int, int]]]:
+    if max_shapes_per_scan is None or max_shapes_per_scan <= 0 or len(shape_cases) <= max_shapes_per_scan:
+        return [list(shape_cases)]
+    return [
+        shape_cases[start : start + max_shapes_per_scan]
+        for start in range(0, len(shape_cases), max_shapes_per_scan)
+    ]
+
+
+def _parse_benchmark_output_rows_and_value_blocks(output: str, preset_name: str) -> tuple[tuple[int, ...], list[dict[str, str]]]:
+    expectation = ARC_BENCH_EXPECTATIONS[preset_name]
+    value_blocks = _parse_gdn_decode_value_blocks(output)
+    rows = _parse_gdn_decode_csv_rows(output, expectation.compare_prefix)
+    return value_blocks, rows
+
+
+def _validate_benchmark_rows(
+    *,
+    preset_name: str,
+    value_blocks: tuple[int, ...],
+    rows: list[dict[str, str]],
+) -> None:
+    expectation = ARC_BENCH_EXPECTATIONS[preset_name]
+    if value_blocks != expectation.expected_value_blocks:
+        raise ValueError(
+            f"{preset_name} resolved value blocks {value_blocks}, expected {expectation.expected_value_blocks}"
+        )
+
+    if len(rows) != expectation.expected_row_count:
+        raise ValueError(f"{preset_name} produced {len(rows)} compare rows, expected {expectation.expected_row_count}")
+
+    if expectation.default_value_block is not None:
+        bad_rows = [
+            row for row in rows if int(row["default_value_block"]) != expectation.default_value_block
+        ]
+        if bad_rows:
+            raise ValueError(
+                f"{preset_name} emitted default_value_block values outside {expectation.default_value_block}: {bad_rows[0]}"
+            )
+    if expectation.default_strategy is not None:
+        bad_rows = [row for row in rows if row["default_strategy"] != expectation.default_strategy]
+        if bad_rows:
+            raise ValueError(
+                f"{preset_name} emitted default_strategy values outside {expectation.default_strategy}: {bad_rows[0]}"
+            )
+    if rows and "value_block" in rows[0]:
+        bad_rows = [row for row in rows if int(row["value_block"]) not in expectation.expected_value_blocks]
+        if bad_rows:
+            raise ValueError(
+                f"{preset_name} emitted unexpected value_block outside {expectation.expected_value_blocks}: {bad_rows[0]}"
+            )
+
+    worst_row = max(rows, key=lambda row: float(row[expectation.ratio_field]))
+    worst_ratio = float(worst_row[expectation.ratio_field])
+    if worst_ratio > expectation.max_ratio:
+        raise ValueError(
+            f"{preset_name} exceeded {expectation.ratio_field} threshold {expectation.max_ratio:.3f}: "
+            f"observed {worst_ratio:.4f} on batch={worst_row['batch']} heads={worst_row['heads']} "
+            f"value_dim={worst_row['value_head_dim']}"
+        )
+    print(
+        f"[validate:{preset_name}] max_{expectation.ratio_field}={worst_ratio:.4f} "
+        f"rows={len(rows)} value_blocks={value_blocks}",
+        flush=True,
+    )
+
+
+def _collect_benchmark_summary_from_rows(
+    *,
+    preset_name: str,
+    value_blocks: tuple[int, ...],
+    rows: list[dict[str, str]],
+) -> dict[str, object]:
+    expectation = ARC_BENCH_EXPECTATIONS[preset_name]
+    worst_row = max(rows, key=lambda row: float(row[expectation.ratio_field]))
+    worst_ratio = float(worst_row[expectation.ratio_field])
+    return {
+        "preset": preset_name,
+        "compare_prefix": expectation.compare_prefix,
+        "expected_value_blocks": list(expectation.expected_value_blocks),
+        "resolved_value_blocks": list(value_blocks),
+        "ratio_field": expectation.ratio_field,
+        "max_ratio_allowed": expectation.max_ratio,
+        "observed_max_ratio": worst_ratio,
+        "row_count": len(rows),
+        "rows": rows,
+        "worst_row": worst_row,
+    }
+
+
+def _run_benchmark_for_preset(
+    *,
+    preset_name: str,
+    warmup: int,
+    iters: int,
+    timing_repeats: int,
+    seeds_csv: str,
+    cwd: Path,
+    env: dict[str, str],
+    max_shapes_per_scan: int | None,
+) -> tuple[list[str], list[list[str]], tuple[int, ...], list[dict[str, str]], int | None]:
+    from tools.bench_xpu_hotspots import GDN_DECODE_SHAPE_PRESETS
+
+    requested_bench_args = _bench_args_for_preset(
+        preset_name=preset_name,
+        warmup=warmup,
+        iters=iters,
+        timing_repeats=timing_repeats,
+        seeds_csv=seeds_csv,
+    )
+    shape_cases = list(GDN_DECODE_SHAPE_PRESETS[preset_name])
+    effective_max_shapes_per_scan = _resolve_validate_bench_max_shapes_per_scan(
+        max_shapes_per_scan,
+        shape_count=len(shape_cases),
+    )
+    case_chunks = _chunk_shape_cases(shape_cases, max_shapes_per_scan=effective_max_shapes_per_scan)
+    if len(case_chunks) > 1:
+        print(
+            f"[chunking:{preset_name}] shape_count={len(shape_cases)} "
+            f"max_shapes_per_scan={effective_max_shapes_per_scan} chunks={len(case_chunks)}",
+            flush=True,
+        )
+
+    bench_runs: list[list[str]] = []
+    rows: list[dict[str, str]] = []
+    resolved_value_blocks: tuple[int, ...] | None = None
+    for chunk_index, case_chunk in enumerate(case_chunks, start=1):
+        if len(case_chunks) > 1:
+            prime_args = _bench_args_for_shape_chunk(
+                preset_name=preset_name,
+                shape_cases=case_chunk,
+                warmup=DEFAULT_VALIDATE_BENCH_PRIME_WARMUP,
+                iters=DEFAULT_VALIDATE_BENCH_PRIME_ITERS,
+                timing_repeats=DEFAULT_VALIDATE_BENCH_PRIME_TIMING_REPEATS,
+                seeds_csv=seeds_csv,
+            )
+            _run_step(
+                args=prime_args,
+                cwd=cwd,
+                env=env,
+                label=f"bench-prime:{preset_name}:{chunk_index}/{len(case_chunks)}",
+                capture_output=False,
+            )
+        bench_args = (
+            _bench_args_for_preset(
+                preset_name=preset_name,
+                warmup=warmup,
+                iters=iters,
+                timing_repeats=timing_repeats,
+                seeds_csv=seeds_csv,
+            )
+            if len(case_chunks) == 1
+            else _bench_args_for_shape_chunk(
+                preset_name=preset_name,
+                shape_cases=case_chunk,
+                warmup=warmup,
+                iters=iters,
+                timing_repeats=timing_repeats,
+                seeds_csv=seeds_csv,
+            )
+        )
+        bench_runs.append(bench_args)
+        label = f"bench:{preset_name}" if len(case_chunks) == 1 else f"bench:{preset_name}:{chunk_index}/{len(case_chunks)}"
+        output = _run_step(
+            args=bench_args,
+            cwd=cwd,
+            env=env,
+            label=label,
+            capture_output=True,
+        )
+        assert output is not None
+        chunk_value_blocks, chunk_rows = _parse_benchmark_output_rows_and_value_blocks(output, preset_name)
+        if resolved_value_blocks is None:
+            resolved_value_blocks = chunk_value_blocks
+        elif chunk_value_blocks != resolved_value_blocks:
+            raise ValueError(
+                f"{preset_name} resolved inconsistent value blocks across chunks: "
+                f"{resolved_value_blocks} vs {chunk_value_blocks}"
+            )
+        rows.extend(chunk_rows)
+    assert resolved_value_blocks is not None
+    return requested_bench_args, bench_runs, resolved_value_blocks, rows, effective_max_shapes_per_scan
+
+
 def _parse_preset_names(raw: str) -> list[str]:
     preset_names = [item.strip() for item in raw.split(",") if item.strip()]
     if not preset_names:
@@ -217,71 +469,17 @@ def _parse_gdn_decode_csv_rows(output: str, prefix: str) -> list[dict[str, str]]
 
 
 def _validate_benchmark_output(output: str, preset_name: str) -> None:
-    expectation = ARC_BENCH_EXPECTATIONS[preset_name]
-    value_blocks = _parse_gdn_decode_value_blocks(output)
-    if value_blocks != expectation.expected_value_blocks:
-        raise ValueError(
-            f"{preset_name} resolved value blocks {value_blocks}, expected {expectation.expected_value_blocks}"
-        )
-
-    rows = _parse_gdn_decode_csv_rows(output, expectation.compare_prefix)
-    if len(rows) != expectation.expected_row_count:
-        raise ValueError(f"{preset_name} produced {len(rows)} compare rows, expected {expectation.expected_row_count}")
-
-    if expectation.default_value_block is not None:
-        bad_rows = [
-            row for row in rows if int(row["default_value_block"]) != expectation.default_value_block
-        ]
-        if bad_rows:
-            raise ValueError(
-                f"{preset_name} emitted default_value_block values outside {expectation.default_value_block}: {bad_rows[0]}"
-            )
-    if expectation.default_strategy is not None:
-        bad_rows = [row for row in rows if row["default_strategy"] != expectation.default_strategy]
-        if bad_rows:
-            raise ValueError(
-                f"{preset_name} emitted default_strategy values outside {expectation.default_strategy}: {bad_rows[0]}"
-            )
-    if "value_block" in rows[0]:
-        bad_rows = [row for row in rows if int(row["value_block"]) not in expectation.expected_value_blocks]
-        if bad_rows:
-            raise ValueError(
-                f"{preset_name} emitted unexpected value_block outside {expectation.expected_value_blocks}: {bad_rows[0]}"
-            )
-
-    worst_row = max(rows, key=lambda row: float(row[expectation.ratio_field]))
-    worst_ratio = float(worst_row[expectation.ratio_field])
-    if worst_ratio > expectation.max_ratio:
-        raise ValueError(
-            f"{preset_name} exceeded {expectation.ratio_field} threshold {expectation.max_ratio:.3f}: "
-            f"observed {worst_ratio:.4f} on batch={worst_row['batch']} heads={worst_row['heads']} "
-            f"value_dim={worst_row['value_head_dim']}"
-        )
-    print(
-        f"[validate:{preset_name}] max_{expectation.ratio_field}={worst_ratio:.4f} "
-        f"rows={len(rows)} value_blocks={value_blocks}",
-        flush=True,
-    )
+    value_blocks, rows = _parse_benchmark_output_rows_and_value_blocks(output, preset_name)
+    _validate_benchmark_rows(preset_name=preset_name, value_blocks=value_blocks, rows=rows)
 
 
 def _collect_benchmark_summary(output: str, preset_name: str) -> dict[str, object]:
-    expectation = ARC_BENCH_EXPECTATIONS[preset_name]
-    value_blocks = _parse_gdn_decode_value_blocks(output)
-    rows = _parse_gdn_decode_csv_rows(output, expectation.compare_prefix)
-    worst_row = max(rows, key=lambda row: float(row[expectation.ratio_field]))
-    worst_ratio = float(worst_row[expectation.ratio_field])
-    return {
-        "preset": preset_name,
-        "compare_prefix": expectation.compare_prefix,
-        "expected_value_blocks": list(expectation.expected_value_blocks),
-        "resolved_value_blocks": list(value_blocks),
-        "ratio_field": expectation.ratio_field,
-        "max_ratio_allowed": expectation.max_ratio,
-        "observed_max_ratio": worst_ratio,
-        "row_count": len(rows),
-        "rows": rows,
-        "worst_row": worst_row,
-    }
+    value_blocks, rows = _parse_benchmark_output_rows_and_value_blocks(output, preset_name)
+    return _collect_benchmark_summary_from_rows(
+        preset_name=preset_name,
+        value_blocks=value_blocks,
+        rows=rows,
+    )
 
 
 def _write_json_report(path: Path, payload: dict[str, object]) -> None:
@@ -449,6 +647,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Repeated timing samples per decode candidate forwarded to tools/bench_xpu_hotspots.py.",
     )
     parser.add_argument(
+        "--max-shapes-per-scan",
+        type=int,
+        default=None,
+        help=(
+            "Split large benchmark presets into multiple benchmark invocations with at most this many shapes each. "
+            f"When omitted, presets larger than {DEFAULT_VALIDATE_BENCH_CHUNK_THRESHOLD} shapes auto-chunk into "
+            f"{DEFAULT_VALIDATE_BENCH_MAX_SHAPES_PER_SCAN}. Pass 0 to disable chunking."
+        ),
+    )
+    parser.add_argument(
         "--skip-bench",
         action="store_true",
         help="Skip the Arc decode benchmark preset commands.",
@@ -519,6 +727,7 @@ def main() -> None:
             "warmup": args.warmup,
             "iters": args.iters,
             "timing_repeats": args.timing_repeats,
+            "max_shapes_per_scan": args.max_shapes_per_scan,
             "skip_bench": args.skip_bench,
             "skip_bench_gates": args.skip_bench_gates,
             "presets": {},
@@ -558,24 +767,30 @@ def main() -> None:
 
     if not args.skip_bench:
         for preset_name in preset_names:
-            output = _run_step(
-                args=_bench_args_for_preset(
-                    preset_name=preset_name,
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    timing_repeats=args.timing_repeats,
-                    seeds_csv=args.seeds,
-                ),
+            bench_args, bench_runs, value_blocks, rows, effective_max_shapes_per_scan = _run_benchmark_for_preset(
+                preset_name=preset_name,
+                warmup=args.warmup,
+                iters=args.iters,
+                timing_repeats=args.timing_repeats,
+                seeds_csv=args.seeds,
                 cwd=root,
                 env=env,
-                label=f"bench:{preset_name}",
-                capture_output=True,
+                max_shapes_per_scan=args.max_shapes_per_scan,
             )
             if not args.skip_bench_gates:
-                assert output is not None
-                _validate_benchmark_output(output, preset_name)
-            assert output is not None
-            benchmark_summary = _collect_benchmark_summary(output, preset_name)
+                _validate_benchmark_rows(
+                    preset_name=preset_name,
+                    value_blocks=value_blocks,
+                    rows=rows,
+                )
+            benchmark_summary = _collect_benchmark_summary_from_rows(
+                preset_name=preset_name,
+                value_blocks=value_blocks,
+                rows=rows,
+            )
+            benchmark_summary["bench_args"] = bench_args
+            benchmark_summary["bench_runs"] = bench_runs
+            benchmark_summary["effective_max_shapes_per_scan"] = effective_max_shapes_per_scan
             cast_benchmark = json_report["benchmark"]
             assert isinstance(cast_benchmark, dict)
             cast_presets = cast_benchmark["presets"]
