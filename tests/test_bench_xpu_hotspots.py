@@ -31,6 +31,24 @@ def test_arc_legacy_v256_block4_preset_keeps_upper_edge_regression_shapes() -> N
     assert (37, 32, 256) in preset
 
 
+def test_arc_watch_v256_block4_preset_tracks_boundary_watch_shapes() -> None:
+    assert GDN_DECODE_SHAPE_PRESETS["arc-watch-v256-block4"] == (
+        (33, 8, 256),
+        (144, 8, 256),
+        (145, 8, 256),
+        (146, 8, 256),
+        (71, 16, 256),
+        (72, 16, 256),
+        (73, 16, 256),
+        (23, 32, 256),
+        (24, 32, 256),
+        (25, 32, 256),
+        (35, 32, 256),
+        (36, 32, 256),
+        (37, 32, 256),
+    )
+
+
 def test_parse_gdn_decode_shape_presets_preserves_order() -> None:
     assert _parse_gdn_decode_shape_presets("arc-default,arc-legacy-v256-block4") == [
         "arc-default",

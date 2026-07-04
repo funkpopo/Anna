@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -16,6 +18,7 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     ARC_V64_DEFAULT_BLOCK16_PRESET,
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
+    ARC_WATCH_V256_BLOCK4_PRESET,
     DEFAULT_BENCH_TIMING_REPEATS,
     DEFAULT_COMPARE_RATIO_DELTA,
     _bench_args_for_preset,
@@ -65,6 +68,7 @@ def test_parse_preset_names_rejects_unknown_values() -> None:
         (ARC_LEGACY_V64_BLOCK8_PRESET, "--gdn-decode-auto-compare"),
         (ARC_LEGACY_V128_BLOCK8_PRESET, "--gdn-decode-auto-compare"),
         (ARC_LEGACY_V256_BLOCK4_PRESET, "--gdn-decode-auto-compare"),
+        (ARC_WATCH_V256_BLOCK4_PRESET, "--gdn-decode-auto-compare"),
     ],
 )
 def test_bench_args_for_preset_uses_expected_compare_flag(
@@ -189,6 +193,28 @@ def test_collect_benchmark_summary_reports_worst_ratio() -> None:
     assert summary["resolved_value_blocks"] == [4]
     assert summary["observed_max_ratio"] == pytest.approx(1.03)
     assert summary["row_count"] == len(GDN_DECODE_SHAPE_PRESETS[ARC_LEGACY_V256_BLOCK4_PRESET])
+
+
+def test_parse_preset_names_accepts_watch_preset() -> None:
+    assert _parse_preset_names("arc-watch-v256-block4") == [ARC_WATCH_V256_BLOCK4_PRESET]
+
+
+def test_validate_script_help_runs_without_preseeded_pythonpath() -> None:
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    completed = subprocess.run(
+        [sys.executable, "tools/validate_arc_gdn_decode.py", "--help"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    normalized_stdout = " ".join(completed.stdout.split())
+    assert "watch-v256-block4" in normalized_stdout
 
 
 def test_validate_and_collect_benchmark_rows_match_output_wrappers() -> None:

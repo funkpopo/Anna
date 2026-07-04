@@ -478,6 +478,23 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (36, 32, 256),
         (37, 32, 256),
     ),
+    # Fast A770 regression watchlist for the V=256/value_block=4 row bands that
+    # have historically flipped strategy near the single-group override islands.
+    "arc-watch-v256-block4": (
+        (33, 8, 256),
+        (144, 8, 256),
+        (145, 8, 256),
+        (146, 8, 256),
+        (71, 16, 256),
+        (72, 16, 256),
+        (73, 16, 256),
+        (23, 32, 256),
+        (24, 32, 256),
+        (25, 32, 256),
+        (35, 32, 256),
+        (36, 32, 256),
+        (37, 32, 256),
+    ),
 }
 
 GDN_DECODE_PRESET_VALUE_BLOCKS: dict[str, tuple[int, ...]] = {
@@ -486,6 +503,7 @@ GDN_DECODE_PRESET_VALUE_BLOCKS: dict[str, tuple[int, ...]] = {
     "arc-legacy-v64-block8": (8,),
     "arc-legacy-v128-block8": (8,),
     "arc-legacy-v256-block4": (4,),
+    "arc-watch-v256-block4": (4,),
 }
 
 

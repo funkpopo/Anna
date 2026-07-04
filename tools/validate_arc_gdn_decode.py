@@ -9,12 +9,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 ARC_DEFAULT_PRESET = "arc-default"
 ARC_V64_DEFAULT_BLOCK16_PRESET = "arc-v64-default-block16"
 ARC_LEGACY_V64_BLOCK8_PRESET = "arc-legacy-v64-block8"
 ARC_LEGACY_V128_BLOCK8_PRESET = "arc-legacy-v128-block8"
 ARC_LEGACY_V256_BLOCK4_PRESET = "arc-legacy-v256-block4"
+ARC_WATCH_V256_BLOCK4_PRESET = "arc-watch-v256-block4"
 DEFAULT_BENCH_TIMING_REPEATS = 5
 
 DEFAULT_PRESETS = (
@@ -24,6 +29,7 @@ DEFAULT_PRESETS = (
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
 )
+ALL_PRESETS = DEFAULT_PRESETS + (ARC_WATCH_V256_BLOCK4_PRESET,)
 
 
 @dataclass(frozen=True)
@@ -77,6 +83,13 @@ ARC_BENCH_EXPECTATIONS = {
         ratio_field="auto_speed_ratio",
         max_ratio=1.03,
     ),
+    ARC_WATCH_V256_BLOCK4_PRESET: ArcBenchExpectation(
+        compare_prefix="gdn_decode_auto_compare",
+        expected_value_blocks=(4,),
+        expected_row_count=13,
+        ratio_field="auto_speed_ratio",
+        max_ratio=1.02,
+    ),
 }
 
 DEFAULT_PYTEST_EXPR = (
@@ -100,7 +113,7 @@ DEFAULT_VALIDATE_CONFIRM_TIMING_REPEATS = 9
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return REPO_ROOT
 
 
 def _default_op_lib_path(root: Path) -> Path:
@@ -467,10 +480,10 @@ def _parse_preset_names(raw: str) -> list[str]:
     preset_names = [item.strip() for item in raw.split(",") if item.strip()]
     if not preset_names:
         raise ValueError("--presets must contain at least one preset name")
-    unknown = [preset_name for preset_name in preset_names if preset_name not in DEFAULT_PRESETS]
+    unknown = [preset_name for preset_name in preset_names if preset_name not in ALL_PRESETS]
     if unknown:
         raise ValueError(
-            f"Unknown preset(s): {', '.join(unknown)}. Available presets: {', '.join(DEFAULT_PRESETS)}"
+            f"Unknown preset(s): {', '.join(unknown)}. Available presets: {', '.join(ALL_PRESETS)}"
         )
     return preset_names
 
@@ -763,7 +776,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=",".join(DEFAULT_PRESETS),
         help=(
             "Comma-separated Arc decode presets to benchmark. "
-            f"Available presets: {', '.join(DEFAULT_PRESETS)}."
+            f"Available presets: {', '.join(ALL_PRESETS)}."
         ),
     )
     parser.add_argument(
