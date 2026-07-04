@@ -326,6 +326,87 @@ def test_compare_benchmark_summary_against_baseline_accepts_small_drift() -> Non
     assert comparison["max_row_ratio_delta"] == pytest.approx(0.01)
 
 
+def test_compare_benchmark_summary_against_baseline_allows_extra_rows() -> None:
+    baseline = {
+        "preset": ARC_LEGACY_V256_BLOCK4_PRESET,
+        "compare_prefix": "gdn_decode_auto_compare",
+        "resolved_value_blocks": [4],
+        "ratio_field": "auto_speed_ratio",
+        "observed_max_ratio": 1.01,
+        "rows": [
+            {
+                "batch": "33",
+                "heads": "8",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_speed_ratio": "1.0000",
+            },
+            {
+                "batch": "65",
+                "heads": "8",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_speed_ratio": "1.0100",
+            },
+        ],
+    }
+    current = {
+        "preset": ARC_LEGACY_V256_BLOCK4_PRESET,
+        "compare_prefix": "gdn_decode_auto_compare",
+        "resolved_value_blocks": [4],
+        "ratio_field": "auto_speed_ratio",
+        "observed_max_ratio": 1.02,
+        "rows": [
+            {
+                "batch": "33",
+                "heads": "8",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_speed_ratio": "1.0050",
+            },
+            {
+                "batch": "65",
+                "heads": "8",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_speed_ratio": "1.0200",
+            },
+            {
+                "batch": "145",
+                "heads": "8",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_speed_ratio": "1.0150",
+            },
+        ],
+    }
+
+    comparison = _compare_benchmark_summary_against_baseline(
+        current_summary=current,
+        baseline_summary=baseline,
+        max_ratio_delta=DEFAULT_COMPARE_RATIO_DELTA,
+    )
+
+    assert comparison["overlap_row_count"] == 2
+    assert comparison["missing_row_count"] == 0
+    assert comparison["extra_row_count"] == 1
+    assert comparison["extra_rows"] == [
+        {
+            "batch": "145",
+            "heads": "8",
+            "key_head_dim": "128",
+            "value_head_dim": "256",
+            "value_block": "4",
+        }
+    ]
+    assert comparison["max_row_ratio_delta"] == pytest.approx(0.01)
+
+
 def test_compare_benchmark_summary_against_baseline_rejects_large_drift() -> None:
     baseline = _collect_benchmark_summary(
         _make_benchmark_output_for_preset(ARC_LEGACY_V256_BLOCK4_PRESET, ratio=1.00),

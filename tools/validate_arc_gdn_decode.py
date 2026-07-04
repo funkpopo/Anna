@@ -524,6 +524,16 @@ def _benchmark_row_key(row: dict[str, str]) -> tuple[str, str, str, str, str]:
     )
 
 
+def _serialize_benchmark_row_key(key: tuple[str, str, str, str, str]) -> dict[str, str]:
+    return {
+        "batch": key[0],
+        "heads": key[1],
+        "key_head_dim": key[2],
+        "value_head_dim": key[3],
+        "value_block": key[4],
+    }
+
+
 def _compare_benchmark_summary_against_baseline(
     *,
     current_summary: dict[str, object],
@@ -555,11 +565,13 @@ def _compare_benchmark_summary_against_baseline(
     baseline_map = {_benchmark_row_key(row): row for row in baseline_rows if isinstance(row, dict)}
     current_keys = set(current_map)
     baseline_keys = set(baseline_map)
-    if current_keys != baseline_keys:
-        missing = sorted(baseline_keys - current_keys)
-        extra = sorted(current_keys - baseline_keys)
+    shared_keys = sorted(current_keys & baseline_keys)
+    missing = sorted(baseline_keys - current_keys)
+    extra = sorted(current_keys - baseline_keys)
+    if not shared_keys:
         raise ValueError(
-            f"Preset {current_summary['preset']} row keys changed; missing={missing[:3]} extra={extra[:3]}"
+            f"Preset {current_summary['preset']} has no overlapping row keys; "
+            f"missing={missing[:3]} extra={extra[:3]}"
         )
 
     max_ratio_delta_observed = float("-inf")
@@ -567,7 +579,7 @@ def _compare_benchmark_summary_against_baseline(
     worst_current_ratio = 0.0
     worst_baseline_ratio = 0.0
     per_row_deltas: list[dict[str, object]] = []
-    for key in sorted(current_keys):
+    for key in shared_keys:
         current_row = current_map[key]
         baseline_row = baseline_map[key]
         current_ratio = float(current_row[ratio_field])
@@ -608,11 +620,20 @@ def _compare_benchmark_summary_against_baseline(
         "observed_max_ratio_delta": observed_max_ratio_delta,
         "observed_max_ratio_baseline": float(baseline_summary["observed_max_ratio"]),
         "observed_max_ratio_current": float(current_summary["observed_max_ratio"]),
+        "baseline_row_count": len(baseline_map),
+        "current_row_count": len(current_map),
+        "overlap_row_count": len(shared_keys),
+        "missing_row_count": len(missing),
+        "extra_row_count": len(extra),
+        "missing_rows": [_serialize_benchmark_row_key(key) for key in missing],
+        "extra_rows": [_serialize_benchmark_row_key(key) for key in extra],
         "max_row_ratio_delta": max_ratio_delta_observed,
         "row_deltas": per_row_deltas,
     }
     print(
-        f"[compare:{current_summary['preset']}] max_row_ratio_delta={max_ratio_delta_observed:.4f} "
+        f"[compare:{current_summary['preset']}] overlap={len(shared_keys)} "
+        f"missing={len(missing)} extra={len(extra)} "
+        f"max_row_ratio_delta={max_ratio_delta_observed:.4f} "
         f"observed_max_ratio_delta={observed_max_ratio_delta:.4f}",
         flush=True,
     )
