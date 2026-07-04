@@ -543,18 +543,14 @@ def _preset_help_text() -> str:
 def _resolve_compare_ratio_delta(
     requested_compare_ratio_delta: float | None,
     *,
-    preset_names: list[str],
+    preset_name: str,
 ) -> float:
     if requested_compare_ratio_delta is not None:
         return requested_compare_ratio_delta
 
-    preset_defaults = [
-        expectation.default_compare_ratio_delta
-        for preset_name, expectation in ARC_BENCH_EXPECTATIONS.items()
-        if preset_name in preset_names and expectation.default_compare_ratio_delta is not None
-    ]
-    if preset_defaults:
-        return max(float(value) for value in preset_defaults)
+    expectation = ARC_BENCH_EXPECTATIONS[preset_name]
+    if expectation.default_compare_ratio_delta is not None:
+        return float(expectation.default_compare_ratio_delta)
     return DEFAULT_COMPARE_RATIO_DELTA
 
 
@@ -1045,10 +1041,6 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_parser().parse_args()
     preset_names = _parse_preset_names(args.presets)
-    compare_ratio_delta = _resolve_compare_ratio_delta(
-        args.compare_ratio_delta,
-        preset_names=preset_names,
-    )
     root = _repo_root()
     op_lib_path = Path(args.op_lib).expanduser() if args.op_lib is not None else _default_op_lib_path(root)
     env = os.environ.copy()
@@ -1071,7 +1063,7 @@ def main() -> None:
         },
         "comparison": {
             "baseline_json": args.compare_json,
-            "max_ratio_delta": compare_ratio_delta,
+            "max_ratio_delta": args.compare_ratio_delta,
             "presets": {},
         },
         "pytest": {
@@ -1158,6 +1150,10 @@ def main() -> None:
                 baseline_presets = baseline_benchmark.get("presets")
                 if not isinstance(baseline_presets, dict) or preset_name not in baseline_presets:
                     raise ValueError(f"Baseline JSON does not include preset {preset_name}")
+                compare_ratio_delta = _resolve_compare_ratio_delta(
+                    args.compare_ratio_delta,
+                    preset_name=preset_name,
+                )
                 comparison_confirmation: dict[str, object] | None = None
                 try:
                     comparison_summary = _compare_benchmark_summary_against_baseline(
