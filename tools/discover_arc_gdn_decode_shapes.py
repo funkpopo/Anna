@@ -57,6 +57,9 @@ DISCOVERY_MODES: dict[str, DiscoveryMode] = {
     ),
 }
 
+DEFAULT_AUTO_CHUNK_THRESHOLD = 32
+DEFAULT_AUTO_MAX_SHAPES_PER_SCAN = 16
+
 
 def _parse_int_spans(raw: str) -> list[int]:
     values: list[int] = []
@@ -473,6 +476,18 @@ def _chunk_shape_cases(
     ]
 
 
+def _resolve_max_shapes_per_scan(
+    requested_max_shapes_per_scan: int | None,
+    *,
+    shape_count: int,
+) -> int | None:
+    if requested_max_shapes_per_scan is not None:
+        return requested_max_shapes_per_scan
+    if shape_count > DEFAULT_AUTO_CHUNK_THRESHOLD:
+        return DEFAULT_AUTO_MAX_SHAPES_PER_SCAN
+    return None
+
+
 def _primary_bench_args(bench_runs: list[list[str]]) -> list[str] | None:
     return bench_runs[0] if len(bench_runs) == 1 else None
 
@@ -492,11 +507,32 @@ def _run_discovery_scan(
     timing_repeats: int,
     max_shapes_per_scan: int | None,
     label: str,
-) -> tuple[list[list[str]], list[dict[str, object]], tuple[int, ...]]:
+) -> tuple[list[str], list[list[str]], list[dict[str, object]], tuple[int, ...], int | None]:
+    requested_bench_args = _build_discovery_bench_args(
+        mode=mode,
+        shape_cases=shape_cases,
+        value_blocks=value_blocks,
+        head_dim=head_dim,
+        seeds=seeds,
+        dtype=dtype,
+        warmup=warmup,
+        iters=iters,
+        timing_repeats=timing_repeats,
+    )
     bench_runs: list[list[str]] = []
     all_rows: list[dict[str, object]] = []
     resolved_value_blocks: tuple[int, ...] | None = None
-    case_chunks = _chunk_shape_cases(shape_cases, max_shapes_per_scan=max_shapes_per_scan)
+    effective_max_shapes_per_scan = _resolve_max_shapes_per_scan(
+        max_shapes_per_scan,
+        shape_count=len(shape_cases),
+    )
+    case_chunks = _chunk_shape_cases(shape_cases, max_shapes_per_scan=effective_max_shapes_per_scan)
+    if len(case_chunks) > 1:
+        print(
+            f"[chunking] label={label} shape_count={len(shape_cases)} "
+            f"max_shapes_per_scan={effective_max_shapes_per_scan} chunks={len(case_chunks)}",
+            flush=True,
+        )
     for chunk_index, case_chunk in enumerate(case_chunks, start=1):
         bench_args = _build_discovery_bench_args(
             mode=mode,
@@ -526,10 +562,10 @@ def _run_discovery_scan(
         elif chunk_value_blocks != resolved_value_blocks:
             raise ValueError(
                 f"Chunked discovery scan resolved inconsistent value blocks: {resolved_value_blocks} vs {chunk_value_blocks}"
-            )
+        )
         all_rows.extend(chunk_rows)
     assert resolved_value_blocks is not None
-    return bench_runs, all_rows, resolved_value_blocks
+    return requested_bench_args, bench_runs, all_rows, resolved_value_blocks, effective_max_shapes_per_scan
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -596,8 +632,10 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Optionally split large shape lists into multiple benchmark invocations with at most this many "
-            "shape cases each. Useful when long sweeps show driver or thermal drift."
+            "Split large shape lists into multiple benchmark invocations with at most this many shape cases "
+            "each. When omitted, discovery auto-chunks sweeps larger than "
+            f"{DEFAULT_AUTO_CHUNK_THRESHOLD} shapes into chunks of {DEFAULT_AUTO_MAX_SHAPES_PER_SCAN}. "
+            "Pass 0 to disable chunking."
         ),
     )
     parser.add_argument("--dtype", type=str, default="bf16", help="Input dtype forwarded to the benchmark.")
@@ -703,7 +741,7 @@ def main() -> None:
             f"Fused-op library not found at {op_lib_path}. Build it first or pass --op-lib explicitly."
         )
 
-    bench_runs, rows, resolved_blocks_from_output = _run_discovery_scan(
+    bench_args, bench_runs, rows, resolved_blocks_from_output, effective_max_shapes_per_scan = _run_discovery_scan(
         root=root,
         env=env,
         mode=mode,
@@ -750,12 +788,20 @@ def main() -> None:
                 f"ratio={float(row['ratio']):.4f},delta_ms={float(row['delta_ms']):.4f}"
             )
 
+    reverse_bench_args: list[str] | None = None
     reverse_bench_runs: list[list[str]] = []
     reverse_rows: list[dict[str, object]] = []
     order_sensitive_rows: list[dict[str, object]] = []
+    reverse_effective_max_shapes_per_scan: int | None = None
     if args.compare_reverse_order:
         reverse_cases = list(reversed(cases))
-        reverse_bench_runs, reverse_rows, _ = _run_discovery_scan(
+        (
+            reverse_bench_args,
+            reverse_bench_runs,
+            reverse_rows,
+            _,
+            reverse_effective_max_shapes_per_scan,
+        ) = _run_discovery_scan(
             root=root,
             env=env,
             mode=mode,
@@ -784,12 +830,14 @@ def main() -> None:
         for row in order_sensitive_rows[: max(0, args.top)]:
             _print_order_sensitive_row("gdn_decode_order_sensitive", row)
 
+    confirm_bench_args: list[str] | None = None
     confirm_bench_runs: list[list[str]] = []
     confirm_cases: list[tuple[int, int, int]] = []
     confirm_value_blocks: list[int] = []
     confirm_rows: list[dict[str, object]] = []
     confirmed_suspicious_rows: list[dict[str, object]] = []
     confirmed_groups: list[dict[str, object]] = []
+    confirm_effective_max_shapes_per_scan: int | None = None
     if args.confirm_suspicious and suspicious_rows:
         confirm_cases = _select_confirmation_shape_cases(suspicious_rows)
         confirm_value_blocks = _select_confirmation_value_blocks(suspicious_rows, resolved_value_blocks)
@@ -798,7 +846,13 @@ def main() -> None:
         confirm_timing_repeats = (
             args.confirm_timing_repeats if args.confirm_timing_repeats is not None else max(args.timing_repeats, 9)
         )
-        confirm_bench_runs, raw_confirm_rows, _ = _run_discovery_scan(
+        (
+            confirm_bench_args,
+            confirm_bench_runs,
+            raw_confirm_rows,
+            _,
+            confirm_effective_max_shapes_per_scan,
+        ) = _run_discovery_scan(
             root=root,
             env=env,
             mode=mode,
@@ -842,8 +896,9 @@ def main() -> None:
         report = {
             "schema_version": 1,
             "mode": mode.name,
-            "bench_args": _primary_bench_args(bench_runs),
+            "bench_args": bench_args,
             "bench_runs": bench_runs,
+            "effective_max_shapes_per_scan": effective_max_shapes_per_scan,
             "shape_count": len(cases),
             "shape_cases": cases,
             "resolved_value_blocks": list(resolved_blocks_from_output),
@@ -854,14 +909,16 @@ def main() -> None:
             "top_rows": top_rows,
             "reverse_order_comparison": {
                 "enabled": args.compare_reverse_order,
-                "bench_args": _primary_bench_args(reverse_bench_runs),
+                "bench_args": reverse_bench_args,
                 "bench_runs": reverse_bench_runs,
+                "effective_max_shapes_per_scan": reverse_effective_max_shapes_per_scan,
                 "rows": order_sensitive_rows,
             },
             "confirmation": {
                 "enabled": args.confirm_suspicious,
-                "bench_args": _primary_bench_args(confirm_bench_runs),
+                "bench_args": confirm_bench_args,
                 "bench_runs": confirm_bench_runs,
+                "effective_max_shapes_per_scan": confirm_effective_max_shapes_per_scan,
                 "shape_cases": confirm_cases,
                 "value_blocks": confirm_value_blocks,
                 "candidate_rows": confirm_rows,

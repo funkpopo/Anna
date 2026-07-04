@@ -20,6 +20,7 @@ from tools.discover_arc_gdn_decode_shapes import (  # noqa: E402
     _format_sampled_int_ranges,
     _parse_int_spans,
     _primary_bench_args,
+    _resolve_max_shapes_per_scan,
     _resolve_shape_cases,
     _select_confirmation_rows,
     _select_confirmation_shape_cases,
@@ -81,6 +82,13 @@ def test_primary_bench_args_returns_single_run_only() -> None:
     single_run = [["python", "tools/bench_xpu_hotspots.py", "--example"]]
     assert _primary_bench_args(single_run) == single_run[0]
     assert _primary_bench_args(single_run * 2) is None
+
+
+def test_resolve_max_shapes_per_scan_auto_chunks_only_large_sweeps() -> None:
+    assert _resolve_max_shapes_per_scan(None, shape_count=32) is None
+    assert _resolve_max_shapes_per_scan(None, shape_count=33) == 16
+    assert _resolve_max_shapes_per_scan(24, shape_count=128) == 24
+    assert _resolve_max_shapes_per_scan(0, shape_count=128) == 0
 
 
 def test_collect_suspicious_rows_flags_mismatches_and_ratio_only_rows() -> None:
