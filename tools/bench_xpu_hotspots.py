@@ -443,6 +443,7 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (91, 8, 256),
         (97, 8, 256),
         (145, 8, 256),
+        (146, 8, 256),
         (193, 8, 256),
         (251, 8, 256),
         (10, 16, 256),
@@ -461,6 +462,7 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (65, 16, 256),
         (71, 16, 256),
         (72, 16, 256),
+        (73, 16, 256),
         (5, 32, 256),
         (9, 32, 256),
         (15, 32, 256),
@@ -474,6 +476,7 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (33, 32, 256),
         (35, 32, 256),
         (36, 32, 256),
+        (37, 32, 256),
     ),
 }
 
