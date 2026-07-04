@@ -460,6 +460,23 @@ def _build_discovery_bench_args(
     ]
 
 
+def _chunk_shape_cases(
+    shape_cases: list[tuple[int, int, int]],
+    *,
+    max_shapes_per_scan: int | None,
+) -> list[list[tuple[int, int, int]]]:
+    if max_shapes_per_scan is None or max_shapes_per_scan <= 0 or len(shape_cases) <= max_shapes_per_scan:
+        return [list(shape_cases)]
+    return [
+        shape_cases[start : start + max_shapes_per_scan]
+        for start in range(0, len(shape_cases), max_shapes_per_scan)
+    ]
+
+
+def _primary_bench_args(bench_runs: list[list[str]]) -> list[str] | None:
+    return bench_runs[0] if len(bench_runs) == 1 else None
+
+
 def _run_discovery_scan(
     *,
     root: Path,
@@ -473,30 +490,46 @@ def _run_discovery_scan(
     warmup: int,
     iters: int,
     timing_repeats: int,
+    max_shapes_per_scan: int | None,
     label: str,
-) -> tuple[list[str], list[dict[str, object]], tuple[int, ...]]:
-    bench_args = _build_discovery_bench_args(
-        mode=mode,
-        shape_cases=shape_cases,
-        value_blocks=value_blocks,
-        head_dim=head_dim,
-        seeds=seeds,
-        dtype=dtype,
-        warmup=warmup,
-        iters=iters,
-        timing_repeats=timing_repeats,
-    )
-    output = _run_step(
-        args=bench_args,
-        cwd=root,
-        env=env,
-        label=label,
-        capture_output=True,
-    )
-    assert output is not None
-    rows = _annotate_rows(_parse_gdn_decode_csv_rows(output, mode.compare_prefix), mode)
-    resolved_value_blocks = _parse_gdn_decode_value_blocks(output)
-    return bench_args, rows, resolved_value_blocks
+) -> tuple[list[list[str]], list[dict[str, object]], tuple[int, ...]]:
+    bench_runs: list[list[str]] = []
+    all_rows: list[dict[str, object]] = []
+    resolved_value_blocks: tuple[int, ...] | None = None
+    case_chunks = _chunk_shape_cases(shape_cases, max_shapes_per_scan=max_shapes_per_scan)
+    for chunk_index, case_chunk in enumerate(case_chunks, start=1):
+        bench_args = _build_discovery_bench_args(
+            mode=mode,
+            shape_cases=case_chunk,
+            value_blocks=value_blocks,
+            head_dim=head_dim,
+            seeds=seeds,
+            dtype=dtype,
+            warmup=warmup,
+            iters=iters,
+            timing_repeats=timing_repeats,
+        )
+        bench_runs.append(bench_args)
+        chunk_label = label if len(case_chunks) == 1 else f"{label}:{chunk_index}/{len(case_chunks)}"
+        output = _run_step(
+            args=bench_args,
+            cwd=root,
+            env=env,
+            label=chunk_label,
+            capture_output=True,
+        )
+        assert output is not None
+        chunk_rows = _annotate_rows(_parse_gdn_decode_csv_rows(output, mode.compare_prefix), mode)
+        chunk_value_blocks = _parse_gdn_decode_value_blocks(output)
+        if resolved_value_blocks is None:
+            resolved_value_blocks = chunk_value_blocks
+        elif chunk_value_blocks != resolved_value_blocks:
+            raise ValueError(
+                f"Chunked discovery scan resolved inconsistent value blocks: {resolved_value_blocks} vs {chunk_value_blocks}"
+            )
+        all_rows.extend(chunk_rows)
+    assert resolved_value_blocks is not None
+    return bench_runs, all_rows, resolved_value_blocks
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -557,6 +590,15 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_BENCH_TIMING_REPEATS,
         help="Repeated timing samples per candidate.",
+    )
+    parser.add_argument(
+        "--max-shapes-per-scan",
+        type=int,
+        default=None,
+        help=(
+            "Optionally split large shape lists into multiple benchmark invocations with at most this many "
+            "shape cases each. Useful when long sweeps show driver or thermal drift."
+        ),
     )
     parser.add_argument("--dtype", type=str, default="bf16", help="Input dtype forwarded to the benchmark.")
     parser.add_argument(
@@ -661,7 +703,7 @@ def main() -> None:
             f"Fused-op library not found at {op_lib_path}. Build it first or pass --op-lib explicitly."
         )
 
-    bench_args, rows, resolved_blocks_from_output = _run_discovery_scan(
+    bench_runs, rows, resolved_blocks_from_output = _run_discovery_scan(
         root=root,
         env=env,
         mode=mode,
@@ -673,6 +715,7 @@ def main() -> None:
         warmup=args.warmup,
         iters=args.iters,
         timing_repeats=args.timing_repeats,
+        max_shapes_per_scan=args.max_shapes_per_scan,
         label=f"discover:{mode.name}",
     )
     suspicious_rows = _collect_suspicious_rows(
@@ -707,12 +750,12 @@ def main() -> None:
                 f"ratio={float(row['ratio']):.4f},delta_ms={float(row['delta_ms']):.4f}"
             )
 
-    reverse_bench_args: list[str] | None = None
+    reverse_bench_runs: list[list[str]] = []
     reverse_rows: list[dict[str, object]] = []
     order_sensitive_rows: list[dict[str, object]] = []
     if args.compare_reverse_order:
         reverse_cases = list(reversed(cases))
-        reverse_bench_args, reverse_rows, _ = _run_discovery_scan(
+        reverse_bench_runs, reverse_rows, _ = _run_discovery_scan(
             root=root,
             env=env,
             mode=mode,
@@ -724,6 +767,7 @@ def main() -> None:
             warmup=args.warmup,
             iters=args.iters,
             timing_repeats=args.timing_repeats,
+            max_shapes_per_scan=args.max_shapes_per_scan,
             label=f"discover-reverse:{mode.name}",
         )
         order_rows = _build_order_sensitivity_rows(rows, reverse_rows, mode=mode)
@@ -740,7 +784,7 @@ def main() -> None:
         for row in order_sensitive_rows[: max(0, args.top)]:
             _print_order_sensitive_row("gdn_decode_order_sensitive", row)
 
-    confirm_bench_args: list[str] | None = None
+    confirm_bench_runs: list[list[str]] = []
     confirm_cases: list[tuple[int, int, int]] = []
     confirm_value_blocks: list[int] = []
     confirm_rows: list[dict[str, object]] = []
@@ -754,7 +798,7 @@ def main() -> None:
         confirm_timing_repeats = (
             args.confirm_timing_repeats if args.confirm_timing_repeats is not None else max(args.timing_repeats, 9)
         )
-        confirm_bench_args, raw_confirm_rows, _ = _run_discovery_scan(
+        confirm_bench_runs, raw_confirm_rows, _ = _run_discovery_scan(
             root=root,
             env=env,
             mode=mode,
@@ -766,6 +810,7 @@ def main() -> None:
             warmup=confirm_warmup,
             iters=confirm_iters,
             timing_repeats=confirm_timing_repeats,
+            max_shapes_per_scan=args.max_shapes_per_scan,
             label=f"confirm:{mode.name}",
         )
         confirm_rows = _select_confirmation_rows(suspicious_rows, raw_confirm_rows)
@@ -797,7 +842,8 @@ def main() -> None:
         report = {
             "schema_version": 1,
             "mode": mode.name,
-            "bench_args": bench_args,
+            "bench_args": _primary_bench_args(bench_runs),
+            "bench_runs": bench_runs,
             "shape_count": len(cases),
             "shape_cases": cases,
             "resolved_value_blocks": list(resolved_blocks_from_output),
@@ -808,12 +854,14 @@ def main() -> None:
             "top_rows": top_rows,
             "reverse_order_comparison": {
                 "enabled": args.compare_reverse_order,
-                "bench_args": reverse_bench_args,
+                "bench_args": _primary_bench_args(reverse_bench_runs),
+                "bench_runs": reverse_bench_runs,
                 "rows": order_sensitive_rows,
             },
             "confirmation": {
                 "enabled": args.confirm_suspicious,
-                "bench_args": confirm_bench_args,
+                "bench_args": _primary_bench_args(confirm_bench_runs),
+                "bench_runs": confirm_bench_runs,
                 "shape_cases": confirm_cases,
                 "value_blocks": confirm_value_blocks,
                 "candidate_rows": confirm_rows,

@@ -13,11 +13,13 @@ from tools.discover_arc_gdn_decode_shapes import (  # noqa: E402
     _annotate_rows,
     _build_order_sensitivity_rows,
     _build_group_summaries,
+    _chunk_shape_cases,
     _collect_suspicious_rows,
     _collect_order_sensitive_rows,
     _discovery_row_key,
     _format_sampled_int_ranges,
     _parse_int_spans,
+    _primary_bench_args,
     _resolve_shape_cases,
     _select_confirmation_rows,
     _select_confirmation_shape_cases,
@@ -62,6 +64,23 @@ def test_resolve_shape_cases_requires_complete_grid_definition() -> None:
 
 def test_format_sampled_int_ranges_compacts_constant_step_sequences() -> None:
     assert _format_sampled_int_ranges([784, 800, 816, 832, 960]) == "784..832/16,960"
+
+
+def test_chunk_shape_cases_splits_large_case_lists_and_preserves_order() -> None:
+    cases = [(batch_size, 8, 256) for batch_size in range(1, 8)]
+    assert _chunk_shape_cases(cases, max_shapes_per_scan=None) == [cases]
+    assert _chunk_shape_cases(cases, max_shapes_per_scan=0) == [cases]
+    assert _chunk_shape_cases(cases, max_shapes_per_scan=3) == [
+        [(1, 8, 256), (2, 8, 256), (3, 8, 256)],
+        [(4, 8, 256), (5, 8, 256), (6, 8, 256)],
+        [(7, 8, 256)],
+    ]
+
+
+def test_primary_bench_args_returns_single_run_only() -> None:
+    single_run = [["python", "tools/bench_xpu_hotspots.py", "--example"]]
+    assert _primary_bench_args(single_run) == single_run[0]
+    assert _primary_bench_args(single_run * 2) is None
 
 
 def test_collect_suspicious_rows_flags_mismatches_and_ratio_only_rows() -> None:
