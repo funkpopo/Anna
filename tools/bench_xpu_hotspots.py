@@ -398,6 +398,8 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (1, 32, 256),
         (4, 32, 256),
     ),
+    # Historical preset name retained; the current Arc default value block for
+    # these V=64 shapes is 8 after the tiled subgroup-span remap.
     "arc-v64-default-block16": (
         (1, 8, 64),
         (4, 8, 64),
@@ -437,8 +439,8 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (5, 32, 128),
         (8, 32, 128),
     ),
-    # Fast A770 regression watchlist for the V=128/value_block=8 row-128
-    # single-group shapes and the adjacent tiled edge band at rows 144..160.
+    # Fast A770 regression watchlist for the V=128/value_block=8 low-row shapes
+    # that flipped from single-group to tiled after the tiled subgroup-span remap.
     "arc-watch-v128-block8": (
         (16, 8, 128),
         (18, 8, 128),
@@ -490,8 +492,8 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (36, 32, 256),
         (37, 32, 256),
     ),
-    # Fast A770 regression watchlist for the V=256/value_block=4 row bands that
-    # have historically flipped strategy near the single-group override islands.
+    # Fast A770 regression watchlist for the V=256/value_block=4 low-row shapes
+    # that flipped from single-group to tiled after the tiled subgroup-span remap.
     "arc-watch-v256-block4": (
         (33, 8, 256),
         (144, 8, 256),
@@ -510,8 +512,8 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
 }
 
 GDN_DECODE_PRESET_VALUE_BLOCKS: dict[str, tuple[int, ...]] = {
-    "arc-default": (16,),
-    "arc-v64-default-block16": (16,),
+    "arc-default": (8, 16),
+    "arc-v64-default-block16": (8,),
     "arc-legacy-v64-block8": (8,),
     "arc-legacy-v128-block8": (8,),
     "arc-watch-v128-block8": (8,),

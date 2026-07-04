@@ -64,23 +64,21 @@ class ArcBenchExpectation:
 ARC_BENCH_EXPECTATIONS = {
     ARC_DEFAULT_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_default_compare",
-        expected_value_blocks=(16,),
+        expected_value_blocks=(8, 16),
         expected_row_count=13,
         ratio_field="default_speed_ratio",
         max_ratio=1.15,
         default_compare_ratio_delta=0.025,
-        default_value_block=16,
-        default_strategy="tiled",
     ),
     ARC_V64_DEFAULT_BLOCK16_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_default_compare",
-        expected_value_blocks=(16,),
+        expected_value_blocks=(8,),
         expected_row_count=11,
         ratio_field="default_speed_ratio",
         max_ratio=1.03,
         default_compare_ratio_delta=0.015,
-        default_value_block=16,
-        default_strategy="tiled",
+        default_value_block=8,
+        default_strategy="single",
     ),
     ARC_LEGACY_V64_BLOCK8_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_auto_compare",
@@ -266,7 +264,7 @@ def _bench_args_for_shape_chunk(
         "--gdn-decode-timing-repeats",
         str(timing_repeats),
     ]
-    if expectation.expected_value_blocks and expectation.compare_prefix == "gdn_decode_auto_compare":
+    if expectation.expected_value_blocks:
         args.extend(
             [
                 "--gdn-decode-value-blocks",

@@ -161,6 +161,12 @@ def _make_benchmark_output_for_preset(
     expectation = ARC_BENCH_EXPECTATIONS[preset_name]
     lines = [f"gdn_decode_value_blocks={','.join(str(value_block) for value_block in expectation.expected_value_blocks)}"]
     if expectation.compare_prefix == "gdn_decode_default_compare":
+        default_value_block = (
+            expectation.default_value_block
+            if expectation.default_value_block is not None
+            else expectation.expected_value_blocks[0]
+        )
+        default_strategy = expectation.default_strategy if expectation.default_strategy is not None else "tiled"
         lines.append(
             "gdn_decode_default_compare,device_name,batch,heads,key_head_dim,value_head_dim,default_value_block,"
             "default_strategy,single_ms,tiled_ms,default_ms,best_explicit_strategy,best_explicit_ms,"
@@ -169,7 +175,7 @@ def _make_benchmark_output_for_preset(
         for _ in range(expectation.expected_row_count):
             lines.append(
                 "gdn_decode_default_compare,Intel Arc,1,16,128,128,"
-                f"{expectation.default_value_block},{expectation.default_strategy},"
+                f"{default_value_block},{default_strategy},"
                 f"0.3000,0.2000,{0.2 * ratio:.4f},tiled,0.2000,{0.2 * ratio - 0.2:.4f},{ratio:.4f},0.000100"
             )
     else:

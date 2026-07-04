@@ -137,6 +137,11 @@ int64_t next_power_of_two(int64_t value) {
   return result;
 }
 
+int64_t ceil_div_int64(int64_t numerator, int64_t denominator) {
+  TORCH_CHECK(denominator > 0, "denominator must be positive");
+  return (numerator + denominator - 1) / denominator;
+}
+
 bool is_power_of_two(int64_t value) {
   return value > 0 && (value & (value - 1)) == 0;
 }
@@ -266,36 +271,24 @@ struct GatedDeltaDecodeAutoStrategyOverride {
   GatedDeltaDecodeStrategy strategy;
 };
 
-// Arc A770 decode sweeps show that K=128 recurrent decode shapes consistently
-// prefer value_block=16 for V={64,128,256}; smaller tiles leave the tiled
-// subgroup kernel underutilized while 32 does not recover enough to win.
+// Arc A770 decode sweeps after the tiled subgroup-span remap show that K=128
+// decode prefers value_block=8 for V={64,256}, while V=128 remains best at 16.
 constexpr GatedDeltaDecodeValueBlockOverride kGatedDeltaDecodeValueBlockOverrides[] = {
-    {"arc", 128, 64, 16},
+    {"arc", 128, 64, 8},
     {"arc", 128, 128, 16},
-    {"arc", 128, 256, 16},
+    {"arc", 128, 256, 8},
 };
 
-// Arc A770 decode sweeps show that some small-block shapes still need narrow
-// row-band overrides on top of the coarse cutovers. V=128/value_block=8 has a
-// tiled edge band at rows 144..152, while V=256/value_block=4 has stable
-// single-group islands at rows 264..464, 520..720, 728..736, 776..944, and
-// 1032..1144.
+// Arc A770 decode sweeps keep V=64 special-cased, while V=128/value_block>=8
+// and V=256/value_block>=4 now stay tiled after the tiled subgroup-span remap.
 constexpr GatedDeltaDecodeAutoStrategyOverride kGatedDeltaDecodeAutoStrategyOverrides[] = {
     {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 1, 8, GatedDeltaDecodeStrategy::SingleGroup},
     {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 16, 16, GatedDeltaDecodeStrategy::TiledValue},
-    {"arc", 128, 128, 144, 152, 8, 8, GatedDeltaDecodeStrategy::TiledValue},
-    {"arc", 128, 256, 264, 464, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
-    {"arc", 128, 256, 520, 720, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
-    {"arc", 128, 256, 728, 736, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
-    {"arc", 128, 256, 776, 944, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
-    {"arc", 128, 256, 1032, 1144, 4, 4, GatedDeltaDecodeStrategy::SingleGroup},
 };
 
 constexpr GatedDeltaDecodeAutoCutover kGatedDeltaDecodeAutoCutovers[] = {
-    {"arc", 128, 128, 160, 8},
-    {"arc", 128, 128, 1, 16},
-    {"arc", 128, 256, 160, 4},
-    {"arc", 128, 256, 1, 8},
+    {"arc", 128, 128, 1, 8},
+    {"arc", 128, 256, 1, 4},
 };
 
 constexpr GatedDeltaDecodeAutoBucket kGatedDeltaDecodeAutoBuckets[] = {
@@ -307,6 +300,23 @@ int64_t resolve_gated_delta_decode_values_per_lane(int64_t value_head_dim) {
   return value_head_dim <= kGatedDeltaDecodeSubgroupSize * kGatedDeltaDecodeValuesPerLaneSmall
       ? kGatedDeltaDecodeValuesPerLaneSmall
       : kGatedDeltaDecodeValuesPerLaneWide;
+}
+
+int64_t resolve_gated_delta_decode_tiled_active_lanes(int64_t value_block) {
+  return std::max<int64_t>(1, std::min<int64_t>(kGatedDeltaDecodeSubgroupSize, value_block));
+}
+
+template <int64_t ValuesPerLane>
+int64_t resolve_gated_delta_decode_tiled_work_group_size(
+    int64_t value_head_dim,
+    int64_t value_block,
+    int64_t max_work_group_size) {
+  const int64_t active_lanes = resolve_gated_delta_decode_tiled_active_lanes(value_block);
+  const int64_t subgroup_value_span = active_lanes * ValuesPerLane;
+  const int64_t subgroups_needed = ceil_div_int64(value_head_dim, subgroup_value_span);
+  const int64_t max_subgroups = std::max<int64_t>(1, max_work_group_size / kGatedDeltaDecodeSubgroupSize);
+  const int64_t subgroups_per_work_group = std::max<int64_t>(1, std::min<int64_t>(subgroups_needed, max_subgroups));
+  return subgroups_per_work_group * kGatedDeltaDecodeSubgroupSize;
 }
 
 template <int64_t StaticDim>
@@ -6042,9 +6052,15 @@ void launch_gated_delta_decode_tiled_subgroup_kernel(
     float query_scale_base) {
   const int64_t resolved_key_head_dim = resolve_gated_delta_static_dim<StaticKeyHeadDim>(key_head_dim);
   const int64_t resolved_value_head_dim = resolve_gated_delta_static_dim<StaticValueHeadDim>(value_head_dim);
-  const int64_t work_group_size = std::max<int64_t>(kGatedDeltaDecodeSubgroupSize, local_size);
   const int64_t subgroup_size = kGatedDeltaDecodeSubgroupSize;
+  const int64_t max_work_group_size = std::max<int64_t>(subgroup_size, local_size);
+  const int64_t work_group_size = resolve_gated_delta_decode_tiled_work_group_size<ValuesPerLane>(
+      resolved_value_head_dim,
+      value_block,
+      max_work_group_size);
   const int64_t subgroups_per_work_group = std::max<int64_t>(1, work_group_size / subgroup_size);
+  const int64_t subgroup_active_lanes = resolve_gated_delta_decode_tiled_active_lanes(value_block);
+  const int64_t subgroup_value_span = subgroup_active_lanes * ValuesPerLane;
   const size_t group_count = static_cast<size_t>(batch_size * num_heads);
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> normalized_query(sycl::range<1>(static_cast<size_t>(resolved_key_head_dim)), cgh);
@@ -6082,32 +6098,34 @@ void launch_gated_delta_decode_tiled_subgroup_kernel(
 
           const float g_scale = sycl::exp(g_ptr[scalar_index]);
           const float beta_value = beta_ptr[scalar_index];
-          const int64_t subgroup_tile_stride = subgroups_per_work_group * value_block;
-          const int64_t lane_value_stride = subgroup_size * ValuesPerLane;
-          for (int64_t value_start = subgroup_id * value_block;
+          const int64_t subgroup_tile_stride = subgroups_per_work_group * subgroup_value_span;
+          const int64_t lane_value_stride = subgroup_value_span;
+          for (int64_t value_start = subgroup_id * subgroup_value_span;
                value_start < resolved_value_head_dim;
                value_start += subgroup_tile_stride) {
-            const int64_t value_limit = sycl::min<int64_t>(resolved_value_head_dim, value_start + value_block);
-            for (int64_t lane_value_base = value_start + lane * ValuesPerLane;
-                 lane_value_base < value_limit;
-                 lane_value_base += lane_value_stride) {
-              gated_delta_decode_process_value_tile<ValuesPerLane, StaticKeyHeadDim, StaticValueHeadDim>(
-                  value_ptr,
-                  v_t_base,
-                  state_read_ptr,
-                  state_write_ptr,
-                  output_ptr,
-                  state_base,
-                  output_base,
-                  resolved_value_head_dim,
-                  value_limit,
-                  resolved_key_head_dim,
-                  lane_value_base,
-                  g_scale,
-                  beta_value,
-                  query_key_dot,
-                  normalized_query,
-                  normalized_key);
+            const int64_t value_limit = sycl::min<int64_t>(resolved_value_head_dim, value_start + subgroup_value_span);
+            if (lane < subgroup_active_lanes) {
+              for (int64_t lane_value_base = value_start + lane * ValuesPerLane;
+                   lane_value_base < value_limit;
+                   lane_value_base += lane_value_stride) {
+                gated_delta_decode_process_value_tile<ValuesPerLane, StaticKeyHeadDim, StaticValueHeadDim>(
+                    value_ptr,
+                    v_t_base,
+                    state_read_ptr,
+                    state_write_ptr,
+                    output_ptr,
+                    state_base,
+                    output_base,
+                    resolved_value_head_dim,
+                    value_limit,
+                    resolved_key_head_dim,
+                    lane_value_base,
+                    g_scale,
+                    beta_value,
+                    query_key_dot,
+                    normalized_query,
+                    normalized_key);
+              }
             }
           }
         });
