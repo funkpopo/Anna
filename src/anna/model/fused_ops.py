@@ -30,6 +30,22 @@ def _op_disabled(env_name: str) -> bool:
     return False
 
 
+_LM_HEAD_INT4_TOPK_ENABLE_ENV = "ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED"
+_LM_HEAD_INT4_TOPK_DISABLE_ENV = "ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK"
+
+
+def _lm_head_int4_topk_enabled() -> bool:
+    if _op_disabled(_LM_HEAD_INT4_TOPK_DISABLE_ENV):
+        return False
+    if not _env_flag_enabled(_LM_HEAD_INT4_TOPK_ENABLE_ENV):
+        logger.info(
+            "Anna lm_head_int4_topk_fused is disabled by default; set %s=1 to enable the experimental path",
+            _LM_HEAD_INT4_TOPK_ENABLE_ENV,
+        )
+        return False
+    return True
+
+
 def _default_library_candidates() -> list[str]:
     roots: list[Path] = []
     env_root = os.getenv("ANNA_PROJECT_ROOT")
@@ -328,7 +344,7 @@ def lm_head_topk_fused_is_available() -> bool:
 
 
 def lm_head_int4_topk_fused_is_available() -> bool:
-    return not _op_disabled("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK") and _lm_head_int4_topk_op() is not None
+    return _lm_head_int4_topk_enabled() and _lm_head_int4_topk_op() is not None
 
 
 def rmsnorm_fused_is_available() -> bool:
@@ -731,16 +747,17 @@ def run_lm_head_int4_topk_fused(
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     op = _lm_head_int4_topk_op()
-    if _op_disabled("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK"):
+    if not _lm_head_int4_topk_enabled():
         op = None
     if op is None:
         maybe_load_gated_delta_library()
         op = _lm_head_int4_topk_op()
-    if _op_disabled("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK"):
+    if not _lm_head_int4_topk_enabled():
         op = None
     if op is None:
         raise RuntimeError(
-            "Anna lm_head_int4_topk_fused op is not registered. Build/load the custom op first, "
+            "Anna lm_head_int4_topk_fused op is not enabled or not registered. Set "
+            f"{_LM_HEAD_INT4_TOPK_ENABLE_ENV}=1 for the experimental path, build/load the custom op first, "
             "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
         )
     return op(hidden_states, qweight, qscale, qzeros, int(group_size), int(in_features), int(top_k))

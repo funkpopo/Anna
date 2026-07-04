@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import itertools
-import os
 from dataclasses import dataclass
 
 import torch
@@ -27,14 +26,6 @@ from anna.model.fused_ops import (
 )
 from anna.model.quantization import XPUInt4Linear
 from anna.model.xpu_decode_profile import xpu_profile_region
-
-_ENABLE_INT4_LM_HEAD_TOPK_FUSED = os.getenv("ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-
 
 @dataclass(slots=True)
 class TextModelOutput:
@@ -82,8 +73,7 @@ def _lm_head_topk(
     if hidden_states.device != lm_head_device:
         hidden_states = hidden_states.to(device=lm_head_device)
     if (
-        _ENABLE_INT4_LM_HEAD_TOPK_FUSED
-        and top_k <= 16
+        top_k <= 16
         and hidden_states.device.type == "xpu"
         and isinstance(lm_head, XPUInt4Linear)
         and lm_head.qweight.device.type == "xpu"

@@ -261,14 +261,6 @@ struct GatedDeltaDecodeValueBlockRowOverride {
   int64_t value_block;
 };
 
-struct GatedDeltaDecodeAutoCutover {
-  const char* device_pattern;
-  int64_t key_head_dim;
-  int64_t value_head_dim;
-  int64_t tiled_min_rows;
-  int64_t tiled_min_value_block;
-};
-
 struct GatedDeltaDecodeAutoStrategyOverride {
   const char* device_pattern;
   int64_t key_head_dim;
@@ -297,17 +289,13 @@ constexpr GatedDeltaDecodeValueBlockRowOverride kGatedDeltaDecodeValueBlockRowOv
 };
 
 // Arc A770 decode sweeps keep V=64 on the single-group path for the common
-// block widths {8,16}, while V=128/value_block>=8 and V=256/value_block>=4
-// stay tiled after the tiled subgroup-span remap and the static full-tile
-// specialization.
+// block widths {8,16}. V=128/value_block>=8 and V=256/value_block>=4 stay
+// tiled, including the latest block=16 A/B pass.
 constexpr GatedDeltaDecodeAutoStrategyOverride kGatedDeltaDecodeAutoStrategyOverrides[] = {
     {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 1, 8, GatedDeltaDecodeStrategy::SingleGroup},
     {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 16, 16, GatedDeltaDecodeStrategy::SingleGroup},
-};
-
-constexpr GatedDeltaDecodeAutoCutover kGatedDeltaDecodeAutoCutovers[] = {
-    {"arc", 128, 128, 1, 8},
-    {"arc", 128, 256, 1, 4},
+    {"arc", 128, 128, 1, std::numeric_limits<int64_t>::max(), 8, 32, GatedDeltaDecodeStrategy::TiledValue},
+    {"arc", 128, 256, 1, std::numeric_limits<int64_t>::max(), 4, 32, GatedDeltaDecodeStrategy::TiledValue},
 };
 
 constexpr GatedDeltaDecodeAutoBucket kGatedDeltaDecodeAutoBuckets[] = {
@@ -524,22 +512,6 @@ GatedDeltaDecodeStrategy resolve_gated_delta_decode_strategy(
     return strategy_override.strategy;
   }
 
-  bool matched_auto_cutover_shape = false;
-  for (const auto& cutover : kGatedDeltaDecodeAutoCutovers) {
-    const bool device_matches =
-        cutover.device_pattern[0] == '\0' || lower_device_name.find(cutover.device_pattern) != std::string::npos;
-    if (!device_matches || cutover.key_head_dim != key_head_dim || cutover.value_head_dim != value_head_dim) {
-      continue;
-    }
-    matched_auto_cutover_shape = true;
-    if (recurrent_rows >= cutover.tiled_min_rows && value_block >= cutover.tiled_min_value_block) {
-      return GatedDeltaDecodeStrategy::TiledValue;
-    }
-  }
-  if (matched_auto_cutover_shape) {
-    return GatedDeltaDecodeStrategy::SingleGroup;
-  }
-
   for (const auto& bucket : kGatedDeltaDecodeAutoBuckets) {
     const bool device_matches =
         bucket.device_pattern[0] == '\0' || lower_device_name.find(bucket.device_pattern) != std::string::npos;
@@ -559,6 +531,21 @@ GatedDeltaDecodeStrategy resolve_gated_delta_decode_strategy(
 
 int64_t default_bounded_local_size(int64_t dimension, int64_t max_value) {
   return std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, std::min<int64_t>(dimension, max_value))), max_value);
+}
+
+int64_t default_xpu_int4_gemv_local_size(
+    int64_t row_count,
+    int64_t in_features,
+    int64_t out_features) {
+  (void)row_count;
+  (void)out_features;
+  if (in_features <= 1024) {
+    return 32;
+  }
+  if (in_features >= 4096) {
+    return 128;
+  }
+  return default_bounded_local_size(in_features, 64);
 }
 
 inline float load_grouped_int4_weight(
@@ -3205,7 +3192,7 @@ at::Tensor xpu_int4_gemv_xpu(
   const auto group_count = qscale.size(0);
   const int64_t local_size = resolve_power_of_two_env_local_size(
       "ANNA_XPU_INT4_GEMV_LOCAL_SIZE",
-      default_bounded_local_size(in_features, 128),
+      default_xpu_int4_gemv_local_size(row_count, in_features, out_features),
       256);
   const int64_t output_tile = resolve_power_of_two_env_local_size(
       "ANNA_XPU_INT4_GEMV_OUTPUT_TILE",

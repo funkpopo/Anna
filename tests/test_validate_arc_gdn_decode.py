@@ -16,6 +16,7 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     ARC_DEFAULT_PRESET,
     ARC_LEGACY_V64_BLOCK8_PRESET,
     ARC_V64_DEFAULT_BLOCK16_PRESET,
+    ARC_WATCH_V64_BLOCK16_PRESET,
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_WATCH_V128_BLOCK8_PRESET,
     ARC_WATCH_V128_DEFAULT8_VS_BLOCK16_PRESET,
@@ -37,6 +38,7 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     _collect_benchmark_summary,
     _collect_benchmark_summary_from_rows,
     _find_benchmark_compare_ratio_failure_rows,
+    _find_benchmark_ratio_confirmation_rows,
     _find_benchmark_ratio_failure_rows,
     _load_json_report,
     _merge_benchmark_rows,
@@ -70,6 +72,7 @@ def test_parse_preset_names_expands_aliases_and_dedupes() -> None:
     assert _parse_preset_names("quick,arc-legacy-v256-block4,watch,ARC-DEFAULT") == [
         *QUICK_PRESETS,
         ARC_LEGACY_V256_BLOCK4_PRESET,
+        ARC_WATCH_V64_BLOCK16_PRESET,
         ARC_WATCH_V128_BLOCK8_PRESET,
         ARC_WATCH_V128_DEFAULT8_VS_BLOCK16_PRESET,
         ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET,
@@ -114,6 +117,18 @@ def test_bench_args_for_preset_uses_expected_compare_flag(
     assert args[args.index("--warmup") + 1] == "7"
     assert args[args.index("--iters") + 1] == "11"
     assert args[args.index("--gdn-decode-timing-repeats") + 1] == str(DEFAULT_BENCH_TIMING_REPEATS)
+
+
+def test_bench_args_for_preset_can_enable_interleaved_timing() -> None:
+    args = _bench_args_for_preset(
+        preset_name=ARC_WATCH_V256_BLOCK4_PRESET,
+        warmup=7,
+        iters=11,
+        timing_repeats=DEFAULT_BENCH_TIMING_REPEATS,
+        seeds_csv="20260960,20260961",
+        interleaved_timing=True,
+    )
+    assert "--gdn-decode-interleaved-timing" in args
 
 
 def test_parse_gdn_decode_value_blocks_extracts_csv() -> None:
@@ -275,6 +290,7 @@ def test_parse_preset_names_accepts_full_alias() -> None:
 
 def test_parse_preset_names_accepts_watch_alias() -> None:
     assert _parse_preset_names("watch") == [
+        ARC_WATCH_V64_BLOCK16_PRESET,
         ARC_WATCH_V128_BLOCK8_PRESET,
         ARC_WATCH_V128_DEFAULT8_VS_BLOCK16_PRESET,
         ARC_WATCH_V256_BLOCK4_PRESET,
@@ -386,6 +402,7 @@ def test_run_benchmark_for_preset_chunks_large_preset_and_merges_rows(
         iters=11,
         timing_repeats=DEFAULT_BENCH_TIMING_REPEATS,
         seeds_csv="20260960,20260961",
+        interleaved_timing=False,
         cwd=Path.cwd(),
         env={},
         max_shapes_per_scan=None,
@@ -434,6 +451,43 @@ def test_find_benchmark_ratio_failure_rows_returns_only_over_threshold_rows() ->
     )
 
     assert failing_rows == [rows[1]]
+
+
+def test_find_benchmark_ratio_confirmation_rows_can_include_near_threshold_rows() -> None:
+    rows = [
+        {
+            "batch": "1",
+            "heads": "8",
+            "key_head_dim": "128",
+            "value_head_dim": "64",
+            "value_block": "16",
+            "auto_speed_ratio": "1.0149",
+        },
+        {
+            "batch": "8",
+            "heads": "8",
+            "key_head_dim": "128",
+            "value_head_dim": "64",
+            "value_block": "16",
+            "auto_speed_ratio": "1.0150",
+        },
+        {
+            "batch": "32",
+            "heads": "16",
+            "key_head_dim": "128",
+            "value_head_dim": "64",
+            "value_block": "16",
+            "auto_speed_ratio": "1.0180",
+        },
+    ]
+
+    confirmation_rows = _find_benchmark_ratio_confirmation_rows(
+        preset_name=ARC_WATCH_V64_BLOCK16_PRESET,
+        rows=rows,
+        threshold_margin=0.005,
+    )
+
+    assert confirmation_rows == rows[1:]
 
 
 def test_merge_benchmark_rows_replaces_matching_row_keys() -> None:
@@ -515,6 +569,7 @@ def test_confirm_benchmark_ratio_failures_reruns_only_failing_shapes(
         preset_name=ARC_LEGACY_V256_BLOCK4_PRESET,
         rows=rows,
         seeds_csv="20260960,20260961",
+        interleaved_timing=False,
         cwd=Path.cwd(),
         env={},
     )
@@ -544,12 +599,74 @@ def test_confirm_benchmark_ratio_failures_skips_when_no_rows_exceed_threshold() 
         preset_name=ARC_LEGACY_V256_BLOCK4_PRESET,
         rows=rows,
         seeds_csv="20260960,20260961",
+        interleaved_timing=False,
         cwd=Path.cwd(),
         env={},
     )
 
     assert summary is None
     assert merged_rows == rows
+
+
+def test_confirm_benchmark_ratio_failures_can_rerun_near_threshold_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run_step(*, args, cwd, env, label, capture_output):
+        assert capture_output is True
+        calls.append(args)
+        assert label == f"confirm-threshold-margin:{ARC_WATCH_V64_BLOCK16_PRESET}"
+        assert args[args.index("--gdn-decode-shape-cases") + 1] == "32x16x64"
+        lines = [
+            "gdn_decode_value_blocks=16",
+            "gdn_decode_auto_compare,device_name,batch,heads,key_head_dim,value_head_dim,value_block,auto_strategy,"
+            "single_ms,tiled_ms,auto_ms,best_explicit_strategy,best_explicit_ms,auto_minus_best_ms,"
+            "auto_speed_ratio,max_abs_diff",
+            "gdn_decode_auto_compare,Intel Arc,32,16,128,64,16,single,0.5400,0.6500,0.5450,single,0.5400,0.0050,1.0093,0.000100",
+        ]
+        return "\n".join(lines)
+
+    monkeypatch.setattr("tools.validate_arc_gdn_decode._run_step", fake_run_step)
+
+    rows = [
+        {
+            "batch": "32",
+            "heads": "16",
+            "key_head_dim": "128",
+            "value_head_dim": "64",
+            "value_block": "16",
+            "auto_speed_ratio": "1.0183",
+        },
+        {
+            "batch": "8",
+            "heads": "16",
+            "key_head_dim": "128",
+            "value_head_dim": "64",
+            "value_block": "16",
+            "auto_speed_ratio": "1.0020",
+        },
+    ]
+
+    summary, merged_rows = _confirm_benchmark_ratio_failures(
+        preset_name=ARC_WATCH_V64_BLOCK16_PRESET,
+        rows=rows,
+        seeds_csv="20260960,20260961",
+        interleaved_timing=True,
+        threshold_margin=0.005,
+        cwd=Path.cwd(),
+        env={},
+    )
+
+    assert summary is not None
+    assert summary["threshold_margin"] == pytest.approx(0.005)
+    assert summary["shape_cases"] == [(32, 16, 64)]
+    assert summary["failing_rows"] == []
+    assert summary["cleared_row_count"] == 0
+    assert len(calls) == 1
+    assert "--gdn-decode-interleaved-timing" in calls[0]
+    assert merged_rows[0]["auto_speed_ratio"] == "1.0093"
+    assert merged_rows[1] == rows[1]
 
 
 def test_write_json_report_creates_parent_directories(tmp_path: Path) -> None:
@@ -886,6 +1003,7 @@ def test_confirm_benchmark_compare_ratio_failures_reruns_only_failing_shapes(
         baseline_summary=baseline_summary,
         max_ratio_delta=0.02,
         seeds_csv="20260960,20260961",
+        interleaved_timing=False,
         cwd=Path.cwd(),
         env={},
     )
@@ -916,6 +1034,7 @@ def test_confirm_benchmark_compare_ratio_failures_skips_when_no_rows_exceed_delt
         baseline_summary=baseline_summary,
         max_ratio_delta=0.02,
         seeds_csv="20260960,20260961",
+        interleaved_timing=False,
         cwd=Path.cwd(),
         env={},
     )

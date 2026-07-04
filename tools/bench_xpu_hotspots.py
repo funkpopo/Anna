@@ -6,6 +6,7 @@ import os
 import statistics
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -14,7 +15,13 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from anna.model.fused_ops import maybe_load_gated_delta_library
-from anna.model.ops import apply_rotary_pos_emb, grouped_query_attention, repeat_kv, torch_recurrent_gated_delta_rule
+from anna.model.ops import (
+    apply_rotary_pos_emb,
+    grouped_query_attention,
+    materialized_kv_single_token_decode_attention,
+    repeat_kv,
+    torch_recurrent_gated_delta_rule,
+)
 from anna.model.quantization import XPUInt4Linear
 from anna.runtime.device import inspect_xpu_device
 
@@ -125,7 +132,7 @@ def _benchmark_flashqla_gdn_prefill(
     return current_ms, flashqla_ms, reference_ms, max(output_diff, current_diff, state_diff)
 
 
-def _benchmark_gated_delta_decode_strategy(
+def _make_gated_delta_decode_candidate_runner(
     *,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -136,9 +143,7 @@ def _benchmark_gated_delta_decode_strategy(
     strategy: str,
     value_block: int | None,
     single_min_elements: int | None,
-    warmup: int,
-    iters: int,
-) -> tuple[float, float]:
+) -> tuple[Callable[[], torch.Tensor], float]:
     anna_ops = getattr(torch.ops, "anna", None)
     if anna_ops is not None and hasattr(anna_ops, "gated_delta_decode_benchmark"):
         strategy_codes = {"auto": -1, "single": 0, "tiled": 1}
@@ -202,31 +207,39 @@ def _benchmark_gated_delta_decode_strategy(
                 0 if single_min_elements is None else single_min_elements,
             )
 
-        candidate_ms = _time_op(candidate, warmup=warmup, iters=iters)
-        return candidate_ms, max_abs_diff
+        return candidate, max_abs_diff
 
     previous_strategy = os.environ.get("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY")
     previous_value_block = os.environ.get("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK")
     previous_single_min_elements = os.environ.get("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS")
-    os.environ["ANNA_XPU_GATED_DELTA_DECODE_STRATEGY"] = strategy
-    if value_block is None:
-        os.environ.pop("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", None)
-    else:
-        os.environ["ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK"] = str(value_block)
-    if single_min_elements is None:
-        os.environ.pop("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS", None)
-    else:
-        os.environ["ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS"] = str(single_min_elements)
+
+    def _run_with_env(state: torch.Tensor) -> torch.Tensor:
+        os.environ["ANNA_XPU_GATED_DELTA_DECODE_STRATEGY"] = strategy
+        if value_block is None:
+            os.environ.pop("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", None)
+        else:
+            os.environ["ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK"] = str(value_block)
+        if single_min_elements is None:
+            os.environ.pop("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS", None)
+        else:
+            os.environ["ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS"] = str(single_min_elements)
+        try:
+            return torch.ops.anna.gated_delta_decode(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                state,
+            )
+        finally:
+            _restore_env("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY", previous_strategy)
+            _restore_env("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", previous_value_block)
+            _restore_env("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS", previous_single_min_elements)
+
     try:
         state_for_correctness = initial_state.clone()
-        candidate_output = torch.ops.anna.gated_delta_decode(
-            query,
-            key,
-            value,
-            g,
-            beta,
-            state_for_correctness,
-        )
+        candidate_output = _run_with_env(state_for_correctness)
         reference_output, reference_state = torch_recurrent_gated_delta_rule(
             query,
             key,
@@ -244,21 +257,42 @@ def _benchmark_gated_delta_decode_strategy(
         state_for_timing = initial_state.clone()
 
         def candidate() -> torch.Tensor:
-            return torch.ops.anna.gated_delta_decode(
-                query,
-                key,
-                value,
-                g,
-                beta,
-                state_for_timing,
-            )
+            return _run_with_env(state_for_timing)
 
-        candidate_ms = _time_op(candidate, warmup=warmup, iters=iters)
-        return candidate_ms, max_abs_diff
+        return candidate, max_abs_diff
     finally:
         _restore_env("ANNA_XPU_GATED_DELTA_DECODE_STRATEGY", previous_strategy)
         _restore_env("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", previous_value_block)
         _restore_env("ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS", previous_single_min_elements)
+
+
+def _benchmark_gated_delta_decode_strategy(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    strategy: str,
+    value_block: int | None,
+    single_min_elements: int | None,
+    warmup: int,
+    iters: int,
+) -> tuple[float, float]:
+    candidate, max_abs_diff = _make_gated_delta_decode_candidate_runner(
+        query=query,
+        key=key,
+        value=value,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        strategy=strategy,
+        value_block=value_block,
+        single_min_elements=single_min_elements,
+    )
+    candidate_ms = _time_op(candidate, warmup=warmup, iters=iters)
+    return candidate_ms, max_abs_diff
 
 
 def _gated_delta_decode_candidate_id(strategy: str, value_block: int | None) -> str:
@@ -278,12 +312,58 @@ def _collect_gated_delta_decode_candidate_timings(
     warmup: int,
     iters: int,
     timing_repeats: int,
+    interleaved_timing: bool = False,
 ) -> dict[str, dict[str, float]]:
     timing_samples_ms: dict[str, list[float]] = {name: [] for name, _, _ in candidates}
     max_abs_diffs: dict[str, float] = {name: 0.0 for name, _, _ in candidates}
     total_candidates = len(candidates)
     if total_candidates == 0:
         return {}
+
+    if interleaved_timing:
+        for repeat_idx in range(max(1, timing_repeats)):
+            order_start = repeat_idx % total_candidates
+            ordered_candidates = candidates[order_start:] + candidates[:order_start]
+            candidate_runners: list[tuple[str, Callable[[], torch.Tensor]]] = []
+            for candidate_name, candidate_strategy, candidate_value_block in ordered_candidates:
+                candidate_runner, diff = _make_gated_delta_decode_candidate_runner(
+                    query=query,
+                    key=key,
+                    value=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=initial_state,
+                    strategy=candidate_strategy,
+                    value_block=candidate_value_block,
+                    single_min_elements=single_min_elements,
+                )
+                candidate_runners.append((candidate_name, candidate_runner))
+                max_abs_diffs[candidate_name] = max(max_abs_diffs[candidate_name], diff)
+
+            with torch.no_grad():
+                for warmup_idx in range(warmup):
+                    warmup_start = warmup_idx % total_candidates
+                    warmup_order = candidate_runners[warmup_start:] + candidate_runners[:warmup_start]
+                    for _, candidate_runner in warmup_order:
+                        candidate_runner()
+                torch.xpu.synchronize()
+
+                for iter_idx in range(max(1, iters)):
+                    measure_start = iter_idx % total_candidates
+                    measure_order = candidate_runners[measure_start:] + candidate_runners[:measure_start]
+                    for candidate_name, candidate_runner in measure_order:
+                        started_at = time.perf_counter()
+                        candidate_runner()
+                        torch.xpu.synchronize()
+                        timing_samples_ms[candidate_name].append((time.perf_counter() - started_at) * 1000.0)
+
+        return {
+            candidate_name: {
+                "candidate_ms": statistics.median(samples_ms),
+                "max_abs_diff": max_abs_diffs[candidate_name],
+            }
+            for candidate_name, samples_ms in timing_samples_ms.items()
+        }
 
     for repeat_idx in range(max(1, timing_repeats)):
         order_start = repeat_idx % total_candidates
@@ -685,6 +765,7 @@ def _compare_gated_delta_decode_auto_against_explicit(
     warmup: int,
     iters: int,
     timing_repeats: int,
+    interleaved_timing: bool = False,
 ) -> dict[str, float | str]:
     candidate_measurements = _collect_gated_delta_decode_candidate_timings(
         query=query,
@@ -702,6 +783,7 @@ def _compare_gated_delta_decode_auto_against_explicit(
         warmup=warmup,
         iters=iters,
         timing_repeats=timing_repeats,
+        interleaved_timing=interleaved_timing,
     )
     single_ms = float(candidate_measurements["single"]["candidate_ms"])
     tiled_ms = float(candidate_measurements["tiled"]["candidate_ms"])
@@ -742,6 +824,7 @@ def _compare_gated_delta_decode_default_against_forced_block(
     warmup: int,
     iters: int,
     timing_repeats: int,
+    interleaved_timing: bool = False,
 ) -> dict[str, float | str | int]:
     default_value_block = _resolve_gated_delta_decode_default_value_block(
         query,
@@ -777,6 +860,7 @@ def _compare_gated_delta_decode_default_against_forced_block(
         warmup=warmup,
         iters=iters,
         timing_repeats=timing_repeats,
+        interleaved_timing=interleaved_timing,
     )
     default_ms = float(candidate_measurements["default"]["candidate_ms"])
     forced_ms = float(candidate_measurements["forced"]["candidate_ms"])
@@ -812,6 +896,7 @@ def _compare_gated_delta_decode_default_against_explicit(
     warmup: int,
     iters: int,
     timing_repeats: int,
+    interleaved_timing: bool = False,
 ) -> dict[str, float | str | int]:
     default_value_block = _resolve_gated_delta_decode_default_value_block(
         query,
@@ -843,6 +928,7 @@ def _compare_gated_delta_decode_default_against_explicit(
         warmup=warmup,
         iters=iters,
         timing_repeats=timing_repeats,
+        interleaved_timing=interleaved_timing,
     )
     default_ms = float(candidate_measurements["default"]["candidate_ms"])
     single_ms = float(candidate_measurements["single"]["candidate_ms"])
@@ -879,6 +965,7 @@ def _run_gated_delta_decode_profile_case(
     warmup: int,
     iters: int,
     timing_repeats: int,
+    interleaved_timing: bool,
     seeds: list[int | None],
     auto_compare: bool,
     default_compare: bool,
@@ -930,6 +1017,7 @@ def _run_gated_delta_decode_profile_case(
                 warmup=warmup,
                 iters=iters,
                 timing_repeats=timing_repeats,
+                interleaved_timing=interleaved_timing,
             )
             profile_measurements_by_seed.append(seed_measurements)
             for candidate in candidates:
@@ -1003,6 +1091,7 @@ def _run_gated_delta_decode_profile_case(
                             warmup=warmup,
                             iters=iters,
                             timing_repeats=timing_repeats,
+                            interleaved_timing=interleaved_timing,
                         )
                     )
             single_ms = statistics.median(float(result["single_ms"]) for result in compare_results)
@@ -1044,6 +1133,7 @@ def _run_gated_delta_decode_profile_case(
                     warmup=warmup,
                     iters=iters,
                     timing_repeats=timing_repeats,
+                    interleaved_timing=interleaved_timing,
                 )
             )
         default_value_block_labels = {int(result["default_value_block"]) for result in compare_results}
@@ -1085,11 +1175,12 @@ def _run_gated_delta_decode_profile_case(
                         beta=beta,
                         initial_state=initial_state,
                         forced_value_block=forced_value_block,
-                        single_min_elements=single_min_elements,
-                        warmup=warmup,
-                        iters=iters,
-                        timing_repeats=timing_repeats,
-                    )
+                    single_min_elements=single_min_elements,
+                    warmup=warmup,
+                    iters=iters,
+                    timing_repeats=timing_repeats,
+                    interleaved_timing=interleaved_timing,
+                )
                 )
             default_value_block_labels = {int(result["default_value_block"]) for result in compare_results}
             default_value_block = default_value_block_labels.pop() if len(default_value_block_labels) == 1 else -1
@@ -1123,7 +1214,9 @@ def _benchmark_xpu_int4_linear(
     warmup: int,
     iters: int,
     strategy: str = "auto",
+    gemv_local_size: int | None = None,
 ) -> tuple[float, float, float]:
+    torch.manual_seed(8100 + tokens * 1_000_000 + in_features * 1000 + out_features + group_size)
     dense = torch.nn.Linear(in_features, out_features, bias=False, device="xpu", dtype=torch.float32)
     quantized = XPUInt4Linear.from_linear(dense, group_size=group_size, compute_dtype=dtype, device="xpu")
     hidden_states = torch.randn(tokens, in_features, device="xpu", dtype=dtype)
@@ -1131,8 +1224,13 @@ def _benchmark_xpu_int4_linear(
 
     baseline = lambda: F.linear(hidden_states, dense_weight)
     previous_strategy = os.environ.get("ANNA_XPU_INT4_MATMUL")
+    previous_gemv_local_size = os.environ.get("ANNA_XPU_INT4_GEMV_LOCAL_SIZE")
     try:
         os.environ["ANNA_XPU_INT4_MATMUL"] = strategy
+        if gemv_local_size is None:
+            os.environ.pop("ANNA_XPU_INT4_GEMV_LOCAL_SIZE", None)
+        else:
+            os.environ["ANNA_XPU_INT4_GEMV_LOCAL_SIZE"] = str(gemv_local_size)
         candidate = lambda: quantized(hidden_states)
         baseline_ms = _time_op(baseline, warmup=warmup, iters=iters)
         baseline_output = baseline()
@@ -1158,6 +1256,157 @@ def _benchmark_xpu_int4_linear(
             os.environ.pop("ANNA_XPU_INT4_MATMUL", None)
         else:
             os.environ["ANNA_XPU_INT4_MATMUL"] = previous_strategy
+        if previous_gemv_local_size is None:
+            os.environ.pop("ANNA_XPU_INT4_GEMV_LOCAL_SIZE", None)
+        else:
+            os.environ["ANNA_XPU_INT4_GEMV_LOCAL_SIZE"] = previous_gemv_local_size
+
+
+def _benchmark_xpu_int4_linear_breakdown(
+    *,
+    tokens: int,
+    in_features: int,
+    out_features: int,
+    group_size: int,
+    dtype: torch.dtype,
+    warmup: int,
+    iters: int,
+    gemv_local_size: int | None = None,
+    include_torch_paths: bool = True,
+) -> list[dict[str, float | str | int]]:
+    torch.manual_seed(9100 + tokens * 1_000_000 + in_features * 1000 + out_features + group_size)
+    dense = torch.nn.Linear(in_features, out_features, bias=False, device="xpu", dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=group_size, compute_dtype=dtype, device="xpu")
+    hidden_states = torch.randn(tokens, in_features, device="xpu", dtype=dtype)
+    dense_weight = dense.weight.detach().to(device="xpu", dtype=dtype)
+
+    baseline = lambda: F.linear(hidden_states, dense_weight)
+    baseline_ms = _time_op(baseline, warmup=warmup, iters=iters)
+    baseline_output = baseline()
+
+    previous_strategy = os.environ.get("ANNA_XPU_INT4_MATMUL")
+    previous_gemv_local_size = os.environ.get("ANNA_XPU_INT4_GEMV_LOCAL_SIZE")
+    try:
+        if gemv_local_size is None:
+            os.environ.pop("ANNA_XPU_INT4_GEMV_LOCAL_SIZE", None)
+        else:
+            os.environ["ANNA_XPU_INT4_GEMV_LOCAL_SIZE"] = str(gemv_local_size)
+
+        rows: list[dict[str, float | str | int]] = []
+
+        def add_candidate(name: str, runner: Callable[[], torch.Tensor]) -> None:
+            try:
+                candidate_output = runner()
+                candidate_ms = _time_op(runner, warmup=warmup, iters=iters)
+                max_abs_diff = float((candidate_output.float() - baseline_output.float()).abs().max().item())
+            except Exception as exc:
+                try:
+                    torch.xpu.synchronize()
+                except Exception:
+                    pass
+                print(
+                    "arc_int4_breakdown_error,"
+                    f"path={name},M={tokens},K={in_features},N={out_features},"
+                    f"group_size={group_size},error={type(exc).__name__}:{exc}"
+                )
+                candidate_ms = float("inf")
+                max_abs_diff = float("inf")
+            rows.append(
+                {
+                    "path": name,
+                    "local_size": "default" if gemv_local_size is None else gemv_local_size,
+                    "baseline_ms": baseline_ms,
+                    "candidate_ms": candidate_ms,
+                    "speedup": baseline_ms / candidate_ms if candidate_ms > 0 else float("inf"),
+                    "max_abs_diff": max_abs_diff,
+                }
+            )
+
+        if include_torch_paths:
+            aten_op = getattr(torch.ops.aten, "_weight_int4pack_mm_with_scales_and_zeros", None)
+            if aten_op is not None:
+                add_candidate(
+                    "aten_int4pack_direct",
+                    lambda: aten_op(hidden_states, quantized.qweight, group_size, quantized.qscale, quantized.qzeros),
+                )
+            add_candidate("xpu_int4_linear_torch_qpath", lambda: quantized._forward_torch_xpu_int4(hidden_states))
+
+        maybe_load_gated_delta_library()
+        anna_ops = getattr(torch.ops, "anna", None)
+        gemv_op = None if anna_ops is None else getattr(anna_ops, "xpu_int4_gemv", None)
+        if gemv_op is not None:
+            add_candidate(
+                "anna_gemv_direct",
+                lambda: gemv_op(
+                    hidden_states,
+                    quantized.qweight,
+                    quantized.qscale,
+                    quantized.qzeros,
+                    group_size,
+                    in_features,
+                ),
+            )
+        add_candidate("xpu_int4_linear_gemv_qpath", lambda: quantized._forward_xpu_int4_gemv(hidden_states, load_library=False))
+        return rows
+    finally:
+        if previous_strategy is None:
+            os.environ.pop("ANNA_XPU_INT4_MATMUL", None)
+        else:
+            os.environ["ANNA_XPU_INT4_MATMUL"] = previous_strategy
+        if previous_gemv_local_size is None:
+            os.environ.pop("ANNA_XPU_INT4_GEMV_LOCAL_SIZE", None)
+        else:
+            os.environ["ANNA_XPU_INT4_GEMV_LOCAL_SIZE"] = previous_gemv_local_size
+
+
+def _parse_arc_int4_strategies(raw: str) -> list[tuple[str, str, int | None]]:
+    valid_strategies = {"auto", "torch", "gemv", "dequant"}
+    strategies: list[tuple[str, str, int | None]] = []
+    seen_labels: set[str] = set()
+    for item in raw.split(","):
+        label = item.strip().lower()
+        if not label:
+            continue
+        strategy = label
+        gemv_local_size = None
+        if label.startswith("gemv_l"):
+            strategy = "gemv"
+            raw_local_size = label.removeprefix("gemv_l")
+            try:
+                gemv_local_size = int(raw_local_size)
+            except ValueError as exc:
+                raise ValueError(f"Unsupported --arc-int4-strategies entry {label!r}; invalid GEMV local size") from exc
+            if gemv_local_size <= 0:
+                raise ValueError(f"Unsupported --arc-int4-strategies entry {label!r}; GEMV local size must be positive")
+        if strategy not in valid_strategies:
+            raise ValueError(
+                f"Unsupported --arc-int4-strategies entry {label!r}; "
+                f"expected one of {', '.join(sorted(valid_strategies))} or gemv_l<size>"
+            )
+        if label not in seen_labels:
+            strategies.append((label, strategy, gemv_local_size))
+            seen_labels.add(label)
+    if not strategies:
+        raise ValueError("--arc-int4-strategies must include at least one strategy")
+    return strategies
+
+
+def _topk_max_abs_diff_allowing_value_ties(
+    candidate_values: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    baseline_values: torch.Tensor,
+    baseline_indices: torch.Tensor,
+) -> float:
+    candidate_values_f = candidate_values.float()
+    baseline_values_f = baseline_values.float()
+    if torch.equal(candidate_indices.cpu(), baseline_indices.cpu()):
+        return float((candidate_values_f - baseline_values_f).abs().max().item())
+
+    candidate_sorted_values = torch.sort(candidate_values_f, dim=-1, descending=True).values
+    baseline_sorted_values = torch.sort(baseline_values_f, dim=-1, descending=True).values
+    if torch.equal(candidate_sorted_values.cpu(), baseline_sorted_values.cpu()):
+        return float((candidate_sorted_values - baseline_sorted_values).abs().max().item())
+    return float("inf")
 
 
 def _benchmark_lm_head_int4_topk(
@@ -1172,6 +1421,7 @@ def _benchmark_lm_head_int4_topk(
     iters: int,
     local_size: int | None = None,
 ) -> tuple[float, float, float]:
+    torch.manual_seed(9100 + tokens * 1_000_000 + in_features * 1000 + vocab_size + top_k + (0 if local_size is None else local_size))
     dense = torch.nn.Linear(in_features, vocab_size, bias=False, device="xpu", dtype=torch.float32)
     quantized = XPUInt4Linear.from_linear(dense, group_size=group_size, compute_dtype=dtype, device="xpu")
     hidden_states = torch.randn(tokens, in_features, device="xpu", dtype=dtype)
@@ -1202,10 +1452,12 @@ def _benchmark_lm_head_int4_topk(
         else:
             os.environ["ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE"] = previous_local_size
 
-    if not torch.equal(candidate_indices.cpu(), baseline_indices.cpu()):
-        max_abs_diff = float("inf")
-    else:
-        max_abs_diff = float((candidate_values.float() - baseline_values.float()).abs().max().item())
+    max_abs_diff = _topk_max_abs_diff_allowing_value_ties(
+        candidate_values,
+        candidate_indices,
+        baseline_values,
+        baseline_indices,
+    )
     return baseline_ms, candidate_ms, max_abs_diff
 
 
@@ -1528,6 +1780,51 @@ def _benchmark_gqa_decode_fused(
     return baseline_ms, gqa_ms, max_abs_diff
 
 
+def _benchmark_materialized_kv_decode_attention(
+    *,
+    batch_size: int,
+    key_len: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    warmup: int,
+    iters: int,
+) -> tuple[float, float, float]:
+    query_states = torch.randn(batch_size, num_heads, 1, head_dim, device="xpu", dtype=dtype)
+    key_states = torch.randn(batch_size, num_kv_heads, key_len, head_dim, device="xpu", dtype=dtype)
+    value_states = torch.randn(batch_size, num_kv_heads, key_len, head_dim, device="xpu", dtype=dtype)
+    num_key_value_groups = max(1, num_heads // max(1, num_kv_heads))
+    visible_lengths = torch.randint(max(1, key_len // 2), key_len + 1, (batch_size,), device="xpu", dtype=torch.long)
+    key_positions = torch.arange(key_len, device="xpu")[None, :]
+    visible_mask = key_positions < visible_lengths[:, None]
+    scaling = head_dim**-0.5
+
+    def materialized():
+        repeated_key_states = repeat_kv(key_states, num_key_value_groups)
+        repeated_value_states = repeat_kv(value_states, num_key_value_groups)
+        attn_scores = torch.matmul(query_states, repeated_key_states.transpose(-1, -2)) * scaling
+        attn_scores = attn_scores.masked_fill(~visible_mask[:, None, None, :], float("-inf"))
+        attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
+        return torch.matmul(attn_probs, repeated_value_states)
+
+    decode = lambda: materialized_kv_single_token_decode_attention(
+        query_states,
+        key_states,
+        value_states,
+        scaling=scaling,
+        num_key_value_groups=num_key_value_groups,
+        visible_lengths=visible_lengths,
+    )
+
+    baseline_ms = _time_op(materialized, warmup=warmup, iters=iters)
+    decode_output = decode()
+    baseline_output = materialized()
+    max_abs_diff = float((decode_output.float() - baseline_output.float()).abs().max().item())
+    decode_ms = _time_op(decode, warmup=warmup, iters=iters)
+    return baseline_ms, decode_ms, max_abs_diff
+
+
 def _benchmark_gqa_decode_gate_layouts(
     *,
     batch_size: int,
@@ -1825,6 +2122,20 @@ def main() -> None:
         help="Only run the Arc int4 profile rows. Requires --arc-profile and skips the general hotspot suite.",
     )
     parser.add_argument(
+        "--arc-int4-strategies",
+        type=str,
+        default="auto",
+        help="Comma-separated XPU int4 matmul strategies for arc-profile rows. Defaults to auto.",
+    )
+    parser.add_argument(
+        "--arc-int4-breakdown",
+        action="store_true",
+        help=(
+            "When --arc-profile is set, also print layered int4 rows for direct aten int4pack, "
+            "direct Anna GEMV, and XPUInt4Linear qpath overhead."
+        ),
+    )
+    parser.add_argument(
         "--csv-output",
         type=str,
         default=None,
@@ -1896,6 +2207,14 @@ def main() -> None:
         help="Repeated timing samples per Gated Delta decode candidate. The reported candidate_ms is the median.",
     )
     parser.add_argument(
+        "--gdn-decode-interleaved-timing",
+        action="store_true",
+        help=(
+            "Interleave decode candidate execution within each timing cycle instead of timing long contiguous runs. "
+            "This is slower but can reduce candidate-order drift for auto-vs-explicit comparisons."
+        ),
+    )
+    parser.add_argument(
         "--gdn-decode-auto-compare",
         action="store_true",
         help="Print per-value-block auto-vs-explicit summary rows after the decode sweep.",
@@ -1941,6 +2260,10 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    try:
+        arc_int4_strategies = _parse_arc_int4_strategies(args.arc_int4_strategies)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.gdn_decode_only:
         args.gdn_decode_profile = True
 
@@ -2076,6 +2399,7 @@ def main() -> None:
                 warmup=args.warmup,
                 iters=args.iters,
                 timing_repeats=args.gdn_decode_timing_repeats,
+                interleaved_timing=args.gdn_decode_interleaved_timing,
                 seeds=case_seeds,
                 auto_compare=args.gdn_decode_auto_compare,
                 default_compare=args.gdn_decode_default_compare,
@@ -2142,6 +2466,18 @@ def main() -> None:
             dtype=dtype,
             warmup=args.warmup,
             iters=args.iters,
+        )
+        materialized_decode_baseline_ms, materialized_decode_ms, materialized_decode_diff = (
+            _benchmark_materialized_kv_decode_attention(
+                batch_size=args.batch_size,
+                key_len=kv_len,
+                num_heads=args.num_heads,
+                num_kv_heads=args.num_kv_heads,
+                head_dim=args.head_dim,
+                dtype=dtype,
+                warmup=args.warmup,
+                iters=args.iters,
+            )
         )
         decode_gate_3d_ms, decode_gate_4d_ms, decode_gate_diff = _benchmark_gqa_decode_gate_layouts(
             batch_size=args.batch_size,
@@ -2248,11 +2584,19 @@ def main() -> None:
         )
         _append_benchmark_row(
             benchmark_rows,
-            op="grouped_query_attention_decode",
+            op="grouped_query_attention_materialized",
             baseline_ms=gqa_baseline_ms,
             fused_ms=gqa_grouped_ms,
             speedup=_format_speedup(gqa_baseline_ms, gqa_grouped_ms),
             max_abs_diff=gqa_diff,
+        )
+        _append_benchmark_row(
+            benchmark_rows,
+            op="materialized_kv_decode_attention",
+            baseline_ms=materialized_decode_baseline_ms,
+            fused_ms=materialized_decode_ms,
+            speedup=_format_speedup(materialized_decode_baseline_ms, materialized_decode_ms),
+            max_abs_diff=materialized_decode_diff,
         )
         _append_benchmark_row(
             benchmark_rows,
@@ -2344,8 +2688,12 @@ def main() -> None:
             f"{_format_speedup(sdpa_baseline_ms, sdpa_gqa_ms)},{sdpa_diff:.6f}"
         )
         print(
-            f"grouped_query_attention_decode,{gqa_baseline_ms:.4f},{gqa_grouped_ms:.4f},"
+            f"grouped_query_attention_materialized,{gqa_baseline_ms:.4f},{gqa_grouped_ms:.4f},"
             f"{_format_speedup(gqa_baseline_ms, gqa_grouped_ms)},{gqa_diff:.6f}"
+        )
+        print(
+            f"materialized_kv_decode_attention,{materialized_decode_baseline_ms:.4f},{materialized_decode_ms:.4f},"
+            f"{_format_speedup(materialized_decode_baseline_ms, materialized_decode_ms)},{materialized_decode_diff:.6f}"
         )
         print(
             f"sdpa_gqa_decode_full_visible,{decode_sdpa_baseline_ms:.4f},{decode_sdpa_gqa_ms:.4f},"
@@ -2399,22 +2747,54 @@ def main() -> None:
             (1, args.hidden_size, args.hidden_size * 4),
             (1, args.hidden_size * 4, args.hidden_size),
         ]
-        for m, k, n in arc_shapes:
-            baseline_ms, candidate_ms, diff = _benchmark_xpu_int4_linear(
-                tokens=m,
-                in_features=k,
-                out_features=n,
-                group_size=args.int4_group_size,
-                dtype=dtype,
-                warmup=args.warmup,
-                iters=args.iters,
-                strategy="auto",
-            )
-            device_name = "" if xpu_info is None else xpu_info.name
+        for strategy_label, strategy, gemv_local_size in arc_int4_strategies:
+            for m, k, n in arc_shapes:
+                baseline_ms, candidate_ms, diff = _benchmark_xpu_int4_linear(
+                    tokens=m,
+                    in_features=k,
+                    out_features=n,
+                    group_size=args.int4_group_size,
+                    dtype=dtype,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    strategy=strategy,
+                    gemv_local_size=gemv_local_size,
+                )
+                device_name = "" if xpu_info is None else xpu_info.name
+                print(
+                    f"arc_int4_profile,{device_name},{strategy_label},{m},{k},{n},{args.int4_group_size},{dtype},"
+                    f"{baseline_ms:.4f},{candidate_ms:.4f},{_format_speedup(baseline_ms, candidate_ms)},{diff:.6f}"
+                )
+        if args.arc_int4_breakdown:
             print(
-                f"arc_int4_profile,{device_name},auto,{m},{k},{n},{args.int4_group_size},{dtype},"
-                f"{baseline_ms:.4f},{candidate_ms:.4f},{_format_speedup(baseline_ms, candidate_ms)},{diff:.6f}"
+                "arc_int4_breakdown,device_name,path,local_size,M,K,N,group_size,dtype,"
+                "baseline_ms,candidate_ms,speedup,max_abs_diff"
             )
+            breakdown_local_sizes = [None]
+            for _strategy_label, strategy, gemv_local_size in arc_int4_strategies:
+                if strategy == "gemv" and gemv_local_size is not None and gemv_local_size not in breakdown_local_sizes:
+                    breakdown_local_sizes.append(gemv_local_size)
+            device_name = "" if xpu_info is None else xpu_info.name
+            for gemv_local_size in breakdown_local_sizes:
+                for m, k, n in arc_shapes:
+                    for row in _benchmark_xpu_int4_linear_breakdown(
+                        tokens=m,
+                        in_features=k,
+                        out_features=n,
+                        group_size=args.int4_group_size,
+                        dtype=dtype,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        gemv_local_size=gemv_local_size,
+                        include_torch_paths=gemv_local_size is None,
+                    ):
+                        print(
+                            f"arc_int4_breakdown,{device_name},{row['path']},{row['local_size']},"
+                            f"{m},{k},{n},{args.int4_group_size},{dtype},"
+                            f"{float(row['baseline_ms']):.4f},{float(row['candidate_ms']):.4f},"
+                            f"{_format_speedup(float(row['baseline_ms']), float(row['candidate_ms']))},"
+                            f"{float(row['max_abs_diff']):.6f}"
+                        )
         print("arc_lm_head_int4_topk_profile,device_name,local_size,M,K,N,top_k,group_size,dtype,baseline_ms,candidate_ms,speedup,max_abs_diff")
         for local_size in (8, 16, 32, 64):
             baseline_ms, candidate_ms, diff = _benchmark_lm_head_int4_topk(

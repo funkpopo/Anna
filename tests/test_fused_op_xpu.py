@@ -32,13 +32,47 @@ def _reference_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> tor
 
 
 def test_int4_fused_op_availability_respects_disable_flags(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK", "1")
+    monkeypatch.delenv("ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED", raising=False)
+    monkeypatch.delenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK", raising=False)
     monkeypatch.setattr(fused_ops, "_lm_head_int4_topk_op", lambda: object())
+    assert fused_ops.lm_head_int4_topk_fused_is_available() is False
+
+    monkeypatch.setenv("ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED", "1")
+    assert fused_ops.lm_head_int4_topk_fused_is_available() is True
+
+    monkeypatch.setenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK", "1")
     assert fused_ops.lm_head_int4_topk_fused_is_available() is False
 
     monkeypatch.setenv("ANNA_XPU_DISABLE_MOE_GROUPED_INT4", "true")
     monkeypatch.setattr(fused_ops, "_moe_grouped_int4_mlp_op", lambda: object())
     assert fused_ops.moe_grouped_int4_mlp_fused_is_available() is False
+
+
+def test_lm_head_int4_topk_wrapper_requires_explicit_enable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED", raising=False)
+    monkeypatch.delenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK", raising=False)
+    monkeypatch.setattr(fused_ops, "maybe_load_gated_delta_library", lambda: False)
+
+    def _unexpected_op(*_args: object) -> tuple[torch.Tensor, torch.Tensor]:
+        pytest.fail("lm_head_int4_topk_fused should not run without explicit opt-in")
+
+    monkeypatch.setattr(fused_ops, "_lm_head_int4_topk_op", lambda: _unexpected_op)
+
+    hidden_states = torch.empty(1, 1, 8)
+    qweight = torch.empty(1, 1, dtype=torch.int32)
+    qscale = torch.empty(1, 1)
+    qzeros = torch.empty(1, 1, dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED=1"):
+        fused_ops.run_lm_head_int4_topk_fused(
+            hidden_states=hidden_states,
+            qweight=qweight,
+            qscale=qscale,
+            qzeros=qzeros,
+            group_size=8,
+            in_features=8,
+            top_k=1,
+        )
 
 
 def test_flashqla_gated_delta_wrapper_raises_without_registered_op(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -352,6 +386,26 @@ def test_xpu_int4_linear_auto_strategy_does_not_use_gemv_by_default(monkeypatch:
     reference = quantized(hidden_states)
 
     monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "auto")
+    output = quantized(hidden_states)
+
+    torch.xpu.synchronize()
+    assert torch.allclose(output.cpu(), reference.cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_xpu_int4_linear_gemv_strategy_matches_torch_int4pack(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "xpu_int4_gemv"):
+        pytest.skip("Anna fused-op library is not built with xpu_int4_gemv")
+
+    torch.manual_seed(8)
+    dense = torch.nn.Linear(1024, 1024, bias=False, device="xpu", dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=128, compute_dtype=torch.bfloat16, device="xpu")
+    hidden_states = torch.randn(2, 1024, device="xpu", dtype=torch.bfloat16)
+
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "torch")
+    reference = quantized(hidden_states)
+
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "gemv")
     output = quantized(hidden_states)
 
     torch.xpu.synchronize()
@@ -1864,6 +1918,10 @@ def test_gated_delta_decode_benchmark_matches_env_forced_path(
         (4, 16, 64, 8),
         (8, 8, 64, 4),
         (8, 16, 64, 16),
+        (1, 8, 128, 16),
+        (4, 16, 128, 16),
+        (1, 8, 256, 16),
+        (4, 16, 256, 16),
         (4, 16, 128, 8),
         (18, 8, 128, 8),
         (19, 8, 128, 8),
@@ -1970,6 +2028,12 @@ def test_gated_delta_decode_xpu_auto_matches_arc_row_cutover_shapes(
         (8, 8, 64, 4, 0),
         (8, 16, 64, 16, 0),
         (128, 8, 64, 16, 0),
+        (1, 8, 128, 16, 1),
+        (4, 16, 128, 16, 1),
+        (8, 32, 128, 16, 1),
+        (1, 8, 256, 16, 1),
+        (4, 16, 256, 16, 1),
+        (1, 32, 256, 16, 1),
         (16, 8, 128, 8, 1),
         (4, 16, 128, 8, 1),
         (18, 8, 128, 8, 1),

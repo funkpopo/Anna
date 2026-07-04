@@ -22,7 +22,7 @@ _AUTO_ROUND_QUANT_METHODS = frozenset({"auto-round", "auto_round"})
 _AUTO_ROUND_PACKING_FORMATS = frozenset({"auto_round:auto_gptq"})
 _FLOAT_OVERRIDE_DATA_TYPES = frozenset({"fp", "float", "float16", "fp16", "bfloat16", "bf16"})
 _REGEX_META_CHARS = frozenset("\\[](){}?*+^$|")
-_XPU_INT4_MATMUL_STRATEGIES = frozenset({"auto", "torch", "dequant"})
+_XPU_INT4_MATMUL_STRATEGIES = frozenset({"auto", "torch", "dequant", "gemv"})
 _XPU_INT4_LAYOUT_CACHE_VERSION = 2
 _XPU_INT4_LAYOUT_NAME = "anna_xpu_int4_linear_v1"
 _XPU_INT4_LM_HEAD_CACHE_TILE = 4
@@ -50,6 +50,13 @@ def _release_cpu_memory_caches() -> None:
             ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
         except Exception:
             logger.debug("Failed to trim Windows working set after XPU int4 cache work.", exc_info=True)
+
+
+def _anna_xpu_int4_gemv_op():
+    namespace = getattr(torch.ops, "anna", None)
+    if namespace is None:
+        return None
+    return getattr(namespace, "xpu_int4_gemv", None)
 
 
 def _empty_parameter(
@@ -657,6 +664,25 @@ class XPUInt4Linear(nn.Module):
             output = output + self.bias.to(device=output.device, dtype=output.dtype)
         return output
 
+    def _forward_xpu_int4_gemv(self, x_padded: torch.Tensor, *, load_library: bool) -> torch.Tensor:
+        op = _anna_xpu_int4_gemv_op()
+        if op is None and load_library:
+            from anna.model.fused_ops import maybe_load_gated_delta_library
+
+            maybe_load_gated_delta_library()
+            op = _anna_xpu_int4_gemv_op()
+        if op is None:
+            raise RuntimeError(
+                "Anna xpu_int4_gemv op is not registered. Build/load the custom op first, "
+                "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
+            )
+        if not x_padded.is_contiguous():
+            x_padded = x_padded.contiguous()
+        output = op(x_padded, self.qweight, self.qscale, self.qzeros, self.group_size, self.in_features)
+        if self.bias is not None:
+            output = output + self.bias.to(device=output.device, dtype=output.dtype)
+        return output
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
@@ -675,6 +701,8 @@ class XPUInt4Linear(nn.Module):
             strategy = self._matmul_strategy()
             if strategy == "dequant":
                 output = self._forward_dequant(x_padded)
+            elif strategy == "gemv":
+                output = self._forward_xpu_int4_gemv(x_padded, load_library=True)
             else:
                 output = self._forward_torch_xpu_int4(x_padded)
         else:

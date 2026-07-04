@@ -253,6 +253,7 @@ def _bench_args_for_preset(
     iters: int,
     timing_repeats: int,
     seeds_csv: str,
+    interleaved_timing: bool = False,
 ) -> list[str]:
     expectation = ARC_BENCH_EXPECTATIONS[preset_name]
     compare_flag = {
@@ -260,7 +261,7 @@ def _bench_args_for_preset(
         "gdn_decode_auto_compare": "--gdn-decode-auto-compare",
         "gdn_decode_default_block_compare": "--gdn-decode-default-block-compare",
     }[expectation.compare_prefix]
-    return [
+    args = [
         sys.executable,
         "tools/bench_xpu_hotspots.py",
         "--gdn-decode-only",
@@ -281,6 +282,9 @@ def _bench_args_for_preset(
         "--gdn-decode-timing-repeats",
         str(timing_repeats),
     ]
+    if interleaved_timing:
+        args.append("--gdn-decode-interleaved-timing")
+    return args
 
 
 def _bench_args_for_shape_chunk(
@@ -291,6 +295,7 @@ def _bench_args_for_shape_chunk(
     iters: int,
     timing_repeats: int,
     seeds_csv: str,
+    interleaved_timing: bool = False,
 ) -> list[str]:
     expectation = ARC_BENCH_EXPECTATIONS[preset_name]
     compare_flag = {
@@ -327,6 +332,8 @@ def _bench_args_for_shape_chunk(
                 ",".join(str(value_block) for value_block in expectation.expected_value_blocks),
             ]
         )
+    if interleaved_timing:
+        args.append("--gdn-decode-interleaved-timing")
     return args
 
 
@@ -450,6 +457,7 @@ def _run_benchmark_for_preset(
     iters: int,
     timing_repeats: int,
     seeds_csv: str,
+    interleaved_timing: bool,
     cwd: Path,
     env: dict[str, str],
     max_shapes_per_scan: int | None,
@@ -462,6 +470,7 @@ def _run_benchmark_for_preset(
         iters=iters,
         timing_repeats=timing_repeats,
         seeds_csv=seeds_csv,
+        interleaved_timing=interleaved_timing,
     )
     shape_cases = list(GDN_DECODE_SHAPE_PRESETS[preset_name])
     effective_max_shapes_per_scan = _resolve_validate_bench_max_shapes_per_scan(
@@ -488,6 +497,7 @@ def _run_benchmark_for_preset(
                 iters=DEFAULT_VALIDATE_BENCH_PRIME_ITERS,
                 timing_repeats=DEFAULT_VALIDATE_BENCH_PRIME_TIMING_REPEATS,
                 seeds_csv=seeds_csv,
+                interleaved_timing=interleaved_timing,
             )
             _run_step(
                 args=prime_args,
@@ -503,6 +513,7 @@ def _run_benchmark_for_preset(
                 iters=iters,
                 timing_repeats=timing_repeats,
                 seeds_csv=seeds_csv,
+                interleaved_timing=interleaved_timing,
             )
             if len(case_chunks) == 1
             else _bench_args_for_shape_chunk(
@@ -512,6 +523,7 @@ def _run_benchmark_for_preset(
                 iters=iters,
                 timing_repeats=timing_repeats,
                 seeds_csv=seeds_csv,
+                interleaved_timing=interleaved_timing,
             )
         )
         bench_runs.append(bench_args)
@@ -545,6 +557,7 @@ def _run_benchmark_for_shape_cases(
     iters: int,
     timing_repeats: int,
     seeds_csv: str,
+    interleaved_timing: bool,
     cwd: Path,
     env: dict[str, str],
     label: str,
@@ -556,6 +569,7 @@ def _run_benchmark_for_shape_cases(
         iters=iters,
         timing_repeats=timing_repeats,
         seeds_csv=seeds_csv,
+        interleaved_timing=interleaved_timing,
     )
     output = _run_step(
         args=bench_args,
@@ -738,6 +752,20 @@ def _find_benchmark_ratio_failure_rows(
     return [row for row in rows if float(row[expectation.ratio_field]) > expectation.max_ratio]
 
 
+def _find_benchmark_ratio_confirmation_rows(
+    *,
+    preset_name: str,
+    rows: list[dict[str, str]],
+    threshold_margin: float,
+) -> list[dict[str, str]]:
+    expectation = ARC_BENCH_EXPECTATIONS[preset_name]
+    if threshold_margin <= 0:
+        return _find_benchmark_ratio_failure_rows(preset_name=preset_name, rows=rows)
+
+    confirmation_floor = expectation.max_ratio - threshold_margin - 1e-12
+    return [row for row in rows if float(row[expectation.ratio_field]) >= confirmation_floor]
+
+
 def _merge_benchmark_rows(
     *,
     base_rows: list[dict[str, str]],
@@ -752,16 +780,25 @@ def _confirm_benchmark_ratio_failures(
     preset_name: str,
     rows: list[dict[str, str]],
     seeds_csv: str,
+    interleaved_timing: bool,
+    threshold_margin: float = 0.0,
     cwd: Path,
     env: dict[str, str],
 ) -> tuple[dict[str, object] | None, list[dict[str, str]]]:
-    failing_rows = _find_benchmark_ratio_failure_rows(preset_name=preset_name, rows=rows)
-    if not failing_rows:
+    candidate_rows = _find_benchmark_ratio_confirmation_rows(
+        preset_name=preset_name,
+        rows=rows,
+        threshold_margin=threshold_margin,
+    )
+    if not candidate_rows:
         return None, rows
 
-    shape_cases = _dedupe_shape_cases([_shape_case_from_benchmark_row(row) for row in failing_rows])
+    failing_rows = _find_benchmark_ratio_failure_rows(preset_name=preset_name, rows=rows)
+    shape_cases = _dedupe_shape_cases([_shape_case_from_benchmark_row(row) for row in candidate_rows])
+    confirmation_label = "confirm-threshold" if failing_rows else "confirm-threshold-margin"
     print(
-        f"[confirm-threshold:{preset_name}] failing_rows={len(failing_rows)} candidate_shapes={len(shape_cases)} "
+        f"[{confirmation_label}:{preset_name}] candidate_rows={len(candidate_rows)} failing_rows={len(failing_rows)} "
+        f"candidate_shapes={len(shape_cases)} threshold_margin={threshold_margin:.4f} "
         f"warmup={DEFAULT_VALIDATE_CONFIRM_WARMUP} iters={DEFAULT_VALIDATE_CONFIRM_ITERS} "
         f"timing_repeats={DEFAULT_VALIDATE_CONFIRM_TIMING_REPEATS}",
         flush=True,
@@ -773,18 +810,21 @@ def _confirm_benchmark_ratio_failures(
         iters=DEFAULT_VALIDATE_CONFIRM_ITERS,
         timing_repeats=DEFAULT_VALIDATE_CONFIRM_TIMING_REPEATS,
         seeds_csv=seeds_csv,
+        interleaved_timing=interleaved_timing,
         cwd=cwd,
         env=env,
-        label=f"confirm-threshold:{preset_name}",
+        label=f"{confirmation_label}:{preset_name}",
     )
     merged_rows = _merge_benchmark_rows(base_rows=rows, override_rows=confirm_rows)
     remaining_failures = _find_benchmark_ratio_failure_rows(preset_name=preset_name, rows=merged_rows)
     summary = {
         "triggered": True,
+        "threshold_margin": threshold_margin,
         "bench_args": confirm_args,
         "shape_cases": shape_cases,
         "resolved_value_blocks": list(confirm_value_blocks),
-        "candidate_rows": failing_rows,
+        "candidate_rows": candidate_rows,
+        "failing_rows": failing_rows,
         "confirmed_rows": confirm_rows,
         "cleared_row_count": len(failing_rows) - len(remaining_failures),
         "remaining_failure_rows": remaining_failures,
@@ -905,6 +945,7 @@ def _confirm_benchmark_compare_ratio_failures(
     baseline_summary: dict[str, object],
     max_ratio_delta: float,
     seeds_csv: str,
+    interleaved_timing: bool,
     cwd: Path,
     env: dict[str, str],
 ) -> tuple[dict[str, object] | None, dict[str, object]]:
@@ -935,6 +976,7 @@ def _confirm_benchmark_compare_ratio_failures(
         iters=DEFAULT_VALIDATE_CONFIRM_ITERS,
         timing_repeats=DEFAULT_VALIDATE_CONFIRM_TIMING_REPEATS,
         seeds_csv=seeds_csv,
+        interleaved_timing=interleaved_timing,
         cwd=cwd,
         env=env,
         label=f"confirm-compare:{preset_name}",
@@ -1039,6 +1081,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Repeated timing samples per decode candidate forwarded to tools/bench_xpu_hotspots.py.",
     )
     parser.add_argument(
+        "--interleaved-bench-timing",
+        action="store_true",
+        help=(
+            "Forward --gdn-decode-interleaved-timing to tools/bench_xpu_hotspots.py for slower but more stable "
+            "candidate comparisons."
+        ),
+    )
+    parser.add_argument(
         "--max-shapes-per-scan",
         type=int,
         default=None,
@@ -1057,6 +1107,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--skip-bench-gates",
         action="store_true",
         help="Skip parsing benchmark output against Arc preset performance thresholds.",
+    )
+    parser.add_argument(
+        "--confirm-threshold-margin",
+        type=float,
+        default=0.0,
+        help=(
+            "Also rerun long confirmation for benchmark rows within this absolute ratio margin below the preset "
+            "threshold. Defaults to 0, which only confirms rows that already exceed the threshold."
+        ),
     )
     parser.add_argument(
         "--skip-pytest",
@@ -1122,6 +1181,7 @@ def main() -> None:
             "warmup": args.warmup,
             "iters": args.iters,
             "timing_repeats": args.timing_repeats,
+            "confirm_threshold_margin": args.confirm_threshold_margin,
             "max_shapes_per_scan": args.max_shapes_per_scan,
             "skip_bench": args.skip_bench,
             "skip_bench_gates": args.skip_bench_gates,
@@ -1168,6 +1228,7 @@ def main() -> None:
                 iters=args.iters,
                 timing_repeats=args.timing_repeats,
                 seeds_csv=args.seeds,
+                interleaved_timing=args.interleaved_bench_timing,
                 cwd=root,
                 env=env,
                 max_shapes_per_scan=args.max_shapes_per_scan,
@@ -1185,6 +1246,8 @@ def main() -> None:
                         preset_name=preset_name,
                         rows=rows,
                         seeds_csv=args.seeds,
+                        interleaved_timing=args.interleaved_bench_timing,
+                        threshold_margin=args.confirm_threshold_margin,
                         cwd=root,
                         env=env,
                     )
@@ -1204,6 +1267,31 @@ def main() -> None:
             benchmark_summary["bench_runs"] = bench_runs
             benchmark_summary["effective_max_shapes_per_scan"] = effective_max_shapes_per_scan
             benchmark_summary["threshold_confirmation"] = threshold_confirmation
+            if threshold_confirmation is None and args.confirm_threshold_margin > 0 and not args.skip_bench_gates:
+                threshold_confirmation, rows = _confirm_benchmark_ratio_failures(
+                    preset_name=preset_name,
+                    rows=rows,
+                    seeds_csv=args.seeds,
+                    interleaved_timing=args.interleaved_bench_timing,
+                    threshold_margin=args.confirm_threshold_margin,
+                    cwd=root,
+                    env=env,
+                )
+                if threshold_confirmation is not None:
+                    _validate_benchmark_rows(
+                        preset_name=preset_name,
+                        value_blocks=value_blocks,
+                        rows=rows,
+                    )
+                    benchmark_summary = _collect_benchmark_summary_from_rows(
+                        preset_name=preset_name,
+                        value_blocks=value_blocks,
+                        rows=rows,
+                    )
+                    benchmark_summary["bench_args"] = bench_args
+                    benchmark_summary["bench_runs"] = bench_runs
+                    benchmark_summary["effective_max_shapes_per_scan"] = effective_max_shapes_per_scan
+                    benchmark_summary["threshold_confirmation"] = threshold_confirmation
             cast_benchmark = json_report["benchmark"]
             assert isinstance(cast_benchmark, dict)
             cast_presets = cast_benchmark["presets"]
@@ -1234,6 +1322,7 @@ def main() -> None:
                         baseline_summary=baseline_presets[preset_name],
                         max_ratio_delta=compare_ratio_delta,
                         seeds_csv=args.seeds,
+                        interleaved_timing=args.interleaved_bench_timing,
                         cwd=root,
                         env=env,
                     )

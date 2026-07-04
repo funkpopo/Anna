@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -14,14 +15,66 @@ from tools.bench_xpu_hotspots import (
     _collect_gated_delta_decode_candidate_timings,
     _dedupe_gdn_decode_shape_cases,
     _gated_delta_decode_candidate_id,
+    _parse_arc_int4_strategies,
     _parse_gdn_decode_shape_presets,
     _resolve_gdn_decode_value_blocks,
     _run_gated_delta_decode_profile_case,
+    _topk_max_abs_diff_allowing_value_ties,
 )
 
 
 def test_gdn_decode_shape_presets_have_matching_value_block_metadata() -> None:
     assert set(GDN_DECODE_SHAPE_PRESETS) == set(GDN_DECODE_PRESET_VALUE_BLOCKS)
+
+
+def test_topk_max_abs_diff_accepts_exact_index_match() -> None:
+    values = torch.tensor([[3.0, 2.0, 1.0]])
+    indices = torch.tensor([[5, 4, 3]])
+
+    assert _topk_max_abs_diff_allowing_value_ties(values, indices, values, indices) == pytest.approx(0.0)
+
+
+def test_topk_max_abs_diff_accepts_equal_value_tie_reordering() -> None:
+    candidate_values = torch.tensor([[3.0, 2.0, 2.0, 1.0]])
+    candidate_indices = torch.tensor([[5, 7, 4, 3]])
+    baseline_values = torch.tensor([[3.0, 2.0, 2.0, 1.0]])
+    baseline_indices = torch.tensor([[5, 4, 7, 3]])
+
+    assert _topk_max_abs_diff_allowing_value_ties(
+        candidate_values,
+        candidate_indices,
+        baseline_values,
+        baseline_indices,
+    ) == pytest.approx(0.0)
+
+
+def test_topk_max_abs_diff_rejects_value_mismatch() -> None:
+    candidate_values = torch.tensor([[3.0, 2.0, 1.5]])
+    candidate_indices = torch.tensor([[5, 4, 2]])
+    baseline_values = torch.tensor([[3.0, 2.0, 1.0]])
+    baseline_indices = torch.tensor([[5, 4, 3]])
+
+    assert _topk_max_abs_diff_allowing_value_ties(
+        candidate_values,
+        candidate_indices,
+        baseline_values,
+        baseline_indices,
+    ) == float("inf")
+
+
+def test_parse_arc_int4_strategies_dedupes_and_validates() -> None:
+    assert _parse_arc_int4_strategies("auto,gemv,auto,torch,gemv_l64") == [
+        ("auto", "auto", None),
+        ("gemv", "gemv", None),
+        ("torch", "torch", None),
+        ("gemv_l64", "gemv", 64),
+    ]
+    with pytest.raises(ValueError, match="Unsupported"):
+        _parse_arc_int4_strategies("auto,bad")
+    with pytest.raises(ValueError, match="local size"):
+        _parse_arc_int4_strategies("gemv_lbad")
+    with pytest.raises(ValueError, match="at least one"):
+        _parse_arc_int4_strategies(" , ")
 
 
 def test_arc_legacy_v256_block4_preset_keeps_upper_edge_regression_shapes() -> None:
@@ -52,39 +105,37 @@ def test_arc_watch_v256_block4_preset_tracks_boundary_watch_shapes() -> None:
 def test_arc_watch_v256_default4_vs_block8_preset_tracks_row_bucket_exits() -> None:
     assert GDN_DECODE_SHAPE_PRESETS["arc-watch-v256-default4-vs-block8"] == (
         (32, 8, 256),
+        (39, 8, 256),
         (40, 8, 256),
         (56, 8, 256),
+        (57, 8, 256),
+        (58, 8, 256),
+        (60, 8, 256),
+        (62, 8, 256),
+        (63, 8, 256),
         (64, 8, 256),
-        (65, 8, 256),
         (16, 16, 256),
         (20, 16, 256),
         (28, 16, 256),
+        (29, 16, 256),
+        (30, 16, 256),
+        (31, 16, 256),
         (32, 16, 256),
-        (33, 16, 256),
-        (10, 32, 256),
         (14, 32, 256),
+        (15, 32, 256),
         (16, 32, 256),
-        (17, 32, 256),
     )
 
 
 def test_arc_watch_v256_default8_vs_block4_preset_tracks_row_bucket_entries() -> None:
     assert GDN_DECODE_SHAPE_PRESETS["arc-watch-v256-default8-vs-block4"] == (
         (33, 8, 256),
-        (36, 8, 256),
         (37, 8, 256),
         (38, 8, 256),
-        (39, 8, 256),
-        (57, 8, 256),
-        (58, 8, 256),
-        (62, 8, 256),
-        (63, 8, 256),
         (17, 16, 256),
         (18, 16, 256),
         (19, 16, 256),
-        (29, 16, 256),
-        (31, 16, 256),
-        (15, 32, 256),
+        (9, 32, 256),
     )
 
 
@@ -217,6 +268,79 @@ def test_collect_gated_delta_decode_candidate_timings_rotates_candidates_and_use
     assert measurements["auto"]["max_abs_diff"] == pytest.approx(0.03)
 
 
+def test_collect_gated_delta_decode_candidate_timings_interleaves_candidates_and_uses_medians(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_order: list[str] = []
+    durations_ms = {
+        "single@8": [1.0, 1.4],
+        "tiled@8": [2.0, 2.4],
+    }
+    current_time_s = 0.0
+    timing_phase = "start"
+    active_candidate: str | None = None
+
+    def fake_make_gated_delta_decode_candidate_runner(**kwargs):
+        candidate_id = f"{kwargs['strategy']}@{kwargs['value_block']}"
+
+        def runner():
+            nonlocal active_candidate
+            call_order.append(candidate_id)
+            active_candidate = candidate_id
+
+        return runner, 0.01
+
+    def fake_perf_counter():
+        nonlocal current_time_s, timing_phase, active_candidate
+        if timing_phase == "start":
+            timing_phase = "end"
+            return current_time_s
+        assert active_candidate is not None
+        current_time_s += durations_ms[active_candidate].pop(0) / 1000.0
+        active_candidate = None
+        timing_phase = "start"
+        return current_time_s
+
+    monkeypatch.setattr(
+        bench_hotspots,
+        "_make_gated_delta_decode_candidate_runner",
+        fake_make_gated_delta_decode_candidate_runner,
+    )
+    monkeypatch.setattr(bench_hotspots.time, "perf_counter", fake_perf_counter)
+    monkeypatch.setattr(bench_hotspots.torch.xpu, "synchronize", lambda: None)
+
+    measurements = _collect_gated_delta_decode_candidate_timings(
+        query=None,
+        key=None,
+        value=None,
+        g=None,
+        beta=None,
+        initial_state=None,
+        candidates=[
+            ("single", "single", 8),
+            ("tiled", "tiled", 8),
+        ],
+        single_min_elements=None,
+        warmup=1,
+        iters=2,
+        timing_repeats=1,
+        interleaved_timing=True,
+    )
+
+    assert call_order == [
+        "single@8",
+        "tiled@8",
+        "single@8",
+        "tiled@8",
+        "tiled@8",
+        "single@8",
+    ]
+    assert measurements["single"]["candidate_ms"] == pytest.approx(1.2)
+    assert measurements["tiled"]["candidate_ms"] == pytest.approx(2.2)
+    assert measurements["single"]["max_abs_diff"] == pytest.approx(0.01)
+    assert measurements["tiled"]["max_abs_diff"] == pytest.approx(0.01)
+
+
 def test_run_gated_delta_decode_profile_case_reuses_profile_measurements_for_auto_compare(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -259,6 +383,7 @@ def test_run_gated_delta_decode_profile_case_reuses_profile_measurements_for_aut
         warmup=1,
         iters=1,
         timing_repeats=3,
+        interleaved_timing=False,
         seeds=[0],
         auto_compare=True,
         default_compare=False,

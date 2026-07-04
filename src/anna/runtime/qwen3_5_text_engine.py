@@ -1407,6 +1407,7 @@ class AnnaQwen3_5TextEngine:
                     "lm_head_block_size": os.getenv("ANNA_XPU_INT4_LM_HEAD_BLOCK_SIZE", "4096"),
                     "moe_gate_local_size": os.getenv("ANNA_XPU_INT4_MOE_GATE_LOCAL_SIZE"),
                     "moe_down_local_size": os.getenv("ANNA_XPU_INT4_MOE_DOWN_LOCAL_SIZE"),
+                    "lm_head_int4_topk_enabled": os.getenv("ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED"),
                     "lm_head_int4_topk_disabled": os.getenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK"),
                     "moe_grouped_int4_disabled": os.getenv("ANNA_XPU_DISABLE_MOE_GROUPED_INT4"),
                 },
