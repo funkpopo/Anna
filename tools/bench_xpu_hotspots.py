@@ -451,6 +451,20 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (4, 32, 128),
         (5, 32, 128),
     ),
+    # Boundary watchlist for Arc's V=128 default block, which should stay on 8
+    # instead of regressing to the slower tiled block=16 variant.
+    "arc-watch-v128-default8-vs-block16": (
+        (4, 8, 128),
+        (16, 8, 128),
+        (24, 8, 128),
+        (4, 16, 128),
+        (8, 16, 128),
+        (12, 16, 128),
+        (1, 32, 128),
+        (4, 32, 128),
+        (6, 32, 128),
+        (8, 32, 128),
+    ),
     "arc-legacy-v256-block4": (
         (33, 8, 256),
         (65, 8, 256),
@@ -554,6 +568,7 @@ GDN_DECODE_PRESET_VALUE_BLOCKS: dict[str, tuple[int, ...]] = {
     "arc-legacy-v64-block8": (8,),
     "arc-legacy-v128-block8": (8,),
     "arc-watch-v128-block8": (8,),
+    "arc-watch-v128-default8-vs-block16": (16,),
     "arc-legacy-v256-block4": (4,),
     "arc-watch-v256-block4": (4,),
     "arc-watch-v256-default4-vs-block8": (8,),

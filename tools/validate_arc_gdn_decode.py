@@ -19,6 +19,7 @@ ARC_V64_DEFAULT_BLOCK16_PRESET = "arc-v64-default-block16"
 ARC_LEGACY_V64_BLOCK8_PRESET = "arc-legacy-v64-block8"
 ARC_LEGACY_V128_BLOCK8_PRESET = "arc-legacy-v128-block8"
 ARC_WATCH_V128_BLOCK8_PRESET = "arc-watch-v128-block8"
+ARC_WATCH_V128_DEFAULT8_VS_BLOCK16_PRESET = "arc-watch-v128-default8-vs-block16"
 ARC_LEGACY_V256_BLOCK4_PRESET = "arc-legacy-v256-block4"
 ARC_WATCH_V256_BLOCK4_PRESET = "arc-watch-v256-block4"
 ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET = "arc-watch-v256-default4-vs-block8"
@@ -37,6 +38,7 @@ DEFAULT_PRESETS = (
 )
 ALL_PRESETS = DEFAULT_PRESETS + (
     ARC_WATCH_V128_BLOCK8_PRESET,
+    ARC_WATCH_V128_DEFAULT8_VS_BLOCK16_PRESET,
     ARC_WATCH_V256_BLOCK4_PRESET,
     ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET,
     ARC_WATCH_V256_DEFAULT8_VS_BLOCK4_PRESET,
@@ -53,6 +55,7 @@ PRESET_ALIASES: dict[str, tuple[str, ...]] = {
     QUICK_PRESET_ALIAS: QUICK_PRESETS,
     WATCH_PRESET_ALIAS: (
         ARC_WATCH_V128_BLOCK8_PRESET,
+        ARC_WATCH_V128_DEFAULT8_VS_BLOCK16_PRESET,
         ARC_WATCH_V256_BLOCK4_PRESET,
         ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET,
         ARC_WATCH_V256_DEFAULT8_VS_BLOCK4_PRESET,
@@ -115,6 +118,16 @@ ARC_BENCH_EXPECTATIONS = {
         ratio_field="auto_speed_ratio",
         max_ratio=1.02,
         default_compare_ratio_delta=0.005,
+    ),
+    ARC_WATCH_V128_DEFAULT8_VS_BLOCK16_PRESET: ArcBenchExpectation(
+        compare_prefix="gdn_decode_default_block_compare",
+        expected_value_blocks=(16,),
+        expected_row_count=10,
+        ratio_field="default_speed_ratio_vs_forced",
+        max_ratio=1.02,
+        default_compare_ratio_delta=0.01,
+        default_value_block=8,
+        default_strategy="tiled",
     ),
     ARC_LEGACY_V256_BLOCK4_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_auto_compare",

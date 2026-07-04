@@ -101,6 +101,21 @@ def test_arc_watch_v128_block8_preset_tracks_boundary_watch_shapes() -> None:
     )
 
 
+def test_arc_watch_v128_default8_vs_block16_preset_tracks_block_regression_shapes() -> None:
+    assert GDN_DECODE_SHAPE_PRESETS["arc-watch-v128-default8-vs-block16"] == (
+        (4, 8, 128),
+        (16, 8, 128),
+        (24, 8, 128),
+        (4, 16, 128),
+        (8, 16, 128),
+        (12, 16, 128),
+        (1, 32, 128),
+        (4, 32, 128),
+        (6, 32, 128),
+        (8, 32, 128),
+    )
+
+
 def test_parse_gdn_decode_shape_presets_preserves_order() -> None:
     assert _parse_gdn_decode_shape_presets("arc-default,arc-legacy-v256-block4") == [
         "arc-default",
