@@ -701,11 +701,10 @@ def _confirm_benchmark_ratio_failures(
     return summary, merged_rows
 
 
-def _compare_benchmark_summary_against_baseline(
+def _collect_benchmark_comparison_summary(
     *,
     current_summary: dict[str, object],
     baseline_summary: dict[str, object],
-    max_ratio_delta: float,
 ) -> dict[str, object]:
     current_prefix = str(current_summary["compare_prefix"])
     baseline_prefix = str(baseline_summary["compare_prefix"])
@@ -770,20 +769,10 @@ def _compare_benchmark_summary_against_baseline(
             }
         )
 
-    if max_ratio_delta_observed > max_ratio_delta:
-        assert worst_key is not None
-        raise ValueError(
-            f"Preset {current_summary['preset']} exceeded ratio delta threshold {max_ratio_delta:.4f}: "
-            f"baseline={worst_baseline_ratio:.4f} current={worst_current_ratio:.4f} "
-            f"delta={max_ratio_delta_observed:.4f} on batch={worst_key[0]} heads={worst_key[1]} "
-            f"value_dim={worst_key[3]} value_block={worst_key[4]}"
-        )
-
     observed_max_ratio_delta = float(current_summary["observed_max_ratio"]) - float(baseline_summary["observed_max_ratio"])
-    summary = {
+    return {
         "preset": current_summary["preset"],
         "ratio_field": ratio_field,
-        "max_ratio_delta_allowed": max_ratio_delta,
         "observed_max_ratio_delta": observed_max_ratio_delta,
         "observed_max_ratio_baseline": float(baseline_summary["observed_max_ratio"]),
         "observed_max_ratio_current": float(current_summary["observed_max_ratio"]),
@@ -797,11 +786,138 @@ def _compare_benchmark_summary_against_baseline(
         "max_row_ratio_delta": max_ratio_delta_observed,
         "row_deltas": per_row_deltas,
     }
+
+
+def _find_benchmark_compare_ratio_failure_rows(
+    *,
+    current_summary: dict[str, object],
+    baseline_summary: dict[str, object],
+    max_ratio_delta: float,
+) -> list[dict[str, object]]:
+    comparison_summary = _collect_benchmark_comparison_summary(
+        current_summary=current_summary,
+        baseline_summary=baseline_summary,
+    )
+    row_deltas = comparison_summary["row_deltas"]
+    assert isinstance(row_deltas, list)
+    return [
+        row_delta
+        for row_delta in row_deltas
+        if isinstance(row_delta, dict) and float(row_delta["ratio_delta"]) > max_ratio_delta
+    ]
+
+
+def _confirm_benchmark_compare_ratio_failures(
+    *,
+    preset_name: str,
+    current_summary: dict[str, object],
+    baseline_summary: dict[str, object],
+    max_ratio_delta: float,
+    seeds_csv: str,
+    cwd: Path,
+    env: dict[str, str],
+) -> tuple[dict[str, object] | None, dict[str, object]]:
+    failing_rows = _find_benchmark_compare_ratio_failure_rows(
+        current_summary=current_summary,
+        baseline_summary=baseline_summary,
+        max_ratio_delta=max_ratio_delta,
+    )
+    if not failing_rows:
+        return None, current_summary
+
+    shape_cases = _dedupe_shape_cases(
+        [
+            (int(row["batch"]), int(row["heads"]), int(row["value_head_dim"]))
+            for row in failing_rows
+        ]
+    )
     print(
-        f"[compare:{current_summary['preset']}] overlap={len(shared_keys)} "
-        f"missing={len(missing)} extra={len(extra)} "
-        f"max_row_ratio_delta={max_ratio_delta_observed:.4f} "
-        f"observed_max_ratio_delta={observed_max_ratio_delta:.4f}",
+        f"[confirm-compare:{preset_name}] failing_rows={len(failing_rows)} candidate_shapes={len(shape_cases)} "
+        f"max_ratio_delta={max_ratio_delta:.4f} warmup={DEFAULT_VALIDATE_CONFIRM_WARMUP} "
+        f"iters={DEFAULT_VALIDATE_CONFIRM_ITERS} timing_repeats={DEFAULT_VALIDATE_CONFIRM_TIMING_REPEATS}",
+        flush=True,
+    )
+    confirm_args, confirm_value_blocks, confirm_rows = _run_benchmark_for_shape_cases(
+        preset_name=preset_name,
+        shape_cases=shape_cases,
+        warmup=DEFAULT_VALIDATE_CONFIRM_WARMUP,
+        iters=DEFAULT_VALIDATE_CONFIRM_ITERS,
+        timing_repeats=DEFAULT_VALIDATE_CONFIRM_TIMING_REPEATS,
+        seeds_csv=seeds_csv,
+        cwd=cwd,
+        env=env,
+        label=f"confirm-compare:{preset_name}",
+    )
+    current_rows = current_summary["rows"]
+    if not isinstance(current_rows, list):
+        raise ValueError("Benchmark summary rows must be lists")
+    merged_rows = _merge_benchmark_rows(
+        base_rows=[row for row in current_rows if isinstance(row, dict)],
+        override_rows=confirm_rows,
+    )
+    current_value_blocks = tuple(int(value) for value in current_summary["resolved_value_blocks"])
+    if tuple(confirm_value_blocks) != current_value_blocks:
+        raise ValueError(
+            f"{preset_name} compare-confirmation resolved value blocks changed from "
+            f"{current_value_blocks} to {tuple(confirm_value_blocks)}"
+        )
+    updated_summary = _collect_benchmark_summary_from_rows(
+        preset_name=preset_name,
+        value_blocks=current_value_blocks,
+        rows=merged_rows,
+    )
+    for passthrough_field in ("bench_args", "bench_runs", "effective_max_shapes_per_scan", "threshold_confirmation"):
+        if passthrough_field in current_summary:
+            updated_summary[passthrough_field] = current_summary[passthrough_field]
+    remaining_failures = _find_benchmark_compare_ratio_failure_rows(
+        current_summary=updated_summary,
+        baseline_summary=baseline_summary,
+        max_ratio_delta=max_ratio_delta,
+    )
+    summary = {
+        "triggered": True,
+        "bench_args": confirm_args,
+        "shape_cases": shape_cases,
+        "resolved_value_blocks": list(confirm_value_blocks),
+        "candidate_rows": failing_rows,
+        "confirmed_rows": confirm_rows,
+        "cleared_row_count": len(failing_rows) - len(remaining_failures),
+        "remaining_failure_rows": remaining_failures,
+    }
+    return summary, updated_summary
+
+
+def _compare_benchmark_summary_against_baseline(
+    *,
+    current_summary: dict[str, object],
+    baseline_summary: dict[str, object],
+    max_ratio_delta: float,
+) -> dict[str, object]:
+    summary = _collect_benchmark_comparison_summary(
+        current_summary=current_summary,
+        baseline_summary=baseline_summary,
+    )
+    summary["max_ratio_delta_allowed"] = max_ratio_delta
+    if float(summary["max_row_ratio_delta"]) > max_ratio_delta:
+        worst_row = max(
+            (
+                row_delta
+                for row_delta in summary["row_deltas"]
+                if isinstance(row_delta, dict)
+            ),
+            key=lambda row_delta: float(row_delta["ratio_delta"]),
+        )
+        raise ValueError(
+            f"Preset {current_summary['preset']} exceeded ratio delta threshold {max_ratio_delta:.4f}: "
+            f"baseline={float(worst_row['baseline_ratio']):.4f} current={float(worst_row['current_ratio']):.4f} "
+            f"delta={float(worst_row['ratio_delta']):.4f} on batch={worst_row['batch']} heads={worst_row['heads']} "
+            f"value_dim={worst_row['value_head_dim']} value_block={worst_row['value_block']}"
+        )
+    print(
+        f"[compare:{current_summary['preset']}] overlap={int(summary['overlap_row_count'])} "
+        f"missing={int(summary['missing_row_count'])} extra={int(summary['extra_row_count'])} "
+        f"max_row_ratio_delta={float(summary['max_row_ratio_delta']):.4f} "
+        f"observed_max_ratio_delta={float(summary['observed_max_ratio_delta']):.4f}",
         flush=True,
     )
     return summary
@@ -1006,11 +1122,32 @@ def main() -> None:
                 baseline_presets = baseline_benchmark.get("presets")
                 if not isinstance(baseline_presets, dict) or preset_name not in baseline_presets:
                     raise ValueError(f"Baseline JSON does not include preset {preset_name}")
-                comparison_summary = _compare_benchmark_summary_against_baseline(
-                    current_summary=benchmark_summary,
-                    baseline_summary=baseline_presets[preset_name],
-                    max_ratio_delta=args.compare_ratio_delta,
-                )
+                comparison_confirmation: dict[str, object] | None = None
+                try:
+                    comparison_summary = _compare_benchmark_summary_against_baseline(
+                        current_summary=benchmark_summary,
+                        baseline_summary=baseline_presets[preset_name],
+                        max_ratio_delta=args.compare_ratio_delta,
+                    )
+                except ValueError:
+                    comparison_confirmation, benchmark_summary = _confirm_benchmark_compare_ratio_failures(
+                        preset_name=preset_name,
+                        current_summary=benchmark_summary,
+                        baseline_summary=baseline_presets[preset_name],
+                        max_ratio_delta=args.compare_ratio_delta,
+                        seeds_csv=args.seeds,
+                        cwd=root,
+                        env=env,
+                    )
+                    if comparison_confirmation is None:
+                        raise
+                    cast_presets[preset_name] = benchmark_summary
+                    comparison_summary = _compare_benchmark_summary_against_baseline(
+                        current_summary=benchmark_summary,
+                        baseline_summary=baseline_presets[preset_name],
+                        max_ratio_delta=args.compare_ratio_delta,
+                    )
+                comparison_summary["delta_confirmation"] = comparison_confirmation
                 cast_comparison = json_report["comparison"]
                 assert isinstance(cast_comparison, dict)
                 cast_comparison_presets = cast_comparison["presets"]

@@ -27,9 +27,12 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     _build_parser,
     _chunk_shape_cases,
     _confirm_benchmark_ratio_failures,
+    _confirm_benchmark_compare_ratio_failures,
     _compare_benchmark_summary_against_baseline,
+    _collect_benchmark_comparison_summary,
     _collect_benchmark_summary,
     _collect_benchmark_summary_from_rows,
+    _find_benchmark_compare_ratio_failure_rows,
     _find_benchmark_ratio_failure_rows,
     _load_json_report,
     _merge_benchmark_rows,
@@ -520,6 +523,25 @@ def test_compare_benchmark_summary_against_baseline_accepts_small_drift() -> Non
     assert comparison["max_row_ratio_delta"] == pytest.approx(0.01)
 
 
+def test_collect_benchmark_comparison_summary_reports_row_deltas_without_threshold_gate() -> None:
+    baseline = _collect_benchmark_summary(
+        _make_benchmark_output_for_preset(ARC_DEFAULT_PRESET, ratio=1.00),
+        ARC_DEFAULT_PRESET,
+    )
+    current = _collect_benchmark_summary(
+        _make_benchmark_output_for_preset(ARC_DEFAULT_PRESET, ratio=1.05),
+        ARC_DEFAULT_PRESET,
+    )
+    comparison = _collect_benchmark_comparison_summary(
+        current_summary=current,
+        baseline_summary=baseline,
+    )
+    assert comparison["preset"] == ARC_DEFAULT_PRESET
+    assert comparison["max_row_ratio_delta"] == pytest.approx(0.05)
+    assert len(comparison["row_deltas"]) == 1
+    assert comparison["row_deltas"][0]["ratio_delta"] == pytest.approx(0.05)
+
+
 def test_compare_benchmark_summary_against_baseline_allows_extra_rows() -> None:
     baseline = {
         "preset": ARC_LEGACY_V256_BLOCK4_PRESET,
@@ -601,6 +623,76 @@ def test_compare_benchmark_summary_against_baseline_allows_extra_rows() -> None:
     assert comparison["max_row_ratio_delta"] == pytest.approx(0.01)
 
 
+def test_find_benchmark_compare_ratio_failure_rows_returns_only_over_delta_rows() -> None:
+    baseline = {
+        "preset": ARC_WATCH_V256_BLOCK4_PRESET,
+        "compare_prefix": "gdn_decode_auto_compare",
+        "resolved_value_blocks": [4],
+        "ratio_field": "auto_speed_ratio",
+        "observed_max_ratio": 1.0,
+        "rows": [
+            {
+                "batch": "33",
+                "heads": "8",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_speed_ratio": "1.0000",
+            },
+            {
+                "batch": "71",
+                "heads": "16",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_speed_ratio": "1.0000",
+            },
+        ],
+    }
+    current = {
+        "preset": ARC_WATCH_V256_BLOCK4_PRESET,
+        "compare_prefix": "gdn_decode_auto_compare",
+        "resolved_value_blocks": [4],
+        "ratio_field": "auto_speed_ratio",
+        "observed_max_ratio": 1.03,
+        "rows": [
+            {
+                "batch": "33",
+                "heads": "8",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_speed_ratio": "1.0100",
+            },
+            {
+                "batch": "71",
+                "heads": "16",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_speed_ratio": "1.0400",
+            },
+        ],
+    }
+    failing_rows = _find_benchmark_compare_ratio_failure_rows(
+        current_summary=current,
+        baseline_summary=baseline,
+        max_ratio_delta=0.02,
+    )
+    assert failing_rows == [
+        {
+            "batch": "71",
+            "heads": "16",
+            "key_head_dim": "128",
+            "value_head_dim": "256",
+            "value_block": "4",
+            "baseline_ratio": 1.0,
+            "current_ratio": 1.04,
+            "ratio_delta": 0.040000000000000036,
+        }
+    ]
+
+
 def test_compare_benchmark_summary_against_baseline_rejects_large_drift() -> None:
     baseline = _collect_benchmark_summary(
         _make_benchmark_output_for_preset(ARC_LEGACY_V256_BLOCK4_PRESET, ratio=1.00),
@@ -616,3 +708,119 @@ def test_compare_benchmark_summary_against_baseline_rejects_large_drift() -> Non
             baseline_summary=baseline,
             max_ratio_delta=0.03,
         )
+
+
+def test_confirm_benchmark_compare_ratio_failures_reruns_only_failing_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run_step(*, args, cwd, env, label, capture_output):
+        assert capture_output is True
+        calls.append(args)
+        assert args[args.index("--gdn-decode-shape-cases") + 1] == "33x8x256"
+        lines = [
+            "gdn_decode_value_blocks=4",
+            "gdn_decode_auto_compare,device_name,batch,heads,key_head_dim,value_head_dim,value_block,auto_strategy,"
+            "single_ms,tiled_ms,auto_ms,best_explicit_strategy,best_explicit_ms,auto_minus_best_ms,"
+            "auto_speed_ratio,max_abs_diff",
+            "gdn_decode_auto_compare,Intel Arc,33,8,128,256,4,single,0.3000,0.2000,0.2010,tiled,0.2000,0.0010,1.0050,0.000100",
+        ]
+        return "\n".join(lines)
+
+    monkeypatch.setattr("tools.validate_arc_gdn_decode._run_step", fake_run_step)
+
+    baseline_summary = {
+        "preset": ARC_WATCH_V256_BLOCK4_PRESET,
+        "compare_prefix": "gdn_decode_auto_compare",
+        "resolved_value_blocks": [4],
+        "ratio_field": "auto_speed_ratio",
+        "observed_max_ratio": 1.0000,
+        "rows": [
+            {
+                "batch": "33",
+                "heads": "8",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_speed_ratio": "1.0000",
+            },
+            {
+                "batch": "71",
+                "heads": "16",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_speed_ratio": "1.0000",
+            },
+        ],
+    }
+    current_summary = {
+        "preset": ARC_WATCH_V256_BLOCK4_PRESET,
+        "compare_prefix": "gdn_decode_auto_compare",
+        "resolved_value_blocks": [4],
+        "ratio_field": "auto_speed_ratio",
+        "observed_max_ratio": 1.0400,
+        "rows": [
+            {
+                "batch": "33",
+                "heads": "8",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_speed_ratio": "1.0400",
+            },
+            {
+                "batch": "71",
+                "heads": "16",
+                "key_head_dim": "128",
+                "value_head_dim": "256",
+                "value_block": "4",
+                "auto_speed_ratio": "1.0000",
+            },
+        ],
+        "bench_args": ["orig"],
+    }
+
+    summary, updated_summary = _confirm_benchmark_compare_ratio_failures(
+        preset_name=ARC_WATCH_V256_BLOCK4_PRESET,
+        current_summary=current_summary,
+        baseline_summary=baseline_summary,
+        max_ratio_delta=0.02,
+        seeds_csv="20260960,20260961",
+        cwd=Path.cwd(),
+        env={},
+    )
+
+    assert summary is not None
+    assert summary["shape_cases"] == [(33, 8, 256)]
+    assert summary["cleared_row_count"] == 1
+    assert summary["remaining_failure_rows"] == []
+    assert len(calls) == 1
+    assert updated_summary["rows"][0]["auto_speed_ratio"] == "1.0050"
+    assert updated_summary["rows"][1] == current_summary["rows"][1]
+    assert updated_summary["bench_args"] == ["orig"]
+
+
+def test_confirm_benchmark_compare_ratio_failures_skips_when_no_rows_exceed_delta() -> None:
+    baseline_summary = _collect_benchmark_summary(
+        _make_benchmark_output_for_preset(ARC_WATCH_V256_BLOCK4_PRESET, ratio=1.00),
+        ARC_WATCH_V256_BLOCK4_PRESET,
+    )
+    current_summary = _collect_benchmark_summary(
+        _make_benchmark_output_for_preset(ARC_WATCH_V256_BLOCK4_PRESET, ratio=1.01),
+        ARC_WATCH_V256_BLOCK4_PRESET,
+    )
+
+    summary, updated_summary = _confirm_benchmark_compare_ratio_failures(
+        preset_name=ARC_WATCH_V256_BLOCK4_PRESET,
+        current_summary=current_summary,
+        baseline_summary=baseline_summary,
+        max_ratio_delta=0.02,
+        seeds_csv="20260960,20260961",
+        cwd=Path.cwd(),
+        env={},
+    )
+
+    assert summary is None
+    assert updated_summary == current_summary
