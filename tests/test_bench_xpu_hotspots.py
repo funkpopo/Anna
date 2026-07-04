@@ -90,9 +90,9 @@ def test_dedupe_gdn_decode_shape_cases_preserves_first_occurrence() -> None:
 
 
 def test_resolve_gdn_decode_value_blocks_uses_preset_recommendations() -> None:
-    assert _resolve_gdn_decode_value_blocks(None, ["arc-default"]) == [8]
+    assert _resolve_gdn_decode_value_blocks(None, ["arc-default"]) == [4, 8]
     assert _resolve_gdn_decode_value_blocks(None, ["arc-legacy-v128-block8"]) == [8]
-    assert _resolve_gdn_decode_value_blocks(None, ["arc-default", "arc-legacy-v256-block4"]) == [8, 4]
+    assert _resolve_gdn_decode_value_blocks(None, ["arc-default", "arc-legacy-v256-block4"]) == [4, 8]
 
 
 def test_resolve_gdn_decode_value_blocks_prefers_explicit_csv() -> None:

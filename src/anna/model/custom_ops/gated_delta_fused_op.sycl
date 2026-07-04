@@ -252,6 +252,15 @@ struct GatedDeltaDecodeValueBlockOverride {
   int64_t value_block;
 };
 
+struct GatedDeltaDecodeValueBlockRowOverride {
+  const char* device_pattern;
+  int64_t key_head_dim;
+  int64_t value_head_dim;
+  int64_t min_rows;
+  int64_t max_rows;
+  int64_t value_block;
+};
+
 struct GatedDeltaDecodeAutoCutover {
   const char* device_pattern;
   int64_t key_head_dim;
@@ -272,11 +281,19 @@ struct GatedDeltaDecodeAutoStrategyOverride {
 };
 
 // Arc A770 decode sweeps after the tiled subgroup-span remap show that K=128
-// decode prefers value_block=8 for V={64,128,256}.
+// decode prefers value_block=8 for V={64,128}. V=256 defaults to 4 and only
+// needs narrow row-band fallbacks to 8.
 constexpr GatedDeltaDecodeValueBlockOverride kGatedDeltaDecodeValueBlockOverrides[] = {
     {"arc", 128, 64, 8},
     {"arc", 128, 128, 8},
-    {"arc", 128, 256, 8},
+    {"arc", 128, 256, 4},
+};
+
+// Arc A770 V=256 decode shapes still have two stable row bands where
+// value_block=8 outperforms the smaller default tiled block.
+constexpr GatedDeltaDecodeValueBlockRowOverride kGatedDeltaDecodeValueBlockRowOverrides[] = {
+    {"arc", 128, 256, 264, 288, 8},
+    {"arc", 128, 256, 464, 496, 8},
 };
 
 // Arc A770 decode sweeps keep V=64 special-cased, while V=128/value_block>=8
@@ -350,6 +367,8 @@ int64_t clamp_gated_delta_decode_value_block(int64_t value_block) {
 
 int64_t resolve_gated_delta_decode_value_block(
     const sycl::device& device,
+    int64_t batch_size,
+    int64_t num_heads,
     int64_t key_head_dim,
     int64_t value_head_dim) {
   const int64_t env_value_block = resolve_env_int64("ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK", 0);
@@ -358,6 +377,20 @@ int64_t resolve_gated_delta_decode_value_block(
   }
 
   const std::string& lower_device_name = cached_lowercase_device_name(device);
+  const int64_t recurrent_rows = batch_size * num_heads;
+  for (const auto& value_block_override : kGatedDeltaDecodeValueBlockRowOverrides) {
+    const bool device_matches = value_block_override.device_pattern[0] == '\0' ||
+        lower_device_name.find(value_block_override.device_pattern) != std::string::npos;
+    if (!device_matches || value_block_override.key_head_dim != key_head_dim ||
+        value_block_override.value_head_dim != value_head_dim) {
+      continue;
+    }
+    if (recurrent_rows < value_block_override.min_rows || recurrent_rows > value_block_override.max_rows) {
+      continue;
+    }
+    return clamp_gated_delta_decode_value_block(value_block_override.value_block);
+  }
+
   for (const auto& value_block_override : kGatedDeltaDecodeValueBlockOverrides) {
     const bool device_matches = value_block_override.device_pattern[0] == '\0' ||
         lower_device_name.find(value_block_override.device_pattern) != std::string::npos;
@@ -7164,7 +7197,12 @@ at::Tensor gated_delta_decode_xpu(
   const int64_t local_size = std::min<int64_t>(next_power_of_two(std::max<int64_t>(1, value_head_dim)), 256);
   validate_gated_delta_local_memory_requirements(stream.queue().get_device(), key_head_dim, local_size);
   const int64_t value_block =
-      resolve_gated_delta_decode_value_block(stream.queue().get_device(), key_head_dim, value_head_dim);
+      resolve_gated_delta_decode_value_block(
+          stream.queue().get_device(),
+          batch_size,
+          num_heads,
+          key_head_dim,
+          value_head_dim);
   const auto decode_strategy = resolve_gated_delta_decode_strategy(
       stream.queue().get_device(),
       batch_size,
@@ -7267,7 +7305,12 @@ at::Tensor gated_delta_decode_benchmark_xpu(
   validate_gated_delta_local_memory_requirements(stream.queue().get_device(), key_head_dim, local_size);
   const int64_t value_block = value_block_override > 0
       ? clamp_gated_delta_decode_value_block(value_block_override)
-      : resolve_gated_delta_decode_value_block(stream.queue().get_device(), key_head_dim, value_head_dim);
+      : resolve_gated_delta_decode_value_block(
+            stream.queue().get_device(),
+            batch_size,
+            num_heads,
+            key_head_dim,
+            value_head_dim);
 
   GatedDeltaDecodeStrategy decode_strategy = GatedDeltaDecodeStrategy::SingleGroup;
   if (strategy_code == 0) {
@@ -7358,7 +7401,12 @@ int64_t gated_delta_decode_value_block_debug_xpu(
   TORCH_CHECK(value_head_dim > 0, "value_head_dim must be positive");
   auto stream = c10::xpu::getCurrentXPUStream(query_in.device().index());
   const int64_t key_head_dim = query_in.size(3);
-  return resolve_gated_delta_decode_value_block(stream.queue().get_device(), key_head_dim, value_head_dim);
+  return resolve_gated_delta_decode_value_block(
+      stream.queue().get_device(),
+      query_in.size(0),
+      query_in.size(2),
+      key_head_dim,
+      value_head_dim);
 }
 
 int64_t gated_delta_decode_strategy_debug_xpu(
