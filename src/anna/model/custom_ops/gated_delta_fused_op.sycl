@@ -293,7 +293,7 @@ constexpr GatedDeltaDecodeValueBlockOverride kGatedDeltaDecodeValueBlockOverride
 // value_block=8 outperforms the smaller default tiled block.
 constexpr GatedDeltaDecodeValueBlockRowOverride kGatedDeltaDecodeValueBlockRowOverrides[] = {
     {"arc", 128, 256, 264, 312, 8},
-    {"arc", 128, 256, 464, 496, 8},
+    {"arc", 128, 256, 456, 504, 8},
 };
 
 // Arc A770 decode sweeps keep V=64 special-cased, while V=128/value_block>=8
