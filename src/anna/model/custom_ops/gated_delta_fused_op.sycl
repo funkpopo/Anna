@@ -282,18 +282,18 @@ struct GatedDeltaDecodeAutoStrategyOverride {
 
 // Arc A770 decode sweeps after the tiled subgroup-span remap show that K=128
 // decode prefers value_block=8 for V={64,128}. V=256 defaults to 4 and only
-// needs narrow row-band fallbacks to 8.
+// keeps a narrow 264..304 row band on 8 after the static full-tile tiled path
+// sped up the broader block=4 cases.
 constexpr GatedDeltaDecodeValueBlockOverride kGatedDeltaDecodeValueBlockOverrides[] = {
     {"arc", 128, 64, 8},
     {"arc", 128, 128, 8},
     {"arc", 128, 256, 4},
 };
 
-// Arc A770 V=256 decode shapes still have two stable row bands where
-// value_block=8 outperforms the smaller default tiled block.
+// Arc A770 V=256 decode keeps a single stable row band where value_block=8
+// still outperforms the smaller default tiled block.
 constexpr GatedDeltaDecodeValueBlockRowOverride kGatedDeltaDecodeValueBlockRowOverrides[] = {
-    {"arc", 128, 256, 264, 312, 8},
-    {"arc", 128, 256, 456, 504, 8},
+    {"arc", 128, 256, 264, 304, 8},
 };
 
 // Arc A770 decode sweeps keep V=64 special-cased, while V=128/value_block>=8
@@ -321,6 +321,52 @@ int64_t resolve_gated_delta_decode_values_per_lane(int64_t value_head_dim) {
 
 int64_t resolve_gated_delta_decode_tiled_active_lanes(int64_t value_block) {
   return std::max<int64_t>(1, std::min<int64_t>(kGatedDeltaDecodeSubgroupSize, value_block));
+}
+
+constexpr int64_t ceil_div_constexpr_int64(int64_t numerator, int64_t denominator) {
+  return (numerator + denominator - 1) / denominator;
+}
+
+template <int64_t StaticValueBlock>
+constexpr int64_t resolve_gated_delta_decode_tiled_active_lanes_static() {
+  if constexpr (StaticValueBlock <= 0) {
+    return 0;
+  }
+  return StaticValueBlock < kGatedDeltaDecodeSubgroupSize ? StaticValueBlock : kGatedDeltaDecodeSubgroupSize;
+}
+
+template <int64_t ValuesPerLane, int64_t StaticValueHeadDim, int64_t StaticValueBlock>
+constexpr int64_t resolve_gated_delta_decode_tiled_work_group_size_static() {
+  if constexpr (StaticValueHeadDim <= 0 || StaticValueBlock <= 0) {
+    return 0;
+  } else {
+    constexpr int64_t subgroup_active_lanes =
+        resolve_gated_delta_decode_tiled_active_lanes_static<StaticValueBlock>();
+    constexpr int64_t subgroup_value_span = subgroup_active_lanes * ValuesPerLane;
+    constexpr int64_t subgroups_needed = ceil_div_constexpr_int64(StaticValueHeadDim, subgroup_value_span);
+    constexpr int64_t max_work_group_size =
+        StaticValueHeadDim > kGatedDeltaDecodeSubgroupSize ? StaticValueHeadDim : kGatedDeltaDecodeSubgroupSize;
+    constexpr int64_t max_subgroups = max_work_group_size / kGatedDeltaDecodeSubgroupSize;
+    constexpr int64_t subgroups_per_work_group =
+        subgroups_needed < max_subgroups ? subgroups_needed : max_subgroups;
+    return subgroups_per_work_group * kGatedDeltaDecodeSubgroupSize;
+  }
+}
+
+template <int64_t ValuesPerLane, int64_t StaticValueHeadDim, int64_t StaticValueBlock>
+constexpr bool can_use_gated_delta_decode_tiled_static_full_tile_mapping() {
+  if constexpr (StaticValueHeadDim <= 0 || StaticValueBlock <= 0) {
+    return false;
+  } else {
+    constexpr int64_t subgroup_active_lanes =
+        resolve_gated_delta_decode_tiled_active_lanes_static<StaticValueBlock>();
+    constexpr int64_t subgroup_value_span = subgroup_active_lanes * ValuesPerLane;
+    constexpr int64_t subgroups_needed = ceil_div_constexpr_int64(StaticValueHeadDim, subgroup_value_span);
+    constexpr int64_t subgroups_per_work_group =
+        resolve_gated_delta_decode_tiled_work_group_size_static<ValuesPerLane, StaticValueHeadDim, StaticValueBlock>() /
+        kGatedDeltaDecodeSubgroupSize;
+    return subgroups_needed == subgroups_per_work_group && (StaticValueHeadDim % subgroup_value_span) == 0;
+  }
 }
 
 template <int64_t ValuesPerLane>
@@ -760,6 +806,7 @@ template <
     int64_t ValuesPerLane,
     int64_t StaticKeyHeadDim = 0,
     int64_t StaticValueHeadDim = 0,
+    bool FullTile = false,
     typename scalar_t,
     typename QueryAccessor,
     typename KeyAccessor>
@@ -800,7 +847,11 @@ inline void gated_delta_decode_process_value_tile(
 #pragma unroll
     for (int64_t value_offset = 0; value_offset < ValuesPerLane; ++value_offset) {
       const int64_t v_idx = lane_value_base + value_offset;
-      if (v_idx < value_limit && v_idx < resolved_value_head_dim) {
+      if constexpr (FullTile) {
+        const float decayed = state_source_ptr[state_row_base + value_offset] * g_scale;
+        kv_mem[value_offset] += decayed * normalized_key_value;
+        decayed_output[value_offset] += decayed * normalized_query_value;
+      } else if (v_idx < value_limit && v_idx < resolved_value_head_dim) {
         const float decayed = state_source_ptr[state_row_base + value_offset] * g_scale;
         kv_mem[value_offset] += decayed * normalized_key_value;
         decayed_output[value_offset] += decayed * normalized_query_value;
@@ -811,7 +862,9 @@ inline void gated_delta_decode_process_value_tile(
 #pragma unroll
   for (int64_t value_offset = 0; value_offset < ValuesPerLane; ++value_offset) {
     const int64_t v_idx = lane_value_base + value_offset;
-    if (v_idx < value_limit && v_idx < resolved_value_head_dim) {
+    if constexpr (FullTile) {
+      delta[value_offset] = gated_delta_compute_delta(value_ptr, value_base, v_idx, kv_mem[value_offset], beta_value);
+    } else if (v_idx < value_limit && v_idx < resolved_value_head_dim) {
       delta[value_offset] = gated_delta_compute_delta(value_ptr, value_base, v_idx, kv_mem[value_offset], beta_value);
     }
   }
@@ -822,7 +875,10 @@ inline void gated_delta_decode_process_value_tile(
 #pragma unroll
     for (int64_t value_offset = 0; value_offset < ValuesPerLane; ++value_offset) {
       const int64_t v_idx = lane_value_base + value_offset;
-      if (v_idx < value_limit && v_idx < resolved_value_head_dim) {
+      if constexpr (FullTile) {
+        state_write_ptr[state_row_base + value_offset] =
+            state_source_ptr[state_row_base + value_offset] * g_scale + normalized_key_value * delta[value_offset];
+      } else if (v_idx < value_limit && v_idx < resolved_value_head_dim) {
         state_write_ptr[state_row_base + value_offset] =
             state_source_ptr[state_row_base + value_offset] * g_scale + normalized_key_value * delta[value_offset];
       }
@@ -832,7 +888,12 @@ inline void gated_delta_decode_process_value_tile(
 #pragma unroll
   for (int64_t value_offset = 0; value_offset < ValuesPerLane; ++value_offset) {
     const int64_t v_idx = lane_value_base + value_offset;
-    if (v_idx < value_limit && v_idx < resolved_value_head_dim) {
+    if constexpr (FullTile) {
+      gated_delta_store_output(
+          output_ptr,
+          output_base + v_idx,
+          decayed_output[value_offset] + delta[value_offset] * query_key_dot);
+    } else if (v_idx < value_limit && v_idx < resolved_value_head_dim) {
       gated_delta_store_output(
           output_ptr,
           output_base + v_idx,
@@ -5893,7 +5954,12 @@ void launch_gated_delta_decode_subgroup_kernel(
   });
 }
 
-template <typename scalar_t, int64_t ValuesPerLane, int64_t StaticKeyHeadDim = 0, int64_t StaticValueHeadDim = 0>
+template <
+    typename scalar_t,
+    int64_t ValuesPerLane,
+    int64_t StaticKeyHeadDim = 0,
+    int64_t StaticValueHeadDim = 0,
+    int64_t StaticValueBlock = 0>
 void launch_gated_delta_decode_tiled_subgroup_kernel(
     sycl::queue& queue,
     const scalar_t* query_ptr,
@@ -5937,6 +6003,32 @@ void launch_gated_delta_decode_tiled_kernel(
   const bool specialize_k128_v256 = key_head_dim == 128 && value_head_dim == 256;
 
   if (specialize_k128_v128) {
+    if (values_per_lane == kGatedDeltaDecodeValuesPerLaneSmall && value_block == 8) {
+      launch_gated_delta_decode_tiled_subgroup_kernel<
+          scalar_t,
+          kGatedDeltaDecodeValuesPerLaneSmall,
+          128,
+          128,
+          8>(
+          queue,
+          query_ptr,
+          key_ptr,
+          value_ptr,
+          g_ptr,
+          beta_ptr,
+          state_read_ptr,
+          state_write_ptr,
+          output_ptr,
+          batch_size,
+          num_heads,
+          key_head_dim,
+          value_head_dim,
+          value_block,
+          local_size,
+          l2_eps_f,
+          query_scale_base);
+      return;
+    }
     if (values_per_lane == kGatedDeltaDecodeValuesPerLaneSmall) {
       launch_gated_delta_decode_tiled_subgroup_kernel<scalar_t, kGatedDeltaDecodeValuesPerLaneSmall, 128, 128>(
           queue,
@@ -5980,6 +6072,58 @@ void launch_gated_delta_decode_tiled_kernel(
   }
 
   if (specialize_k128_v256) {
+    if (values_per_lane == kGatedDeltaDecodeValuesPerLaneSmall && value_block == 4) {
+      launch_gated_delta_decode_tiled_subgroup_kernel<
+          scalar_t,
+          kGatedDeltaDecodeValuesPerLaneSmall,
+          128,
+          256,
+          4>(
+          queue,
+          query_ptr,
+          key_ptr,
+          value_ptr,
+          g_ptr,
+          beta_ptr,
+          state_read_ptr,
+          state_write_ptr,
+          output_ptr,
+          batch_size,
+          num_heads,
+          key_head_dim,
+          value_head_dim,
+          value_block,
+          local_size,
+          l2_eps_f,
+          query_scale_base);
+      return;
+    }
+    if (values_per_lane == kGatedDeltaDecodeValuesPerLaneSmall && value_block == 8) {
+      launch_gated_delta_decode_tiled_subgroup_kernel<
+          scalar_t,
+          kGatedDeltaDecodeValuesPerLaneSmall,
+          128,
+          256,
+          8>(
+          queue,
+          query_ptr,
+          key_ptr,
+          value_ptr,
+          g_ptr,
+          beta_ptr,
+          state_read_ptr,
+          state_write_ptr,
+          output_ptr,
+          batch_size,
+          num_heads,
+          key_head_dim,
+          value_head_dim,
+          value_block,
+          local_size,
+          l2_eps_f,
+          query_scale_base);
+      return;
+    }
     if (values_per_lane == kGatedDeltaDecodeValuesPerLaneSmall) {
       launch_gated_delta_decode_tiled_subgroup_kernel<scalar_t, kGatedDeltaDecodeValuesPerLaneSmall, 128, 256>(
           queue,
@@ -6064,7 +6208,7 @@ void launch_gated_delta_decode_tiled_kernel(
       query_scale_base);
 }
 
-template <typename scalar_t, int64_t ValuesPerLane, int64_t StaticKeyHeadDim, int64_t StaticValueHeadDim>
+template <typename scalar_t, int64_t ValuesPerLane, int64_t StaticKeyHeadDim, int64_t StaticValueHeadDim, int64_t StaticValueBlock>
 void launch_gated_delta_decode_tiled_subgroup_kernel(
     sycl::queue& queue,
     const scalar_t* query_ptr,
@@ -6085,15 +6229,35 @@ void launch_gated_delta_decode_tiled_subgroup_kernel(
     float query_scale_base) {
   const int64_t resolved_key_head_dim = resolve_gated_delta_static_dim<StaticKeyHeadDim>(key_head_dim);
   const int64_t resolved_value_head_dim = resolve_gated_delta_static_dim<StaticValueHeadDim>(value_head_dim);
+  constexpr bool use_static_full_tile_mapping =
+      can_use_gated_delta_decode_tiled_static_full_tile_mapping<ValuesPerLane, StaticValueHeadDim, StaticValueBlock>();
+  constexpr int64_t static_subgroup_size = kGatedDeltaDecodeSubgroupSize;
+  constexpr int64_t static_work_group_size = use_static_full_tile_mapping
+      ? resolve_gated_delta_decode_tiled_work_group_size_static<ValuesPerLane, StaticValueHeadDim, StaticValueBlock>()
+      : 0;
+  constexpr int64_t static_subgroups_per_work_group =
+      use_static_full_tile_mapping ? static_work_group_size / static_subgroup_size : 0;
+  constexpr int64_t static_subgroup_active_lanes =
+      use_static_full_tile_mapping ? resolve_gated_delta_decode_tiled_active_lanes_static<StaticValueBlock>() : 0;
+  constexpr int64_t static_subgroup_value_span =
+      use_static_full_tile_mapping ? static_subgroup_active_lanes * ValuesPerLane : 0;
   const int64_t subgroup_size = kGatedDeltaDecodeSubgroupSize;
   const int64_t max_work_group_size = std::max<int64_t>(subgroup_size, local_size);
-  const int64_t work_group_size = resolve_gated_delta_decode_tiled_work_group_size<ValuesPerLane>(
-      resolved_value_head_dim,
-      value_block,
-      max_work_group_size);
-  const int64_t subgroups_per_work_group = std::max<int64_t>(1, work_group_size / subgroup_size);
-  const int64_t subgroup_active_lanes = resolve_gated_delta_decode_tiled_active_lanes(value_block);
-  const int64_t subgroup_value_span = subgroup_active_lanes * ValuesPerLane;
+  const int64_t work_group_size = use_static_full_tile_mapping
+      ? static_work_group_size
+      : resolve_gated_delta_decode_tiled_work_group_size<ValuesPerLane>(
+            resolved_value_head_dim,
+            value_block,
+            max_work_group_size);
+  const int64_t subgroups_per_work_group = use_static_full_tile_mapping
+      ? static_subgroups_per_work_group
+      : std::max<int64_t>(1, work_group_size / subgroup_size);
+  const int64_t subgroup_active_lanes = use_static_full_tile_mapping
+      ? static_subgroup_active_lanes
+      : resolve_gated_delta_decode_tiled_active_lanes(value_block);
+  const int64_t subgroup_value_span = use_static_full_tile_mapping
+      ? static_subgroup_value_span
+      : subgroup_active_lanes * ValuesPerLane;
   const size_t group_count = static_cast<size_t>(batch_size * num_heads);
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> normalized_query(sycl::range<1>(static_cast<size_t>(resolved_key_head_dim)), cgh);
@@ -6131,6 +6295,34 @@ void launch_gated_delta_decode_tiled_subgroup_kernel(
 
           const float g_scale = sycl::exp(g_ptr[scalar_index]);
           const float beta_value = beta_ptr[scalar_index];
+          if constexpr (use_static_full_tile_mapping) {
+            if (lane < static_subgroup_active_lanes) {
+              const int64_t lane_value_base = subgroup_id * static_subgroup_value_span + lane * ValuesPerLane;
+              gated_delta_decode_process_value_tile<
+                  ValuesPerLane,
+                  StaticKeyHeadDim,
+                  StaticValueHeadDim,
+                  true>(
+                  value_ptr,
+                  v_t_base,
+                  state_read_ptr,
+                  state_write_ptr,
+                  output_ptr,
+                  state_base,
+                  output_base,
+                  resolved_value_head_dim,
+                  resolved_value_head_dim,
+                  resolved_key_head_dim,
+                  lane_value_base,
+                  g_scale,
+                  beta_value,
+                  query_key_dot,
+                  normalized_query,
+                  normalized_key);
+            }
+            return;
+          }
+
           const int64_t subgroup_tile_stride = subgroups_per_work_group * subgroup_value_span;
           const int64_t lane_value_stride = subgroup_value_span;
           for (int64_t value_start = subgroup_id * subgroup_value_span;

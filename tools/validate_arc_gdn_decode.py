@@ -148,7 +148,7 @@ ARC_BENCH_EXPECTATIONS = {
     ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_default_block_compare",
         expected_value_blocks=(8,),
-        expected_row_count=14,
+        expected_row_count=20,
         ratio_field="default_speed_ratio_vs_forced",
         max_ratio=1.02,
         default_compare_ratio_delta=0.01,
@@ -158,7 +158,7 @@ ARC_BENCH_EXPECTATIONS = {
     ARC_WATCH_V256_DEFAULT8_VS_BLOCK4_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_default_block_compare",
         expected_value_blocks=(4,),
-        expected_row_count=15,
+        expected_row_count=7,
         ratio_field="default_speed_ratio_vs_forced",
         max_ratio=1.02,
         default_compare_ratio_delta=0.01,

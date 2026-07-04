@@ -524,41 +524,42 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (37, 32, 256),
     ),
     # Boundary shapes where Arc's V=256 default block should stay on 4 even when
-    # compared directly against forced block=8.
+    # compared directly against forced block=8, including both sides of the
+    # retained 264..304 block=8 band and the old second band that now falls
+    # back to block=4 after the tiled full-tile specialization.
     "arc-watch-v256-default4-vs-block8": (
         (32, 8, 256),
+        (39, 8, 256),
         (40, 8, 256),
         (56, 8, 256),
+        (57, 8, 256),
+        (58, 8, 256),
+        (60, 8, 256),
+        (62, 8, 256),
+        (63, 8, 256),
         (64, 8, 256),
-        (65, 8, 256),
         (16, 16, 256),
         (20, 16, 256),
         (28, 16, 256),
+        (29, 16, 256),
+        (30, 16, 256),
+        (31, 16, 256),
         (32, 16, 256),
-        (33, 16, 256),
-        (10, 32, 256),
         (14, 32, 256),
+        (15, 32, 256),
         (16, 32, 256),
-        (17, 32, 256),
     ),
-    # Boundary shapes where Arc's V=256 default block should stay on 8 even when
-    # compared directly against forced block=4.
+    # Boundary shapes where Arc's V=256 default block should stay on 8 inside
+    # the retained 264..304 row band when compared directly against forced
+    # block=4.
     "arc-watch-v256-default8-vs-block4": (
         (33, 8, 256),
-        (36, 8, 256),
         (37, 8, 256),
         (38, 8, 256),
-        (39, 8, 256),
-        (57, 8, 256),
-        (58, 8, 256),
-        (62, 8, 256),
-        (63, 8, 256),
         (17, 16, 256),
         (18, 16, 256),
         (19, 16, 256),
-        (29, 16, 256),
-        (31, 16, 256),
-        (15, 32, 256),
+        (9, 32, 256),
     ),
 }
 
