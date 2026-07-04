@@ -437,6 +437,18 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (5, 32, 128),
         (8, 32, 128),
     ),
+    # Fast A770 regression watchlist for the V=128/value_block=8 row-128
+    # single-group shapes and the adjacent tiled edge band at rows 144..160.
+    "arc-watch-v128-block8": (
+        (16, 8, 128),
+        (18, 8, 128),
+        (19, 8, 128),
+        (8, 16, 128),
+        (9, 16, 128),
+        (10, 16, 128),
+        (4, 32, 128),
+        (5, 32, 128),
+    ),
     "arc-legacy-v256-block4": (
         (33, 8, 256),
         (65, 8, 256),
@@ -502,6 +514,7 @@ GDN_DECODE_PRESET_VALUE_BLOCKS: dict[str, tuple[int, ...]] = {
     "arc-v64-default-block16": (16,),
     "arc-legacy-v64-block8": (8,),
     "arc-legacy-v128-block8": (8,),
+    "arc-watch-v128-block8": (8,),
     "arc-legacy-v256-block4": (4,),
     "arc-watch-v256-block4": (4,),
 }

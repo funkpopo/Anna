@@ -17,6 +17,7 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     ARC_LEGACY_V64_BLOCK8_PRESET,
     ARC_V64_DEFAULT_BLOCK16_PRESET,
     ARC_LEGACY_V128_BLOCK8_PRESET,
+    ARC_WATCH_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
     ARC_WATCH_V256_BLOCK4_PRESET,
     DEFAULT_PRESETS,
@@ -65,6 +66,7 @@ def test_parse_preset_names_expands_aliases_and_dedupes() -> None:
     assert _parse_preset_names("quick,arc-legacy-v256-block4,watch,ARC-DEFAULT") == [
         *QUICK_PRESETS,
         ARC_LEGACY_V256_BLOCK4_PRESET,
+        ARC_WATCH_V128_BLOCK8_PRESET,
     ]
 
 
@@ -80,6 +82,7 @@ def test_parse_preset_names_rejects_unknown_values() -> None:
         (ARC_V64_DEFAULT_BLOCK16_PRESET, "--gdn-decode-default-compare"),
         (ARC_LEGACY_V64_BLOCK8_PRESET, "--gdn-decode-auto-compare"),
         (ARC_LEGACY_V128_BLOCK8_PRESET, "--gdn-decode-auto-compare"),
+        (ARC_WATCH_V128_BLOCK8_PRESET, "--gdn-decode-auto-compare"),
         (ARC_LEGACY_V256_BLOCK4_PRESET, "--gdn-decode-auto-compare"),
         (ARC_WATCH_V256_BLOCK4_PRESET, "--gdn-decode-auto-compare"),
     ],
@@ -212,8 +215,16 @@ def test_parse_preset_names_accepts_watch_preset() -> None:
     assert _parse_preset_names("arc-watch-v256-block4") == [ARC_WATCH_V256_BLOCK4_PRESET]
 
 
+def test_parse_preset_names_accepts_v128_watch_preset() -> None:
+    assert _parse_preset_names("arc-watch-v128-block8") == [ARC_WATCH_V128_BLOCK8_PRESET]
+
+
 def test_parse_preset_names_accepts_full_alias() -> None:
     assert _parse_preset_names("full") == list(DEFAULT_PRESETS)
+
+
+def test_parse_preset_names_accepts_watch_alias() -> None:
+    assert _parse_preset_names("watch") == [ARC_WATCH_V128_BLOCK8_PRESET, ARC_WATCH_V256_BLOCK4_PRESET]
 
 
 def test_validate_script_help_runs_without_preseeded_pythonpath() -> None:
@@ -233,6 +244,7 @@ def test_validate_script_help_runs_without_preseeded_pythonpath() -> None:
     normalized_stdout = " ".join(completed.stdout.split())
     assert "quick" in normalized_stdout
     assert "watch" in normalized_stdout
+    assert "watch-v128-block8" in normalized_stdout
     assert "watch-v256-block4" in normalized_stdout
 
 
