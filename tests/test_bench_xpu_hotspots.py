@@ -24,6 +24,13 @@ def test_gdn_decode_shape_presets_have_matching_value_block_metadata() -> None:
     assert set(GDN_DECODE_SHAPE_PRESETS) == set(GDN_DECODE_PRESET_VALUE_BLOCKS)
 
 
+def test_arc_legacy_v256_block4_preset_keeps_upper_edge_regression_shapes() -> None:
+    preset = GDN_DECODE_SHAPE_PRESETS["arc-legacy-v256-block4"]
+    assert (146, 8, 256) in preset
+    assert (73, 16, 256) in preset
+    assert (37, 32, 256) in preset
+
+
 def test_parse_gdn_decode_shape_presets_preserves_order() -> None:
     assert _parse_gdn_decode_shape_presets("arc-default,arc-legacy-v256-block4") == [
         "arc-default",
