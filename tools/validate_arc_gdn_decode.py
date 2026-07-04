@@ -21,6 +21,8 @@ ARC_LEGACY_V128_BLOCK8_PRESET = "arc-legacy-v128-block8"
 ARC_WATCH_V128_BLOCK8_PRESET = "arc-watch-v128-block8"
 ARC_LEGACY_V256_BLOCK4_PRESET = "arc-legacy-v256-block4"
 ARC_WATCH_V256_BLOCK4_PRESET = "arc-watch-v256-block4"
+ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET = "arc-watch-v256-default4-vs-block8"
+ARC_WATCH_V256_DEFAULT8_VS_BLOCK4_PRESET = "arc-watch-v256-default8-vs-block4"
 FULL_PRESET_ALIAS = "full"
 QUICK_PRESET_ALIAS = "quick"
 WATCH_PRESET_ALIAS = "watch"
@@ -33,7 +35,12 @@ DEFAULT_PRESETS = (
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
 )
-ALL_PRESETS = DEFAULT_PRESETS + (ARC_WATCH_V128_BLOCK8_PRESET, ARC_WATCH_V256_BLOCK4_PRESET)
+ALL_PRESETS = DEFAULT_PRESETS + (
+    ARC_WATCH_V128_BLOCK8_PRESET,
+    ARC_WATCH_V256_BLOCK4_PRESET,
+    ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET,
+    ARC_WATCH_V256_DEFAULT8_VS_BLOCK4_PRESET,
+)
 QUICK_PRESETS = (
     ARC_DEFAULT_PRESET,
     ARC_V64_DEFAULT_BLOCK16_PRESET,
@@ -44,7 +51,12 @@ QUICK_PRESETS = (
 PRESET_ALIASES: dict[str, tuple[str, ...]] = {
     FULL_PRESET_ALIAS: DEFAULT_PRESETS,
     QUICK_PRESET_ALIAS: QUICK_PRESETS,
-    WATCH_PRESET_ALIAS: (ARC_WATCH_V128_BLOCK8_PRESET, ARC_WATCH_V256_BLOCK4_PRESET),
+    WATCH_PRESET_ALIAS: (
+        ARC_WATCH_V128_BLOCK8_PRESET,
+        ARC_WATCH_V256_BLOCK4_PRESET,
+        ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET,
+        ARC_WATCH_V256_DEFAULT8_VS_BLOCK4_PRESET,
+    ),
 }
 ALL_PRESET_TOKENS = tuple(PRESET_ALIASES) + ALL_PRESETS
 
@@ -119,6 +131,26 @@ ARC_BENCH_EXPECTATIONS = {
         ratio_field="auto_speed_ratio",
         max_ratio=1.02,
         default_compare_ratio_delta=0.005,
+    ),
+    ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET: ArcBenchExpectation(
+        compare_prefix="gdn_decode_default_block_compare",
+        expected_value_blocks=(8,),
+        expected_row_count=9,
+        ratio_field="default_speed_ratio_vs_forced",
+        max_ratio=1.02,
+        default_compare_ratio_delta=0.01,
+        default_value_block=4,
+        default_strategy="tiled",
+    ),
+    ARC_WATCH_V256_DEFAULT8_VS_BLOCK4_PRESET: ArcBenchExpectation(
+        compare_prefix="gdn_decode_default_block_compare",
+        expected_value_blocks=(4,),
+        expected_row_count=11,
+        ratio_field="default_speed_ratio_vs_forced",
+        max_ratio=1.02,
+        default_compare_ratio_delta=0.01,
+        default_value_block=8,
+        default_strategy="tiled",
     ),
 }
 
@@ -199,11 +231,11 @@ def _bench_args_for_preset(
     seeds_csv: str,
 ) -> list[str]:
     expectation = ARC_BENCH_EXPECTATIONS[preset_name]
-    compare_flag = (
-        "--gdn-decode-default-compare"
-        if expectation.compare_prefix == "gdn_decode_default_compare"
-        else "--gdn-decode-auto-compare"
-    )
+    compare_flag = {
+        "gdn_decode_default_compare": "--gdn-decode-default-compare",
+        "gdn_decode_auto_compare": "--gdn-decode-auto-compare",
+        "gdn_decode_default_block_compare": "--gdn-decode-default-block-compare",
+    }[expectation.compare_prefix]
     return [
         sys.executable,
         "tools/bench_xpu_hotspots.py",
@@ -237,11 +269,11 @@ def _bench_args_for_shape_chunk(
     seeds_csv: str,
 ) -> list[str]:
     expectation = ARC_BENCH_EXPECTATIONS[preset_name]
-    compare_flag = (
-        "--gdn-decode-default-compare"
-        if expectation.compare_prefix == "gdn_decode_default_compare"
-        else "--gdn-decode-auto-compare"
-    )
+    compare_flag = {
+        "gdn_decode_default_compare": "--gdn-decode-default-compare",
+        "gdn_decode_auto_compare": "--gdn-decode-auto-compare",
+        "gdn_decode_default_block_compare": "--gdn-decode-default-block-compare",
+    }[expectation.compare_prefix]
     shape_cases_csv = ",".join(f"{batch_size}x{num_heads}x{value_head_dim}" for batch_size, num_heads, value_head_dim in shape_cases)
     args = [
         sys.executable,
@@ -340,6 +372,13 @@ def _validate_benchmark_rows(
         if bad_rows:
             raise ValueError(
                 f"{preset_name} emitted unexpected value_block outside {expectation.expected_value_blocks}: {bad_rows[0]}"
+            )
+    if rows and "forced_value_block" in rows[0]:
+        bad_rows = [row for row in rows if int(row["forced_value_block"]) not in expectation.expected_value_blocks]
+        if bad_rows:
+            raise ValueError(
+                f"{preset_name} emitted unexpected forced_value_block outside {expectation.expected_value_blocks}: "
+                f"{bad_rows[0]}"
             )
 
     worst_row = max(rows, key=lambda row: float(row[expectation.ratio_field]))
@@ -631,7 +670,7 @@ def _validate_benchmark_config_against_baseline(
 
 
 def _benchmark_row_key(row: dict[str, str]) -> tuple[str, str, str, str, str]:
-    value_block = row.get("value_block", row.get("default_value_block", ""))
+    value_block = row.get("forced_value_block", row.get("value_block", row.get("default_value_block", "")))
     return (
         row["batch"],
         row["heads"],

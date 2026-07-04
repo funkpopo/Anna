@@ -509,6 +509,34 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (36, 32, 256),
         (37, 32, 256),
     ),
+    # Boundary shapes where Arc's V=256 default block should stay on 4 even when
+    # compared directly against forced block=8.
+    "arc-watch-v256-default4-vs-block8": (
+        (32, 8, 256),
+        (40, 8, 256),
+        (16, 16, 256),
+        (20, 16, 256),
+        (28, 16, 256),
+        (32, 16, 256),
+        (10, 32, 256),
+        (14, 32, 256),
+        (16, 32, 256),
+    ),
+    # Boundary shapes where Arc's V=256 default block should stay on 8 even when
+    # compared directly against forced block=4.
+    "arc-watch-v256-default8-vs-block4": (
+        (33, 8, 256),
+        (36, 8, 256),
+        (37, 8, 256),
+        (38, 8, 256),
+        (39, 8, 256),
+        (17, 16, 256),
+        (18, 16, 256),
+        (19, 16, 256),
+        (29, 16, 256),
+        (31, 16, 256),
+        (15, 32, 256),
+    ),
 }
 
 GDN_DECODE_PRESET_VALUE_BLOCKS: dict[str, tuple[int, ...]] = {
@@ -519,6 +547,8 @@ GDN_DECODE_PRESET_VALUE_BLOCKS: dict[str, tuple[int, ...]] = {
     "arc-watch-v128-block8": (8,),
     "arc-legacy-v256-block4": (4,),
     "arc-watch-v256-block4": (4,),
+    "arc-watch-v256-default4-vs-block8": (8,),
+    "arc-watch-v256-default8-vs-block4": (4,),
 }
 
 
@@ -710,8 +740,10 @@ def _compare_gated_delta_decode_default_against_forced_block(
     )
     default_ms = float(candidate_measurements["default"]["candidate_ms"])
     forced_ms = float(candidate_measurements["forced"]["candidate_ms"])
+    default_best_ms = min(default_ms, forced_ms)
     forced_minus_default_ms = forced_ms - default_ms
     forced_over_default_ratio = forced_ms / default_ms if default_ms > 0 else float("inf")
+    default_speed_ratio_vs_forced = default_ms / default_best_ms if default_best_ms > 0 else float("inf")
     max_abs_diff = max(float(candidate["max_abs_diff"]) for candidate in candidate_measurements.values())
     return {
         "default_value_block": -1 if default_value_block is None else default_value_block,
@@ -720,8 +752,10 @@ def _compare_gated_delta_decode_default_against_forced_block(
         "forced_strategy": forced_strategy,
         "default_ms": default_ms,
         "forced_ms": forced_ms,
+        "default_best_ms": default_best_ms,
         "forced_minus_default_ms": forced_minus_default_ms,
         "forced_over_default_ratio": forced_over_default_ratio,
+        "default_speed_ratio_vs_forced": default_speed_ratio_vs_forced,
         "max_abs_diff": max_abs_diff,
     }
 
@@ -1025,14 +1059,17 @@ def _run_gated_delta_decode_profile_case(
             forced_strategy = forced_strategy_labels.pop() if len(forced_strategy_labels) == 1 else "inconsistent"
             default_ms = statistics.median(float(result["default_ms"]) for result in compare_results)
             forced_ms = statistics.median(float(result["forced_ms"]) for result in compare_results)
+            default_best_ms = min(default_ms, forced_ms)
             forced_minus_default_ms = forced_ms - default_ms
             forced_over_default_ratio = forced_ms / default_ms if default_ms > 0 else float("inf")
+            default_speed_ratio_vs_forced = default_ms / default_best_ms if default_best_ms > 0 else float("inf")
             max_abs_diff = max(float(result["max_abs_diff"]) for result in compare_results)
             print(
                 f"gdn_decode_default_block_compare,{device_name},{batch_size},{num_heads},"
                 f"{key_head_dim},{value_head_dim},{default_value_block},{default_strategy},{forced_value_block},"
-                f"{forced_strategy},{default_ms:.4f},{forced_ms:.4f},{forced_minus_default_ms:.4f},"
-                f"{forced_over_default_ratio:.4f},{max_abs_diff:.6f}"
+                f"{forced_strategy},{default_ms:.4f},{forced_ms:.4f},{default_best_ms:.4f},"
+                f"{forced_minus_default_ms:.4f},{forced_over_default_ratio:.4f},"
+                f"{default_speed_ratio_vs_forced:.4f},{max_abs_diff:.6f}"
             )
 
 
@@ -1979,7 +2016,8 @@ def main() -> None:
             print(
                 "gdn_decode_default_block_compare,device_name,batch,heads,key_head_dim,value_head_dim,"
                 "default_value_block,default_strategy,forced_value_block,forced_strategy,default_ms,forced_ms,"
-                "forced_minus_default_ms,forced_over_default_ratio,max_abs_diff"
+                "default_best_ms,forced_minus_default_ms,forced_over_default_ratio,default_speed_ratio_vs_forced,"
+                "max_abs_diff"
             )
         for case_idx, (batch_size, num_heads, value_head_dim) in enumerate(gdn_decode_shape_cases):
             case_seeds = [

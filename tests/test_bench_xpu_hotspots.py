@@ -49,6 +49,36 @@ def test_arc_watch_v256_block4_preset_tracks_boundary_watch_shapes() -> None:
     )
 
 
+def test_arc_watch_v256_default4_vs_block8_preset_tracks_row_bucket_exits() -> None:
+    assert GDN_DECODE_SHAPE_PRESETS["arc-watch-v256-default4-vs-block8"] == (
+        (32, 8, 256),
+        (40, 8, 256),
+        (16, 16, 256),
+        (20, 16, 256),
+        (28, 16, 256),
+        (32, 16, 256),
+        (10, 32, 256),
+        (14, 32, 256),
+        (16, 32, 256),
+    )
+
+
+def test_arc_watch_v256_default8_vs_block4_preset_tracks_row_bucket_entries() -> None:
+    assert GDN_DECODE_SHAPE_PRESETS["arc-watch-v256-default8-vs-block4"] == (
+        (33, 8, 256),
+        (36, 8, 256),
+        (37, 8, 256),
+        (38, 8, 256),
+        (39, 8, 256),
+        (17, 16, 256),
+        (18, 16, 256),
+        (19, 16, 256),
+        (29, 16, 256),
+        (31, 16, 256),
+        (15, 32, 256),
+    )
+
+
 def test_arc_watch_v128_block8_preset_tracks_boundary_watch_shapes() -> None:
     assert GDN_DECODE_SHAPE_PRESETS["arc-watch-v128-block8"] == (
         (16, 8, 128),

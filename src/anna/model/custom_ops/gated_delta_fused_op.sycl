@@ -292,7 +292,7 @@ constexpr GatedDeltaDecodeValueBlockOverride kGatedDeltaDecodeValueBlockOverride
 // Arc A770 V=256 decode shapes still have two stable row bands where
 // value_block=8 outperforms the smaller default tiled block.
 constexpr GatedDeltaDecodeValueBlockRowOverride kGatedDeltaDecodeValueBlockRowOverrides[] = {
-    {"arc", 128, 256, 264, 288, 8},
+    {"arc", 128, 256, 264, 312, 8},
     {"arc", 128, 256, 464, 496, 8},
 };
 

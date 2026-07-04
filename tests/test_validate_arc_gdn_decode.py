@@ -20,6 +20,8 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     ARC_WATCH_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
     ARC_WATCH_V256_BLOCK4_PRESET,
+    ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET,
+    ARC_WATCH_V256_DEFAULT8_VS_BLOCK4_PRESET,
     DEFAULT_PRESETS,
     QUICK_PRESETS,
     DEFAULT_BENCH_TIMING_REPEATS,
@@ -68,6 +70,8 @@ def test_parse_preset_names_expands_aliases_and_dedupes() -> None:
         *QUICK_PRESETS,
         ARC_LEGACY_V256_BLOCK4_PRESET,
         ARC_WATCH_V128_BLOCK8_PRESET,
+        ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET,
+        ARC_WATCH_V256_DEFAULT8_VS_BLOCK4_PRESET,
     ]
 
 
@@ -86,6 +90,8 @@ def test_parse_preset_names_rejects_unknown_values() -> None:
         (ARC_WATCH_V128_BLOCK8_PRESET, "--gdn-decode-auto-compare"),
         (ARC_LEGACY_V256_BLOCK4_PRESET, "--gdn-decode-auto-compare"),
         (ARC_WATCH_V256_BLOCK4_PRESET, "--gdn-decode-auto-compare"),
+        (ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET, "--gdn-decode-default-block-compare"),
+        (ARC_WATCH_V256_DEFAULT8_VS_BLOCK4_PRESET, "--gdn-decode-default-block-compare"),
     ],
 )
 def test_bench_args_for_preset_uses_expected_compare_flag(
@@ -178,6 +184,28 @@ def _make_benchmark_output_for_preset(
                 f"{default_value_block},{default_strategy},"
                 f"0.3000,0.2000,{0.2 * ratio:.4f},tiled,0.2000,{0.2 * ratio - 0.2:.4f},{ratio:.4f},0.000100"
             )
+    elif expectation.compare_prefix == "gdn_decode_default_block_compare":
+        default_value_block = expectation.default_value_block if expectation.default_value_block is not None else 8
+        default_strategy = expectation.default_strategy if expectation.default_strategy is not None else "tiled"
+        forced_value_block = expectation.expected_value_blocks[0]
+        default_ms = 0.2 * ratio
+        forced_ms = 0.2
+        default_best_ms = min(default_ms, forced_ms)
+        forced_minus_default_ms = forced_ms - default_ms
+        forced_over_default_ratio = forced_ms / default_ms
+        lines.append(
+            "gdn_decode_default_block_compare,device_name,batch,heads,key_head_dim,value_head_dim,"
+            "default_value_block,default_strategy,forced_value_block,forced_strategy,default_ms,forced_ms,"
+            "default_best_ms,forced_minus_default_ms,forced_over_default_ratio,default_speed_ratio_vs_forced,"
+            "max_abs_diff"
+        )
+        for _ in range(expectation.expected_row_count):
+            lines.append(
+                "gdn_decode_default_block_compare,Intel Arc,1,16,128,256,"
+                f"{default_value_block},{default_strategy},{forced_value_block},tiled,"
+                f"{default_ms:.4f},{forced_ms:.4f},{default_best_ms:.4f},{forced_minus_default_ms:.4f},"
+                f"{forced_over_default_ratio:.4f},{ratio:.4f},0.000100"
+            )
     else:
         lines.append(
             "gdn_decode_auto_compare,device_name,batch,heads,key_head_dim,value_head_dim,value_block,auto_strategy,"
@@ -226,12 +254,25 @@ def test_parse_preset_names_accepts_v128_watch_preset() -> None:
     assert _parse_preset_names("arc-watch-v128-block8") == [ARC_WATCH_V128_BLOCK8_PRESET]
 
 
+def test_parse_preset_names_accepts_v256_default4_vs_block8_watch_preset() -> None:
+    assert _parse_preset_names("arc-watch-v256-default4-vs-block8") == [ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET]
+
+
+def test_parse_preset_names_accepts_v256_default8_vs_block4_watch_preset() -> None:
+    assert _parse_preset_names("arc-watch-v256-default8-vs-block4") == [ARC_WATCH_V256_DEFAULT8_VS_BLOCK4_PRESET]
+
+
 def test_parse_preset_names_accepts_full_alias() -> None:
     assert _parse_preset_names("full") == list(DEFAULT_PRESETS)
 
 
 def test_parse_preset_names_accepts_watch_alias() -> None:
-    assert _parse_preset_names("watch") == [ARC_WATCH_V128_BLOCK8_PRESET, ARC_WATCH_V256_BLOCK4_PRESET]
+    assert _parse_preset_names("watch") == [
+        ARC_WATCH_V128_BLOCK8_PRESET,
+        ARC_WATCH_V256_BLOCK4_PRESET,
+        ARC_WATCH_V256_DEFAULT4_VS_BLOCK8_PRESET,
+        ARC_WATCH_V256_DEFAULT8_VS_BLOCK4_PRESET,
+    ]
 
 
 def test_validate_script_help_runs_without_preseeded_pythonpath() -> None:
@@ -253,6 +294,8 @@ def test_validate_script_help_runs_without_preseeded_pythonpath() -> None:
     assert "watch" in normalized_stdout
     assert "watch-v128-block8" in normalized_stdout
     assert "watch-v256-block4" in normalized_stdout
+    assert "watch-v256-default4-vs-block8" in normalized_stdout
+    assert "watch-v256-default8-vs-block4" in normalized_stdout
     assert "preset-aware defaults" in normalized_stdout
 
 
@@ -264,6 +307,8 @@ def test_build_parser_defaults_to_full_alias() -> None:
 def test_resolve_compare_ratio_delta_uses_watch_default_when_omitted() -> None:
     assert _resolve_compare_ratio_delta(None, preset_name="arc-watch-v128-block8") == pytest.approx(0.005)
     assert _resolve_compare_ratio_delta(None, preset_name="arc-watch-v256-block4") == pytest.approx(0.005)
+    assert _resolve_compare_ratio_delta(None, preset_name="arc-watch-v256-default4-vs-block8") == pytest.approx(0.01)
+    assert _resolve_compare_ratio_delta(None, preset_name="arc-watch-v256-default8-vs-block4") == pytest.approx(0.01)
 
 
 def test_resolve_compare_ratio_delta_uses_legacy_v256_preset_default() -> None:
@@ -272,6 +317,7 @@ def test_resolve_compare_ratio_delta_uses_legacy_v256_preset_default() -> None:
 
 def test_resolve_compare_ratio_delta_prefers_explicit_override() -> None:
     assert _resolve_compare_ratio_delta(0.0125, preset_name="arc-watch-v256-block4") == pytest.approx(0.0125)
+    assert _resolve_compare_ratio_delta(0.0125, preset_name="arc-watch-v256-default8-vs-block4") == pytest.approx(0.0125)
 
 
 def test_resolve_compare_ratio_delta_uses_non_watch_quick_preset_defaults() -> None:

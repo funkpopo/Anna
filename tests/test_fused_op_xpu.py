@@ -1726,9 +1726,15 @@ def test_gated_delta_decode_strategy_debug_matches_qwen35_family_lookup(
         (4, 16, 256, 4, 1),
         (32, 8, 256, 4, 1),
         (33, 8, 256, 8, 1),
+        (37, 8, 256, 8, 1),
+        (38, 8, 256, 8, 1),
+        (39, 8, 256, 8, 1),
+        (40, 8, 256, 4, 1),
         (16, 16, 256, 4, 1),
         (17, 16, 256, 8, 1),
         (18, 16, 256, 8, 1),
+        (19, 16, 256, 8, 1),
+        (20, 16, 256, 4, 1),
         (28, 16, 256, 4, 1),
         (29, 16, 256, 8, 1),
         (32, 16, 256, 4, 1),
@@ -1737,6 +1743,7 @@ def test_gated_delta_decode_strategy_debug_matches_qwen35_family_lookup(
         (14, 32, 256, 4, 1),
         (15, 32, 256, 8, 1),
         (16, 32, 256, 4, 1),
+        (10, 32, 256, 4, 1),
     ],
 )
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
