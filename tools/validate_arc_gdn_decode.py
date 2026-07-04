@@ -64,11 +64,12 @@ class ArcBenchExpectation:
 ARC_BENCH_EXPECTATIONS = {
     ARC_DEFAULT_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_default_compare",
-        expected_value_blocks=(8, 16),
+        expected_value_blocks=(8,),
         expected_row_count=13,
         ratio_field="default_speed_ratio",
         max_ratio=1.15,
         default_compare_ratio_delta=0.025,
+        default_value_block=8,
     ),
     ARC_V64_DEFAULT_BLOCK16_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_default_compare",

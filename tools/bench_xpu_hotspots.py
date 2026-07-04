@@ -512,7 +512,7 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
 }
 
 GDN_DECODE_PRESET_VALUE_BLOCKS: dict[str, tuple[int, ...]] = {
-    "arc-default": (8, 16),
+    "arc-default": (8,),
     "arc-v64-default-block16": (8,),
     "arc-legacy-v64-block8": (8,),
     "arc-legacy-v128-block8": (8,),

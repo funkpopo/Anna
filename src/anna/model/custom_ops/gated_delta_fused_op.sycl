@@ -272,10 +272,10 @@ struct GatedDeltaDecodeAutoStrategyOverride {
 };
 
 // Arc A770 decode sweeps after the tiled subgroup-span remap show that K=128
-// decode prefers value_block=8 for V={64,256}, while V=128 remains best at 16.
+// decode prefers value_block=8 for V={64,128,256}.
 constexpr GatedDeltaDecodeValueBlockOverride kGatedDeltaDecodeValueBlockOverrides[] = {
     {"arc", 128, 64, 8},
-    {"arc", 128, 128, 16},
+    {"arc", 128, 128, 8},
     {"arc", 128, 256, 8},
 };
 
