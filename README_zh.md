@@ -10,7 +10,7 @@ Anna 是一个基于 PyTorch 的本地推理运行时，目标是在 Intel Arc /
 
 - OpenAI 兼容 HTTP API：Chat、Completion、语音合成、语音识别、模型列表。
 - 命令行工具：`anna-serve`、`anna-generate`、`anna-bench`、`anna-speak`、`anna-transcribe`、`anna-xpu-int4-cache`。
-- Intel XPU 优化：连续批处理、token budget 调度、TurboQuant KV cache、XPU int4 权重、prompt cache、fused SYCL 自定义算子。
+- Intel XPU 优化：连续批处理（整批向量化采样）、token budget 调度、TurboQuant KV cache、XPU int4 权重、prompt cache、fused SYCL 自定义算子。
 - Qwen3.5 推理路径包含 Gated Delta、attention、RMSNorm、rotary、LM head 等热点算子优化入口。
 - 提供本地 HTTP 并发压测和 XPU 热点 microbench 工具。
 

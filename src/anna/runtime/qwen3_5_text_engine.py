@@ -49,7 +49,11 @@ from anna.runtime.memory_release import release_conversion_artifacts
 from anna.runtime.runtime_health import PROCESS_ADMISSION_GATE, RuntimeAdmissionGate
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
 from anna.runtime.streaming import IncrementalTextAssembler
-from anna.sampling.sampler import sample_next_token, sample_next_token_from_candidates
+from anna.sampling.sampler import (
+    sample_next_token,
+    sample_next_token_from_candidates,
+    token_ids_to_host,
+)
 from anna.weights.qwen3_5_text_weight_loader import build_qwen3_5_text_model, estimate_qwen3_5_text_model_weight_bytes, load_qwen3_5_text_model_config, load_qwen3_5_text_model_weights
 from anna.weights.qwen3_5_text_tokenizer import Qwen3_5TextTokenizer
 
@@ -1622,6 +1626,10 @@ class AnnaQwen3_5TextEngine:
                 "prompt_cache_entries": len(self._prompt_cache),
                 "prefer_prompt_cache_over_prefix": self.optimization_config.prefer_prompt_cache_over_prefix,
                 "profile_runtime": self.optimization_config.profile_runtime,
+                # P2 hot-loop reduction: scheduler samples a whole decode batch in one
+                # vectorized pass; non-streaming generation defers host token materialization.
+                "batched_sampling": True,
+                "device_decode_token_loop": True,
                 "kv_cache_quantization": self.optimization_config.kv_cache_quantization,
                 "kv_cache_quant_bits": self.optimization_config.kv_cache_quant_bits,
                 "kv_cache_residual_len": self.optimization_config.kv_cache_residual_len,
@@ -3052,7 +3060,22 @@ class AnnaQwen3_5TextEngine:
 
     @staticmethod
     def _token_id_from_tensor(next_token: torch.Tensor) -> int:
-        return int(next_token.detach().reshape(-1).to(device="cpu")[0])
+        return token_ids_to_host(next_token)[0]
+
+    @staticmethod
+    def _stop_token_tensor(stop_token_ids: set[int], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if not stop_token_ids:
+            return torch.empty((0,), dtype=dtype, device=device)
+        return torch.tensor(sorted(stop_token_ids), dtype=dtype, device=device)
+
+    @staticmethod
+    def _is_stop_token_device(next_token: torch.Tensor, stop_token_ids: torch.Tensor) -> bool:
+        if stop_token_ids.numel() == 0:
+            return False
+        flat = next_token.detach().reshape(-1)
+        # Keep the stop check on-device to avoid a host sync every decode step; the
+        # boolean result is a single scalar transfer only when needed by control flow.
+        return bool(torch.isin(flat[:1], stop_token_ids).item())
 
     def _raise_if_generation_cancelled(self, config: GenerationConfig) -> None:
         if config.cancellation_event is not None and config.cancellation_event.is_set():
@@ -3076,91 +3099,40 @@ class AnnaQwen3_5TextEngine:
         prepared: PreparedInputs,
         config: GenerationConfig,
     ) -> tuple[list[int], str, int, int, GenerationPerfStats]:
-        completion_ids: list[int] = []
-        events = self._iter_generation_events(prepared, config, with_assembler=False)
-        try:
-            for _delta, token_id, finished, reason, prompt_length, completion_count, perf in events:
-                if token_id is not None:
-                    completion_ids.append(token_id)
-                if finished:
-                    return completion_ids, reason or "stop", prompt_length, completion_count, perf
-        finally:
-            events.close()
-        raise RuntimeError("Generation ended without a finish event.")
-
-    def _iter_generation(
-        self,
-        prepared: PreparedInputs,
-        config: GenerationConfig,
-    ) -> Iterator[tuple[str, bool, str | None, int, int, GenerationPerfStats | None]]:
-        events = self._iter_generation_events(prepared, config, with_assembler=True)
-        try:
-            for delta, _token_id, finished, reason, prompt_length, completion_count, perf in events:
-                if delta or finished:
-                    yield delta, finished, reason, prompt_length, completion_count, perf
-        finally:
-            events.close()
+        # Non-streaming path: keep sampled tokens on-device and bulk-sync once at the
+        # end (or on stop) instead of a host round-trip every decode step.
+        return self._generate_token_ids_device_loop(prepared, config=config)
 
     @torch.inference_mode()
-    def _iter_generation_events(
+    def _generate_token_ids_device_loop(
         self,
         prepared: PreparedInputs,
-        config: GenerationConfig,
         *,
-        with_assembler: bool,
-    ) -> Iterator[tuple[str, int | None, bool, str | None, int, int, GenerationPerfStats | None]]:
-        """Single-request generation loop shared by the token-ids and streaming paths.
+        config: GenerationConfig,
+    ) -> tuple[list[int], str, int, int, GenerationPerfStats]:
+        """Decode loop that defers host token materialization.
 
-        Yields ``(delta, token_id, finished, finish_reason, prompt_length, completion_count, perf)``.
-        Token events carry ``token_id`` (with a possibly empty text delta); the final event carries
-        ``finished=True`` plus the finish reason and perf stats. ``with_assembler`` enables
-        incremental text decoding and stop-string detection.
+        Forward + sample stay on the execution device; stop checks use an on-device
+        ``isin`` against EOS ids. Token ids are bulk-copied to host only when the
+        sequence finishes (or cancellation forces an early exit). This cuts Python
+        hot-loop overhead for non-streaming generation.
         """
         prompt_ids, prompt_length, config = self._validate_generation_request(prepared, config=config)
         prepared = self._move_prepared_for_generation(prepared, config=config)
 
-        completion_ids: list[int] = []
         stop_token_ids = self._stop_token_ids()
         repetition_history, repetition_history_ids = self._init_repetition_penalty_state(
             prompt_ids,
             config.repetition_penalty,
             config.presence_penalty,
         )
-        text_assembler = (
-            IncrementalTextAssembler(tokenizer=self.tokenizer, stop_strings=config.stop_strings)
-            if with_assembler
-            else None
-        )
 
         started_at = time.perf_counter()
         first_token_at = None
-        input_ids = None
         past_key_values = None
-
-        def _finish_event(reason: str) -> tuple[str, int | None, bool, str | None, int, int, GenerationPerfStats]:
-            total_seconds = time.perf_counter() - started_at
-            prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
-            return (
-                "",
-                None,
-                True,
-                reason,
-                prompt_length,
-                len(completion_ids),
-                self._build_generation_perf_stats(
-                    prompt_tokens=prompt_length,
-                    completion_tokens=len(completion_ids),
-                    total_seconds=total_seconds,
-                    prefill_seconds=prefill_seconds,
-                    decode_seconds=max(0.0, total_seconds - prefill_seconds),
-                ),
-            )
-
-        def _flush_tail() -> str:
-            if text_assembler is None:
-                return ""
-            tail, _ = text_assembler.flush()
-            return tail
+        device_tokens: list[torch.Tensor] = []
+        finish_reason = "length"
+        input_ids = None
 
         try:
             with steady_decode_accumulation(enabled=self.optimization_config.profile_runtime, log=logger):
@@ -3170,6 +3142,11 @@ class AnnaQwen3_5TextEngine:
                     raise self._handle_runtime_failure(exc) from exc
                 past_key_values = prefill.past_key_values
                 current_logits = prefill.logits
+                stop_tensor = self._stop_token_tensor(
+                    stop_token_ids,
+                    device=current_logits.device,
+                    dtype=torch.long,
+                )
 
                 for step_idx in range(config.max_new_tokens):
                     self._raise_if_generation_cancelled(config)
@@ -3228,17 +3205,212 @@ class AnnaQwen3_5TextEngine:
                             presence_penalty=config.presence_penalty,
                             repetition_penalty=config.repetition_penalty,
                         )
-                    token_id = self._token_id_from_tensor(next_token)
+
                     if first_token_at is None:
                         first_token_at = time.perf_counter()
 
-                    if token_id in stop_token_ids:
+                    if self._is_stop_token_device(next_token, stop_tensor):
+                        finish_reason = "stop"
+                        break
+
+                    # Keep penalty history on-device (no per-step host id). Duplicate
+                    # entries are harmless: apply_*_penalty runs torch.unique.
+                    if repetition_history is not None:
+                        flat = next_token.detach().reshape(1)
+                        if flat.device != repetition_history.device:
+                            flat = flat.to(device=repetition_history.device)
+                        if repetition_history.numel() == 0:
+                            repetition_history = flat
+                        else:
+                            repetition_history = torch.cat([repetition_history, flat])
+
+                    device_tokens.append(next_token.detach().reshape(()))
+                    metrics = getattr(self, "metrics", None)
+                    if metrics is not None:
+                        metrics.record_generation_tokens(1)
+
+                    input_ids = next_token.view(1, 1)
+
+                    if step_idx + 1 >= config.max_new_tokens:
+                        break
+
+            if device_tokens:
+                completion_ids = token_ids_to_host(torch.stack(device_tokens))
+            else:
+                completion_ids = []
+
+            total_seconds = time.perf_counter() - started_at
+            prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
+            perf = self._build_generation_perf_stats(
+                prompt_tokens=prompt_length,
+                completion_tokens=len(completion_ids),
+                total_seconds=total_seconds,
+                prefill_seconds=prefill_seconds,
+                decode_seconds=max(0.0, total_seconds - prefill_seconds),
+            )
+            return completion_ids, finish_reason, prompt_length, len(completion_ids), perf
+        finally:
+            if past_key_values is not None:
+                past_key_values.release()
+
+    def _iter_generation(
+        self,
+        prepared: PreparedInputs,
+        config: GenerationConfig,
+    ) -> Iterator[tuple[str, bool, str | None, int, int, GenerationPerfStats | None]]:
+        events = self._iter_generation_events(prepared, config, with_assembler=True)
+        try:
+            for delta, _token_id, finished, reason, prompt_length, completion_count, perf in events:
+                if delta or finished:
+                    yield delta, finished, reason, prompt_length, completion_count, perf
+        finally:
+            events.close()
+
+    @torch.inference_mode()
+    def _iter_generation_events(
+        self,
+        prepared: PreparedInputs,
+        config: GenerationConfig,
+        *,
+        with_assembler: bool,
+    ) -> Iterator[tuple[str, int | None, bool, str | None, int, int, GenerationPerfStats | None]]:
+        """Single-request generation loop shared by the token-ids and streaming paths.
+
+        Yields ``(delta, token_id, finished, finish_reason, prompt_length, completion_count, perf)``.
+        Token events carry ``token_id`` (with a possibly empty text delta); the final event carries
+        ``finished=True`` plus the finish reason and perf stats. ``with_assembler`` enables
+        incremental text decoding and stop-string detection.
+        """
+        prompt_ids, prompt_length, config = self._validate_generation_request(prepared, config=config)
+        prepared = self._move_prepared_for_generation(prepared, config=config)
+
+        completion_ids: list[int] = []
+        stop_token_ids = self._stop_token_ids()
+        repetition_history, repetition_history_ids = self._init_repetition_penalty_state(
+            prompt_ids,
+            config.repetition_penalty,
+            config.presence_penalty,
+        )
+        text_assembler = (
+            IncrementalTextAssembler(tokenizer=self.tokenizer, stop_strings=config.stop_strings)
+            if with_assembler
+            else None
+        )
+
+        started_at = time.perf_counter()
+        first_token_at = None
+        input_ids = None
+        past_key_values = None
+        stop_tensor: torch.Tensor | None = None
+
+        def _finish_event(reason: str) -> tuple[str, int | None, bool, str | None, int, int, GenerationPerfStats]:
+            total_seconds = time.perf_counter() - started_at
+            prefill_seconds = total_seconds if first_token_at is None else first_token_at - started_at
+            return (
+                "",
+                None,
+                True,
+                reason,
+                prompt_length,
+                len(completion_ids),
+                self._build_generation_perf_stats(
+                    prompt_tokens=prompt_length,
+                    completion_tokens=len(completion_ids),
+                    total_seconds=total_seconds,
+                    prefill_seconds=prefill_seconds,
+                    decode_seconds=max(0.0, total_seconds - prefill_seconds),
+                ),
+            )
+
+        def _flush_tail() -> str:
+            if text_assembler is None:
+                return ""
+            tail, _ = text_assembler.flush()
+            return tail
+
+        try:
+            with steady_decode_accumulation(enabled=self.optimization_config.profile_runtime, log=logger):
+                try:
+                    prefill = self._prefill_generation_prompt(prepared)
+                except RuntimeError as exc:
+                    raise self._handle_runtime_failure(exc) from exc
+                past_key_values = prefill.past_key_values
+                current_logits = prefill.logits
+                stop_tensor = self._stop_token_tensor(
+                    stop_token_ids,
+                    device=current_logits.device,
+                    dtype=torch.long,
+                )
+
+                for step_idx in range(config.max_new_tokens):
+                    self._raise_if_generation_cancelled(config)
+                    candidate_logits = None
+                    candidate_token_ids = None
+                    if step_idx > 0:
+                        try:
+                            with self.execution_lock:
+                                candidate_count = self._fused_lm_head_candidate_count(config)
+                                outputs = (
+                                    self._forward_generation_model_topk(
+                                        input_ids=input_ids,
+                                        attention_mask=None,
+                                        past_key_values=past_key_values,
+                                        use_cache=True,
+                                        logits_to_keep=1,
+                                        top_k=candidate_count,
+                                    )
+                                    if candidate_count is not None
+                                    else None
+                                )
+                                if outputs is None:
+                                    outputs = self._profiled_forward_generation_model(
+                                        stage=f"decode[{step_idx}]",
+                                        input_ids=input_ids,
+                                        attention_mask=None,
+                                        past_key_values=past_key_values,
+                                        use_cache=True,
+                                        logits_to_keep=1,
+                                    )
+                            if hasattr(outputs, "candidate_logits"):
+                                candidate_logits = outputs.candidate_logits[0, -1]
+                                candidate_token_ids = outputs.candidate_token_ids[0, -1]
+                            else:
+                                current_logits = outputs.logits[0, -1]
+                            past_key_values = outputs.past_key_values
+                        except RuntimeError as exc:
+                            raise self._handle_runtime_failure(exc) from exc
+
+                    if candidate_logits is not None and candidate_token_ids is not None:
+                        next_token = sample_next_token_from_candidates(
+                            candidate_logits,
+                            candidate_token_ids,
+                            temperature=config.temperature,
+                            top_p=config.top_p,
+                            min_p=config.min_p,
+                        )
+                    else:
+                        next_token = sample_next_token(
+                            current_logits,
+                            generated_ids=repetition_history,
+                            temperature=config.temperature,
+                            top_p=config.top_p,
+                            top_k=config.top_k,
+                            min_p=config.min_p,
+                            presence_penalty=config.presence_penalty,
+                            repetition_penalty=config.repetition_penalty,
+                        )
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+
+                    # On-device stop check before host materialization (avoids decoding EOS).
+                    if stop_tensor is not None and self._is_stop_token_device(next_token, stop_tensor):
                         tail = _flush_tail()
                         if tail:
                             yield tail, None, False, None, prompt_length, len(completion_ids), None
                         yield _finish_event("stop")
                         return
 
+                    token_id = self._token_id_from_tensor(next_token)
                     completion_ids.append(token_id)
                     metrics = getattr(self, "metrics", None)
                     if metrics is not None:

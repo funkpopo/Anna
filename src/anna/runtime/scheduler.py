@@ -13,7 +13,13 @@ import torch
 from anna.mm.prepared_inputs import PreparedInputsLike
 from anna.runtime.scheduler_profiles import compute_dynamic_token_budgets
 from anna.runtime.streaming import IncrementalTextAssembler
-from anna.sampling.sampler import sample_next_token, sample_next_token_from_candidates
+from anna.sampling.sampler import (
+    sample_next_token,
+    sample_next_token_from_candidates,
+    sample_next_tokens,
+    sample_next_tokens_from_candidates,
+    token_ids_to_host,
+)
 
 if TYPE_CHECKING:
     from anna.runtime.qwen3_5_text_engine import (
@@ -850,20 +856,41 @@ class AnnaScheduler:
         When every row remains active, the returned SchedulerDecodeGroup keeps the batched
         KV cache intact across decode steps. This avoids the stack/split churn that otherwise
         dominates small-token continuous batches.
+
+        Sampling is vectorized across the batch (P2 hot-loop reduction): one multinomial /
+        argmax path plus a single device→host sync for all token ids, instead of per-row
+        Python sampling and per-row ``.cpu()`` round-trips.
         """
         metrics = getattr(self.engine, "metrics", None)
         stop_token_ids = self.engine._stop_token_ids()
         next_active: list[SchedulerRequest] = []
         next_input_ids: list[torch.Tensor] = []
         continuing_by_row: dict[int, SchedulerRequest] = {}
+
+        active_rows: list[int] = []
         for row_idx, request in enumerate(requests):
             if self._is_request_cancelled(request):
                 self._drop_cancelled_request(request)
-                continue
-            next_token = self._sample_next_token_from_outputs(outputs, row_idx=row_idx, request=request)
-            token_id = self.engine._token_id_from_tensor(next_token)
+            else:
+                active_rows.append(row_idx)
+
+        if not active_rows:
+            if batch_cache is not None:
+                release = getattr(batch_cache, "release", None)
+                if callable(release):
+                    release()
+            return []
+
+        next_tokens = self._sample_next_tokens_from_outputs(outputs, requests=requests, row_indices=active_rows)
+        token_ids = token_ids_to_host(next_tokens)
+        now = time.perf_counter()
+
+        for sample_idx, row_idx in enumerate(active_rows):
+            request = requests[row_idx]
+            next_token = next_tokens[sample_idx]
+            token_id = token_ids[sample_idx]
             if request.first_token_at is None:
-                request.first_token_at = time.perf_counter()
+                request.first_token_at = now
             if token_id in stop_token_ids:
                 self._finish_request(request, finish_reason="stop")
                 continue
@@ -1149,6 +1176,7 @@ class AnnaScheduler:
         )
 
     def _sample_next_token_from_outputs(self, outputs, *, row_idx: int, request: SchedulerRequest) -> torch.Tensor:
+        """Single-row sampling (tests / fallback). Prefer :meth:`_sample_next_tokens_from_outputs`."""
         if hasattr(outputs, "candidate_logits") and hasattr(outputs, "candidate_token_ids"):
             return sample_next_token_from_candidates(
                 outputs.candidate_logits[row_idx, -1],
@@ -1166,6 +1194,55 @@ class AnnaScheduler:
             min_p=request.config.min_p,
             presence_penalty=request.config.presence_penalty,
             repetition_penalty=request.config.repetition_penalty,
+        )
+
+    def _sample_next_tokens_from_outputs(
+        self,
+        outputs,
+        *,
+        requests: list[SchedulerRequest],
+        row_indices: list[int],
+    ) -> torch.Tensor:
+        """Vectorized next-token sampling for the active rows of a decode batch.
+
+        Returns a rank-1 long tensor on the logits device with ``len(row_indices)`` entries.
+        """
+        if not row_indices:
+            device = getattr(getattr(outputs, "logits", None), "device", None)
+            if device is None and hasattr(outputs, "candidate_logits"):
+                device = outputs.candidate_logits.device
+            return torch.empty((0,), dtype=torch.long, device=device or "cpu")
+
+        active = [requests[row_idx] for row_idx in row_indices]
+        if hasattr(outputs, "candidate_logits") and hasattr(outputs, "candidate_token_ids"):
+            # candidate_* layouts are [B, T, K]; decode keeps T=1 so take the last time step.
+            candidate_logits = outputs.candidate_logits
+            candidate_token_ids = outputs.candidate_token_ids
+            if candidate_logits.ndim == 3:
+                candidate_logits = candidate_logits[:, -1, :]
+                candidate_token_ids = candidate_token_ids[:, -1, :]
+            row_tensor = torch.tensor(row_indices, dtype=torch.long, device=candidate_logits.device)
+            return sample_next_tokens_from_candidates(
+                candidate_logits.index_select(0, row_tensor),
+                candidate_token_ids.index_select(0, row_tensor),
+                temperatures=[request.config.temperature for request in active],
+                top_ps=[request.config.top_p for request in active],
+                min_ps=[request.config.min_p for request in active],
+            )
+
+        logits = outputs.logits
+        if logits.ndim == 3:
+            logits = logits[:, -1, :]
+        row_tensor = torch.tensor(row_indices, dtype=torch.long, device=logits.device)
+        return sample_next_tokens(
+            logits.index_select(0, row_tensor),
+            generated_ids_rows=[request.repetition_history for request in active],
+            temperatures=[request.config.temperature for request in active],
+            top_ps=[request.config.top_p for request in active],
+            top_ks=[request.config.top_k for request in active],
+            min_ps=[request.config.min_p for request in active],
+            presence_penalties=[request.config.presence_penalty for request in active],
+            repetition_penalties=[request.config.repetition_penalty for request in active],
         )
 
     def _batch_text_inputs(self, requests: list[SchedulerRequest]) -> PreparedInputsLike:

@@ -866,6 +866,94 @@ def test_scheduler_streaming_final_event_includes_usage_stats() -> None:
         scheduler.shutdown()
 
 
+def test_scheduler_samples_decode_batch_in_one_vectorized_pass() -> None:
+    """P2 hot-loop: batch sampling returns one device tensor + single host sync path."""
+    from types import MethodType
+
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine._token_id_from_tensor = staticmethod(AnnaQwen3_5TextEngine._token_id_from_tensor).__func__  # type: ignore[attr-defined]
+    engine._append_repetition_penalty_token = MethodType(
+        AnnaQwen3_5TextEngine._append_repetition_penalty_token,
+        engine,
+    )
+    engine._stop_token_ids = MethodType(lambda self: {9}, engine)
+
+    scheduler = object.__new__(AnnaScheduler)
+    scheduler.engine = engine
+
+    outputs = type(
+        "Outputs",
+        (),
+        {
+            "logits": torch.tensor(
+                [
+                    [[0.0, 5.0, 1.0, -1.0]],
+                    [[3.0, 0.0, 2.0, 1.0]],
+                ]
+            ),
+        },
+    )()
+    requests = [
+        SchedulerRequest(
+            prepared=_prepared([1]),
+            config=GenerationConfig(
+                max_new_tokens=4,
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                presence_penalty=0.0,
+                repetition_penalty=1.0,
+            ),
+            stream=False,
+            prompt_length=1,
+            assembler=None,
+        ),
+        SchedulerRequest(
+            prepared=_prepared([1]),
+            config=GenerationConfig(
+                max_new_tokens=4,
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                presence_penalty=0.0,
+                repetition_penalty=1.0,
+            ),
+            stream=False,
+            prompt_length=1,
+            assembler=None,
+        ),
+    ]
+
+    sampled = scheduler._sample_next_tokens_from_outputs(outputs, requests=requests, row_indices=[0, 1])
+    assert sampled.tolist() == [1, 0]
+
+    finished: list[str] = []
+
+    def _finish(request, *, finish_reason: str) -> None:
+        finished.append(finish_reason)
+        request.done.set()
+
+    scheduler._finish_request = _finish  # type: ignore[method-assign]
+    scheduler._emit_text = lambda request, text: None  # type: ignore[method-assign]
+    scheduler._is_request_cancelled = lambda request: False  # type: ignore[method-assign]
+    scheduler._drop_cancelled_request = lambda request: False  # type: ignore[method-assign]
+    scheduler._compact_cache_rows = lambda cache, rows: None  # type: ignore[method-assign]
+    scheduler._split_cache = lambda cache, n, avoid_turboquant_clone=False: [None] * n  # type: ignore[method-assign]
+    scheduler._make_decode_group_from_requests = lambda reqs: reqs  # type: ignore[method-assign]
+
+    active = scheduler._consume_batch_outputs(
+        requests,
+        outputs,
+        batch_cache=None,
+        keep_batched_cache=False,
+        avoid_turboquant_clone=True,
+    )
+
+    assert [request.completion_ids[-1] for request in active] == [1, 0]
+    assert all(request.input_ids is not None and request.input_ids.shape == (1, 1) for request in active)
+    assert finished == []
+
+
 def test_scheduler_batching_preserves_prepared_input_dataclass_type() -> None:
     scheduler = object.__new__(AnnaScheduler)
     scheduler.engine = type(

@@ -10,7 +10,7 @@ Models under `models/` are used for local testing, model-family analysis, and ar
 
 - OpenAI-compatible HTTP API for chat, completion, speech synthesis, speech transcription, and model listing.
 - CLI tools: `anna-serve`, `anna-generate`, `anna-bench`, `anna-speak`, `anna-transcribe`, `anna-xpu-int4-cache`.
-- Intel XPU optimization paths: continuous batching, token-budget scheduling, TurboQuant KV cache, XPU int4 weights, prompt cache, and fused SYCL custom operators.
+- Intel XPU optimization paths: continuous batching with vectorized batch sampling, token-budget scheduling, TurboQuant KV cache, XPU int4 weights, prompt cache, and fused SYCL custom operators.
 - Qwen3.5 inference hotspot work includes Gated Delta, attention, RMSNorm, rotary, LM head, and related fused-kernel paths.
 - Includes local HTTP concurrency benchmarking and XPU hotspot microbench tooling.
 
