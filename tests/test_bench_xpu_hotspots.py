@@ -167,6 +167,15 @@ def test_arc_watch_v128_default8_vs_block16_preset_tracks_block_regression_shape
     )
 
 
+def test_arc_v64_default_block8_preset_matches_historical_block16_alias() -> None:
+    # Canonical name reflects the baked-in Arc default (value_block=8 / single).
+    # The block16 preset name is retained only for script compatibility.
+    assert GDN_DECODE_SHAPE_PRESETS["arc-v64-default-block8"] == GDN_DECODE_SHAPE_PRESETS["arc-v64-default-block16"]
+    assert GDN_DECODE_PRESET_VALUE_BLOCKS["arc-v64-default-block8"] == (8,)
+    assert GDN_DECODE_PRESET_VALUE_BLOCKS["arc-v64-default-block16"] == (8,)
+    assert _resolve_gdn_decode_value_blocks(None, ["arc-v64-default-block8"]) == [8]
+
+
 def test_parse_gdn_decode_shape_presets_preserves_order() -> None:
     assert _parse_gdn_decode_shape_presets("arc-default,arc-legacy-v256-block4") == [
         "arc-default",

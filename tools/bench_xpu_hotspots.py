@@ -478,9 +478,23 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
         (1, 32, 256),
         (4, 32, 256),
     ),
-    # Historical preset name retained; the current Arc default value block for
-    # these V=64 shapes is 8 after the tiled subgroup-span remap.
+    # V=64 default-path shapes. Historical name keeps "block16" for script
+    # compatibility, but the baked-in Arc default value block is 8 (single).
+    # Prefer the arc-v64-default-block8 alias in new scripts.
     "arc-v64-default-block16": (
+        (1, 8, 64),
+        (4, 8, 64),
+        (8, 8, 64),
+        (16, 8, 64),
+        (1, 16, 64),
+        (2, 16, 64),
+        (4, 16, 64),
+        (8, 16, 64),
+        (1, 32, 64),
+        (2, 32, 64),
+        (4, 32, 64),
+    ),
+    "arc-v64-default-block8": (
         (1, 8, 64),
         (4, 8, 64),
         (8, 8, 64),
@@ -660,6 +674,7 @@ GDN_DECODE_SHAPE_PRESETS: dict[str, tuple[tuple[int, int, int], ...]] = {
 GDN_DECODE_PRESET_VALUE_BLOCKS: dict[str, tuple[int, ...]] = {
     "arc-default": (4, 8),
     "arc-v64-default-block16": (8,),
+    "arc-v64-default-block8": (8,),
     "arc-legacy-v64-block8": (8,),
     "arc-watch-v64-block16": (16,),
     "arc-legacy-v128-block8": (8,),

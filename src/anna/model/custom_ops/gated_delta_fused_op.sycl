@@ -272,10 +272,16 @@ struct GatedDeltaDecodeAutoStrategyOverride {
   GatedDeltaDecodeStrategy strategy;
 };
 
-// Arc A770 decode sweeps after the tiled subgroup-span remap show that K=128
-// decode prefers value_block=8 for V={64,128}. V=256 defaults to 4 and only
-// keeps a narrow 264..304 row band on 8 after the static full-tile tiled path
-// sped up the broader block=4 cases.
+// P0-2.1 Arc A770 decode default table (K=128). Baked into the runtime so
+// common Qwen3.5 shapes do not need ANNA_XPU_GATED_DELTA_DECODE_* env overrides.
+//
+//   V     default value_block   default strategy   notes
+//   64    8                     single             forced block=16 also single
+//   128   8                     tiled              prefer 8 over slower block=16
+//   256   4                     tiled              rows 264..304 use block=8
+//
+// Source of truth for gates: tools/validate_arc_gdn_decode.py + tests in
+// test_fused_op_xpu.py (value_block_debug / strategy_debug / row cutovers).
 constexpr GatedDeltaDecodeValueBlockOverride kGatedDeltaDecodeValueBlockOverrides[] = {
     {"arc", 128, 64, 8},
     {"arc", 128, 128, 8},
@@ -288,9 +294,9 @@ constexpr GatedDeltaDecodeValueBlockRowOverride kGatedDeltaDecodeValueBlockRowOv
     {"arc", 128, 256, 264, 304, 8},
 };
 
-// Arc A770 decode sweeps keep V=64 on the single-group path for the common
-// block widths {8,16}. V=128/value_block>=8 and V=256/value_block>=4 stay
-// tiled, including the latest block=16 A/B pass.
+// Arc A770 strategy overrides for the default blocks above. V=64 stays on the
+// single-group path for the common block widths {8,16}. V=128/value_block>=8
+// and V=256/value_block>=4 stay tiled after the tiled subgroup-span remap.
 constexpr GatedDeltaDecodeAutoStrategyOverride kGatedDeltaDecodeAutoStrategyOverrides[] = {
     {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 1, 8, GatedDeltaDecodeStrategy::SingleGroup},
     {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 16, 16, GatedDeltaDecodeStrategy::SingleGroup},

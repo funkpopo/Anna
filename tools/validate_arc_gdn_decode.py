@@ -15,6 +15,9 @@ if str(REPO_ROOT) not in sys.path:
 
 
 ARC_DEFAULT_PRESET = "arc-default"
+# Canonical V=64 default-path preset name (baked-in Arc value_block=8).
+ARC_V64_DEFAULT_BLOCK8_PRESET = "arc-v64-default-block8"
+# Historical alias retained for scripts that still pass the old preset name.
 ARC_V64_DEFAULT_BLOCK16_PRESET = "arc-v64-default-block16"
 ARC_LEGACY_V64_BLOCK8_PRESET = "arc-legacy-v64-block8"
 ARC_WATCH_V64_BLOCK16_PRESET = "arc-watch-v64-block16"
@@ -32,12 +35,13 @@ DEFAULT_BENCH_TIMING_REPEATS = 5
 
 DEFAULT_PRESETS = (
     ARC_DEFAULT_PRESET,
-    ARC_V64_DEFAULT_BLOCK16_PRESET,
+    ARC_V64_DEFAULT_BLOCK8_PRESET,
     ARC_LEGACY_V64_BLOCK8_PRESET,
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_LEGACY_V256_BLOCK4_PRESET,
 )
 ALL_PRESETS = DEFAULT_PRESETS + (
+    ARC_V64_DEFAULT_BLOCK16_PRESET,
     ARC_WATCH_V64_BLOCK16_PRESET,
     ARC_WATCH_V128_BLOCK8_PRESET,
     ARC_WATCH_V128_DEFAULT8_VS_BLOCK16_PRESET,
@@ -47,7 +51,7 @@ ALL_PRESETS = DEFAULT_PRESETS + (
 )
 QUICK_PRESETS = (
     ARC_DEFAULT_PRESET,
-    ARC_V64_DEFAULT_BLOCK16_PRESET,
+    ARC_V64_DEFAULT_BLOCK8_PRESET,
     ARC_LEGACY_V64_BLOCK8_PRESET,
     ARC_LEGACY_V128_BLOCK8_PRESET,
     ARC_WATCH_V256_BLOCK4_PRESET,
@@ -88,6 +92,17 @@ ARC_BENCH_EXPECTATIONS = {
         max_ratio=1.15,
         default_compare_ratio_delta=0.025,
     ),
+    ARC_V64_DEFAULT_BLOCK8_PRESET: ArcBenchExpectation(
+        compare_prefix="gdn_decode_default_compare",
+        expected_value_blocks=(8,),
+        expected_row_count=11,
+        ratio_field="default_speed_ratio",
+        max_ratio=1.03,
+        default_compare_ratio_delta=0.015,
+        default_value_block=8,
+        default_strategy="single",
+    ),
+    # Same shapes/gates as arc-v64-default-block8; kept for historical CLI names.
     ARC_V64_DEFAULT_BLOCK16_PRESET: ArcBenchExpectation(
         compare_prefix="gdn_decode_default_compare",
         expected_value_blocks=(8,),

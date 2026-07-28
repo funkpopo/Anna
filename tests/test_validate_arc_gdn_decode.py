@@ -15,6 +15,7 @@ from tools.validate_arc_gdn_decode import (  # noqa: E402
     ARC_BENCH_EXPECTATIONS,
     ARC_DEFAULT_PRESET,
     ARC_LEGACY_V64_BLOCK8_PRESET,
+    ARC_V64_DEFAULT_BLOCK8_PRESET,
     ARC_V64_DEFAULT_BLOCK16_PRESET,
     ARC_WATCH_V64_BLOCK16_PRESET,
     ARC_LEGACY_V128_BLOCK8_PRESET,
@@ -89,6 +90,7 @@ def test_parse_preset_names_rejects_unknown_values() -> None:
     ("preset_name", "expected_compare_flag"),
     [
         (ARC_DEFAULT_PRESET, "--gdn-decode-default-compare"),
+        (ARC_V64_DEFAULT_BLOCK8_PRESET, "--gdn-decode-default-compare"),
         (ARC_V64_DEFAULT_BLOCK16_PRESET, "--gdn-decode-default-compare"),
         (ARC_LEGACY_V64_BLOCK8_PRESET, "--gdn-decode-auto-compare"),
         (ARC_LEGACY_V128_BLOCK8_PRESET, "--gdn-decode-auto-compare"),
@@ -348,10 +350,19 @@ def test_resolve_compare_ratio_delta_prefers_explicit_override() -> None:
 
 def test_resolve_compare_ratio_delta_uses_non_watch_quick_preset_defaults() -> None:
     assert _resolve_compare_ratio_delta(None, preset_name="arc-default") == pytest.approx(0.025)
+    assert _resolve_compare_ratio_delta(None, preset_name="arc-v64-default-block8") == pytest.approx(0.015)
     assert _resolve_compare_ratio_delta(None, preset_name="arc-v64-default-block16") == pytest.approx(0.015)
     assert _resolve_compare_ratio_delta(None, preset_name="arc-legacy-v64-block8") == pytest.approx(0.02)
     assert _resolve_compare_ratio_delta(None, preset_name="arc-legacy-v128-block8") == pytest.approx(0.01)
     assert _resolve_compare_ratio_delta(None, preset_name="arc-watch-v256-block4") == pytest.approx(0.005)
+
+
+def test_quick_and_default_presets_prefer_v64_block8_canonical_name() -> None:
+    assert ARC_V64_DEFAULT_BLOCK8_PRESET in QUICK_PRESETS
+    assert ARC_V64_DEFAULT_BLOCK8_PRESET in DEFAULT_PRESETS
+    assert ARC_V64_DEFAULT_BLOCK16_PRESET not in QUICK_PRESETS
+    assert ARC_V64_DEFAULT_BLOCK16_PRESET not in DEFAULT_PRESETS
+    assert ARC_BENCH_EXPECTATIONS[ARC_V64_DEFAULT_BLOCK8_PRESET] == ARC_BENCH_EXPECTATIONS[ARC_V64_DEFAULT_BLOCK16_PRESET]
 
 
 def test_validate_and_collect_benchmark_rows_match_output_wrappers() -> None:

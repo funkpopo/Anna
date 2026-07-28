@@ -360,9 +360,19 @@ These values only apply when an API request omits the matching field.
 - `--enable-flashqla-gdn-prefill`: enable the XPU SYCL Gated Delta prefill path; unsupported shapes, dtypes, or devices raise immediately.
 - `--xpu-int4-matmul auto|torch|dequant`: XPU int4 dense linear execution strategy.
 - `ANNA_GATED_DELTA_OP_LIB`: explicitly point to a fused-op `.pyd` / `.so`.
-- `ANNA_XPU_GATED_DELTA_DECODE_STRATEGY=auto|single|single_group|untiled|tiled|tiled_value`: Gated Delta decode kernel strategy.
-- `ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK=N`: override the tiled decode value block size. When unset, Anna uses a device/shape default; current Arc K=128 V={64,128,256} decode shapes default to `16`.
-- `ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS=N`: optional override for `auto`; when set, bypass the device/shape lookup and use this single-group element threshold.
+- `ANNA_XPU_GATED_DELTA_DECODE_STRATEGY=auto|single|single_group|untiled|tiled|tiled_value`: Gated Delta decode kernel strategy. Leave unset (or set `auto`) for the built-in Arc shape lookup; force `single` / `tiled` only when debugging.
+- `ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK=N`: optional override for the tiled decode value block. When unset, Anna picks a device/shape default from the baked-in Arc table (no manual env tuning required for common Qwen3.5 shapes).
+- `ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS=N`: optional override for `auto`; when set, bypass the device/shape strategy lookup and use this single-group element threshold.
+
+Arc A770 K=128 decode defaults currently baked into the fused op (rows = `batch * heads`):
+
+| V (value head dim) | Default value block | Default strategy | Notes |
+| --- | --- | --- | --- |
+| 64 | 8 | `single` | Also keeps forced block=16 on `single` |
+| 128 | 8 | `tiled` | Prefer block=8 over block=16 |
+| 256 | 4 | `tiled` | Rows 264..304 use value block=8 |
+
+Validate the table with `python tools/validate_arc_gdn_decode.py --preset quick` (or `full` / `watch`).
 
 ### Continuous Batching and Token Budgets
 
