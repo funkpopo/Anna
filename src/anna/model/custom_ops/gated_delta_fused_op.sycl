@@ -272,41 +272,69 @@ struct GatedDeltaDecodeAutoStrategyOverride {
   GatedDeltaDecodeStrategy strategy;
 };
 
-// P0-2.1 Arc A770 decode default table (K=128). Baked into the runtime so
-// common Qwen3.5 shapes do not need ANNA_XPU_GATED_DELTA_DECODE_* env overrides.
+// P0-2.1 Arc decode default table. Baked into the runtime so common Qwen3.5
+// shapes do not need ANNA_XPU_GATED_DELTA_DECODE_* env overrides.
 //
+// Primary (bench-gated) K=128 path:
 //   V     default value_block   default strategy   notes
 //   64    8                     single             forced block=16 also single
 //   128   8                     tiled              prefer 8 over slower block=16
 //   256   4                     tiled              rows 264..304 use block=8
 //
-// Source of truth for gates: tools/validate_arc_gdn_decode.py + tests in
-// test_fused_op_xpu.py (value_block_debug / strategy_debug / row cutovers).
+// K∈{64,256} reuse the same V-based defaults so boundary head dims stay on the
+// interpretable Arc table instead of the generic min(4,V) fallback. Source of
+// truth for K=128 gates: tools/validate_arc_gdn_decode.py + test_fused_op_xpu.py.
 constexpr GatedDeltaDecodeValueBlockOverride kGatedDeltaDecodeValueBlockOverrides[] = {
+    {"arc", 64, 64, 8},
+    {"arc", 64, 128, 8},
+    {"arc", 64, 256, 4},
     {"arc", 128, 64, 8},
     {"arc", 128, 128, 8},
     {"arc", 128, 256, 4},
+    {"arc", 256, 64, 8},
+    {"arc", 256, 128, 8},
+    {"arc", 256, 256, 4},
 };
 
-// Arc A770 V=256 decode keeps a single stable row band where value_block=8
-// still outperforms the smaller default tiled block.
+// Arc V=256 keeps a single stable row band where value_block=8 still beats the
+// smaller default tiled block (same cutover for K∈{64,128,256}).
 constexpr GatedDeltaDecodeValueBlockRowOverride kGatedDeltaDecodeValueBlockRowOverrides[] = {
+    {"arc", 64, 256, 264, 304, 8},
     {"arc", 128, 256, 264, 304, 8},
+    {"arc", 256, 256, 264, 304, 8},
 };
 
-// Arc A770 strategy overrides for the default blocks above. V=64 stays on the
+// Arc strategy overrides for the default blocks above. V=64 stays on the
 // single-group path for the common block widths {8,16}. V=128/value_block>=8
 // and V=256/value_block>=4 stay tiled after the tiled subgroup-span remap.
 constexpr GatedDeltaDecodeAutoStrategyOverride kGatedDeltaDecodeAutoStrategyOverrides[] = {
+    {"arc", 64, 64, 1, std::numeric_limits<int64_t>::max(), 1, 8, GatedDeltaDecodeStrategy::SingleGroup},
+    {"arc", 64, 64, 1, std::numeric_limits<int64_t>::max(), 16, 16, GatedDeltaDecodeStrategy::SingleGroup},
+    {"arc", 64, 128, 1, std::numeric_limits<int64_t>::max(), 8, 32, GatedDeltaDecodeStrategy::TiledValue},
+    {"arc", 64, 256, 1, std::numeric_limits<int64_t>::max(), 4, 32, GatedDeltaDecodeStrategy::TiledValue},
     {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 1, 8, GatedDeltaDecodeStrategy::SingleGroup},
     {"arc", 128, 64, 1, std::numeric_limits<int64_t>::max(), 16, 16, GatedDeltaDecodeStrategy::SingleGroup},
     {"arc", 128, 128, 1, std::numeric_limits<int64_t>::max(), 8, 32, GatedDeltaDecodeStrategy::TiledValue},
     {"arc", 128, 256, 1, std::numeric_limits<int64_t>::max(), 4, 32, GatedDeltaDecodeStrategy::TiledValue},
+    {"arc", 256, 64, 1, std::numeric_limits<int64_t>::max(), 1, 8, GatedDeltaDecodeStrategy::SingleGroup},
+    {"arc", 256, 64, 1, std::numeric_limits<int64_t>::max(), 16, 16, GatedDeltaDecodeStrategy::SingleGroup},
+    {"arc", 256, 128, 1, std::numeric_limits<int64_t>::max(), 8, 32, GatedDeltaDecodeStrategy::TiledValue},
+    {"arc", 256, 256, 1, std::numeric_limits<int64_t>::max(), 4, 32, GatedDeltaDecodeStrategy::TiledValue},
 };
 
+// Generic (device-agnostic) row thresholds for auto strategy when no Arc
+// override hits. Thresholds scale roughly with V so single-group only wins
+// once there is enough parallel work (rows * V).
 constexpr GatedDeltaDecodeAutoBucket kGatedDeltaDecodeAutoBuckets[] = {
+    {"", 64, 64, 64},
+    {"", 64, 128, 32},
+    {"", 64, 256, 16},
+    {"", 128, 64, 64},
     {"", 128, 128, 32},
     {"", 128, 256, 96},
+    {"", 256, 64, 32},
+    {"", 256, 128, 16},
+    {"", 256, 256, 8},
 };
 
 int64_t resolve_gated_delta_decode_values_per_lane(int64_t value_head_dim) {
@@ -407,6 +435,25 @@ int64_t clamp_gated_delta_decode_value_block(int64_t value_block) {
   return std::max<int64_t>(1, std::min<int64_t>(32, value_block));
 }
 
+// Interpretable fallback when no device/shape override matches:
+// pick the largest power-of-two block in {1,2,4} that fits in V (and divides V
+// when possible). Replaces the old opaque min(4, V) path so uncommon K/V still
+// get a documented tile width instead of an ad-hoc constant.
+int64_t resolve_gated_delta_decode_value_block_fallback(int64_t value_head_dim) {
+  if (value_head_dim <= 1) {
+    return 1;
+  }
+  if (value_head_dim < 4) {
+    return value_head_dim;
+  }
+  for (const int64_t candidate : {int64_t{4}, int64_t{2}, int64_t{1}}) {
+    if (candidate <= value_head_dim && (value_head_dim % candidate) == 0) {
+      return candidate;
+    }
+  }
+  return std::min<int64_t>(4, value_head_dim);
+}
+
 int64_t resolve_gated_delta_decode_value_block(
     const sycl::device& device,
     int64_t batch_size,
@@ -443,7 +490,7 @@ int64_t resolve_gated_delta_decode_value_block(
     return clamp_gated_delta_decode_value_block(value_block_override.value_block);
   }
 
-  return std::max<int64_t>(1, std::min<int64_t>(4, value_head_dim));
+  return clamp_gated_delta_decode_value_block(resolve_gated_delta_decode_value_block_fallback(value_head_dim));
 }
 
 GatedDeltaDecodeStrategy resolve_gated_delta_decode_strategy(

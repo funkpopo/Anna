@@ -7,7 +7,12 @@ sum of recorded categories (excludes layernorm, LM head, etc.).
 When wrapped with ``steady_decode_accumulation`` during Qwen3.5 generation, the
 engine also logs **steady-state** averages over ``decode[2+]`` only (skips
 ``decode[1]`` compile/warmup skew) for apples-to-apples comparisons across batch,
-KV mode, or kernel changes. ``scheduler_decode`` batches are not split yet.
+KV mode, or kernel changes.
+
+Continuous-batch ``scheduler_decode`` steps feed a separate process-level
+``SchedulerDecodeSteadyAccum`` keyed by batch size (amortized per-request ms =
+batch totals / batch_size). The first ``warmup_batches`` scheduler decode
+forwards are skipped to drop compile skew.
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ import logging
 import re
 import threading
 from collections import defaultdict
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -27,7 +32,11 @@ _session: ContextVar["DecodeProfileSession | None"] = ContextVar("anna_xpu_decod
 # Steady-state accum uses thread-local storage so generator close() / torch generator_context
 # cannot hit ContextVar.reset() from a different logical Context (ValueError).
 _steady_tls = threading.local()
+_scheduler_steady_lock = threading.Lock()
+_scheduler_steady: "SchedulerDecodeSteadyAccum | None" = None
 _DECODE_STAGE_RE = re.compile(r"^decode\[(\d+)\]$")
+_SCHEDULER_DECODE_STAGE = "scheduler_decode"
+DEFAULT_SCHEDULER_DECODE_WARMUP_BATCHES = 1
 
 
 def _steady_tls_get_accum() -> SteadyDecodeAccum | None:
@@ -146,12 +155,17 @@ class SteadyDecodeAccum:
             self.totals[key] += float(value)
         self.step_count += 1
 
+    def average_ms(self) -> dict[str, float]:
+        if self.step_count <= 0:
+            return {}
+        inv = 1.0 / float(self.step_count)
+        return {k: v * inv for k, v in self.totals.items()}
+
     def log_avg(self, *, lg: logging.Logger | None = None) -> None:
         sink = lg or logger
-        if self.step_count <= 0:
+        avg = self.average_ms()
+        if not avg:
             return
-        inv = 1.0 / float(self.step_count)
-        avg = {k: v * inv for k, v in self.totals.items()}
         tracked = sum(avg.values())
         if tracked <= 0:
             return
@@ -165,18 +179,139 @@ class SteadyDecodeAccum:
         )
 
 
-def record_steady_decode_step_if_applicable(stage: str, ms: dict[str, float]) -> None:
+def _amortized_per_request_ms(ms: Mapping[str, float], batch_size: int) -> dict[str, float]:
+    size = max(1, int(batch_size))
+    return {k: float(v) / float(size) for k, v in ms.items()}
+
+
+@dataclass
+class SchedulerDecodeSteadyAccum:
+    """Process-level steady-state component ms for continuous-batch decode, keyed by batch size."""
+
+    by_batch: dict[int, SteadyDecodeAccum] = field(default_factory=dict)
+    warmup_batches: int = DEFAULT_SCHEDULER_DECODE_WARMUP_BATCHES
+    total_seen: int = 0
+    skipped_warmup: int = 0
+
+    def record(
+        self,
+        ms: dict[str, float],
+        *,
+        batch_size: int,
+    ) -> bool:
+        """Record one scheduler decode forward. Returns True when counted in steady-state."""
+        if not ms:
+            return False
+        self.total_seen += 1
+        if self.total_seen <= max(0, int(self.warmup_batches)):
+            self.skipped_warmup += 1
+            return False
+        size = max(1, int(batch_size))
+        bucket = self.by_batch.get(size)
+        if bucket is None:
+            bucket = SteadyDecodeAccum()
+            self.by_batch[size] = bucket
+        bucket.add_step(ms)
+        return True
+
+    def snapshot(self) -> dict[str, object]:
+        batches: dict[str, object] = {}
+        for batch_size, accum in sorted(self.by_batch.items()):
+            avg = accum.average_ms()
+            if not avg:
+                continue
+            batches[str(batch_size)] = {
+                "n": accum.step_count,
+                "avg_ms": {k: round(v, 3) for k, v in avg.items()},
+                "avg_ms_per_req": {k: round(v, 3) for k, v in _amortized_per_request_ms(avg, batch_size).items()},
+                "tracked_avg_total_ms": round(sum(avg.values()), 3),
+            }
+        return {
+            "total_seen": self.total_seen,
+            "skipped_warmup": self.skipped_warmup,
+            "warmup_batches": self.warmup_batches,
+            "by_batch_size": batches,
+        }
+
+    def log_summary(self, *, lg: logging.Logger | None = None) -> None:
+        sink = lg or logger
+        snapshot = self.snapshot()
+        by_batch = snapshot.get("by_batch_size") or {}
+        if not by_batch:
+            return
+        for batch_size, stats in by_batch.items():
+            sink.info(
+                "xpu_scheduler_decode_steady_avg_ms (batch_size=%s, n=%s) %s | "
+                "avg_ms_per_req %s | tracked_avg_total_ms=%.3f",
+                batch_size,
+                stats["n"],
+                stats["avg_ms"],
+                stats["avg_ms_per_req"],
+                float(stats["tracked_avg_total_ms"]),
+            )
+
+
+def get_or_create_scheduler_decode_steady_accum(
+    *,
+    enabled: bool,
+    warmup_batches: int = DEFAULT_SCHEDULER_DECODE_WARMUP_BATCHES,
+) -> SchedulerDecodeSteadyAccum | None:
+    global _scheduler_steady
+    if not enabled:
+        return None
+    with _scheduler_steady_lock:
+        if _scheduler_steady is None:
+            _scheduler_steady = SchedulerDecodeSteadyAccum(warmup_batches=max(0, int(warmup_batches)))
+        return _scheduler_steady
+
+
+def reset_scheduler_decode_steady_accum() -> None:
+    global _scheduler_steady
+    with _scheduler_steady_lock:
+        _scheduler_steady = None
+
+
+def record_steady_decode_step_if_applicable(
+    stage: str,
+    ms: dict[str, float],
+    *,
+    batch_size: int | None = None,
+    token_cost: int | None = None,
+    profile_meta: Mapping[str, object] | None = None,
+) -> None:
+    """Record single-request decode[2+] and/or scheduler_decode steady-state samples."""
+    del token_cost  # reserved for future token-cost banding; batch_size is the primary key today
     if not ms:
         return
-    accum = _steady_tls_get_accum()
-    if accum is None:
+
+    if stage == _SCHEDULER_DECODE_STAGE or stage.startswith(f"{_SCHEDULER_DECODE_STAGE}["):
+        size = int(batch_size) if batch_size is not None else 1
+        if profile_meta is not None and batch_size is None:
+            raw = profile_meta.get("batch_size")
+            if raw is not None:
+                size = int(raw)
+        accum = get_or_create_scheduler_decode_steady_accum(enabled=True)
+        if accum is not None:
+            accum.record(ms, batch_size=size)
+        return
+
+    single = _steady_tls_get_accum()
+    if single is None:
         return
     matched = _DECODE_STAGE_RE.match(stage)
     if matched is None:
         return
     if int(matched.group(1)) < 2:
         return
-    accum.add_step(ms)
+    single.add_step(ms)
+
+
+def log_scheduler_decode_steady_if_any(*, log: logging.Logger | None = None) -> None:
+    with _scheduler_steady_lock:
+        accum = _scheduler_steady
+    if accum is None:
+        return
+    accum.log_summary(lg=log)
 
 
 @contextmanager

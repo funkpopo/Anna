@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     )
 
 
+logger = logging.getLogger(__name__)
 _DONE = object()
 
 
@@ -928,6 +930,8 @@ class AnnaScheduler:
         model_kwargs: dict[str, object] | None = None,
     ):
         candidate_count = self._shared_fused_lm_head_candidate_count(requests)
+        batch_size = len(requests)
+        token_cost = sum(self._decode_request_token_cost(request) for request in requests) if requests else 0
         outputs = (
             self.engine._forward_generation_model_topk(
                 input_ids=input_ids,
@@ -942,6 +946,14 @@ class AnnaScheduler:
             else None
         )
         if outputs is not None:
+            if stage.startswith("scheduler_decode"):
+                # Fused LM-head top-k bypasses component profiling; keep the gap visible.
+                logger.debug(
+                    "xpu_profile stage=%s batch_size=%s token_cost=%s profile_skipped=fused_lm_head_topk",
+                    stage,
+                    batch_size,
+                    token_cost,
+                )
             return outputs
         return self.engine._profiled_forward_generation_model(
             stage=stage,
@@ -951,6 +963,8 @@ class AnnaScheduler:
             model_kwargs=model_kwargs,
             use_cache=True,
             logits_to_keep=1,
+            batch_size=batch_size,
+            token_cost=token_cost,
         )
 
     def _sample_next_token_from_outputs(self, outputs, *, row_idx: int, request: SchedulerRequest) -> torch.Tensor:

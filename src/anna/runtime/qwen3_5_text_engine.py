@@ -27,7 +27,12 @@ from anna.model.quantization import AutoRoundGPTQLinear, convert_module_linears_
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.model.turboquant import VALID_KV_CACHE_QUANT_BITS, turboquant_is_available
-from anna.model.xpu_decode_profile import record_steady_decode_step_if_applicable, steady_decode_accumulation
+from anna.model.xpu_decode_profile import (
+    _amortized_per_request_ms,
+    get_or_create_scheduler_decode_steady_accum,
+    record_steady_decode_step_if_applicable,
+    steady_decode_accumulation,
+)
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.memory_release import release_conversion_artifacts
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
@@ -1459,8 +1464,17 @@ class AnnaQwen3_5TextEngine:
                 "scheduler_decode_batch_requests_max": service_metrics.scheduler_decode_batch_requests_max,
                 "scheduler_decode_batch_tokens_total": service_metrics.scheduler_decode_batch_tokens_total,
                 "scheduler_decode_batch_tokens_max": service_metrics.scheduler_decode_batch_tokens_max,
+                "scheduler_decode_profile": self._scheduler_decode_profile_snapshot(),
             },
         }
+
+    def _scheduler_decode_profile_snapshot(self) -> dict[str, object] | None:
+        if not self.optimization_config.profile_runtime:
+            return None
+        accum = get_or_create_scheduler_decode_steady_accum(enabled=True)
+        if accum is None:
+            return None
+        return accum.snapshot()
 
     def _resident_expert_layer_indices(self) -> list[int]:
         text_model = getattr(getattr(self.model, "model", None), "language_model", None)
@@ -1725,11 +1739,25 @@ class AnnaQwen3_5TextEngine:
         memory_after: object | None,
         stats_before: dict[str, int | float] | None,
         stats_after: dict[str, int | float] | None,
+        batch_size: int | None = None,
+        token_cost: int | None = None,
+        component_ms: dict[str, float] | None = None,
+        steady_recorded: bool | None = None,
     ) -> None:
         cache_length = getattr(past_key_values, "get_seq_length", None)
         seen_tokens = cache_length() if callable(cache_length) else 0
+        resolved_batch = int(batch_size) if batch_size is not None else int(input_ids.shape[0])
+        extra = ""
+        if stage.startswith("scheduler_decode"):
+            per_req = _amortized_per_request_ms(component_ms or {}, resolved_batch) if component_ms else {}
+            extra = (
+                f" batch_size={resolved_batch} token_cost={token_cost if token_cost is not None else '-'} "
+                f"component_ms_per_req={{{', '.join(f'{k}: {round(v, 3)}' for k, v in sorted(per_req.items()))}}} "
+                f"steady={1 if steady_recorded else 0}"
+            )
         logger.info(
-            "xpu_profile stage=%s input_tokens=%s cache_tokens=%s elapsed_seconds=%.6f free_before=%s free_after=%s stats_before=%s stats_after=%s",
+            "xpu_profile stage=%s input_tokens=%s cache_tokens=%s elapsed_seconds=%.6f "
+            "free_before=%s free_after=%s stats_before=%s stats_after=%s%s",
             stage,
             int(input_ids.shape[-1]),
             seen_tokens,
@@ -1738,6 +1766,7 @@ class AnnaQwen3_5TextEngine:
             format_bytes(memory_after.free_bytes if memory_after is not None else None),
             stats_before,
             stats_after,
+            extra,
         )
 
     def _profiled_forward_generation_model(
@@ -1750,6 +1779,8 @@ class AnnaQwen3_5TextEngine:
         model_kwargs: dict[str, object] | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | None = None,
+        batch_size: int | None = None,
+        token_cost: int | None = None,
     ):
         if not self.optimization_config.profile_runtime:
             return self._forward_generation_model(
@@ -1762,6 +1793,10 @@ class AnnaQwen3_5TextEngine:
             )
 
         from anna.model.xpu_decode_profile import decode_profile_session
+
+        resolved_batch = int(batch_size) if batch_size is not None else int(input_ids.shape[0])
+        if stage.startswith("scheduler_decode"):
+            get_or_create_scheduler_decode_steady_accum(enabled=True)
 
         self.device_context.synchronize()
         memory_before = self.device_context.get_memory_info()
@@ -1778,7 +1813,26 @@ class AnnaQwen3_5TextEngine:
             )
             self.device_context.synchronize()
             ms = decode_prof.log_summary(log=logger)
-        record_steady_decode_step_if_applicable(stage, ms)
+        steady_recorded = None
+        if ms:
+            if stage.startswith("scheduler_decode"):
+                accum = get_or_create_scheduler_decode_steady_accum(enabled=True)
+                if accum is not None:
+                    steady_recorded = accum.record(ms, batch_size=resolved_batch)
+                else:
+                    record_steady_decode_step_if_applicable(
+                        stage,
+                        ms,
+                        batch_size=resolved_batch,
+                        token_cost=token_cost,
+                    )
+            else:
+                record_steady_decode_step_if_applicable(
+                    stage,
+                    ms,
+                    batch_size=resolved_batch,
+                    token_cost=token_cost,
+                )
         elapsed_seconds = time.perf_counter() - started_at
         self.device_context.synchronize()
         memory_after = self.device_context.get_memory_info()
@@ -1792,6 +1846,10 @@ class AnnaQwen3_5TextEngine:
             memory_after=memory_after,
             stats_before=stats_before,
             stats_after=stats_after,
+            batch_size=resolved_batch,
+            token_cost=token_cost,
+            component_ms=ms or None,
+            steady_recorded=steady_recorded,
         )
         return outputs
 
@@ -2052,7 +2110,7 @@ class AnnaQwen3_5TextEngine:
         decode_steps: int = 1,
         batch_size: int = 1,
     ) -> None:
-        from anna.model.fused_ops import maybe_load_gated_delta_library
+        from anna.model.fused_ops import maybe_load_gated_delta_library, resolve_flashqla_gdn_prefill_mode
 
         maybe_load_gated_delta_library()
         cfg = self.config.text_config
@@ -2065,19 +2123,38 @@ class AnnaQwen3_5TextEngine:
         prefill_tokens = max(2, int(prefill_tokens))
         decode_steps = max(1, int(decode_steps))
         batch_size = max(1, int(batch_size))
+        # Multi-shape prefill ladder reduces first-request SYCL JIT when FlashQLA (or fused GDN) is on.
+        flashqla_mode = resolve_flashqla_gdn_prefill_mode()
+        prefill_lengths = [2, 64, prefill_tokens]
+        chunk = int(getattr(self.optimization_config, "prefill_chunk_size", 0) or 0)
+        if chunk > 1:
+            prefill_lengths.append(chunk)
+        # Dedup, keep ascending, clamp to a sane upper bound for warmup.
+        prefill_lengths = sorted({max(2, int(length)) for length in prefill_lengths if int(length) > 1})
+        prefill_lengths = [length for length in prefill_lengths if length <= max(prefill_tokens, 256)]
+        if prefill_tokens not in prefill_lengths:
+            prefill_lengths.append(prefill_tokens)
+            prefill_lengths.sort()
         with torch.inference_mode():
             # Fused causal_conv1d_prefill / gated_delta_prefill require seq_len > 1 (see SYCL TORCH_CHECK).
-            input_ids = torch.full((batch_size, prefill_tokens), token_id, device=device, dtype=torch.long)
-            attention_mask = torch.ones_like(input_ids)
-            outputs = self._forward_generation_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=None,
-                model_kwargs={},
-                use_cache=True,
-                logits_to_keep=1,
-            )
-            past = outputs.past_key_values
+            past = None
+            for length in prefill_lengths:
+                if past is not None:
+                    release = getattr(past, "release", None)
+                    if callable(release):
+                        release()
+                    past = None
+                input_ids = torch.full((batch_size, length), token_id, device=device, dtype=torch.long)
+                attention_mask = torch.ones_like(input_ids)
+                outputs = self._forward_generation_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=None,
+                    model_kwargs={},
+                    use_cache=True,
+                    logits_to_keep=1,
+                )
+                past = outputs.past_key_values
             if past is not None:
                 decode_ids = torch.full((batch_size, 1), token_id, device=device, dtype=torch.long)
                 for _ in range(decode_steps):
@@ -2091,11 +2168,16 @@ class AnnaQwen3_5TextEngine:
                     )
                     past = outputs.past_key_values
                 past.release()
+            if device.type == "xpu" and hasattr(torch, "xpu"):
+                torch.xpu.synchronize()
         logger.info(
-            "XPU inference warmup finished (prefill_tokens=%s decode_steps=%s batch_size=%s).",
+            "XPU inference warmup finished (prefill_tokens=%s prefill_shapes=%s decode_steps=%s "
+            "batch_size=%s flashqla_mode=%s).",
             prefill_tokens,
+            prefill_lengths,
             decode_steps,
             batch_size,
+            flashqla_mode,
         )
 
     @staticmethod

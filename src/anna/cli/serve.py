@@ -74,13 +74,24 @@ def configure_int4_kernel_environment(args: argparse.Namespace) -> None:
 
 
 def configure_flashqla_environment(args: argparse.Namespace) -> None:
-    if not getattr(args, "enable_flashqla_gdn_prefill", False):
-        return
-    os.environ["ANNA_XPU_FLASHQLA_GDN_PREFILL"] = "1"
-    logger.info(
-        "Enabled XPU SYCL GDN prefill via CLI. "
-        "Unsupported devices, shapes, dtypes, or missing custom ops will raise without fallback."
-    )
+    mode = getattr(args, "flashqla_gdn_prefill_mode", None)
+    if mode is None or mode == "off":
+        if getattr(args, "enable_flashqla_gdn_prefill", False):
+            mode = "strict"
+        else:
+            return
+    os.environ["ANNA_XPU_FLASHQLA_GDN_PREFILL"] = str(mode)
+    if mode == "strict":
+        logger.info(
+            "Enabled XPU SYCL GDN prefill via CLI (mode=strict). "
+            "Unsupported devices, shapes, dtypes, or missing custom ops raise without fallback."
+        )
+    else:
+        logger.info(
+            "Enabled XPU SYCL GDN prefill via CLI (mode=%s). "
+            "Unsupported shapes/dtypes/ops degrade to the default fused or torch prefill path.",
+            mode,
+        )
 
 
 def _build_safety_policy(settings: ServeSettings) -> RuntimeSafetyPolicy | None:
@@ -228,8 +239,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable-flashqla-gdn-prefill",
         action="store_true",
-        help="Enable the XPU SYCL GDN prefill path. This path does not fall back: "
-        "unsupported shapes/dtypes/devices or missing custom ops raise immediately.",
+        help="Enable the XPU SYCL GDN prefill path in strict mode (alias of "
+        "--flashqla-gdn-prefill-mode strict). Unsupported shapes/dtypes/devices or "
+        "missing custom ops raise immediately.",
+    )
+    parser.add_argument(
+        "--flashqla-gdn-prefill-mode",
+        choices=("off", "strict", "prefer"),
+        default=None,
+        help="FlashQLA GDN prefill policy: off (default), strict (hard error, no fallback), "
+        "or prefer (use FlashQLA when supported, otherwise degrade to fused/torch with a warning). "
+        "Overrides --enable-flashqla-gdn-prefill when set.",
     )
     parser.add_argument(
         "--kv-cache-quantization",

@@ -371,6 +371,62 @@ def flashqla_gated_delta_fused_is_available() -> bool:
     return _flashqla_gated_delta_op() is not None
 
 
+def resolve_flashqla_gdn_prefill_mode(raw: str | None = None) -> str:
+    """Return ``off`` | ``strict`` | ``prefer`` for the FlashQLA GDN prefill path.
+
+    Env/CLI values:
+    - empty / ``0`` / ``false`` / ``off`` → off (default XPU fused or torch)
+    - ``1`` / ``true`` / ``on`` / ``strict`` → strict (hard error, no fallback)
+    - ``prefer`` / ``auto`` / ``fallback`` → prefer FlashQLA, degrade with a warning
+    """
+    value = (raw if raw is not None else os.environ.get("ANNA_XPU_FLASHQLA_GDN_PREFILL", "")).strip().lower()
+    if value in ("", "0", "false", "no", "off"):
+        return "off"
+    if value in ("1", "true", "yes", "on", "strict"):
+        return "strict"
+    if value in ("prefer", "auto", "fallback"):
+        return "prefer"
+    raise RuntimeError(
+        "ANNA_XPU_FLASHQLA_GDN_PREFILL must be one of off, 0, false, strict, 1, true, on, prefer, auto, fallback; "
+        f"got {value!r}"
+    )
+
+
+def flashqla_prefill_unsupported_reason(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor | None = None,
+) -> str | None:
+    """Return a greppable reason code if FlashQLA prefill cannot run, else None.
+
+    Reason codes: ``device``, ``seq_len``, ``dtype``, ``state_dtype``, ``op_missing``.
+    """
+    if query.device.type != "xpu":
+        return f"device (query.device={query.device}, reason_code=device)"
+    if int(query.shape[1]) <= 1:
+        return f"seq_len (seq_len={int(query.shape[1])}, reason_code=seq_len)"
+    if query.dtype not in (torch.float16, torch.bfloat16):
+        return f"dtype (query.dtype={query.dtype}, supported=(float16,bfloat16), reason_code=dtype)"
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        return (
+            f"dtype (key.dtype={key.dtype}, value.dtype={value.dtype}, "
+            f"expected={query.dtype}, reason_code=dtype)"
+        )
+    if g.dtype != torch.float32 or beta.dtype != torch.float32:
+        return f"state_dtype (g.dtype={g.dtype}, beta.dtype={beta.dtype}, reason_code=state_dtype)"
+    if state is not None and state.dtype != torch.float32:
+        return f"state_dtype (state.dtype={state.dtype}, reason_code=state_dtype)"
+    if not flashqla_gated_delta_fused_is_available():
+        maybe_load_gated_delta_library()
+    if not flashqla_gated_delta_fused_is_available():
+        return "op_missing (flashqla_gated_delta_prefill not registered, reason_code=op_missing)"
+    return None
+
+
 def flashqla_chunk_local_cumsum_is_available() -> bool:
     return _flashqla_chunk_local_cumsum_op() is not None
 
@@ -957,6 +1013,20 @@ def run_flashqla_gated_delta_prefill(
     beta: torch.Tensor,
     state: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    unsupported = flashqla_prefill_unsupported_reason(
+        query=query,
+        key=key,
+        value=value,
+        g=g,
+        beta=beta,
+        state=state,
+    )
+    if unsupported is not None and "op_missing" in unsupported:
+        raise RuntimeError(
+            "Anna flashqla_gated_delta_prefill op is not registered. Build/load the custom op first, "
+            "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path. This path does not fall back. "
+            f"({unsupported})"
+        )
     op = _flashqla_gated_delta_op()
     if op is None:
         maybe_load_gated_delta_library()

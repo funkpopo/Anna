@@ -357,14 +357,15 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 
 ### XPU fused op 和 int4 kernel
 
-- `--enable-flashqla-gdn-prefill`：启用 XPU SYCL Gated Delta prefill 路径；不支持的 shape/dtype/device 会直接报错。
+- `--enable-flashqla-gdn-prefill`：以 **strict** 模式启用 XPU SYCL Gated Delta prefill（不降级）。
+- `--flashqla-gdn-prefill-mode off|strict|prefer`：FlashQLA 策略。`strict` 在不支持的 device/shape/dtype/op 上硬失败；`prefer` 降级到默认 fused 或 torch prefill，并按 reason 一次性告警。环境变量 `ANNA_XPU_FLASHQLA_GDN_PREFILL` 取值相同（`1`/`true`/`on` ≡ `strict`）。
 - `--xpu-int4-matmul auto|torch|dequant`：XPU int4 dense linear 执行策略。
 - `ANNA_GATED_DELTA_OP_LIB`：显式指定 fused op `.pyd` / `.so` 路径。
 - `ANNA_XPU_GATED_DELTA_DECODE_STRATEGY=auto|single|single_group|untiled|tiled|tiled_value`：Gated Delta decode kernel 策略。不设置（或设为 `auto`）时走内置 Arc shape 查表；仅在调试时强制 `single` / `tiled`。
 - `ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK=N`：可选覆盖 tiled decode 的 value block。不设置时，Anna 按内置 Arc 表为 device/shape 选默认值；常见 Qwen3.5 shape 无需再手工调环境变量。
 - `ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS=N`：`auto` 的可选覆盖项；设置后会跳过设备/shape 策略查表，改用这个 single-group 元素阈值。
 
-当前 fused op 内固化的 Arc A770 K=128 decode 默认（rows = `batch * heads`）：
+当前 fused op 内固化的 Arc A770 decode 默认（rows = `batch * heads`）。主门禁覆盖 **K=128**；K∈{64,256} 复用同一套 V 默认。非常见 K/V 走可解释的 power-of-two fallback（`{1,2,4}`）：
 
 | V (value head dim) | 默认 value block | 默认 strategy | 说明 |
 | --- | --- | --- | --- |
@@ -372,7 +373,7 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 | 128 | 8 | `tiled` | 优先 block=8，避免退回更慢的 block=16 |
 | 256 | 4 | `tiled` | rows 264..304 使用 value block=8 |
 
-用 `python tools/validate_arc_gdn_decode.py --preset quick`（或 `full` / `watch`）验收该表。
+用 `python tools/validate_arc_gdn_decode.py --preset quick`（或 `full` / `watch`）验收 K=128 表。
 
 ### 连续批处理和 token budget
 

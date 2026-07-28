@@ -357,14 +357,15 @@ These values only apply when an API request omits the matching field.
 
 ### XPU Fused Ops and Int4 Kernels
 
-- `--enable-flashqla-gdn-prefill`: enable the XPU SYCL Gated Delta prefill path; unsupported shapes, dtypes, or devices raise immediately.
+- `--enable-flashqla-gdn-prefill`: enable the XPU SYCL Gated Delta prefill path in **strict** mode (no fallback).
+- `--flashqla-gdn-prefill-mode off|strict|prefer`: FlashQLA policy. `strict` hard-fails on unsupported device/shape/dtype/op; `prefer` degrades to the default fused or torch prefill with a one-shot warning per reason. Env `ANNA_XPU_FLASHQLA_GDN_PREFILL` accepts the same values (`1`/`true`/`on` ≡ `strict`).
 - `--xpu-int4-matmul auto|torch|dequant`: XPU int4 dense linear execution strategy.
 - `ANNA_GATED_DELTA_OP_LIB`: explicitly point to a fused-op `.pyd` / `.so`.
 - `ANNA_XPU_GATED_DELTA_DECODE_STRATEGY=auto|single|single_group|untiled|tiled|tiled_value`: Gated Delta decode kernel strategy. Leave unset (or set `auto`) for the built-in Arc shape lookup; force `single` / `tiled` only when debugging.
 - `ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK=N`: optional override for the tiled decode value block. When unset, Anna picks a device/shape default from the baked-in Arc table (no manual env tuning required for common Qwen3.5 shapes).
 - `ANNA_XPU_GATED_DELTA_DECODE_SINGLE_MIN_ELEMENTS=N`: optional override for `auto`; when set, bypass the device/shape strategy lookup and use this single-group element threshold.
 
-Arc A770 K=128 decode defaults currently baked into the fused op (rows = `batch * heads`):
+Arc A770 decode defaults currently baked into the fused op (rows = `batch * heads`). Primary gates cover **K=128**; K∈{64,256} reuse the same V-based defaults. Uncommon K/V fall back to an interpretable power-of-two block in `{1,2,4}`:
 
 | V (value head dim) | Default value block | Default strategy | Notes |
 | --- | --- | --- | --- |
@@ -372,7 +373,7 @@ Arc A770 K=128 decode defaults currently baked into the fused op (rows = `batch 
 | 128 | 8 | `tiled` | Prefer block=8 over block=16 |
 | 256 | 4 | `tiled` | Rows 264..304 use value block=8 |
 
-Validate the table with `python tools/validate_arc_gdn_decode.py --preset quick` (or `full` / `watch`).
+Validate the K=128 table with `python tools/validate_arc_gdn_decode.py --preset quick` (or `full` / `watch`).
 
 ### Continuous Batching and Token Budgets
 

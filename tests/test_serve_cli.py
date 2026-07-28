@@ -175,7 +175,18 @@ def test_configure_flashqla_environment_applies_cli_override(monkeypatch) -> Non
 
     configure_flashqla_environment(args)
 
-    assert os.environ["ANNA_XPU_FLASHQLA_GDN_PREFILL"] == "1"
+    assert os.environ["ANNA_XPU_FLASHQLA_GDN_PREFILL"] == "strict"
+    monkeypatch.delenv("ANNA_XPU_FLASHQLA_GDN_PREFILL", raising=False)
+
+
+def test_configure_flashqla_environment_applies_prefer_mode(monkeypatch) -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--model-dir", "model", "--flashqla-gdn-prefill-mode", "prefer"])
+    monkeypatch.delenv("ANNA_XPU_FLASHQLA_GDN_PREFILL", raising=False)
+
+    configure_flashqla_environment(args)
+
+    assert os.environ["ANNA_XPU_FLASHQLA_GDN_PREFILL"] == "prefer"
     monkeypatch.delenv("ANNA_XPU_FLASHQLA_GDN_PREFILL", raising=False)
 
 

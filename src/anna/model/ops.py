@@ -17,7 +17,9 @@ from anna.model.prefix_block_cache import PrefixBlockPool
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.model.turboquant import VALID_KV_CACHE_QUANT_BITS, TurboQuantKVRow
 from anna.model.fused_ops import (
+    flashqla_prefill_unsupported_reason,
     loaded_fused_library_paths,
+    resolve_flashqla_gdn_prefill_mode,
     run_causal_conv1d_decode_fused,
     run_causal_conv1d_prefill_fused,
     run_flashqla_gated_delta_prefill,
@@ -38,6 +40,7 @@ from anna.model.xpu_decode_profile import xpu_profile_region
 
 logger = logging.getLogger(__name__)
 _LOGGED_FLASHQLA_GDN_PREFILL = False
+_FLASHQLA_PREFILL_DEGRADED_REASONS: set[str] = set()
 
 
 def _compiler_disable(fn: Callable[..., object]) -> Callable[..., object]:
@@ -1636,6 +1639,82 @@ def paged_kv_single_token_decode_attention(
     )
 
 
+def single_token_gqa_decode(
+    *,
+    query_states: torch.Tensor,
+    scaling: float,
+    num_key_value_groups: int,
+    gate: torch.Tensor | None,
+    past_key_values: Qwen3DynamicCache,
+    layer_idx: int,
+    past_lengths: torch.Tensor,
+    key_states: torch.Tensor | None,
+    value_states: torch.Tensor | None,
+    prefer_paged_decode: bool,
+    use_turboquant_cache: bool,
+) -> torch.Tensor | None:
+    """Unified single-token GQA decode entry (TurboQuant / paged / dense fused).
+
+    Returns attention output in ``[B, H, 1, D]`` layout, or ``None`` when the
+    caller must fall through to multi-token / masked ``grouped_query_attention``.
+    Gate is accepted flat ``[B, 1, H*D]`` and reshaped once for all fused backends.
+    """
+    if query_states.shape[2] != 1:
+        return None
+    num_heads = int(query_states.shape[1])
+    head_dim = int(query_states.shape[3])
+    gate_fused = None
+    if gate is not None:
+        gate_fused = _reshape_decode_gate_to_query_layout(
+            gate,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+
+    if use_turboquant_cache:
+        return past_key_values.turboquant_single_token_decode_attention(
+            layer_idx,
+            query_states,
+            scaling=scaling,
+            num_key_value_groups=num_key_value_groups,
+            gate=gate_fused,
+        )
+
+    visible_lengths = past_lengths + 1
+    if prefer_paged_decode:
+        paged_state = past_key_values.paged_attention_state(layer_idx)
+        if paged_state is not None:
+            key_pages, value_pages, page_table, _ = paged_state
+            return paged_kv_single_token_decode_attention(
+                query_states,
+                key_pages,
+                value_pages,
+                page_table,
+                scaling=scaling,
+                visible_lengths=visible_lengths,
+                gate=gate_fused,
+            )
+
+    if query_states.device.type != "xpu":
+        return None
+
+    resolved_key = key_states
+    resolved_value = value_states
+    if resolved_key is None or resolved_value is None:
+        resolved_key, resolved_value, _ = past_key_values._gather_layer_cache(layer_idx)
+        if resolved_key is None or resolved_value is None:
+            raise RuntimeError("Failed to materialize KV cache for Qwen single-token decode.")
+    return materialized_kv_single_token_decode_attention(
+        query_states,
+        resolved_key,
+        resolved_value,
+        scaling=scaling,
+        num_key_value_groups=num_key_value_groups,
+        visible_lengths=visible_lengths,
+        gate=gate_fused,
+    )
+
+
 def _reshape_decode_gate_to_query_layout(
     gate: torch.Tensor,
     *,
@@ -1946,64 +2025,29 @@ class Qwen3Attention(nn.Module):
             causal_mask = None
             visible_mask = None
             key_padding_mask = None
-            if use_turboquant_cache and attention_mask is None and seq_len == 1 and past_key_values is not None:
-                gate_fused = _reshape_decode_gate_to_query_layout(
-                    gate,
-                    num_heads=query_states.size(1),
-                    head_dim=self.head_dim,
-                )
-                attn_output = past_key_values.turboquant_single_token_decode_attention(
-                    self.layer_idx,
-                    query_states,
+            # Single-token unmasked decode: one entry for TurboQuant / paged / dense fused.
+            if (
+                attention_mask is None
+                and past_key_values is not None
+                and seq_len == 1
+                and (use_turboquant_cache or prefer_paged_decode or hidden_states.device.type == "xpu")
+            ):
+                attn_output = single_token_gqa_decode(
+                    query_states=query_states,
                     scaling=self.scaling,
                     num_key_value_groups=self.num_key_value_groups,
-                    gate=gate_fused,
+                    gate=gate,
+                    past_key_values=past_key_values,
+                    layer_idx=self.layer_idx,
+                    past_lengths=past_lengths,
+                    key_states=key_states,
+                    value_states=value_states,
+                    prefer_paged_decode=prefer_paged_decode,
+                    use_turboquant_cache=use_turboquant_cache,
                 )
-                attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
-                return self.o_proj(attn_output)
-            if prefer_paged_decode and past_key_values is not None:
-                visible_lengths = past_lengths + seq_len
-                paged_state = past_key_values.paged_attention_state(self.layer_idx)
-                if paged_state is not None:
-                    key_pages, value_pages, page_table, _ = paged_state
-                    gate_fused = _reshape_decode_gate_to_query_layout(
-                        gate,
-                        num_heads=query_states.size(1),
-                        head_dim=self.head_dim,
-                    )
-                    attn_output = paged_kv_single_token_decode_attention(
-                        query_states,
-                        key_pages,
-                        value_pages,
-                        page_table,
-                        scaling=self.scaling,
-                        visible_lengths=visible_lengths,
-                        gate=gate_fused,
-                    )
+                if attn_output is not None:
                     attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
                     return self.o_proj(attn_output)
-            if attention_mask is None and past_key_values is not None and seq_len == 1 and hidden_states.device.type == "xpu":
-                if key_states is None or value_states is None:
-                    key_states, value_states, _ = past_key_values._gather_layer_cache(self.layer_idx)
-                    if key_states is None or value_states is None:
-                        raise RuntimeError("Failed to materialize KV cache for Qwen single-token decode.")
-                visible_lengths = past_lengths + seq_len
-                gate_fused = _reshape_decode_gate_to_query_layout(
-                    gate,
-                    num_heads=query_states.size(1),
-                    head_dim=self.head_dim,
-                )
-                attn_output = materialized_kv_single_token_decode_attention(
-                    query_states,
-                    key_states,
-                    value_states,
-                    scaling=self.scaling,
-                    num_key_value_groups=self.num_key_value_groups,
-                    visible_lengths=visible_lengths,
-                    gate=gate_fused,
-                )
-                attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
-                return self.o_proj(attn_output)
             # Multi-token decode and masked full-attention stay on the explicit grouped path.
             if not (batch_size == 1 and seq_len == 1 and attention_mask is None and past_key_values is not None):
                 visible_lengths = past_lengths + seq_len
@@ -2380,50 +2424,23 @@ class Qwen3GatedDeltaNet(nn.Module):
         initial_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         seq_len = int(query.shape[1])
-        use_flashqla_prefill = os.environ.get("ANNA_XPU_FLASHQLA_GDN_PREFILL", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        if use_flashqla_prefill and query.device.type != "xpu":
-            raise RuntimeError(
-                "ANNA_XPU_FLASHQLA_GDN_PREFILL=1 requires XPU tensors; "
-                f"got query.device={query.device}. This path does not fall back."
+        flashqla_mode = resolve_flashqla_gdn_prefill_mode()
+
+        def _torch_prefill() -> tuple[torch.Tensor, torch.Tensor]:
+            core_attn_out, recurrent_state = torch_chunk_gated_delta_rule(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=True,
             )
-        if use_flashqla_prefill and seq_len <= 1:
-            raise RuntimeError(
-                "ANNA_XPU_FLASHQLA_GDN_PREFILL=1 requires prefill seq_len > 1; "
-                f"got seq_len={seq_len}. This path does not fall back."
-            )
-        if query.device.type == "xpu" and seq_len > 1:
-            state = initial_state
-            if state is None:
-                state = torch.zeros(
-                    (query.shape[0], self.recurrent_num_heads, self.head_k_dim, self.head_v_dim),
-                    device=query.device,
-                    dtype=torch.float32,
-                )
-            if use_flashqla_prefill:
-                global _LOGGED_FLASHQLA_GDN_PREFILL
-                if not _LOGGED_FLASHQLA_GDN_PREFILL:
-                    logger.info(
-                        "Enabled XPU SYCL GDN prefill via ANNA_XPU_FLASHQLA_GDN_PREFILL: supported_dtypes=(float16,bfloat16) "
-                        "head_k_dim=%s head_v_dim=%s num_heads=%s fused_libraries=%s",
-                        self.head_k_dim,
-                        self.head_v_dim,
-                        self.recurrent_num_heads,
-                        loaded_fused_library_paths(),
-                    )
-                    _LOGGED_FLASHQLA_GDN_PREFILL = True
-                return run_flashqla_gated_delta_prefill(
-                    query=query,
-                    key=key,
-                    value=value,
-                    g=g,
-                    beta=beta,
-                    state=state,
-                )
+            if recurrent_state is None:
+                raise RuntimeError("chunk_gated_delta_rule must return the final recurrent state for prefill.")
+            return core_attn_out, recurrent_state
+
+        def _xpu_fused_prefill(state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             return run_gated_delta_prefill_fused(
                 query=query,
                 key=key,
@@ -2432,18 +2449,82 @@ class Qwen3GatedDeltaNet(nn.Module):
                 beta=beta,
                 state=state,
             )
-        core_attn_out, recurrent_state = torch_chunk_gated_delta_rule(
-            query=query,
-            key=key,
-            value=value,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            output_final_state=True,
-        )
-        if recurrent_state is None:
-            raise RuntimeError("chunk_gated_delta_rule must return the final recurrent state for prefill.")
-        return core_attn_out, recurrent_state
+
+        def _degrade(reason: str, state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+            global _FLASHQLA_PREFILL_DEGRADED_REASONS
+            if reason not in _FLASHQLA_PREFILL_DEGRADED_REASONS:
+                logger.warning(
+                    "FlashQLA GDN prefill degraded to fallback (mode=%s, %s). "
+                    "Set ANNA_XPU_FLASHQLA_GDN_PREFILL=strict to hard-fail instead.",
+                    flashqla_mode,
+                    reason,
+                )
+                _FLASHQLA_PREFILL_DEGRADED_REASONS.add(reason)
+            if query.device.type == "xpu" and seq_len > 1:
+                resolved_state = state
+                if resolved_state is None:
+                    resolved_state = torch.zeros(
+                        (query.shape[0], self.recurrent_num_heads, self.head_k_dim, self.head_v_dim),
+                        device=query.device,
+                        dtype=torch.float32,
+                    )
+                return _xpu_fused_prefill(resolved_state)
+            return _torch_prefill()
+
+        if flashqla_mode != "off":
+            unsupported = flashqla_prefill_unsupported_reason(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                state=initial_state,
+            )
+            if unsupported is not None:
+                if flashqla_mode == "strict":
+                    raise RuntimeError(
+                        f"ANNA_XPU_FLASHQLA_GDN_PREFILL=strict cannot run FlashQLA prefill: {unsupported}. "
+                        "This path does not fall back."
+                    )
+                return _degrade(unsupported, initial_state)
+
+        if query.device.type == "xpu" and seq_len > 1:
+            state = initial_state
+            if state is None:
+                state = torch.zeros(
+                    (query.shape[0], self.recurrent_num_heads, self.head_k_dim, self.head_v_dim),
+                    device=query.device,
+                    dtype=torch.float32,
+                )
+            if flashqla_mode != "off":
+                global _LOGGED_FLASHQLA_GDN_PREFILL
+                if not _LOGGED_FLASHQLA_GDN_PREFILL:
+                    logger.info(
+                        "Enabled XPU SYCL GDN prefill via ANNA_XPU_FLASHQLA_GDN_PREFILL=%s: "
+                        "supported_dtypes=(float16,bfloat16) head_k_dim=%s head_v_dim=%s num_heads=%s "
+                        "fused_libraries=%s",
+                        flashqla_mode,
+                        self.head_k_dim,
+                        self.head_v_dim,
+                        self.recurrent_num_heads,
+                        loaded_fused_library_paths(),
+                    )
+                    _LOGGED_FLASHQLA_GDN_PREFILL = True
+                try:
+                    return run_flashqla_gated_delta_prefill(
+                        query=query,
+                        key=key,
+                        value=value,
+                        g=g,
+                        beta=beta,
+                        state=state,
+                    )
+                except RuntimeError as exc:
+                    if flashqla_mode == "strict":
+                        raise
+                    return _degrade(f"kernel ({exc}, reason_code=kernel)", state)
+            return _xpu_fused_prefill(state)
+        return _torch_prefill()
 
     def _run_recurrent_decode(
         self,
