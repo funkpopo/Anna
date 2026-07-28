@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 
 from anna.mm.prepared_inputs import PreparedInputsLike
+from anna.runtime.scheduler_profiles import compute_dynamic_token_budgets
 from anna.runtime.streaming import IncrementalTextAssembler
 from anna.sampling.sampler import sample_next_token, sample_next_token_from_candidates
 
@@ -78,6 +79,13 @@ class AnnaScheduler:
         prefill_interval_steps: int = 1,
         max_prefill_tokens: int = 0,
         max_decode_tokens: int = 0,
+        max_waiting_requests: int = 0,
+        dynamic_token_budget: bool = False,
+        # Default False preserves coalesce-wait behaviour for manual/throughput configs.
+        # Interactive profile sets this True so an idle GPU starts the first wave immediately (TTFT).
+        skip_batch_wait_when_idle: bool = False,
+        max_queue_wait_ms: float = 0.0,
+        profile: str = "none",
     ) -> None:
         self.engine = engine
         self.max_batch_size = max(1, max_batch_size)
@@ -85,6 +93,12 @@ class AnnaScheduler:
         self.prefill_interval_steps = max(1, int(prefill_interval_steps))
         self.max_prefill_tokens = max(0, int(max_prefill_tokens))
         self.max_decode_tokens = max(0, int(max_decode_tokens))
+        # 0 = unlimited waiting queue (legacy behaviour).
+        self.max_waiting_requests = max(0, int(max_waiting_requests))
+        self.dynamic_token_budget = bool(dynamic_token_budget)
+        self.skip_batch_wait_when_idle = bool(skip_batch_wait_when_idle)
+        self.max_queue_wait_seconds = max(0.0, float(max_queue_wait_ms)) / 1000.0
+        self.profile = str(profile or "none")
         self._decode_steps_since_prefill = 0
         self._pending: deque[SchedulerRequest] = deque()
         self._condition = threading.Condition()
@@ -142,13 +156,17 @@ class AnnaScheduler:
     def _submit(self, prepared: PreparedInputsLike, *, config: "GenerationConfig", stream: bool) -> SchedulerRequest:
         if self._fatal_error is not None:
             raise self._fatal_error
-        request = SchedulerRequest(prepared=prepared, config=config, stream=stream)
         metrics = getattr(self.engine, "metrics", None)
-        if metrics is not None:
-            metrics.record_request_submitted(waiting=True)
         with self._condition:
+            if self.max_waiting_requests > 0 and len(self._pending) >= self.max_waiting_requests:
+                if metrics is not None:
+                    metrics.record_queue_rejected(1)
+                raise self._queue_full_error(waiting=len(self._pending))
+            request = SchedulerRequest(prepared=prepared, config=config, stream=stream)
             self._pending.append(request)
             self._condition.notify()
+        if metrics is not None:
+            metrics.record_request_submitted(waiting=True)
         return request
 
     def _run_loop(self) -> None:
@@ -160,7 +178,15 @@ class AnnaScheduler:
                         self._condition.wait()
                     if self._stop and not self._pending and not active:
                         return
-                    if not active and self._pending and self.batch_wait_seconds > 0:
+                    # TTFT: when the GPU is idle, start the first wave immediately unless the
+                    # profile explicitly wants idle coalescing (throughput).
+                    should_coalesce = (
+                        self._pending
+                        and self.batch_wait_seconds > 0
+                        and len(self._pending) < self.max_batch_size
+                        and (active or not self.skip_batch_wait_when_idle)
+                    )
+                    if should_coalesce:
                         self._condition.wait(timeout=self.batch_wait_seconds)
 
                     pending_batch: list[SchedulerRequest] = []
@@ -332,18 +358,55 @@ class AnnaScheduler:
             stop_strings=request.config.stop_strings,
         )
 
+    def _effective_token_budgets(
+        self,
+        *,
+        active_requests: list[SchedulerRequest] | None = None,
+    ) -> tuple[int, int]:
+        """Return (max_prefill_tokens, max_decode_tokens), optionally scaled dynamically."""
+        prefill = self.max_prefill_tokens
+        decode = self.max_decode_tokens
+        if not self.dynamic_token_budget:
+            return prefill, decode
+
+        free_bytes = None
+        total_bytes = None
+        memory_info = self.engine.device_context.get_memory_info()
+        if memory_info is not None:
+            free_bytes = int(memory_info.free_bytes)
+            total_bytes = int(memory_info.total_bytes)
+
+        running = 0 if active_requests is None else len(active_requests)
+        with self._condition:
+            waiting = len(self._pending)
+        avg_seq = 0.0
+        if active_requests:
+            costs = [self._decode_request_token_cost(request) for request in active_requests]
+            avg_seq = sum(costs) / max(1, len(costs))
+
+        return compute_dynamic_token_budgets(
+            base_prefill_tokens=prefill,
+            base_decode_tokens=decode,
+            free_bytes=free_bytes,
+            total_bytes=total_bytes,
+            running_requests=running,
+            waiting_requests=waiting,
+            avg_running_seq_len=avg_seq,
+        )
+
     def _select_prefill_admission(
         self,
         requests: list[SchedulerRequest],
     ) -> tuple[list[SchedulerRequest], list[SchedulerRequest]]:
-        if self.max_prefill_tokens <= 0:
+        max_prefill_tokens, _ = self._effective_token_budgets()
+        if max_prefill_tokens <= 0:
             return requests, []
         accepted: list[SchedulerRequest] = []
         deferred: list[SchedulerRequest] = []
         used_tokens = 0
         for request in requests:
             prompt_tokens = max(1, int(request.prompt_length))
-            if accepted and used_tokens + prompt_tokens > self.max_prefill_tokens:
+            if accepted and used_tokens + prompt_tokens > max_prefill_tokens:
                 deferred.append(request)
                 continue
             accepted.append(request)
@@ -359,14 +422,15 @@ class AnnaScheduler:
             self._condition.notify_all()
 
     def _iter_prefill_group_chunks(self, requests: list[SchedulerRequest]) -> Iterator[list[SchedulerRequest]]:
-        if self.max_prefill_tokens <= 0:
+        max_prefill_tokens, _ = self._effective_token_budgets()
+        if max_prefill_tokens <= 0:
             yield requests
             return
         chunk: list[SchedulerRequest] = []
         chunk_tokens = 0
         for request in requests:
             prompt_tokens = max(1, int(request.prompt_length))
-            if chunk and chunk_tokens + prompt_tokens > self.max_prefill_tokens:
+            if chunk and chunk_tokens + prompt_tokens > max_prefill_tokens:
                 yield chunk
                 chunk = []
                 chunk_tokens = 0
@@ -374,6 +438,23 @@ class AnnaScheduler:
             chunk_tokens += prompt_tokens
         if chunk:
             yield chunk
+
+    def _oldest_pending_wait_seconds(self) -> float:
+        # Condition uses an RLock by default, so nested acquire from the worker is safe.
+        with self._condition:
+            if not self._pending:
+                return 0.0
+            oldest = self._pending[0].queued_at
+        return max(0.0, time.perf_counter() - oldest)
+
+    def _should_force_prefill_for_fairness(self) -> bool:
+        """Admit waiting prefills early when the head of the queue has waited too long.
+
+        Prevents long-running decode batches from starving newly arrived prompts (TTFT fairness).
+        """
+        if self.max_queue_wait_seconds <= 0:
+            return False
+        return self._oldest_pending_wait_seconds() >= self.max_queue_wait_seconds
 
     def _should_admit_prefill(
         self,
@@ -383,10 +464,14 @@ class AnnaScheduler:
             return False
         if any(isinstance(item, SchedulerPrefillGroup) for item in active):
             return False
-        return self._decode_steps_since_prefill >= self.prefill_interval_steps
+        if self._decode_steps_since_prefill >= self.prefill_interval_steps:
+            return True
+        return self._should_force_prefill_for_fairness()
 
     def _should_run_prefill_step(self) -> bool:
-        return self._decode_steps_since_prefill >= self.prefill_interval_steps
+        if self._decode_steps_since_prefill >= self.prefill_interval_steps:
+            return True
+        return self._should_force_prefill_for_fairness()
 
     def _prefill_same_length_group(
         self,
@@ -768,12 +853,13 @@ class AnnaScheduler:
         return next_active
 
     def _iter_decode_chunks(self, requests: list[SchedulerRequest]) -> Iterator[list[SchedulerRequest]]:
+        _, max_decode_tokens = self._effective_token_budgets(active_requests=requests)
         chunk: list[SchedulerRequest] = []
         chunk_tokens = 0
         for request in requests:
             cost = self._decode_request_token_cost(request)
             batch_full = len(chunk) >= self.max_batch_size
-            token_full = self.max_decode_tokens > 0 and chunk and chunk_tokens + cost > self.max_decode_tokens
+            token_full = max_decode_tokens > 0 and chunk and chunk_tokens + cost > max_decode_tokens
             if batch_full or token_full:
                 yield chunk
                 chunk = []
@@ -1146,6 +1232,19 @@ class AnnaScheduler:
             status_code=499,
             error_type="server_error",
             code="client_disconnected",
+        )
+
+    def _queue_full_error(self, *, waiting: int) -> "AnnaEngineError":
+        from anna.runtime.qwen3_5_text_engine import AnnaEngineError
+
+        return AnnaEngineError(
+            (
+                f"Scheduler waiting queue is full ({waiting}/{self.max_waiting_requests}). "
+                "Retry later, reduce concurrency, or raise --scheduler-max-waiting-requests."
+            ),
+            status_code=429,
+            error_type="server_error",
+            code="scheduler_queue_full",
         )
 
     def _build_perf_stats(self, request: SchedulerRequest):

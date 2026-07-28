@@ -51,6 +51,130 @@ def turboquant_is_available() -> bool:
 # KV-cache TurboQuant bit-widths allowed by Anna runtimes (value packing supports 2/3/4 in this module).
 VALID_KV_CACHE_QUANT_BITS: frozenset[int] = frozenset((2, 3, 4))
 
+# Approximate FP16/BF16 weight footprint thresholds used for TurboQuant size tiers.
+_TURBOQUANT_TIER_BYTES: tuple[tuple[str, int], ...] = (
+    # (tier_name, max_exclusive_weight_bytes)
+    ("small", 6 * (1 << 30)),  # ~<= 3B params @ bf16
+    ("medium", 28 * (1 << 30)),  # ~<= 14B
+    ("large", 70 * (1 << 30)),  # ~<= 35B
+)
+
+
+class TurboQuantPreset(NamedTuple):
+    """Recommended TurboQuant bits / residual window for a model size tier."""
+
+    tier: str
+    bits: int
+    residual_len: int
+    description: str
+
+
+# Size-tier defaults: smaller models keep more residual precision; larger models
+# compress more aggressively to free KV pages for longer context / bigger batches.
+TURBOQUANT_PRESETS: dict[str, TurboQuantPreset] = {
+    "small": TurboQuantPreset(
+        tier="small",
+        bits=4,
+        residual_len=128,
+        description="<=~3B: 4-bit KV, 128-token full-precision residual (quality-first).",
+    ),
+    "medium": TurboQuantPreset(
+        tier="medium",
+        bits=3,
+        residual_len=128,
+        description="~3–14B: 3-bit KV, 128-token residual (balanced).",
+    ),
+    "large": TurboQuantPreset(
+        tier="large",
+        bits=2,
+        residual_len=96,
+        description="~14–35B: 2-bit KV, 96-token residual (memory-first).",
+    ),
+    "xlarge": TurboQuantPreset(
+        tier="xlarge",
+        bits=2,
+        residual_len=64,
+        description=">~35B: 2-bit KV, 64-token residual (max compression).",
+    ),
+}
+
+
+def turboquant_tier_for_weight_bytes(weight_bytes: int) -> str:
+    """Map estimated model weight footprint to a TurboQuant size tier."""
+    size = max(0, int(weight_bytes))
+    for tier, max_bytes in _TURBOQUANT_TIER_BYTES:
+        if size < max_bytes:
+            return tier
+    return "xlarge"
+
+
+def recommend_turboquant_preset(weight_bytes: int) -> TurboQuantPreset:
+    """Return the recommended TurboQuant bits/residual for an estimated weight size."""
+    tier = turboquant_tier_for_weight_bytes(weight_bytes)
+    return TURBOQUANT_PRESETS[tier]
+
+
+def resolve_turboquant_runtime_settings(
+    *,
+    requested_mode: str,
+    requested_bits: int,
+    requested_residual_len: int,
+    weight_bytes: int | None = None,
+    bits_explicit: bool = False,
+    residual_explicit: bool = False,
+    turboquant_available: bool | None = None,
+) -> tuple[str, int, int, str | None]:
+    """Resolve KV quantization mode + TurboQuant knobs.
+
+    ``requested_mode``:
+      - ``none``: disable
+      - ``turboquant``: enable with given bits/residual (optionally filled from size preset
+        when the caller did not explicitly set bits/residual and ``weight_bytes`` is known)
+      - ``auto``: enable turboquant when the optional dependency is present; pick bits/residual
+        from the size tier when not explicitly set
+
+    Returns ``(mode, bits, residual_len, preset_tier_or_none)``.
+    """
+    mode = (requested_mode or "none").strip().lower()
+    bits = int(requested_bits)
+    residual = max(1, int(requested_residual_len))
+    available = turboquant_is_available() if turboquant_available is None else bool(turboquant_available)
+    preset_tier: str | None = None
+
+    if mode not in {"none", "turboquant", "auto"}:
+        raise ValueError(
+            f"Unsupported KV-cache quantization mode: {requested_mode}. "
+            "Expected one of: auto, none, turboquant."
+        )
+
+    if mode == "none":
+        return "none", bits, residual, None
+
+    if mode == "auto":
+        if not available:
+            return "none", bits, residual, None
+        mode = "turboquant"
+
+    if mode == "turboquant" and not available:
+        raise RuntimeError(
+            "TurboQuant KV-cache compression was requested, but the 'turboquant' dependency is not installed."
+        )
+
+    if weight_bytes is not None and (not bits_explicit or not residual_explicit):
+        preset = recommend_turboquant_preset(int(weight_bytes))
+        preset_tier = preset.tier
+        if not bits_explicit:
+            bits = int(preset.bits)
+        if not residual_explicit:
+            residual = int(preset.residual_len)
+
+    if bits not in VALID_KV_CACHE_QUANT_BITS:
+        raise ValueError(
+            f"Unsupported TurboQuant KV-cache bit-width: {bits}. "
+            f"Expected one of {sorted(VALID_KV_CACHE_QUANT_BITS)}."
+        )
+    return mode, bits, residual, preset_tier
+
 
 def _require_turboquant_core() -> tuple[Any, Any]:
     try:

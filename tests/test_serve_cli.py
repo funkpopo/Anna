@@ -12,6 +12,7 @@ from anna.cli.serve import (
     _build_safety_policy,
     _build_scheduler,
     _log_available_routes,
+    _resolve_serve_scheduler_knobs,
     build_parser,
     configure_flashqla_environment,
     configure_int4_kernel_environment,
@@ -93,6 +94,10 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "8",
             "--warmup-batch-size",
             "4",
+            "--scheduler-max-batch-size",
+            "4",
+            "--scheduler-batch-wait-ms",
+            "2.0",
             "--scheduler-prefill-interval-steps",
             "3",
             "--scheduler-max-prefill-tokens",
@@ -205,11 +210,53 @@ def test_serve_parser_defaults_to_direct_generation() -> None:
 
     args = parser.parse_args(["--model-dir", "model"])
 
-    assert args.scheduler_max_batch_size == 1
-    assert args.scheduler_prefill_interval_steps == 1
-    assert args.scheduler_max_prefill_tokens == 0
-    assert args.scheduler_max_decode_tokens == 0
+    # Scheduler knobs default to None and are resolved via profile/hard defaults.
+    assert args.scheduler_profile == "none"
+    assert args.scheduler_max_batch_size is None
+    assert args.scheduler_prefill_interval_steps is None
+    assert args.scheduler_max_prefill_tokens is None
+    assert args.scheduler_max_decode_tokens is None
+    assert args.kv_cache_quant_bits is None
+    assert args.kv_cache_residual_len is None
     assert args.metrics_log_interval_seconds == 10.0
+
+    knobs = _resolve_serve_scheduler_knobs(args)
+    assert knobs["max_batch_size"] == 1
+    assert knobs["prefill_interval_steps"] == 1
+    assert knobs["max_prefill_tokens"] == 0
+    assert knobs["max_decode_tokens"] == 0
+
+
+def test_serve_parser_scheduler_profile_interactive() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--model-dir", "model", "--scheduler-profile", "interactive"])
+    knobs = _resolve_serve_scheduler_knobs(args)
+    assert knobs["profile"] == "interactive"
+    assert knobs["max_batch_size"] == 2
+    assert knobs["batch_wait_ms"] == 0.5
+    assert knobs["dynamic_token_budget"] is True
+    assert knobs["skip_batch_wait_when_idle"] is True
+    assert knobs["max_waiting_requests"] == 32
+
+
+def test_serve_parser_scheduler_profile_override() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--model-dir",
+            "model",
+            "--scheduler-profile",
+            "throughput",
+            "--scheduler-max-batch-size",
+            "3",
+            "--no-scheduler-dynamic-token-budget",
+        ]
+    )
+    knobs = _resolve_serve_scheduler_knobs(args)
+    assert knobs["profile"] == "throughput"
+    assert knobs["max_batch_size"] == 3
+    assert knobs["batch_wait_ms"] == 8.0
+    assert knobs["dynamic_token_budget"] is False
 
 
 def test_serve_parser_accepts_kv_cache_quant_bits_two() -> None:
@@ -249,10 +296,15 @@ def test_build_scheduler_passes_prefill_interval_to_scheduler() -> None:
     engine = _FakeEngine()
     settings = ServeSettings(
         model_dir=Path("dummy"),
+        scheduler_profile="interactive",
         scheduler_max_batch_size=4,
         scheduler_prefill_interval_steps=3,
         scheduler_max_prefill_tokens=1024,
         scheduler_max_decode_tokens=4096,
+        scheduler_max_waiting_requests=16,
+        scheduler_dynamic_token_budget=True,
+        scheduler_skip_batch_wait_when_idle=True,
+        scheduler_max_queue_wait_ms=50.0,
     )
 
     scheduler = _build_scheduler(engine, settings)
@@ -262,6 +314,10 @@ def test_build_scheduler_passes_prefill_interval_to_scheduler() -> None:
         assert scheduler.prefill_interval_steps == 3
         assert scheduler.max_prefill_tokens == 1024
         assert scheduler.max_decode_tokens == 4096
+        assert scheduler.max_waiting_requests == 16
+        assert scheduler.dynamic_token_budget is True
+        assert scheduler.skip_batch_wait_when_idle is True
+        assert scheduler.profile == "interactive"
         assert engine.scheduler is scheduler
     finally:
         if scheduler is not None:

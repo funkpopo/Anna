@@ -33,7 +33,11 @@ from anna.model.quantization import (
 )
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
-from anna.model.turboquant import VALID_KV_CACHE_QUANT_BITS, turboquant_is_available
+from anna.model.turboquant import (
+    VALID_KV_CACHE_QUANT_BITS,
+    resolve_turboquant_runtime_settings,
+    turboquant_is_available,
+)
 from anna.model.xpu_decode_profile import (
     _amortized_per_request_ms,
     get_or_create_scheduler_decode_steady_accum,
@@ -54,6 +58,7 @@ ReasoningFormat = Literal["none", "deepseek"]
 _REASONING_FORMAT_VALUES = frozenset({"none", "deepseek"})
 _DEFAULT_REASONING_FORMAT: ReasoningFormat = "deepseek"
 _COMPILE_MODE_VALUES = frozenset({"none", "auto", "default", "reduce-overhead", "max-autotune"})
+# Final runtime modes only (``auto`` is resolved before EngineOptimizationConfig is built).
 _KV_CACHE_QUANTIZATION_VALUES = frozenset({"none", "turboquant"})
 
 
@@ -141,6 +146,11 @@ class EngineOptimizationConfig:
     kv_cache_quantization: str = "none"
     kv_cache_quant_bits: int = 4
     kv_cache_residual_len: int = 128
+    # Size-tier name applied when bits/residual came from recommend_turboquant_preset.
+    kv_cache_turboquant_preset: str | None = None
+    # When True, skip paged prefix-block registration for prompts that are eligible
+    # for exact prompt-cache reuse (avoids dual full-KV + page registry waste).
+    prefer_prompt_cache_over_prefix: bool = True
 
 
 @dataclass(slots=True)
@@ -304,6 +314,7 @@ class AnnaQwen3_5TextEngine:
         self._prompt_cache: OrderedDict[tuple[int, ...], PromptCacheEntry] = OrderedDict()
         self.metrics = AnnaServiceMetrics()
         self._apply_runtime_optimizations()
+        self._attach_prefix_share_gate()
 
     @staticmethod
     def _normalize_optimization_config(config: EngineOptimizationConfig | None) -> EngineOptimizationConfig:
@@ -325,6 +336,8 @@ class AnnaQwen3_5TextEngine:
             kv_cache_quantization=normalize_kv_cache_quantization(config.kv_cache_quantization),
             kv_cache_quant_bits=kv_cache_quant_bits,
             kv_cache_residual_len=max(1, int(config.kv_cache_residual_len)),
+            kv_cache_turboquant_preset=config.kv_cache_turboquant_preset,
+            prefer_prompt_cache_over_prefix=bool(config.prefer_prompt_cache_over_prefix),
         )
 
     def _resolve_prefill_chunk_size(self, requested_chunk_size: int) -> int:
@@ -443,11 +456,26 @@ class AnnaQwen3_5TextEngine:
             "turboquant_enabled": turboquant_enabled,
             "turboquant_bits": self.optimization_config.kv_cache_quant_bits if turboquant_enabled else None,
             "turboquant_residual_len": self.optimization_config.kv_cache_residual_len if turboquant_enabled else None,
+            "turboquant_preset": self.optimization_config.kv_cache_turboquant_preset if turboquant_enabled else None,
             "turboquant_applies_to": "full_attention_only" if turboquant_enabled else "disabled",
             "full_attention_layers": len(full_attention_layers),
             "full_attention_layer_indices": full_attention_layers,
             "turboquant_quantized_layers": len(full_attention_layers) if turboquant_enabled else 0,
             "turboquant_quantized_layer_indices": full_attention_layers if turboquant_enabled else [],
+            "prompt_cache_vs_prefix": {
+                "prompt_cache_size": self.optimization_config.prompt_cache_size,
+                "prompt_cache_max_tokens": self.optimization_config.prompt_cache_max_tokens,
+                "prefer_prompt_cache_over_prefix": self.optimization_config.prefer_prompt_cache_over_prefix,
+                "prefix_kv_share_env": os.environ.get("ANNA_PREFIX_KV_SHARE", "1"),
+                "strategy": (
+                    "exact_prompt_cache_skips_prefix_registration"
+                    if (
+                        self.optimization_config.prompt_cache_size > 0
+                        and self.optimization_config.prefer_prompt_cache_over_prefix
+                    )
+                    else "prefix_block_sharing"
+                ),
+            },
         }
 
     @classmethod
@@ -467,6 +495,8 @@ class AnnaQwen3_5TextEngine:
         kv_cache_quantization: str = "none",
         kv_cache_quant_bits: int = 4,
         kv_cache_residual_len: int = 128,
+        kv_cache_quant_bits_explicit: bool = False,
+        kv_cache_residual_len_explicit: bool = False,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
         default_temperature: float | None = None,
@@ -502,8 +532,19 @@ class AnnaQwen3_5TextEngine:
             )
         if safety_policy is not None:
             device_context.safety_policy = safety_policy
-        resolved_kv_cache_quantization = cls._resolve_kv_cache_quantization(
+        weight_bytes = estimate_qwen3_5_text_model_weight_bytes(model_path)
+        (
+            resolved_kv_cache_quantization,
+            kv_cache_quant_bits,
+            kv_cache_residual_len,
+            turboquant_preset,
+        ) = cls._resolve_kv_cache_quantization(
             requested_mode=kv_cache_quantization,
+            requested_bits=kv_cache_quant_bits,
+            requested_residual_len=kv_cache_residual_len,
+            bits_explicit=kv_cache_quant_bits_explicit,
+            residual_explicit=kv_cache_residual_len_explicit,
+            weight_bytes=weight_bytes,
             device_context=device_context,
         )
         resolved_offload_mode = cls._resolve_offload_mode(
@@ -806,17 +847,24 @@ class AnnaQwen3_5TextEngine:
                 kv_cache_quantization=resolved_kv_cache_quantization,
                 kv_cache_quant_bits=kv_cache_quant_bits,
                 kv_cache_residual_len=kv_cache_residual_len,
+                kv_cache_turboquant_preset=turboquant_preset,
+                prefer_prompt_cache_over_prefix=prompt_cache_size > 0,
             ),
         )
         kv_cache_info = engine._kv_cache_runtime_info()
         logger.info(
-            "Qwen3.5 KV cache runtime: mode=%s turboquant_enabled=%s turboquant_bits=%s turboquant_residual_len=%s full_attention_layers=%s turboquant_quantized_layers=%s",
+            "Qwen3.5 KV cache runtime: mode=%s turboquant_enabled=%s turboquant_bits=%s "
+            "turboquant_residual_len=%s turboquant_preset=%s full_attention_layers=%s "
+            "turboquant_quantized_layers=%s prompt_cache_size=%s prefer_prompt_cache_over_prefix=%s",
             kv_cache_info.get("mode"),
             kv_cache_info.get("turboquant_enabled"),
             kv_cache_info.get("turboquant_bits"),
             kv_cache_info.get("turboquant_residual_len"),
+            kv_cache_info.get("turboquant_preset"),
             kv_cache_info.get("full_attention_layers"),
             kv_cache_info.get("turboquant_quantized_layers"),
+            prompt_cache_size,
+            engine.optimization_config.prefer_prompt_cache_over_prefix,
         )
         return engine
 
@@ -847,14 +895,25 @@ class AnnaQwen3_5TextEngine:
     def _resolve_kv_cache_quantization(
         *,
         requested_mode: str,
-        device_context: DeviceContext,
-    ) -> str:
-        normalized = normalize_kv_cache_quantization(requested_mode)
-        if normalized == "turboquant" and not turboquant_is_available():
-            raise ValueError(
-                "TurboQuant KV-cache compression was requested, but the 'turboquant' dependency is not installed."
+        requested_bits: int = 4,
+        requested_residual_len: int = 128,
+        bits_explicit: bool = False,
+        residual_explicit: bool = False,
+        weight_bytes: int | None = None,
+        device_context: DeviceContext | None = None,
+    ) -> tuple[str, int, int, str | None]:
+        del device_context  # reserved for future device-specific TurboQuant defaults
+        try:
+            return resolve_turboquant_runtime_settings(
+                requested_mode=requested_mode,
+                requested_bits=requested_bits,
+                requested_residual_len=requested_residual_len,
+                weight_bytes=weight_bytes,
+                bits_explicit=bits_explicit,
+                residual_explicit=residual_explicit,
             )
-        return normalized
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
 
     @staticmethod
     def _resolve_offload_vision(
@@ -1276,8 +1335,34 @@ class AnnaQwen3_5TextEngine:
             kv_cache_residual_len=self.optimization_config.kv_cache_residual_len,
         )
         cache.reserve_sequence_capacity(int(prepared.input_ids.shape[1]))
-        cache.set_prompt_token_ids(prepared.input_ids)
+        # Exact prompt-cache eligible prompts skip prefix registration (dual-cache boundary).
+        if not self._should_skip_prefix_registration(prepared):
+            cache.set_prompt_token_ids(prepared.input_ids)
         return cache
+
+    def _attach_prefix_share_gate(self) -> None:
+        """Wire model-created caches to the same prompt-cache vs prefix boundary policy."""
+
+        def _allow_prefix_share(input_ids: torch.Tensor) -> bool:
+            if int(input_ids.shape[0]) != 1:
+                return True
+            if self.optimization_config.prompt_cache_size <= 0:
+                return True
+            if not self.optimization_config.prefer_prompt_cache_over_prefix:
+                return True
+            max_tokens = self.optimization_config.prompt_cache_max_tokens
+            seq = int(input_ids.shape[1])
+            if max_tokens > 0 and seq > max_tokens:
+                return True  # long prompts are not exact-cached → allow prefix sharing
+            return False  # exact-cache eligible → skip prefix registration
+
+        language_model = getattr(getattr(self.model, "model", None), "language_model", None)
+        if language_model is None:
+            language_model = getattr(self.model, "model", None)
+        if language_model is not None:
+            language_model._anna_prefix_share_gate = _allow_prefix_share  # type: ignore[attr-defined]
+        # Also attach on the outer conditional-generation module used by multimodal forward.
+        setattr(self.model, "_anna_prefix_share_gate", _allow_prefix_share)
 
     def _trim_runtime_cache_if_idle(self) -> None:
         metrics = getattr(self, "metrics", None)
@@ -1373,14 +1458,36 @@ class AnnaQwen3_5TextEngine:
 
     def service_metrics_snapshot(self) -> ServiceMetricsSnapshot:
         metrics = getattr(self, "metrics", None)
+        prefix_stats = None
+        pool = getattr(getattr(self, "cache_allocator", None), "prefix_block_pool", None)
+        if pool is not None and hasattr(pool, "stats"):
+            prefix_stats = pool.stats()
+            if metrics is not None:
+                metrics.set_prefix_block_stats(
+                    lookups_total=prefix_stats.lookups_total,
+                    hits_total=prefix_stats.hits_total,
+                    misses_total=prefix_stats.misses_total,
+                    registers_total=prefix_stats.registers_total,
+                    entries=prefix_stats.entries,
+                )
         snapshot = metrics.snapshot() if metrics is not None else ServiceMetricsSnapshot(timestamp=time.perf_counter())
         used_pages, total_pages = self._kv_cache_page_counts()
-        return replace(
-            snapshot,
-            kv_cache_used_pages=used_pages,
-            kv_cache_total_pages=total_pages,
-            prompt_cache_entries=len(getattr(self, "_prompt_cache", {})),
-        )
+        extra: dict[str, object] = {
+            "kv_cache_used_pages": used_pages,
+            "kv_cache_total_pages": total_pages,
+            "prompt_cache_entries": len(getattr(self, "_prompt_cache", {})),
+        }
+        if prefix_stats is not None and metrics is None:
+            extra.update(
+                {
+                    "prefix_block_lookups_total": prefix_stats.lookups_total,
+                    "prefix_block_hits_total": prefix_stats.hits_total,
+                    "prefix_block_misses_total": prefix_stats.misses_total,
+                    "prefix_block_registers_total": prefix_stats.registers_total,
+                    "prefix_block_entries": prefix_stats.entries,
+                }
+            )
+        return replace(snapshot, **extra)  # type: ignore[arg-type]
 
     def health(self) -> dict[str, Any]:
         quant_method = self.config.quantization_config.quant_method or "dense"
@@ -1422,10 +1529,12 @@ class AnnaQwen3_5TextEngine:
                 "prompt_cache_size": self.optimization_config.prompt_cache_size,
                 "prompt_cache_max_tokens": self.optimization_config.prompt_cache_max_tokens,
                 "prompt_cache_entries": len(self._prompt_cache),
+                "prefer_prompt_cache_over_prefix": self.optimization_config.prefer_prompt_cache_over_prefix,
                 "profile_runtime": self.optimization_config.profile_runtime,
                 "kv_cache_quantization": self.optimization_config.kv_cache_quantization,
                 "kv_cache_quant_bits": self.optimization_config.kv_cache_quant_bits,
                 "kv_cache_residual_len": self.optimization_config.kv_cache_residual_len,
+                "kv_cache_turboquant_preset": self.optimization_config.kv_cache_turboquant_preset,
                 "xpu_int4_kernels": {
                     "matmul_strategy": os.getenv("ANNA_XPU_INT4_MATMUL", "auto"),
                     "matmul_backend": XPUInt4Linear.resolve_matmul_backend(),
@@ -1471,6 +1580,17 @@ class AnnaQwen3_5TextEngine:
                 "prompt_cache_queries_total": service_metrics.prompt_cache_queries_total,
                 "prompt_cache_hits_total": service_metrics.prompt_cache_hits_total,
                 "prompt_cache_entries": service_metrics.prompt_cache_entries,
+                "prefix_block_lookups_total": service_metrics.prefix_block_lookups_total,
+                "prefix_block_hits_total": service_metrics.prefix_block_hits_total,
+                "prefix_block_misses_total": service_metrics.prefix_block_misses_total,
+                "prefix_block_registers_total": service_metrics.prefix_block_registers_total,
+                "prefix_block_entries": service_metrics.prefix_block_entries,
+                "prefix_block_hit_rate": (
+                    0.0
+                    if service_metrics.prefix_block_lookups_total <= 0
+                    else service_metrics.prefix_block_hits_total / service_metrics.prefix_block_lookups_total
+                ),
+                "queue_rejected_total": service_metrics.queue_rejected_total,
                 "running_requests": service_metrics.running_requests,
                 "waiting_requests": service_metrics.waiting_requests,
                 "kv_cache_used_pages": service_metrics.kv_cache_used_pages,
@@ -1889,6 +2009,22 @@ class AnnaQwen3_5TextEngine:
         if prompt_cache_max_tokens > 0 and int(prepared.input_ids.shape[1]) > prompt_cache_max_tokens:
             return None
         return tuple(int(token_id) for token_id in prepared.input_ids[0].tolist())
+
+    def _prompt_is_exact_cache_eligible(self, prepared: PreparedInputs) -> bool:
+        """True when this prompt would use the exact prompt-cache path (not prefix-only)."""
+        return self._prompt_cache_key(prepared) is not None
+
+    def _should_skip_prefix_registration(self, prepared: PreparedInputs) -> bool:
+        """Avoid dual caching: exact prompt-cache eligible prompts skip paged prefix registration.
+
+        - Exact full-prompt reuse → prompt cache (whole KV clone)
+        - Shared system-prefix across different prompts → paged PrefixBlockPool
+        When both are enabled, prompts that fit the exact-cache policy skip prefix page
+        registration so we do not keep two residency strategies for the same full prompt.
+        """
+        if not self.optimization_config.prefer_prompt_cache_over_prefix:
+            return False
+        return self._prompt_is_exact_cache_eligible(prepared)
 
     def _evict_prompt_cache_entry(self, key: tuple[int, ...], entry: PromptCacheEntry) -> None:
         release = getattr(entry.past_key_values, "release", None)

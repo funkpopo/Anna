@@ -314,12 +314,36 @@ def test_handle_runtime_failure_clears_runtime_caches_after_recover() -> None:
 
 
 def test_qwen_runtime_accepts_turboquant_kv_cache_quantization_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("anna.runtime.qwen3_5_text_engine.turboquant_is_available", lambda: True)
-    resolved = AnnaQwen3_5TextEngine._resolve_kv_cache_quantization(
+    monkeypatch.setattr("anna.model.turboquant.turboquant_is_available", lambda: True)
+    mode, bits, residual, tier = AnnaQwen3_5TextEngine._resolve_kv_cache_quantization(
         requested_mode="turboquant",
+        requested_bits=4,
+        requested_residual_len=128,
+        bits_explicit=True,
+        residual_explicit=True,
         device_context=SimpleNamespace(),
     )
-    assert resolved == "turboquant"
+    assert mode == "turboquant"
+    assert bits == 4
+    assert residual == 128
+    assert tier is None
+
+
+def test_qwen_runtime_auto_turboquant_applies_size_preset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("anna.model.turboquant.turboquant_is_available", lambda: True)
+    mode, bits, residual, tier = AnnaQwen3_5TextEngine._resolve_kv_cache_quantization(
+        requested_mode="auto",
+        requested_bits=4,
+        requested_residual_len=128,
+        bits_explicit=False,
+        residual_explicit=False,
+        weight_bytes=40 * (1 << 30),
+        device_context=SimpleNamespace(),
+    )
+    assert mode == "turboquant"
+    assert bits == 2
+    assert residual == 96
+    assert tier == "large"
 
 
 def test_generate_chat_keeps_raw_think_tags_when_reasoning_format_is_none() -> None:

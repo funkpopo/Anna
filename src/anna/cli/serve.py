@@ -13,8 +13,9 @@ from anna.core.model_path import resolve_model_dir, resolve_model_name
 from anna.cli.xpu_env import add_xpu_environment_args, configure_cli_xpu_environment
 from anna.runtime.device import RuntimeSafetyPolicy
 from anna.runtime.model_runtime_loader import load_model_runtime_from_model_dir
-from anna.runtime.service_metrics import AnnaServiceMetricsLogger
 from anna.runtime.scheduler import AnnaScheduler
+from anna.runtime.scheduler_profiles import resolve_scheduler_settings
+from anna.runtime.service_metrics import AnnaServiceMetricsLogger
 
 logger = logging.getLogger(__name__)
 
@@ -148,8 +149,28 @@ def _build_scheduler(engine, settings: ServeSettings) -> AnnaScheduler | None:
         prefill_interval_steps=settings.scheduler_prefill_interval_steps,
         max_prefill_tokens=settings.scheduler_max_prefill_tokens,
         max_decode_tokens=settings.scheduler_max_decode_tokens,
+        max_waiting_requests=settings.scheduler_max_waiting_requests,
+        dynamic_token_budget=settings.scheduler_dynamic_token_budget,
+        skip_batch_wait_when_idle=settings.scheduler_skip_batch_wait_when_idle,
+        max_queue_wait_ms=settings.scheduler_max_queue_wait_ms,
+        profile=settings.scheduler_profile,
     )
     engine.set_scheduler(scheduler)
+    logger.info(
+        "Continuous batching enabled: profile=%s max_batch=%s batch_wait_ms=%s "
+        "prefill_interval=%s max_prefill_tokens=%s max_decode_tokens=%s "
+        "max_waiting=%s dynamic_token_budget=%s skip_idle_wait=%s max_queue_wait_ms=%s",
+        settings.scheduler_profile,
+        settings.scheduler_max_batch_size,
+        settings.scheduler_batch_wait_ms,
+        settings.scheduler_prefill_interval_steps,
+        settings.scheduler_max_prefill_tokens,
+        settings.scheduler_max_decode_tokens,
+        settings.scheduler_max_waiting_requests,
+        settings.scheduler_dynamic_token_budget,
+        settings.scheduler_skip_batch_wait_when_idle,
+        settings.scheduler_max_queue_wait_ms,
+    )
     return scheduler
 
 
@@ -253,22 +274,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--kv-cache-quantization",
-        choices=("none", "turboquant"),
+        choices=("none", "turboquant", "auto"),
         default="none",
-        help="Quantize compatible KV caches. TurboQuant is supported by the Qwen3.5 and Gemma4 runtimes.",
+        help=(
+            "KV-cache quantization mode. 'turboquant' enables TurboQuant; 'auto' enables it when the "
+            "optional turboquant dependency is installed and picks bits/residual from model-size presets "
+            "unless --kv-cache-quant-bits / --kv-cache-residual-len are set explicitly. "
+            "Supported by the Qwen3.5 and Gemma4 runtimes."
+        ),
     )
     parser.add_argument(
         "--kv-cache-quant-bits",
         type=int,
         choices=(2, 3, 4),
-        default=4,
-        help="TurboQuant KV-cache bit-width for compatible runtimes (2, 3, or 4).",
+        default=None,
+        help=(
+            "TurboQuant KV-cache bit-width (2, 3, or 4). When omitted with turboquant/auto, Anna picks a "
+            "size-tier default (small=4, medium=3, large/xlarge=2)."
+        ),
     )
     parser.add_argument(
         "--kv-cache-residual-len",
         type=_positive_int,
-        default=128,
-        help="Keep the newest N KV tokens in full precision before TurboQuant compresses older entries.",
+        default=None,
+        help=(
+            "Keep the newest N KV tokens in full precision before TurboQuant compresses older entries. "
+            "When omitted with turboquant/auto, Anna picks a size-tier default (128/128/96/64)."
+        ),
     )
     thinking_group = parser.add_mutually_exclusive_group()
     thinking_group.add_argument(
@@ -407,40 +439,74 @@ def build_parser() -> argparse.ArgumentParser:
         help="Multiplier applied to estimated generation memory. Defaults to 2.0.",
     )
     parser.add_argument(
+        "--scheduler-profile",
+        choices=("none", "interactive", "throughput"),
+        default="none",
+        help=(
+            "Built-in continuous-batching preset. 'interactive' optimizes TTFT/latency; 'throughput' "
+            "optimizes tok/s. Explicit --scheduler-* flags override the profile. 'none' keeps manual knobs "
+            "(default max batch 1 = no continuous batching)."
+        ),
+    )
+    parser.add_argument(
         "--scheduler-max-batch-size",
         type=_positive_int,
-        default=1,
+        default=None,
         help="Enable continuous batching when > 1: decode steps run batched, amortizing XPU "
-        "fused kernel launches. Defaults to 1 (per-request, lower latency, more launches).",
+        "fused kernel launches. Defaults to 1 without a profile (per-request). Profile defaults: "
+        "interactive=2, throughput=8.",
     )
     parser.add_argument(
         "--scheduler-batch-wait-ms",
         type=float,
-        default=2.0,
+        default=None,
         help="When max batch > 1, how long to wait to fill a batch (ms). Higher values increase "
-        "coalescing at the cost of tail latency. Ignored if max batch is 1.",
+        "coalescing at the cost of tail latency. Ignored if max batch is 1. Profile defaults: "
+        "interactive=0.5, throughput=8, none=2.",
     )
     parser.add_argument(
         "--scheduler-prefill-interval-steps",
         type=_positive_int,
-        default=1,
+        default=None,
         help="When continuous batching is enabled, run at most one pending prefill chunk after this many "
         "batched decode steps. Lower values improve TTFT for newly queued prompts; higher values protect "
-        "inter-token latency for active decodes.",
+        "inter-token latency for active decodes. Profile defaults: interactive=1, throughput=4.",
     )
     parser.add_argument(
         "--scheduler-max-prefill-tokens",
         type=_non_negative_int,
-        default=0,
+        default=None,
         help="Maximum prompt tokens admitted into one scheduler prefill wave. Set 0 to disable token-budget "
-        "packing and rely only on max batch size.",
+        "packing and rely only on max batch size. Profile defaults: interactive=1024, throughput=2048.",
     )
     parser.add_argument(
         "--scheduler-max-decode-tokens",
         type=_non_negative_int,
-        default=0,
+        default=None,
         help="Maximum cached sequence tokens packed into one scheduler decode batch. Set 0 to disable this "
-        "token budget and rely only on max batch size.",
+        "token budget and rely only on max batch size. Profile defaults: interactive=2048, throughput=4096.",
+    )
+    parser.add_argument(
+        "--scheduler-max-waiting-requests",
+        type=_non_negative_int,
+        default=None,
+        help="Reject new requests with HTTP 429 when the waiting queue reaches this depth (backpressure). "
+        "Set 0 for unlimited. Profile defaults: interactive=32, throughput=128.",
+    )
+    parser.add_argument(
+        "--scheduler-dynamic-token-budget",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Adapt max prefill/decode token budgets from free XPU memory and running sequence lengths. "
+        "Enabled by interactive/throughput profiles; use --no-scheduler-dynamic-token-budget to disable.",
+    )
+    parser.add_argument(
+        "--scheduler-max-queue-wait-ms",
+        type=_non_negative_float,
+        default=None,
+        help="Fairness: force prefill admission when the oldest waiter exceeds this age (ms), even if "
+        "prefill-interval-steps has not elapsed. Set 0 to disable. Profile defaults: interactive=50, "
+        "throughput=500.",
     )
     parser.add_argument(
         "--asr-max-inference-batch-size",
@@ -466,6 +532,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_serve_scheduler_knobs(args: argparse.Namespace) -> dict:
+    return resolve_scheduler_settings(
+        profile=args.scheduler_profile,
+        max_batch_size=args.scheduler_max_batch_size,
+        batch_wait_ms=args.scheduler_batch_wait_ms,
+        prefill_interval_steps=args.scheduler_prefill_interval_steps,
+        max_prefill_tokens=args.scheduler_max_prefill_tokens,
+        max_decode_tokens=args.scheduler_max_decode_tokens,
+        max_waiting_requests=args.scheduler_max_waiting_requests,
+        dynamic_token_budget=args.scheduler_dynamic_token_budget,
+        max_queue_wait_ms=args.scheduler_max_queue_wait_ms,
+    )
+
+
 def main() -> None:
     args = build_parser().parse_args()
     setup_logging(args.log_level)
@@ -478,6 +558,10 @@ def main() -> None:
     configure_flashqla_environment(args)
     model_dir = resolve_model_dir(args.model_dir)
     model_name = resolve_model_name(model_name=args.model_name, model_dir=model_dir)
+    scheduler_knobs = _resolve_serve_scheduler_knobs(args)
+    # Size-tier TurboQuant defaults when bits/residual are omitted.
+    kv_bits = 4 if args.kv_cache_quant_bits is None else int(args.kv_cache_quant_bits)
+    kv_residual = 128 if args.kv_cache_residual_len is None else int(args.kv_cache_residual_len)
     settings = ServeSettings(
         model_dir=model_dir,
         model_id=model_name,
@@ -490,8 +574,8 @@ def main() -> None:
         prompt_cache_max_tokens=args.prompt_cache_max_tokens,
         profile_runtime=args.profile_runtime,
         kv_cache_quantization=args.kv_cache_quantization,
-        kv_cache_quant_bits=args.kv_cache_quant_bits,
-        kv_cache_residual_len=args.kv_cache_residual_len,
+        kv_cache_quant_bits=kv_bits,
+        kv_cache_residual_len=kv_residual,
         default_max_completion_tokens=args.max_completion_tokens,
         default_temperature=args.temperature,
         default_top_p=args.top_p,
@@ -512,11 +596,16 @@ def main() -> None:
         reserve_memory_mib=args.reserve_memory_mib,
         max_estimated_usage_ratio=args.max_estimated_usage_ratio,
         generation_memory_safety_factor=args.generation_memory_safety_factor,
-        scheduler_max_batch_size=args.scheduler_max_batch_size,
-        scheduler_batch_wait_ms=args.scheduler_batch_wait_ms,
-        scheduler_prefill_interval_steps=args.scheduler_prefill_interval_steps,
-        scheduler_max_prefill_tokens=args.scheduler_max_prefill_tokens,
-        scheduler_max_decode_tokens=args.scheduler_max_decode_tokens,
+        scheduler_profile=str(scheduler_knobs["profile"]),
+        scheduler_max_batch_size=int(scheduler_knobs["max_batch_size"]),
+        scheduler_batch_wait_ms=float(scheduler_knobs["batch_wait_ms"]),
+        scheduler_prefill_interval_steps=int(scheduler_knobs["prefill_interval_steps"]),
+        scheduler_max_prefill_tokens=int(scheduler_knobs["max_prefill_tokens"]),
+        scheduler_max_decode_tokens=int(scheduler_knobs["max_decode_tokens"]),
+        scheduler_max_waiting_requests=int(scheduler_knobs["max_waiting_requests"]),
+        scheduler_dynamic_token_budget=bool(scheduler_knobs["dynamic_token_budget"]),
+        scheduler_skip_batch_wait_when_idle=bool(scheduler_knobs["skip_batch_wait_when_idle"]),
+        scheduler_max_queue_wait_ms=float(scheduler_knobs["max_queue_wait_ms"]),
         asr_max_inference_batch_size=args.asr_max_inference_batch_size,
         asr_max_new_tokens=args.asr_max_new_tokens,
         warmup_prefill_tokens=args.warmup_prefill_tokens,
@@ -542,6 +631,8 @@ def main() -> None:
         kv_cache_quantization=settings.kv_cache_quantization,
         kv_cache_quant_bits=settings.kv_cache_quant_bits,
         kv_cache_residual_len=settings.kv_cache_residual_len,
+        kv_cache_quant_bits_explicit=args.kv_cache_quant_bits is not None,
+        kv_cache_residual_len_explicit=args.kv_cache_residual_len is not None,
         safety_policy=_build_safety_policy(settings),
         default_max_completion_tokens=settings.default_max_completion_tokens,
         default_temperature=settings.default_temperature,
@@ -563,10 +654,12 @@ def main() -> None:
         asr_max_new_tokens=settings.asr_max_new_tokens,
     )
     if not args.no_inference_warmup and hasattr(engine, "warmup_inference_kernels"):
+        # TTFT: cover real continuous-batch shapes when the scheduler profile raises batch size.
+        warmup_batch = max(int(settings.warmup_batch_size), int(settings.scheduler_max_batch_size))
         engine.warmup_inference_kernels(
             prefill_tokens=settings.warmup_prefill_tokens,
             decode_steps=settings.warmup_decode_steps,
-            batch_size=settings.warmup_batch_size,
+            batch_size=warmup_batch,
         )
     scheduler = _build_scheduler(engine, settings)
     metrics_logger = _build_metrics_logger(engine, settings)

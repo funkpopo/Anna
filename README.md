@@ -111,22 +111,32 @@ anna-serve `
   --dtype bf16 `
   --compile-mode none `
   --weight-quant int4 `
-  --kv-cache-quantization turboquant `
-  --kv-cache-quant-bits 2 `
-  --kv-cache-residual-len 128 `
+  --kv-cache-quantization auto `
   --enable-flashqla-gdn-prefill `
-  --scheduler-max-batch-size 8 `
-  --scheduler-batch-wait-ms 8 `
-  --scheduler-prefill-interval-steps 4 `
-  --scheduler-max-prefill-tokens 2048 `
-  --scheduler-max-decode-tokens 4096 `
+  --scheduler-profile throughput `
   --metrics-log-interval-seconds 2 `
   --profile-runtime `
   --host 127.0.0.1 `
   --port 8000
 ```
 
-This profile is intended for throughput testing. For interactive low-latency usage, reduce `--scheduler-batch-wait-ms` or lower `--scheduler-max-batch-size`.
+`--scheduler-profile throughput` maps to larger batches, longer coalesce waits, and dynamic token budgets.
+For interactive low-latency usage, use `--scheduler-profile interactive` (or override individual `--scheduler-*` knobs).
+`--kv-cache-quantization auto` enables TurboQuant when installed and picks bits/residual from model-size presets.
+
+### Interactive (Low-Latency) XPU Serving Example
+
+```powershell
+anna-serve `
+  --model-dir D:\Models\Qwen3.5 `
+  --device xpu `
+  --dtype bf16 `
+  --weight-quant int4 `
+  --kv-cache-quantization auto `
+  --scheduler-profile interactive `
+  --host 127.0.0.1 `
+  --port 8000
+```
 
 ### One-Shot Text Generation
 
@@ -338,11 +348,12 @@ These values only apply when an API request omits the matching field.
 ### Memory and Weight Strategy
 
 - `--prefill-chunk-size N`: chunk size for long prompt prefill; `0` enables XPU auto-sizing.
-- `--prompt-cache-size N`: number of exact text prompt KV caches to keep; `0` disables prompt cache.
-- `--prompt-cache-max-tokens N`: only cache prompts up to N tokens; `0` means no limit.
-- `--kv-cache-quantization none|turboquant`: KV-cache quantization mode.
-- `--kv-cache-quant-bits 2|3|4`: TurboQuant KV bit width.
-- `--kv-cache-residual-len N`: keep the newest N KV tokens in full precision.
+- `--prompt-cache-size N`: number of **exact** text prompt KV caches to keep; `0` disables prompt cache.
+- `--prompt-cache-max-tokens N`: only exact-cache prompts up to N tokens; `0` means no limit.
+- **Cache roles**: exact full-prompt reuse → prompt cache; shared system-prefix across different prompts → paged `PrefixBlockPool`. When prompt cache is enabled, exact-cache-eligible prompts skip prefix-block registration to avoid dual residency. Disable prefix sharing entirely with `ANNA_PREFIX_KV_SHARE=0`. Prefix hit/miss rates are exposed on `/healthz` and metrics logs.
+- `--kv-cache-quantization none|turboquant|auto`: KV-cache quantization. `auto` enables TurboQuant when the optional dependency is installed and selects bits/residual from size-tier presets unless bits/residual are set explicitly.
+- `--kv-cache-quant-bits 2|3|4`: TurboQuant KV bit width. When omitted with turboquant/auto: small≈4, medium≈3, large/xlarge≈2.
+- `--kv-cache-residual-len N`: keep the newest N KV tokens in full precision. When omitted with turboquant/auto: 128/128/96/64 by tier.
 - `--weight-quant auto|none|int4`: dense weight quantization strategy. `auto` promotes to int4 when estimated weights exceed **85%** of total XPU memory (**70%** for MoE models or experts offload).
 - `--expert-quant auto|none|int4`: MoE expert weight quantization strategy.
 - `--offload-mode auto|none|experts`: MoE expert offload strategy.
@@ -383,12 +394,18 @@ Validate the K=128 table with `python tools/validate_arc_gdn_decode.py --preset 
 
 ### Continuous Batching and Token Budgets
 
+- `--scheduler-profile none|interactive|throughput`: built-in continuous-batching preset. Explicit `--scheduler-*` flags override the profile.
+  - **interactive**: batch=2, wait=0.5ms, prefill interval=1, prefill/decode budgets 1024/2048, max waiting=32, dynamic budgets on, skip idle coalesce wait (TTFT-friendly).
+  - **throughput**: batch=8, wait=8ms, prefill interval=4, budgets 2048/4096, max waiting=128, dynamic budgets on, idle coalesce wait kept.
 - `--scheduler-max-batch-size N`: enable continuous batching when greater than `1`.
-- `--scheduler-batch-wait-ms MS`: wait time for request coalescing; higher values may improve throughput but increase tail latency.
+- `--scheduler-batch-wait-ms MS`: wait time for request coalescing; higher values may improve throughput but increase tail latency. Idle GPU skips this wait under interactive defaults (TTFT).
 - `--scheduler-prefill-interval-steps N`: insert pending prefill scheduling every N decode steps.
-- `--scheduler-max-prefill-tokens N`: prompt-token budget for one prefill admission wave; `0` disables the budget.
+- `--scheduler-max-prefill-tokens N`: prompt-token budget for one prefill admission wave; `0` disables the budget (unless dynamic budgets derive a soft default).
 - `--scheduler-max-decode-tokens N`: cached-sequence-token budget for one decode batch; `0` disables the budget.
-- `--metrics-log-interval-seconds S`: emit aggregate runtime metrics periodically; `0` disables metrics logging.
+- `--scheduler-max-waiting-requests N`: reject new work with HTTP 429 when the waiting queue reaches N (backpressure); `0` = unlimited.
+- `--scheduler-dynamic-token-budget` / `--no-scheduler-dynamic-token-budget`: scale prefill/decode budgets from free XPU memory and running sequence lengths.
+- `--scheduler-max-queue-wait-ms MS`: fairness — force prefill admission when the oldest waiter exceeds this age, so long decodes cannot starve new prompts.
+- `--metrics-log-interval-seconds S`: emit aggregate runtime metrics periodically; `0` disables metrics logging. Logs include prompt-cache and prefix-block hit rates plus queue rejections.
 
 ### ASR Serving Options
 

@@ -204,7 +204,9 @@ class Qwen3TextModel(nn.Module):
                 kv_cache_residual_len=self.kv_cache_residual_len,
             )
             if input_ids is not None:
-                past_key_values.set_prompt_token_ids(input_ids)
+                gate = getattr(self, "_anna_prefix_share_gate", None)
+                if gate is None or gate(input_ids):
+                    past_key_values.set_prompt_token_ids(input_ids)
 
         execution_device = self.execution_device or _module_device(self.norm)
         if inputs_embeds.device != execution_device:
@@ -743,7 +745,11 @@ class Qwen3Model(nn.Module):
                 kv_cache_residual_len=self.language_model.kv_cache_residual_len,
             )
             if input_ids is not None:
-                past_key_values.set_prompt_token_ids(input_ids)
+                gate = getattr(self, "_anna_prefix_share_gate", None) or getattr(
+                    self.language_model, "_anna_prefix_share_gate", None
+                )
+                if gate is None or gate(input_ids):
+                    past_key_values.set_prompt_token_ids(input_ids)
 
         if inputs_embeds is None:
             embedding_device = self.get_input_embeddings().weight.device

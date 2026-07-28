@@ -30,11 +30,17 @@ class ServiceMetricsSnapshot:
     generation_tokens_total: int = 0
     prompt_cache_queries_total: int = 0
     prompt_cache_hits_total: int = 0
+    prefix_block_lookups_total: int = 0
+    prefix_block_hits_total: int = 0
+    prefix_block_misses_total: int = 0
+    prefix_block_registers_total: int = 0
+    prefix_block_entries: int = 0
     running_requests: int = 0
     waiting_requests: int = 0
     kv_cache_used_pages: int = 0
     kv_cache_total_pages: int = 0
     prompt_cache_entries: int = 0
+    queue_rejected_total: int = 0
     queue_wait_seconds_total: float = 0.0
     queue_wait_count: int = 0
     queue_wait_seconds_max: float = 0.0
@@ -84,8 +90,14 @@ class AnnaServiceMetrics:
         self._generation_tokens_total = 0
         self._prompt_cache_queries_total = 0
         self._prompt_cache_hits_total = 0
+        self._prefix_block_lookups_total = 0
+        self._prefix_block_hits_total = 0
+        self._prefix_block_misses_total = 0
+        self._prefix_block_registers_total = 0
+        self._prefix_block_entries = 0
         self._running_requests = 0
         self._waiting_requests = 0
+        self._queue_rejected_total = 0
         self._queue_wait_seconds_total = 0.0
         self._queue_wait_count = 0
         self._queue_wait_seconds_max = 0.0
@@ -245,6 +257,32 @@ class AnnaServiceMetrics:
                 self._prompt_cache_hits_total += 1
         self._activity_event.set()
 
+    def record_queue_rejected(self, count: int = 1) -> None:
+        normalized = max(0, int(count))
+        if normalized <= 0:
+            return
+        with self._lock:
+            self._queue_rejected_total += normalized
+        self._activity_event.set()
+
+    def set_prefix_block_stats(
+        self,
+        *,
+        lookups_total: int,
+        hits_total: int,
+        misses_total: int,
+        registers_total: int,
+        entries: int,
+    ) -> None:
+        """Refresh absolute prefix-block pool counters (sourced from PrefixBlockPool.stats)."""
+        with self._lock:
+            self._prefix_block_lookups_total = max(0, int(lookups_total))
+            self._prefix_block_hits_total = max(0, int(hits_total))
+            self._prefix_block_misses_total = max(0, int(misses_total))
+            self._prefix_block_registers_total = max(0, int(registers_total))
+            self._prefix_block_entries = max(0, int(entries))
+        self._activity_event.set()
+
     @property
     def activity_event(self) -> threading.Event:
         return self._activity_event
@@ -260,8 +298,14 @@ class AnnaServiceMetrics:
                 generation_tokens_total=self._generation_tokens_total,
                 prompt_cache_queries_total=self._prompt_cache_queries_total,
                 prompt_cache_hits_total=self._prompt_cache_hits_total,
+                prefix_block_lookups_total=self._prefix_block_lookups_total,
+                prefix_block_hits_total=self._prefix_block_hits_total,
+                prefix_block_misses_total=self._prefix_block_misses_total,
+                prefix_block_registers_total=self._prefix_block_registers_total,
+                prefix_block_entries=self._prefix_block_entries,
                 running_requests=self._running_requests,
                 waiting_requests=self._waiting_requests,
+                queue_rejected_total=self._queue_rejected_total,
                 queue_wait_seconds_total=self._queue_wait_seconds_total,
                 queue_wait_count=self._queue_wait_count,
                 queue_wait_seconds_max=self._queue_wait_seconds_max,
@@ -333,6 +377,9 @@ class AnnaServiceMetricsLogger:
         generation_tokens = max(0, current.generation_tokens_total - previous.generation_tokens_total)
         cache_queries = max(0, current.prompt_cache_queries_total - previous.prompt_cache_queries_total)
         cache_hits = max(0, current.prompt_cache_hits_total - previous.prompt_cache_hits_total)
+        prefix_lookups = max(0, current.prefix_block_lookups_total - previous.prefix_block_lookups_total)
+        prefix_hits = max(0, current.prefix_block_hits_total - previous.prefix_block_hits_total)
+        queue_rejected = max(0, current.queue_rejected_total - previous.queue_rejected_total)
         queue_wait_total = max(0.0, current.queue_wait_seconds_total - previous.queue_wait_seconds_total)
         queue_wait_count = max(0, current.queue_wait_count - previous.queue_wait_count)
         prefill_step_total = max(0.0, current.prefill_step_seconds_total - previous.prefill_step_seconds_total)
@@ -375,6 +422,7 @@ class AnnaServiceMetricsLogger:
         prompt_tokens_per_second = prompt_tokens / elapsed
         generation_tokens_per_second = generation_tokens / elapsed
         prompt_cache_hit_rate = 0.0 if cache_queries <= 0 else (cache_hits / cache_queries) * 100.0
+        prefix_block_hit_rate = 0.0 if prefix_lookups <= 0 else (prefix_hits / prefix_lookups) * 100.0
         kv_cache_usage = current.kv_cache_usage_ratio * 100.0
         queue_wait_avg_ms = 0.0 if queue_wait_count <= 0 else (queue_wait_total / queue_wait_count) * 1000.0
         prefill_step_avg_ms = 0.0 if prefill_step_count <= 0 else (prefill_step_total / prefill_step_count) * 1000.0
@@ -411,9 +459,13 @@ class AnnaServiceMetricsLogger:
             f"Prefill admission tokens avg/max: {prefill_admitted_tokens_avg:.1f}/{current.scheduler_prefill_admitted_tokens_max}, "
             f"Decode batch reqs avg/max: {decode_batch_requests_avg:.1f}/{current.scheduler_decode_batch_requests_max}, "
             f"Decode batch tokens avg/max: {decode_batch_tokens_avg:.1f}/{current.scheduler_decode_batch_tokens_max}, "
-            f"Waiting: {current.waiting_requests} reqs, GPU KV cache usage: {kv_cache_usage:.1f}% "
+            f"Waiting: {current.waiting_requests} reqs, Queue rejected: {queue_rejected}, "
+            f"GPU KV cache usage: {kv_cache_usage:.1f}% "
             f"({current.kv_cache_used_pages}/{current.kv_cache_total_pages} pages), "
-            f"Prompt cache hit rate: {prompt_cache_hit_rate:.1f}%"
+            f"Prompt cache hit rate: {prompt_cache_hit_rate:.1f}%, "
+            f"Prefix block hit rate: {prefix_block_hit_rate:.1f}% "
+            f"({current.prefix_block_hits_total}/{current.prefix_block_lookups_total}, "
+            f"entries={current.prefix_block_entries})"
         )
 
     @staticmethod
@@ -428,9 +480,14 @@ class AnnaServiceMetricsLogger:
             current.generation_tokens_total - previous.generation_tokens_total,
             current.prompt_cache_queries_total - previous.prompt_cache_queries_total,
             current.prompt_cache_hits_total - previous.prompt_cache_hits_total,
+            current.prefix_block_lookups_total - previous.prefix_block_lookups_total,
+            current.prefix_block_hits_total - previous.prefix_block_hits_total,
+            current.prefix_block_registers_total - previous.prefix_block_registers_total,
+            current.prefix_block_entries - previous.prefix_block_entries,
             current.kv_cache_used_pages - previous.kv_cache_used_pages,
             current.kv_cache_total_pages - previous.kv_cache_total_pages,
             current.prompt_cache_entries - previous.prompt_cache_entries,
+            current.queue_rejected_total - previous.queue_rejected_total,
             current.queue_wait_count - previous.queue_wait_count,
             current.prefill_step_count - previous.prefill_step_count,
             current.decode_step_count - previous.decode_step_count,

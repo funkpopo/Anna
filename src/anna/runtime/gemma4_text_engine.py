@@ -172,6 +172,8 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         kv_cache_quantization: str = "none",
         kv_cache_quant_bits: int = 4,
         kv_cache_residual_len: int = 128,
+        kv_cache_quant_bits_explicit: bool = False,
+        kv_cache_residual_len_explicit: bool = False,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
         default_temperature: float | None = None,
@@ -193,6 +195,7 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         asr_max_new_tokens: int = 512,
     ) -> "AnnaGemma4TextEngine":
         del asr_max_inference_batch_size, asr_max_new_tokens
+        del kv_cache_quant_bits_explicit, kv_cache_residual_len_explicit
         if offload_mode.lower() not in {"auto", "none"}:
             raise ValueError("Gemma4 text runtime does not support expert offload.")
         if expert_quant.lower() not in {"auto", "none"}:

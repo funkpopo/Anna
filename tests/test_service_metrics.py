@@ -22,6 +22,14 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     metrics.record_generation_tokens(5)
     metrics.record_prompt_cache_lookup(hit=True)
     metrics.record_prompt_cache_lookup(hit=False)
+    metrics.record_queue_rejected(2)
+    metrics.set_prefix_block_stats(
+        lookups_total=10,
+        hits_total=7,
+        misses_total=3,
+        registers_total=4,
+        entries=5,
+    )
     metrics.record_request_finished(success=True)
     metrics.record_request_finished(success=False)
 
@@ -34,6 +42,12 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     assert snapshot.generation_tokens_total == 5
     assert snapshot.prompt_cache_queries_total == 2
     assert snapshot.prompt_cache_hits_total == 1
+    assert snapshot.queue_rejected_total == 2
+    assert snapshot.prefix_block_lookups_total == 10
+    assert snapshot.prefix_block_hits_total == 7
+    assert snapshot.prefix_block_misses_total == 3
+    assert snapshot.prefix_block_registers_total == 4
+    assert snapshot.prefix_block_entries == 5
     assert snapshot.running_requests == 0
     assert snapshot.waiting_requests == 0
     assert snapshot.queue_wait_count == 1
@@ -83,6 +97,10 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
         generation_tokens_total=14,
         prompt_cache_queries_total=5,
         prompt_cache_hits_total=3,
+        prefix_block_lookups_total=20,
+        prefix_block_hits_total=10,
+        prefix_block_entries=4,
+        queue_rejected_total=2,
         running_requests=2,
         waiting_requests=1,
         kv_cache_used_pages=6,
@@ -137,8 +155,10 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
     assert "Decode batch reqs avg/max: 2.3/3" in line
     assert "Decode batch tokens avg/max: 14.0/18" in line
     assert "Waiting: 1 reqs" in line
+    assert "Queue rejected: 2" in line
     assert "GPU KV cache usage: 50.0% (6/12 pages)" in line
     assert "Prompt cache hit rate: 75.0%" in line
+    assert "Prefix block hit rate: 50.0%" in line
 
 
 def test_service_metrics_logger_skips_idle_intervals_without_changes() -> None:

@@ -87,6 +87,8 @@ class AnnaQwen3ASREngine:
         kv_cache_quantization: str = "none",
         kv_cache_quant_bits: int = 4,
         kv_cache_residual_len: int = 128,
+        kv_cache_quant_bits_explicit: bool = False,
+        kv_cache_residual_len_explicit: bool = False,
         safety_policy: RuntimeSafetyPolicy | None = None,
         default_max_completion_tokens: int | None = None,
         default_temperature: float | None = None,
@@ -120,6 +122,8 @@ class AnnaQwen3ASREngine:
             resident_expert_layers,
             resident_expert_layer_indices,
             cached_experts_per_layer,
+            kv_cache_quant_bits_explicit,
+            kv_cache_residual_len_explicit,
         )
         model_path = Path(model_dir)
         device_context = DeviceContext.resolve(device=device, dtype=dtype, model_dtype="bfloat16")

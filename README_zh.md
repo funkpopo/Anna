@@ -111,22 +111,32 @@ anna-serve `
   --dtype bf16 `
   --compile-mode none `
   --weight-quant int4 `
-  --kv-cache-quantization turboquant `
-  --kv-cache-quant-bits 2 `
-  --kv-cache-residual-len 128 `
+  --kv-cache-quantization auto `
   --enable-flashqla-gdn-prefill `
-  --scheduler-max-batch-size 8 `
-  --scheduler-batch-wait-ms 8 `
-  --scheduler-prefill-interval-steps 4 `
-  --scheduler-max-prefill-tokens 2048 `
-  --scheduler-max-decode-tokens 4096 `
+  --scheduler-profile throughput `
   --metrics-log-interval-seconds 2 `
   --profile-runtime `
   --host 127.0.0.1 `
   --port 8000
 ```
 
-这个配置适合压测吞吐。交互式低延迟场景可以降低 `--scheduler-batch-wait-ms`，或把 `--scheduler-max-batch-size` 调小。
+`--scheduler-profile throughput` 对应更大 batch、更长合批等待与动态 token budget。
+交互式低延迟用 `--scheduler-profile interactive`（也可用单独的 `--scheduler-*` 覆盖）。
+`--kv-cache-quantization auto` 在已安装 turboquant 时启用，并按模型规模预设 bits/residual。
+
+### 交互式（低延迟）XPU 服务示例
+
+```powershell
+anna-serve `
+  --model-dir D:\Models\Qwen3.5 `
+  --device xpu `
+  --dtype bf16 `
+  --weight-quant int4 `
+  --kv-cache-quantization auto `
+  --scheduler-profile interactive `
+  --host 127.0.0.1 `
+  --port 8000
+```
 
 ### 单次文本生成
 
@@ -338,11 +348,12 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 ### 显存和权重策略
 
 - `--prefill-chunk-size N`：长 prompt prefill chunk 大小；`0` 表示 XPU 自动估算。
-- `--prompt-cache-size N`：缓存完全相同文本 prompt 的 KV cache 数量；`0` 表示关闭。
-- `--prompt-cache-max-tokens N`：只缓存不超过 N token 的 prompt；`0` 表示不限制。
-- `--kv-cache-quantization none|turboquant`：KV cache 量化模式。
-- `--kv-cache-quant-bits 2|3|4`：TurboQuant KV bit 数。
-- `--kv-cache-residual-len N`：最近 N 个 KV token 保留全精度。
+- `--prompt-cache-size N`：缓存**完全相同**文本 prompt 的 KV 数量；`0` 表示关闭。
+- `--prompt-cache-max-tokens N`：只对不超过 N token 的 prompt 做精确缓存；`0` 表示不限制。
+- **缓存职责**：完全相同 prompt → prompt cache；跨请求共享 system 前缀 → 分页 `PrefixBlockPool`。开启 prompt cache 时，可精确缓存的 prompt 会跳过 prefix 注册，避免双重驻留。`ANNA_PREFIX_KV_SHARE=0` 可全局关闭 prefix 共享。prefix hit/miss 暴露在 `/healthz` 与 metrics 日志。
+- `--kv-cache-quantization none|turboquant|auto`：KV 量化。`auto` 在已安装依赖时启用 TurboQuant，并按模型规模预设 bits/residual（显式 bits/residual 优先）。
+- `--kv-cache-quant-bits 2|3|4`：TurboQuant bit 数。省略时按规模：small≈4、medium≈3、large/xlarge≈2。
+- `--kv-cache-residual-len N`：最近 N 个 KV token 保留全精度。省略时按规模：128/128/96/64。
 - `--weight-quant auto|none|int4`：dense 权重量化策略。`auto` 在估算权重大于 XPU 总显存 **85%** 时提升为 int4（MoE 或 experts offload 时阈值为 **70%**）。
 - `--expert-quant auto|none|int4`：MoE expert 权重量化策略。
 - `--offload-mode auto|none|experts`：MoE expert offload 策略。
@@ -383,10 +394,17 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 
 ### 连续批处理和 token budget
 
+- `--scheduler-profile none|interactive|throughput`：内置连续批处理 preset；显式 `--scheduler-*` 覆盖 profile。
+  - **interactive**：batch=2、wait=0.5ms、prefill interval=1、budget 1024/2048、等待队列 32、动态 budget、空闲跳过合批等待（利 TTFT）。
+  - **throughput**：batch=8、wait=8ms、prefill interval=4、budget 2048/4096、等待队列 128、动态 budget、保留空闲合批等待。
 - `--scheduler-max-batch-size N`：大于 `1` 时启用连续批处理。
-- `--scheduler-batch-wait-ms MS`：等待更多请求合批的时间；越大吞吐越高但尾延迟可能上升。
+- `--scheduler-batch-wait-ms MS`：等待更多请求合批的时间；越大吞吐越高但尾延迟可能上升。interactive 默认在 GPU 空闲时跳过等待以降低 TTFT。
 - `--scheduler-prefill-interval-steps N`：每 N 个 decode step 插入一次 pending prefill 调度。
-- `--scheduler-max-prefill-tokens N`：单轮 prefill admission 的 prompt token 预算；`0` 表示关闭。
+- `--scheduler-max-prefill-tokens N`：单轮 prefill admission 的 prompt token 预算；`0` 表示关闭（动态 budget 开启时会推导软默认）。
+- `--scheduler-max-decode-tokens N`：单轮 decode batch 的序列 token 预算；`0` 表示关闭。
+- `--scheduler-max-waiting-requests N`：等待队列达到 N 时以 HTTP 429 拒绝新请求（背压）；`0` 表示不限制。
+- `--scheduler-dynamic-token-budget` / `--no-scheduler-dynamic-token-budget`：按空闲显存与 running 序列长度自适应 token budget。
+- `--scheduler-max-queue-wait-ms MS`：公平性——最老等待请求超过该时延时强制插入 prefill，避免长 decode 饿死新 prompt。
 - `--scheduler-max-decode-tokens N`：单个 decode batch 的 cached sequence token 预算；`0` 表示关闭。
 - `--metrics-log-interval-seconds S`：周期性输出聚合指标；`0` 表示关闭。
 
