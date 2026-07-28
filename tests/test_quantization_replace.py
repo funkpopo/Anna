@@ -202,12 +202,21 @@ def test_xpu_int4_linear_cpu_dequant_path_matches_dense_linear_closely() -> None
 def test_xpu_int4_linear_strategy_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "dequant")
     assert XPUInt4Linear._matmul_strategy() == "dequant"
+    assert XPUInt4Linear.resolve_matmul_backend() == "dequant"
+
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "auto")
+    assert XPUInt4Linear._matmul_strategy() == "auto"
+    assert XPUInt4Linear.resolve_matmul_backend() == "torch"
+
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "gemv")
+    assert XPUInt4Linear.resolve_matmul_backend() == "gemv"
 
     monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "invalid")
     assert XPUInt4Linear._matmul_strategy() == "auto"
+    assert XPUInt4Linear.resolve_matmul_backend() == "torch"
 
 
-def test_convert_module_linears_to_xpu_int4_ignores_persistent_layout_cache(
+def test_convert_module_linears_to_xpu_int4_uses_layout_cache(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -224,16 +233,41 @@ def test_convert_module_linears_to_xpu_int4_ignores_persistent_layout_cache(
     )
 
     assert converted == 3
-    assert not cache_dir.exists()
+    assert len(list(cache_dir.glob("*.pt"))) == 3
 
     def _raise_if_repacked(*args, **kwargs):
-        raise AssertionError("persistent layout cache is disabled")
+        raise AssertionError("cache hit should avoid repacking dense weights")
 
     monkeypatch.setattr(XPUInt4Linear, "_quantize_weight", staticmethod(_raise_if_repacked))
-    with pytest.raises(AssertionError, match="persistent layout cache is disabled"):
-        convert_module_linears_to_xpu_int4(
-            second,
-            group_size=32,
-            device=torch.device("cpu"),
-            cache_dir=cache_dir,
-        )
+    converted_from_cache = convert_module_linears_to_xpu_int4(
+        second,
+        group_size=32,
+        device=torch.device("cpu"),
+        cache_dir=cache_dir,
+    )
+
+    assert converted_from_cache == 3
+    assert isinstance(second.proj, XPUInt4Linear)
+    assert torch.equal(second.proj.qweight, first.proj.qweight)
+    assert torch.equal(second.proj.qscale, first.proj.qscale)
+    assert torch.equal(second.proj.qzeros, first.proj.qzeros)
+    payload = torch.load(next(cache_dir.glob("proj-*.pt")), map_location="cpu", weights_only=False)
+    assert payload["metadata"]["layout"] == "anna_xpu_int4_linear_v1"
+    assert payload["metadata"]["version"] == 2
+
+
+def test_convert_module_linears_to_xpu_int4_can_disable_layout_cache(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANNA_XPU_DISABLE_INT4_CACHE", "1")
+    model = _TinyQuantNet()
+    cache_dir = tmp_path / "xpu_int4_cache"
+    converted = convert_module_linears_to_xpu_int4(
+        model,
+        group_size=32,
+        device=torch.device("cpu"),
+        cache_dir=cache_dir,
+    )
+    assert converted == 3
+    assert not cache_dir.exists()

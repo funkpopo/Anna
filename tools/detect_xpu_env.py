@@ -111,8 +111,11 @@ def collect_xpu_env() -> dict[str, Any]:
     info["torch"]["xpu_devices"] = devices
     info["anna_recommendations"] = {
         "dense_int4_backend": "torch_int4pack_default",
-        "avoid": ["--xpu-int4-matmul sycl", "ANNA_XPU_INT4_GEMV_*"],
-        "enable_for_qwen3_5": ["ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED=1"],
+        "weight_quant_auto": "int4 when weights > 85% total XPU mem (70% MoE/experts offload)",
+        "xpu_int4_matmul_auto": "torch int4pack; gemv/dequant are explicit opt-in only",
+        "lm_head_int4_topk": "enabled by default on XPU int4; disable with ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK=1",
+        "int4_layout_cache": "auto under {model}/.anna/xpu_int4_cache; disable with ANNA_XPU_DISABLE_INT4_CACHE=1",
+        "avoid": ["--xpu-int4-matmul sycl"],
     }
     return info
 
@@ -146,7 +149,10 @@ def main() -> None:
     print("Tool paths:")
     for key, value in info.get("tools", {}).items():
         print(f"  {key}={value}")
-    print("Anna backend: dense int4 defaults to PyTorch int4pack; do not use retired SYCL GEMV knobs.")
+    print(
+        "Anna backend: dense int4 auto=torch int4pack; LM head int4 top-k default on; "
+        "layout cache under model/.anna/xpu_int4_cache."
+    )
 
 
 if __name__ == "__main__":

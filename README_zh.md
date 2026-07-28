@@ -343,7 +343,7 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 - `--kv-cache-quantization none|turboquant`：KV cache 量化模式。
 - `--kv-cache-quant-bits 2|3|4`：TurboQuant KV bit 数。
 - `--kv-cache-residual-len N`：最近 N 个 KV token 保留全精度。
-- `--weight-quant auto|none|int4`：dense 权重量化策略。
+- `--weight-quant auto|none|int4`：dense 权重量化策略。`auto` 在估算权重大于 XPU 总显存 **85%** 时提升为 int4（MoE 或 experts offload 时阈值为 **70%**）。
 - `--expert-quant auto|none|int4`：MoE expert 权重量化策略。
 - `--offload-mode auto|none|experts`：MoE expert offload 策略。
 - `--offload-vision`：将 vision tower 留在 CPU，降低 XPU 显存占用。
@@ -359,7 +359,13 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 
 - `--enable-flashqla-gdn-prefill`：以 **strict** 模式启用 XPU SYCL Gated Delta prefill（不降级）。
 - `--flashqla-gdn-prefill-mode off|strict|prefer`：FlashQLA 策略。`strict` 在不支持的 device/shape/dtype/op 上硬失败；`prefer` 降级到默认 fused 或 torch prefill，并按 reason 一次性告警。环境变量 `ANNA_XPU_FLASHQLA_GDN_PREFILL` 取值相同（`1`/`true`/`on` ≡ `strict`）。
-- `--xpu-int4-matmul auto|torch|dequant`：XPU int4 dense linear 执行策略。
+- `--xpu-int4-matmul auto|torch|dequant|gemv`：XPU int4 dense linear 执行策略。
+  - **`auto`（默认）**：Arc 上走 PyTorch `int4pack`，**没有**按 M 行在 GEMV/dequant 间自动切换的阈值。
+  - **`torch`**：强制 int4pack。
+  - **`gemv`**：显式开启 SYCL GEMV（decode 实验）；不会被 auto 选中。
+  - **`dequant`**：完整反量化 + `F.linear`（调试）。
+- LM head int4 top-k fused 在 XPU int4 上**默认开启**（`top_k ≤ 16`）。用 `ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK=1` 关闭。兼容旧变量 `ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED=0|1` 强制关/开。
+- XPU int4 layout cache：首次 int4 转换写入 `{model}/.anna/xpu_int4_cache`（可用 `ANNA_XPU_INT4_CACHE_DIR` 覆盖）。版本/指纹不匹配自动重建；读写失败回退到现场量化。`ANNA_XPU_DISABLE_INT4_CACHE=1` 关闭。可用 `anna-xpu-int4-cache --model-dir ...` 检查。
 - `ANNA_GATED_DELTA_OP_LIB`：显式指定 fused op `.pyd` / `.so` 路径。
 - `ANNA_XPU_GATED_DELTA_DECODE_STRATEGY=auto|single|single_group|untiled|tiled|tiled_value`：Gated Delta decode kernel 策略。不设置（或设为 `auto`）时走内置 Arc shape 查表；仅在调试时强制 `single` / `tiled`。
 - `ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK=N`：可选覆盖 tiled decode 的 value block。不设置时，Anna 按内置 Arc 表为 device/shape 选默认值；常见 Qwen3.5 shape 无需再手工调环境变量。

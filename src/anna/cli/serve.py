@@ -348,13 +348,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--weight-quant",
         choices=("auto", "none", "int4"),
         default="auto",
-        help="Quantization used for dense language-model linear weights executed on XPU. 'auto' enables int4 when the model is oversized for available XPU memory.",
+        help=(
+            "Quantization used for dense language-model linear weights executed on XPU. "
+            "'auto' enables int4 when estimated weights exceed 85% of total XPU memory "
+            "(70% for MoE or experts offload)."
+        ),
     )
     parser.add_argument(
         "--xpu-int4-matmul",
-        choices=("auto", "torch", "dequant"),
+        choices=("auto", "torch", "dequant", "gemv"),
         default=None,
-        help="XPU int4 dense linear execution strategy. Omit to use the runtime default, currently torch int4pack.",
+        help=(
+            "XPU int4 dense linear execution strategy. "
+            "'auto' (default) uses PyTorch int4pack on Arc; 'gemv' is opt-in SYCL GEMV; "
+            "'dequant' fully dequantizes then runs F.linear (debug). "
+            "There is no auto M-row GEMV/dequant threshold — force gemv/dequant explicitly."
+        ),
     )
     parser.add_argument(
         "--resident-expert-layers",

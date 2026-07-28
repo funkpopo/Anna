@@ -9,6 +9,7 @@ import torch
 from anna.core.gguf_model import has_gguf_model
 from anna.core.logging import setup_logging
 from anna.core.model_path import resolve_model_dir
+from anna.model.quantization import resolve_xpu_int4_layout_cache_dir
 from anna.runtime.device import DeviceContext, DeviceMemoryInfo, RuntimeSafetyPolicy
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine
 from anna.weights.qwen3_5_text_weight_loader import (
@@ -26,7 +27,11 @@ def _positive_float(value: str) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Inspect whether a Qwen3.5 model will use Anna's runtime XPU int4 layout cache."
+        description=(
+            "Inspect whether a Qwen3.5 model will use Anna's runtime XPU int4 layout cache. "
+            "Serve/generate paths auto-write the cache on first int4 conversion, rebuild on "
+            "version/fingerprint mismatch, and fall back to live quantize on cache failures."
+        )
     )
     parser.add_argument("--model-dir", required=True)
     parser.add_argument(
@@ -87,6 +92,9 @@ def main() -> None:
     )
     quant_config = getattr(config, "quantization_config", None)
     quant_config_enabled = bool(getattr(quant_config, "is_enabled", False))
+    cache_dir = resolve_xpu_int4_layout_cache_dir(model_path=model_dir)
+    cache_enabled = resolved_weight_quant == "int4" and cache_dir is not None
+    cache_files = len(tuple(cache_dir.glob("*.pt"))) if cache_dir is not None and cache_dir.exists() else 0
 
     print(f"model_dir={model_dir}")
     print(f"uses_gguf={uses_gguf}")
@@ -96,10 +104,10 @@ def main() -> None:
     print(f"quantization_config_enabled={quant_config_enabled}")
     print(f"requested_weight_quant={args.weight_quant}")
     print(f"resolved_weight_quant={resolved_weight_quant}")
-    print("xpu_int4_cache_enabled=False")
-    print("xpu_int4_cache_dir=")
-    print("xpu_int4_cache_exists=False")
-    print("xpu_int4_cache_files=0")
+    print(f"xpu_int4_cache_enabled={cache_enabled}")
+    print(f"xpu_int4_cache_dir={cache_dir if cache_dir is not None else ''}")
+    print(f"xpu_int4_cache_exists={bool(cache_dir is not None and cache_dir.exists())}")
+    print(f"xpu_int4_cache_files={cache_files}")
 
 
 if __name__ == "__main__":

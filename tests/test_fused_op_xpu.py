@@ -35,6 +35,10 @@ def test_int4_fused_op_availability_respects_disable_flags(monkeypatch: pytest.M
     monkeypatch.delenv("ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED", raising=False)
     monkeypatch.delenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK", raising=False)
     monkeypatch.setattr(fused_ops, "_lm_head_int4_topk_op", lambda: object())
+    # Default-on for XPU int4 once the op is registered.
+    assert fused_ops.lm_head_int4_topk_fused_is_available() is True
+
+    monkeypatch.setenv("ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED", "0")
     assert fused_ops.lm_head_int4_topk_fused_is_available() is False
 
     monkeypatch.setenv("ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED", "1")
@@ -48,13 +52,13 @@ def test_int4_fused_op_availability_respects_disable_flags(monkeypatch: pytest.M
     assert fused_ops.moe_grouped_int4_mlp_fused_is_available() is False
 
 
-def test_lm_head_int4_topk_wrapper_requires_explicit_enable(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_lm_head_int4_topk_wrapper_respects_disable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED", raising=False)
-    monkeypatch.delenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK", raising=False)
+    monkeypatch.setenv("ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK", "1")
     monkeypatch.setattr(fused_ops, "maybe_load_gated_delta_library", lambda: False)
 
     def _unexpected_op(*_args: object) -> tuple[torch.Tensor, torch.Tensor]:
-        pytest.fail("lm_head_int4_topk_fused should not run without explicit opt-in")
+        pytest.fail("lm_head_int4_topk_fused should not run when disabled")
 
     monkeypatch.setattr(fused_ops, "_lm_head_int4_topk_op", lambda: _unexpected_op)
 
@@ -63,7 +67,7 @@ def test_lm_head_int4_topk_wrapper_requires_explicit_enable(monkeypatch: pytest.
     qscale = torch.empty(1, 1)
     qzeros = torch.empty(1, 1, dtype=torch.int32)
 
-    with pytest.raises(RuntimeError, match="ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED=1"):
+    with pytest.raises(RuntimeError, match="ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK"):
         fused_ops.run_lm_head_int4_topk_fused(
             hidden_states=hidden_states,
             qweight=qweight,

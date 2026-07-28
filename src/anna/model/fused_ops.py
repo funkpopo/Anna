@@ -35,14 +35,16 @@ _LM_HEAD_INT4_TOPK_DISABLE_ENV = "ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK"
 
 
 def _lm_head_int4_topk_enabled() -> bool:
+    """LM head int4 top-k fused is on by default for XPU int4; opt out with DISABLE.
+
+    Legacy opt-in env ``ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED`` is still honored when set:
+    ``0/false/off`` forces off; ``1/true/on`` forces on (subject to DISABLE).
+    """
     if _op_disabled(_LM_HEAD_INT4_TOPK_DISABLE_ENV):
         return False
-    if not _env_flag_enabled(_LM_HEAD_INT4_TOPK_ENABLE_ENV):
-        logger.info(
-            "Anna lm_head_int4_topk_fused is disabled by default; set %s=1 to enable the experimental path",
-            _LM_HEAD_INT4_TOPK_ENABLE_ENV,
-        )
-        return False
+    enable_value = os.getenv(_LM_HEAD_INT4_TOPK_ENABLE_ENV)
+    if enable_value is not None:
+        return enable_value.strip().lower() in {"1", "true", "yes", "on"}
     return True
 
 
@@ -812,8 +814,9 @@ def run_lm_head_int4_topk_fused(
         op = None
     if op is None:
         raise RuntimeError(
-            "Anna lm_head_int4_topk_fused op is not enabled or not registered. Set "
-            f"{_LM_HEAD_INT4_TOPK_ENABLE_ENV}=1 for the experimental path, build/load the custom op first, "
+            "Anna lm_head_int4_topk_fused op is not enabled or not registered. "
+            f"Unset {_LM_HEAD_INT4_TOPK_DISABLE_ENV} (default is enabled on XPU int4), "
+            f"or set {_LM_HEAD_INT4_TOPK_ENABLE_ENV}=1; build/load the custom op first, "
             "or set ANNA_GATED_DELTA_OP_LIB to the compiled library path."
         )
     return op(hidden_states, qweight, qscale, qzeros, int(group_size), int(in_features), int(top_k))

@@ -19,6 +19,7 @@ from anna.model.turboquant import VALID_KV_CACHE_QUANT_BITS, TurboQuantKVRow
 from anna.model.fused_ops import (
     flashqla_prefill_unsupported_reason,
     loaded_fused_library_paths,
+    moe_grouped_int4_mlp_fused_is_available,
     resolve_flashqla_gdn_prefill_mode,
     run_causal_conv1d_decode_fused,
     run_causal_conv1d_prefill_fused,
@@ -2741,6 +2742,54 @@ class Qwen3SparseMoeBlock(nn.Module):
         )
 
     @staticmethod
+    def _grouped_int4_shape_supported(linear: XPUInt4Linear) -> bool:
+        """Common Qwen3.5 expert shapes: group_size multiple of 32, no bias, padded K."""
+        if linear.bias is not None:
+            return False
+        if linear.group_size <= 0 or linear.group_size % 32 != 0:
+            return False
+        if linear.padded_in_features % linear.group_size != 0:
+            return False
+        if linear.padded_in_features % 8 != 0:
+            return False
+        return True
+
+    def _can_use_grouped_int4_mlp(self, expert_indices: list[int]) -> bool:
+        if not expert_indices or not self._should_use_xpu_int4():
+            return False
+        if not moe_grouped_int4_mlp_fused_is_available():
+            return False
+        capacity = self._grouped_int4_wave_capacity(len(expert_indices))
+        if capacity <= 0:
+            return False
+        # Offload path prepacks to XPUInt4Linear with group_size multiples of 32.
+        if self.offload_experts:
+            return self.expert_quant_group_size > 0 and self.expert_quant_group_size % 32 == 0
+        probe_idx = int(expert_indices[0])
+        if probe_idx < 0 or probe_idx >= len(self.experts):
+            return False
+        probe = self.experts[probe_idx]
+        try:
+            gate = self._require_grouped_int4_linear(probe.gate_proj, linear_name="gate_proj", require_xpu=False)
+            up = self._require_grouped_int4_linear(probe.up_proj, linear_name="up_proj", require_xpu=False)
+            down = self._require_grouped_int4_linear(probe.down_proj, linear_name="down_proj", require_xpu=False)
+        except RuntimeError:
+            return False
+        return (
+            self._grouped_int4_shape_supported(gate)
+            and self._grouped_int4_shape_supported(up)
+            and self._grouped_int4_shape_supported(down)
+        )
+
+    def _grouped_int4_wave_capacity(self, required: int) -> int:
+        if self.cached_experts_per_layer > 0:
+            return min(self.cached_experts_per_layer, max(1, required))
+        if self.offload_experts:
+            return 0
+        # Resident int4 experts: size the bank to the active wave (common top_k shapes).
+        return min(self.num_experts, max(required, self.top_k, 1))
+
+    @staticmethod
     def _pin_module_host_memory(module: nn.Module) -> bool:
         pinned_any = False
         try:
@@ -2790,11 +2839,13 @@ class Qwen3SparseMoeBlock(nn.Module):
         gate_proj: XPUInt4Linear,
         up_proj: XPUInt4Linear,
         down_proj: XPUInt4Linear,
+        capacity: int | None = None,
     ) -> _GroupedInt4ExpertBank:
         if self.execution_device is None or self.execution_device.type != "xpu":
             raise RuntimeError("Grouped int4 expert GEMM requires an XPU execution device.")
-        if self.cached_experts_per_layer <= 0:
-            raise RuntimeError("Grouped int4 expert GEMM requires cached_experts_per_layer > 0.")
+        resolved_capacity = int(capacity) if capacity is not None else self._grouped_int4_wave_capacity(1)
+        if resolved_capacity <= 0:
+            raise RuntimeError("Grouped int4 expert GEMM requires a positive bank capacity.")
 
         hidden_dim = int(gate_proj.in_features)
         intermediate_dim = int(gate_proj.out_features)
@@ -2804,6 +2855,15 @@ class Qwen3SparseMoeBlock(nn.Module):
             raise RuntimeError("Grouped int4 expert GEMM requires down_proj to invert gate_proj dimensions.")
         if gate_proj.group_size != up_proj.group_size or gate_proj.group_size != down_proj.group_size:
             raise RuntimeError("Grouped int4 expert GEMM requires a shared int4 group size across all expert projections.")
+        if not (
+            self._grouped_int4_shape_supported(gate_proj)
+            and self._grouped_int4_shape_supported(up_proj)
+            and self._grouped_int4_shape_supported(down_proj)
+        ):
+            raise RuntimeError(
+                "Grouped int4 expert GEMM does not support the current expert projection shapes "
+                f"(group_size={gate_proj.group_size}, padded_in={gate_proj.padded_in_features})."
+            )
 
         bank = self._grouped_int4_bank
         if bank is not None:
@@ -2812,32 +2872,34 @@ class Qwen3SparseMoeBlock(nn.Module):
                 self.execution_device.index is None or bank_device.index == self.execution_device.index
             )
             if (
-                bank.capacity != self.cached_experts_per_layer
+                bank.capacity < resolved_capacity
                 or bank.hidden_dim != hidden_dim
                 or bank.intermediate_dim != intermediate_dim
                 or bank.group_size != gate_proj.group_size
                 or not execution_device_matches
             ):
-                raise RuntimeError(
-                    "Grouped int4 expert bank layout does not match the currently prepared MoE experts."
-                )
-            return bank
+                # Layout change or undersized bank: rebuild. Callers re-stage experts.
+                self._grouped_int4_lru.clear()
+                self._grouped_int4_bank = None
+                bank = None
+            else:
+                return bank
 
         bank = _GroupedInt4ExpertBank(
-            capacity=self.cached_experts_per_layer,
+            capacity=resolved_capacity,
             hidden_dim=hidden_dim,
             intermediate_dim=intermediate_dim,
             group_size=gate_proj.group_size,
-            gate_qweight=torch.empty((self.cached_experts_per_layer, *gate_proj.qweight.shape), dtype=gate_proj.qweight.dtype, device=self.execution_device),
-            gate_qscale=torch.empty((self.cached_experts_per_layer, *gate_proj.qscale.shape), dtype=gate_proj.qscale.dtype, device=self.execution_device),
-            gate_qzeros=torch.empty((self.cached_experts_per_layer, *gate_proj.qzeros.shape), dtype=gate_proj.qzeros.dtype, device=self.execution_device),
-            up_qweight=torch.empty((self.cached_experts_per_layer, *up_proj.qweight.shape), dtype=up_proj.qweight.dtype, device=self.execution_device),
-            up_qscale=torch.empty((self.cached_experts_per_layer, *up_proj.qscale.shape), dtype=up_proj.qscale.dtype, device=self.execution_device),
-            up_qzeros=torch.empty((self.cached_experts_per_layer, *up_proj.qzeros.shape), dtype=up_proj.qzeros.dtype, device=self.execution_device),
-            down_qweight=torch.empty((self.cached_experts_per_layer, *down_proj.qweight.shape), dtype=down_proj.qweight.dtype, device=self.execution_device),
-            down_qscale=torch.empty((self.cached_experts_per_layer, *down_proj.qscale.shape), dtype=down_proj.qscale.dtype, device=self.execution_device),
-            down_qzeros=torch.empty((self.cached_experts_per_layer, *down_proj.qzeros.shape), dtype=down_proj.qzeros.dtype, device=self.execution_device),
-            slot_to_expert=[None] * self.cached_experts_per_layer,
+            gate_qweight=torch.empty((resolved_capacity, *gate_proj.qweight.shape), dtype=gate_proj.qweight.dtype, device=self.execution_device),
+            gate_qscale=torch.empty((resolved_capacity, *gate_proj.qscale.shape), dtype=gate_proj.qscale.dtype, device=self.execution_device),
+            gate_qzeros=torch.empty((resolved_capacity, *gate_proj.qzeros.shape), dtype=gate_proj.qzeros.dtype, device=self.execution_device),
+            up_qweight=torch.empty((resolved_capacity, *up_proj.qweight.shape), dtype=up_proj.qweight.dtype, device=self.execution_device),
+            up_qscale=torch.empty((resolved_capacity, *up_proj.qscale.shape), dtype=up_proj.qscale.dtype, device=self.execution_device),
+            up_qzeros=torch.empty((resolved_capacity, *up_proj.qzeros.shape), dtype=up_proj.qzeros.dtype, device=self.execution_device),
+            down_qweight=torch.empty((resolved_capacity, *down_proj.qweight.shape), dtype=down_proj.qweight.dtype, device=self.execution_device),
+            down_qscale=torch.empty((resolved_capacity, *down_proj.qscale.shape), dtype=down_proj.qscale.dtype, device=self.execution_device),
+            down_qzeros=torch.empty((resolved_capacity, *down_proj.qzeros.shape), dtype=down_proj.qzeros.dtype, device=self.execution_device),
+            slot_to_expert=[None] * resolved_capacity,
             expert_to_slot={},
         )
         self._grouped_int4_bank = bank
@@ -2863,10 +2925,12 @@ class Qwen3SparseMoeBlock(nn.Module):
         slot: int,
         non_blocking: bool,
     ) -> None:
+        # Direct slot copy_ avoids an intermediate .to() allocation (host↔device
+        # fragmentation under expert offload). Pinned host tensors use non_blocking H2D.
         with torch.no_grad():
-            qweight_bank[slot].copy_(linear.qweight.to(device=qweight_bank.device, non_blocking=non_blocking))
-            qscale_bank[slot].copy_(linear.qscale.to(device=qscale_bank.device, non_blocking=non_blocking))
-            qzeros_bank[slot].copy_(linear.qzeros.to(device=qzeros_bank.device, non_blocking=non_blocking))
+            qweight_bank[slot].copy_(linear.qweight, non_blocking=non_blocking)
+            qscale_bank[slot].copy_(linear.qscale, non_blocking=non_blocking)
+            qzeros_bank[slot].copy_(linear.qzeros, non_blocking=non_blocking)
 
     def _release_grouped_int4_bank_slot(self, expert_idx: int) -> None:
         bank = self._grouped_int4_bank
@@ -2972,12 +3036,13 @@ class Qwen3SparseMoeBlock(nn.Module):
     def _prepare_grouped_int4_bank_slots(self, required_expert_indices: list[int]) -> list[int]:
         if self.execution_device is None or self.execution_device.type != "xpu":
             raise RuntimeError("Grouped int4 expert bank preparation requires an XPU execution device.")
-        if self.cached_experts_per_layer <= 0:
-            raise RuntimeError("Grouped int4 expert bank preparation requires cached_experts_per_layer > 0.")
-        if len(required_expert_indices) > self.cached_experts_per_layer:
+        wave_capacity = self._grouped_int4_wave_capacity(len(required_expert_indices))
+        if wave_capacity <= 0:
+            raise RuntimeError("Grouped int4 expert bank preparation requires a positive wave capacity.")
+        if len(required_expert_indices) > wave_capacity:
             raise RuntimeError(
                 "Grouped int4 expert bank preparation requires cache capacity >= active expert wave size: "
-                f"required={len(required_expert_indices)} capacity={self.cached_experts_per_layer}"
+                f"required={len(required_expert_indices)} capacity={wave_capacity}"
             )
 
         started_at = time.perf_counter()
@@ -3004,16 +3069,20 @@ class Qwen3SparseMoeBlock(nn.Module):
 
         missing = [int(expert_idx) for expert_idx in required_expert_indices if int(expert_idx) not in slots_by_expert]
         for expert_idx in missing:
-            prepacked = self._get_host_prepacked_expert(expert_idx)
-            if prepacked is None:
-                raise RuntimeError("Grouped int4 expert bank preparation requires a host prepacked expert.")
-            gate_proj = self._require_grouped_int4_linear(prepacked.gate_proj, linear_name="gate_proj", require_xpu=False)
-            up_proj = self._require_grouped_int4_linear(prepacked.up_proj, linear_name="up_proj", require_xpu=False)
-            down_proj = self._require_grouped_int4_linear(prepacked.down_proj, linear_name="down_proj", require_xpu=False)
+            if self.offload_experts:
+                expert_layer = self._get_host_prepacked_expert(expert_idx)
+                if expert_layer is None:
+                    raise RuntimeError("Grouped int4 expert bank preparation requires a host prepacked expert.")
+            else:
+                expert_layer = self.experts[expert_idx]
+            gate_proj = self._require_grouped_int4_linear(expert_layer.gate_proj, linear_name="gate_proj", require_xpu=False)
+            up_proj = self._require_grouped_int4_linear(expert_layer.up_proj, linear_name="up_proj", require_xpu=False)
+            down_proj = self._require_grouped_int4_linear(expert_layer.down_proj, linear_name="down_proj", require_xpu=False)
             bank = self._resolve_grouped_int4_bank_from_linears(
                 gate_proj=gate_proj,
                 up_proj=up_proj,
                 down_proj=down_proj,
+                capacity=wave_capacity,
             )
 
             free_slot = next((idx for idx, mapped in enumerate(bank.slot_to_expert) if mapped is None), None)
@@ -3036,7 +3105,7 @@ class Qwen3SparseMoeBlock(nn.Module):
 
             self._copy_grouped_int4_expert_to_bank_slot_(
                 expert_idx=expert_idx,
-                expert_layer=prepacked,
+                expert_layer=expert_layer,
                 slot=free_slot,
             )
             slots_by_expert[expert_idx] = free_slot
@@ -3051,7 +3120,7 @@ class Qwen3SparseMoeBlock(nn.Module):
                 staged,
                 evicted,
                 0 if self._grouped_int4_bank is None else len(self._grouped_int4_bank.expert_to_slot),
-                self.cached_experts_per_layer,
+                0 if self._grouped_int4_bank is None else self._grouped_int4_bank.capacity,
                 time.perf_counter() - started_at,
             )
 
@@ -3128,24 +3197,14 @@ class Qwen3SparseMoeBlock(nn.Module):
             device=self.execution_device,
             padded_in_features=source.padded_in_features,
         )
+        non_blocking = self.host_prepacked_experts_pinned
         with torch.no_grad():
-            cloned.qweight.copy_(
-                source.qweight.to(device=cloned.qweight.device, non_blocking=self.host_prepacked_experts_pinned)
-            )
-            cloned.qscale.copy_(
-                source.qscale.to(device=cloned.qscale.device, non_blocking=self.host_prepacked_experts_pinned)
-            )
-            cloned.qzeros.copy_(
-                source.qzeros.to(device=cloned.qzeros.device, non_blocking=self.host_prepacked_experts_pinned)
-            )
+            # Direct copy_ from (pinned) host avoids intermediate .to() buffers.
+            cloned.qweight.copy_(source.qweight, non_blocking=non_blocking)
+            cloned.qscale.copy_(source.qscale, non_blocking=non_blocking)
+            cloned.qzeros.copy_(source.qzeros, non_blocking=non_blocking)
             if source.bias is not None and cloned.bias is not None:
-                cloned.bias.copy_(
-                    source.bias.to(
-                        device=cloned.bias.device,
-                        dtype=cloned.bias.dtype,
-                        non_blocking=self.host_prepacked_experts_pinned,
-                    )
-                )
+                cloned.bias.copy_(source.bias, non_blocking=non_blocking)
         return cloned
 
     def _copy_prepacked_linear_to_execution_device_(self, source: XPUInt4Linear, target: XPUInt4Linear) -> None:
@@ -3160,24 +3219,13 @@ class Qwen3SparseMoeBlock(nn.Module):
                 f"source=({source.in_features}, {source.out_features}, group={source.group_size}, padded={source.padded_in_features}) "
                 f"target=({target.in_features}, {target.out_features}, group={target.group_size}, padded={target.padded_in_features})"
             )
+        non_blocking = self.host_prepacked_experts_pinned
         with torch.no_grad():
-            target.qweight.copy_(
-                source.qweight.to(device=target.qweight.device, non_blocking=self.host_prepacked_experts_pinned)
-            )
-            target.qscale.copy_(
-                source.qscale.to(device=target.qscale.device, non_blocking=self.host_prepacked_experts_pinned)
-            )
-            target.qzeros.copy_(
-                source.qzeros.to(device=target.qzeros.device, non_blocking=self.host_prepacked_experts_pinned)
-            )
+            target.qweight.copy_(source.qweight, non_blocking=non_blocking)
+            target.qscale.copy_(source.qscale, non_blocking=non_blocking)
+            target.qzeros.copy_(source.qzeros, non_blocking=non_blocking)
             if source.bias is not None and target.bias is not None:
-                target.bias.copy_(
-                    source.bias.to(
-                        device=target.bias.device,
-                        dtype=target.bias.dtype,
-                        non_blocking=self.host_prepacked_experts_pinned,
-                    )
-                )
+                target.bias.copy_(source.bias, non_blocking=non_blocking)
 
     def _materialize_prepacked_expert(
         self,
@@ -3554,14 +3602,18 @@ class Qwen3SparseMoeBlock(nn.Module):
         if self.cached_experts_per_layer <= 0:
             raise RuntimeError("Offloaded MoE execution requires cached_experts_per_layer > 0.")
 
-        wave_capacity = min(self.cached_experts_per_layer, len(hit_experts))
+        wave_capacity = self._grouped_int4_wave_capacity(len(hit_experts)) if self._should_use_xpu_int4() else min(
+            self.cached_experts_per_layer, len(hit_experts)
+        )
+        if wave_capacity <= 0:
+            wave_capacity = min(max(1, self.cached_experts_per_layer), len(hit_experts)) if hit_experts else 0
         if wave_capacity <= 0:
             return
 
         offsets_np = expert_offsets_host.detach().numpy()
         for wave_start in range(0, len(hit_experts), wave_capacity):
             wave_indices = hit_experts[wave_start : wave_start + wave_capacity]
-            if self._should_use_xpu_int4():
+            if self._can_use_grouped_int4_mlp(wave_indices):
                 wave_slots = self._prepare_grouped_int4_bank_slots(wave_indices)
                 self._execute_grouped_int4_experts(
                     wave_indices=wave_indices,
@@ -3628,6 +3680,23 @@ class Qwen3SparseMoeBlock(nn.Module):
                     execution_device=execution_device,
                     hidden_dtype=hidden_states.dtype,
                 )
+            elif hit_expert_list and self._can_use_grouped_int4_mlp(hit_expert_list):
+                # Resident int4 experts: pack common shapes into the grouped bank
+                # (avoids per-expert Python GEMM loops on XPU).
+                wave_capacity = self._grouped_int4_wave_capacity(len(hit_expert_list))
+                offsets_np = expert_offsets_host.detach().numpy()
+                for wave_start in range(0, len(hit_expert_list), wave_capacity):
+                    wave_indices = hit_expert_list[wave_start : wave_start + wave_capacity]
+                    wave_slots = self._prepare_grouped_int4_bank_slots(wave_indices)
+                    self._execute_grouped_int4_experts(
+                        wave_indices=wave_indices,
+                        wave_slots=wave_slots,
+                        offsets_np=offsets_np,
+                        expert_offsets_device=expert_offsets,
+                        compact_hidden_states=compact_hidden_states,
+                        compact_routing_weights=compact_routing_weights,
+                        compact_outputs=compact_outputs,
+                    )
             else:
                 offsets_np = expert_offsets_host.detach().numpy()
                 for expert_idx in hit_expert_list:

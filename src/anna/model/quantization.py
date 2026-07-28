@@ -26,8 +26,53 @@ _XPU_INT4_MATMUL_STRATEGIES = frozenset({"auto", "torch", "dequant", "gemv"})
 _XPU_INT4_LAYOUT_CACHE_VERSION = 2
 _XPU_INT4_LAYOUT_NAME = "anna_xpu_int4_linear_v1"
 _XPU_INT4_LM_HEAD_CACHE_TILE = 4
+# Arc auto policy for dense int4 matmul:
+# - auto/torch → PyTorch int4pack (best general throughput on Arc for M>=1)
+# - gemv → SYCL GEMV, opt-in for decode-like M=1 experiments; not selected by auto
+# - dequant → full dequant + F.linear, debug/fallback only
+# GEMV is never chosen by auto (no M-row threshold); force via ANNA_XPU_INT4_MATMUL=gemv.
+_XPU_INT4_AUTO_MATMUL_BACKEND = "torch"
+# weight-quant auto thresholds vs total XPU memory (see resolve helpers in engines)
+_WEIGHT_QUANT_AUTO_DENSE_USAGE_THRESHOLD = 0.85
+_WEIGHT_QUANT_AUTO_MOE_USAGE_THRESHOLD = 0.70
+_XPU_INT4_CACHE_DIR_ENV = "ANNA_XPU_INT4_CACHE_DIR"
+_XPU_INT4_CACHE_DISABLE_ENV = "ANNA_XPU_DISABLE_INT4_CACHE"
 
 logger = logging.getLogger(__name__)
+
+
+def weight_quant_auto_usage_threshold(*, is_moe_or_expert_offload: bool) -> float:
+    """Fraction of total XPU memory above which ``weight-quant auto`` promotes to int4."""
+    if is_moe_or_expert_offload:
+        return _WEIGHT_QUANT_AUTO_MOE_USAGE_THRESHOLD
+    return _WEIGHT_QUANT_AUTO_DENSE_USAGE_THRESHOLD
+
+
+def resolve_xpu_int4_layout_cache_dir(
+    cache_dir: str | Path | None = None,
+    *,
+    model_path: str | Path | None = None,
+) -> Path | None:
+    """Resolve persistent XPU int4 layout cache directory.
+
+    Priority:
+    1. Explicit ``cache_dir`` argument
+    2. ``ANNA_XPU_INT4_CACHE_DIR``
+    3. ``{model_path}/.anna/xpu_int4_cache`` when ``model_path`` is provided
+
+    Disable with ``ANNA_XPU_DISABLE_INT4_CACHE=1`` (or true/yes/on).
+    """
+    disable = os.getenv(_XPU_INT4_CACHE_DISABLE_ENV)
+    if disable is not None and disable.strip().lower() in {"1", "true", "yes", "on"}:
+        return None
+    if cache_dir is not None:
+        return Path(cache_dir)
+    env_cache_dir = os.getenv(_XPU_INT4_CACHE_DIR_ENV)
+    if env_cache_dir:
+        return Path(env_cache_dir)
+    if model_path is not None:
+        return Path(model_path) / ".anna" / "xpu_int4_cache"
+    return None
 
 
 def _release_cpu_memory_caches() -> None:
@@ -636,11 +681,26 @@ class XPUInt4Linear(nn.Module):
 
     @staticmethod
     def _matmul_strategy() -> str:
+        """Return the configured strategy label (auto/torch/dequant/gemv)."""
         strategy = os.getenv("ANNA_XPU_INT4_MATMUL", "auto").strip().lower()
         if strategy not in _XPU_INT4_MATMUL_STRATEGIES:
             logger.warning("Ignoring unsupported ANNA_XPU_INT4_MATMUL=%r; using auto.", strategy)
             return "auto"
         return strategy
+
+    @staticmethod
+    def resolve_matmul_backend(strategy: str | None = None) -> str:
+        """Map configured strategy to the backend actually used on XPU.
+
+        Arc defaults (``auto``): PyTorch int4pack. GEMV is never selected by auto;
+        there is no M-row GEMV/dequant threshold — use explicit ``gemv`` / ``dequant``.
+        """
+        resolved = (strategy or XPUInt4Linear._matmul_strategy()).strip().lower()
+        if resolved == "auto":
+            return _XPU_INT4_AUTO_MATMUL_BACKEND
+        if resolved in _XPU_INT4_MATMUL_STRATEGIES:
+            return resolved
+        return _XPU_INT4_AUTO_MATMUL_BACKEND
 
     def _forward_dequant(self, x_padded: torch.Tensor) -> torch.Tensor:
         weight = self._dequantize_weight().to(device=x_padded.device, dtype=self.compute_dtype)
@@ -698,10 +758,10 @@ class XPUInt4Linear(nn.Module):
             x_padded = x_2d.to(dtype=self.compute_dtype)
 
         if uses_xpu_kernel:
-            strategy = self._matmul_strategy()
-            if strategy == "dequant":
+            backend = self.resolve_matmul_backend()
+            if backend == "dequant":
                 output = self._forward_dequant(x_padded)
-            elif strategy == "gemv":
+            elif backend == "gemv":
                 output = self._forward_xpu_int4_gemv(x_padded, load_library=True)
             else:
                 output = self._forward_torch_xpu_int4(x_padded)
@@ -921,10 +981,14 @@ def convert_module_linears_to_xpu_int4(
     device: torch.device | str = torch.device("xpu"),
     include_predicate: Callable[[str, nn.Module], bool] | None = None,
     cache_dir: str | Path | None = None,
+    model_path: str | Path | None = None,
 ) -> int:
     count = 0
     gc_every = 16
-    resolved_cache_dir = None
+    resolved_cache_dir = resolve_xpu_int4_layout_cache_dir(cache_dir, model_path=model_path)
+    cache_hits = 0
+    cache_misses = 0
+    cache_save_failures = 0
     module_names = [module_name for module_name, _child in module.named_modules() if module_name]
     for module_name in module_names:
         try:
@@ -960,9 +1024,14 @@ def convert_module_linears_to_xpu_int4(
                     compute_dtype=resolved_compute_dtype,
                     fingerprint=fingerprint,
                 )
+                if replacement is not None:
+                    cache_hits += 1
+                else:
+                    cache_misses += 1
             except Exception:
                 logger.warning("Failed to probe XPU int4 cache for module %s", module_name, exc_info=True)
                 replacement = None
+                cache_misses += 1
 
         if replacement is None:
             replacement = XPUInt4Linear.from_linear(
@@ -978,7 +1047,12 @@ def convert_module_linears_to_xpu_int4(
                     _save_xpu_int4_linear_to_cache(cache_path, replacement, fingerprint=fingerprint)
                     logger.info("Saved XPU int4 layout cache: %s", cache_path)
                 except Exception:
-                    logger.warning("Failed to save XPU int4 cache for module %s", module_name, exc_info=True)
+                    cache_save_failures += 1
+                    logger.warning(
+                        "Failed to save XPU int4 cache for module %s; continuing without cache",
+                        module_name,
+                        exc_info=True,
+                    )
         if module_name == "lm_head" or module_name.endswith(".lm_head"):
             replacement.prepare_lm_head_topk_layout()
         _set_submodule(module, module_name, replacement)
@@ -991,6 +1065,15 @@ def convert_module_linears_to_xpu_int4(
 
     del module_names
     _release_cpu_memory_caches()
+    if resolved_cache_dir is not None and count > 0:
+        logger.info(
+            "XPU int4 layout cache: dir=%s hits=%s misses=%s save_failures=%s replacements=%s",
+            resolved_cache_dir,
+            cache_hits,
+            cache_misses,
+            cache_save_failures,
+            count,
+        )
     return count
 
 

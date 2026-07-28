@@ -12,7 +12,11 @@ from anna.core.format_utils import format_bytes
 from anna.mm.gemma4_text_processor import Gemma4TextProcessor
 from anna.mm.prepared_inputs import PreparedInputs
 from anna.model.gemma4_text_model import Gemma4DynamicCache, Gemma4ForConditionalGeneration
-from anna.model.quantization import convert_module_linears_to_xpu_int4
+from anna.model.quantization import (
+    convert_module_linears_to_xpu_int4,
+    resolve_xpu_int4_layout_cache_dir,
+    weight_quant_auto_usage_threshold,
+)
 from anna.model.turboquant import turboquant_is_available
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.memory_release import release_conversion_artifacts
@@ -250,6 +254,7 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
                 device=device_context.device,
                 compute_dtype=device_context.dtype,
                 offload_vision=resolved_offload_vision,
+                cache_dir=model_path / ".anna" / "xpu_int4_cache",
             )
         model.configure_runtime(
             device_context.device,
@@ -370,7 +375,8 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         if memory_info is None:
             return "none"
         weight_bytes = estimate_gemma4_text_model_weight_bytes(model_path)
-        if weight_bytes > int(memory_info.total_bytes * 0.85):
+        usage_threshold = weight_quant_auto_usage_threshold(is_moe_or_expert_offload=False)
+        if weight_bytes > int(memory_info.total_bytes * usage_threshold):
             return "int4"
         return "none"
 
@@ -391,6 +397,7 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         device: torch.device,
         compute_dtype: torch.dtype,
         offload_vision: bool,
+        cache_dir: Path | None = None,
     ) -> int:
         def _should_quantize(module_name: str, _module: torch.nn.Module) -> bool:
             normalized = module_name.replace("\\", "/")
@@ -400,18 +407,21 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
                 return False
             return True
 
+        resolved_cache_dir = resolve_xpu_int4_layout_cache_dir(cache_dir)
         replacements = convert_module_linears_to_xpu_int4(
             model,
             compute_dtype=compute_dtype,
             device=device,
             include_predicate=_should_quantize,
+            cache_dir=resolved_cache_dir,
         )
         logger.info(
-            "Runtime dense XPU int4 quantization for Gemma4: replacements=%s device=%s compute_dtype=%s offload_vision=%s cache_dir=disabled",
+            "Runtime dense XPU int4 quantization for Gemma4: replacements=%s device=%s compute_dtype=%s offload_vision=%s cache_dir=%s",
             replacements,
             device,
             compute_dtype,
             offload_vision,
+            resolved_cache_dir if resolved_cache_dir is not None else "disabled",
         )
         return replacements
 

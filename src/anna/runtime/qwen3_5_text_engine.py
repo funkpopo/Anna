@@ -23,7 +23,14 @@ from anna.model.fused_ops import (
     maybe_load_gated_delta_library,
     paged_gqa_decode_fused_is_available,
 )
-from anna.model.quantization import AutoRoundGPTQLinear, convert_module_linears_to_xpu_int4, estimate_module_xpu_int4_bytes
+from anna.model.quantization import (
+    AutoRoundGPTQLinear,
+    XPUInt4Linear,
+    convert_module_linears_to_xpu_int4,
+    estimate_module_xpu_int4_bytes,
+    resolve_xpu_int4_layout_cache_dir,
+    weight_quant_auto_usage_threshold,
+)
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration
 from anna.model.ops import Qwen3DynamicCache, Qwen3PageAllocator, Qwen3SparseMoeBlock
 from anna.model.turboquant import VALID_KV_CACHE_QUANT_BITS, turboquant_is_available
@@ -584,6 +591,7 @@ class AnnaQwen3_5TextEngine:
                     model=model,
                     device=device_context.device,
                     compute_dtype=device_context.dtype,
+                    cache_dir=resolve_xpu_int4_layout_cache_dir(model_path=model_path),
                 )
                 release_conversion_artifacts(device_context.device)
             total_quantized_replacements = model_quantized_replacements + runtime_weight_quantized_replacements
@@ -614,11 +622,13 @@ class AnnaQwen3_5TextEngine:
                 kv_cache_quant_bits=kv_cache_quant_bits,
                 kv_cache_residual_len=kv_cache_residual_len,
             )
+            int4_cache_dir = resolve_xpu_int4_layout_cache_dir(model_path=model_path)
             logger.info("Preparing loaded quantized Qwen3.5 modules for XPU execution.")
             cls._prepare_loaded_quantized_modules_for_execution(
                 model=model,
                 config=config,
                 device=device_context.device,
+                cache_dir=int4_cache_dir,
             )
             if auto_resident_indices:
                 resolved_resident_expert_layer_indices = cls._estimate_resident_expert_layer_indices(
@@ -643,6 +653,7 @@ class AnnaQwen3_5TextEngine:
                     model=model,
                     config=config,
                     device=device_context.device,
+                    cache_dir=int4_cache_dir,
                 )
             if auto_cached_experts_per_layer:
                 resolved_cached_experts_per_layer = cls._estimate_cached_experts_per_layer(
@@ -667,6 +678,7 @@ class AnnaQwen3_5TextEngine:
                     model=model,
                     config=config,
                     device=device_context.device,
+                    cache_dir=int4_cache_dir,
                 )
             elif (
                 resolved_offload_mode == "experts"
@@ -892,7 +904,10 @@ class AnnaQwen3_5TextEngine:
             return "none"
 
         weight_bytes = estimate_qwen3_5_text_model_weight_bytes(model_path)
-        usage_threshold = 0.70 if resolved_offload_mode == "experts" or config.text_config.is_moe_model else 0.85
+        is_moe_or_expert_offload = resolved_offload_mode == "experts" or bool(
+            getattr(config.text_config, "is_moe_model", False)
+        )
+        usage_threshold = weight_quant_auto_usage_threshold(is_moe_or_expert_offload=is_moe_or_expert_offload)
         if weight_bytes > int(memory_info.total_bytes * usage_threshold):
             return "int4"
         return "none"
@@ -904,6 +919,7 @@ class AnnaQwen3_5TextEngine:
         model: Qwen3_5TextForConditionalGeneration,
         device: torch.device,
         compute_dtype: torch.dtype,
+        cache_dir: Path | None = None,
     ) -> int:
         def _should_quantize(module_name: str, _module: torch.nn.Module) -> bool:
             normalized = module_name.replace("\\", "/")
@@ -914,17 +930,20 @@ class AnnaQwen3_5TextEngine:
                 and ".mlp._expert_cache." not in normalized
             )
 
+        resolved_cache_dir = resolve_xpu_int4_layout_cache_dir(cache_dir)
         replacements = convert_module_linears_to_xpu_int4(
             model,
             compute_dtype=compute_dtype,
             device=device,
             include_predicate=_should_quantize,
+            cache_dir=resolved_cache_dir,
         )
         logger.info(
-            "Runtime dense XPU int4 quantization: replacements=%s device=%s compute_dtype=%s cache_dir=disabled",
+            "Runtime dense XPU int4 quantization: replacements=%s device=%s compute_dtype=%s cache_dir=%s",
             replacements,
             device,
             compute_dtype,
+            resolved_cache_dir if resolved_cache_dir is not None else "disabled",
         )
         return replacements
 
@@ -935,6 +954,7 @@ class AnnaQwen3_5TextEngine:
         model: Qwen3_5TextForConditionalGeneration,
         config: object,
         device: torch.device,
+        cache_dir: Path | None = None,
     ) -> int:
         quantization_config = getattr(config, "quantization_config", None)
         quant_method = (getattr(quantization_config, "quant_method", None) or "").strip().lower()
@@ -953,6 +973,7 @@ class AnnaQwen3_5TextEngine:
             include_predicate=lambda _module_name, module: (
                 isinstance(module, AutoRoundGPTQLinear) and module.qweight.device.type == "xpu"
             ),
+            cache_dir=resolve_xpu_int4_layout_cache_dir(cache_dir),
         )
         if replacements > 0:
             logger.info(
@@ -1407,6 +1428,12 @@ class AnnaQwen3_5TextEngine:
                 "kv_cache_residual_len": self.optimization_config.kv_cache_residual_len,
                 "xpu_int4_kernels": {
                     "matmul_strategy": os.getenv("ANNA_XPU_INT4_MATMUL", "auto"),
+                    "matmul_backend": XPUInt4Linear.resolve_matmul_backend(),
+                    "layout_cache_dir": (
+                        str(_layout_cache)
+                        if (_layout_cache := resolve_xpu_int4_layout_cache_dir()) is not None
+                        else None
+                    ),
                     "lm_head_local_size": os.getenv("ANNA_XPU_INT4_LM_HEAD_LOCAL_SIZE"),
                     "lm_head_block_topk_threshold": os.getenv("ANNA_XPU_INT4_LM_HEAD_BLOCK_TOPK_THRESHOLD", "65536"),
                     "lm_head_block_size": os.getenv("ANNA_XPU_INT4_LM_HEAD_BLOCK_SIZE", "4096"),

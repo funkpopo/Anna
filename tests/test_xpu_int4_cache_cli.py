@@ -63,5 +63,6 @@ def test_xpu_int4_cache_cli_reports_safetensors_auto_int4(
     assert "uses_gguf=False" in output
     assert "uses_safetensors=True" in output
     assert "resolved_weight_quant=int4" in output
-    assert "xpu_int4_cache_enabled=False" in output
+    assert "xpu_int4_cache_enabled=True" in output
     assert "xpu_int4_cache_dir=" in output
+    assert "xpu_int4_cache" in output

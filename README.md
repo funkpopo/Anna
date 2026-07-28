@@ -343,7 +343,7 @@ These values only apply when an API request omits the matching field.
 - `--kv-cache-quantization none|turboquant`: KV-cache quantization mode.
 - `--kv-cache-quant-bits 2|3|4`: TurboQuant KV bit width.
 - `--kv-cache-residual-len N`: keep the newest N KV tokens in full precision.
-- `--weight-quant auto|none|int4`: dense weight quantization strategy.
+- `--weight-quant auto|none|int4`: dense weight quantization strategy. `auto` promotes to int4 when estimated weights exceed **85%** of total XPU memory (**70%** for MoE models or experts offload).
 - `--expert-quant auto|none|int4`: MoE expert weight quantization strategy.
 - `--offload-mode auto|none|experts`: MoE expert offload strategy.
 - `--offload-vision`: keep the vision tower on CPU to reduce XPU memory use.
@@ -359,7 +359,13 @@ These values only apply when an API request omits the matching field.
 
 - `--enable-flashqla-gdn-prefill`: enable the XPU SYCL Gated Delta prefill path in **strict** mode (no fallback).
 - `--flashqla-gdn-prefill-mode off|strict|prefer`: FlashQLA policy. `strict` hard-fails on unsupported device/shape/dtype/op; `prefer` degrades to the default fused or torch prefill with a one-shot warning per reason. Env `ANNA_XPU_FLASHQLA_GDN_PREFILL` accepts the same values (`1`/`true`/`on` ≡ `strict`).
-- `--xpu-int4-matmul auto|torch|dequant`: XPU int4 dense linear execution strategy.
+- `--xpu-int4-matmul auto|torch|dequant|gemv`: XPU int4 dense linear execution strategy.
+  - **`auto` (default)**: PyTorch `int4pack` on Arc — no M-row GEMV/dequant threshold.
+  - **`torch`**: force int4pack.
+  - **`gemv`**: opt-in SYCL GEMV (decode experiments); not selected by auto.
+  - **`dequant`**: full dequant + `F.linear` (debug).
+- LM head int4 top-k fused is **on by default** for XPU int4 (`top_k ≤ 16`). Disable with `ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK=1`. Legacy `ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED=0|1` still forces off/on.
+- XPU int4 layout cache: on first int4 conversion Anna writes `{model}/.anna/xpu_int4_cache` (override with `ANNA_XPU_INT4_CACHE_DIR`). Version/fingerprint mismatch rebuilds; load/save failures fall back to live quantize. Disable with `ANNA_XPU_DISABLE_INT4_CACHE=1`. Inspect with `anna-xpu-int4-cache --model-dir ...`.
 - `ANNA_GATED_DELTA_OP_LIB`: explicitly point to a fused-op `.pyd` / `.so`.
 - `ANNA_XPU_GATED_DELTA_DECODE_STRATEGY=auto|single|single_group|untiled|tiled|tiled_value`: Gated Delta decode kernel strategy. Leave unset (or set `auto`) for the built-in Arc shape lookup; force `single` / `tiled` only when debugging.
 - `ANNA_XPU_GATED_DELTA_DECODE_VALUE_BLOCK=N`: optional override for the tiled decode value block. When unset, Anna picks a device/shape default from the baked-in Arc table (no manual env tuning required for common Qwen3.5 shapes).
