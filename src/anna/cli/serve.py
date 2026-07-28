@@ -529,6 +529,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--log-format",
+        choices=("text", "json"),
+        default="text",
+        help="Log line format. 'json' emits one structured JSON object per line with optional trace_id.",
+    )
     return parser
 
 
@@ -548,7 +554,7 @@ def _resolve_serve_scheduler_knobs(args: argparse.Namespace) -> dict:
 
 def main() -> None:
     args = build_parser().parse_args()
-    setup_logging(args.log_level)
+    setup_logging(args.log_level, log_format=args.log_format)
     configure_cli_xpu_environment(
         device=args.device,
         xpu_device_index=args.xpu_device_index,

@@ -23,6 +23,9 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     metrics.record_prompt_cache_lookup(hit=True)
     metrics.record_prompt_cache_lookup(hit=False)
     metrics.record_queue_rejected(2)
+    metrics.record_ttft(0.2)
+    metrics.record_itl(0.01)
+    metrics.record_generation_latency(ttft_seconds=0.15, decode_seconds=0.4, decode_tokens=4)
     metrics.set_prefix_block_stats(
         lookups_total=10,
         hits_total=7,
@@ -48,6 +51,11 @@ def test_service_metrics_tracks_request_queueing_and_counters() -> None:
     assert snapshot.prefix_block_misses_total == 3
     assert snapshot.prefix_block_registers_total == 4
     assert snapshot.prefix_block_entries == 5
+    assert snapshot.ttft_count == 2
+    assert snapshot.itl_count == 2
+    assert snapshot.scheduler_queue_depth == 0
+    assert snapshot.ttft_histogram()["count"] == 2
+    assert snapshot.itl_histogram()["count"] == 2
     assert snapshot.running_requests == 0
     assert snapshot.waiting_requests == 0
     assert snapshot.queue_wait_count == 1
@@ -116,6 +124,11 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
         decode_step_count=5,
         decode_step_seconds_max=0.05,
         decode_step_recent_seconds=(0.005, 0.01, 0.02, 0.04, 0.05),
+        ttft_recent_seconds=(0.1, 0.2, 0.3),
+        ttft_count=3,
+        itl_recent_seconds=(0.01, 0.02, 0.03),
+        itl_count=3,
+        kernel_strategy_hits={"gqa_decode:paged": 4, "gdn_decode:fused": 2},
         cache_stack_seconds_total=0.06,
         cache_stack_count=3,
         cache_stack_seconds_max=0.03,
@@ -155,10 +168,14 @@ def test_service_metrics_logger_formats_interval_rates() -> None:
     assert "Decode batch reqs avg/max: 2.3/3" in line
     assert "Decode batch tokens avg/max: 14.0/18" in line
     assert "Waiting: 1 reqs" in line
+    assert "Queue depth: 1" in line
     assert "Queue rejected: 2" in line
     assert "GPU KV cache usage: 50.0% (6/12 pages)" in line
     assert "Prompt cache hit rate: 75.0%" in line
     assert "Prefix block hit rate: 50.0%" in line
+    assert "TTFT p50/p95/p99:" in line
+    assert "ITL p50/p95/p99:" in line
+    assert "Kernel strategy hits:" in line
 
 
 def test_service_metrics_logger_skips_idle_intervals_without_changes() -> None:

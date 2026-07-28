@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from anna.api.schemas import ChatCompletionRequest, CompletionRequest, SpeechRequest, TranscriptionRequest
 from anna.core.format_utils import format_bytes
+from anna.core.logging import get_trace_id
 from anna.runtime.qwen3_5_text_engine import (
     AnnaEngineError,
     GenerationConfig,
@@ -226,6 +227,8 @@ def _log_generation_result(
     memory_after,
 ) -> None:
     perf = result.perf
+    trace_id = get_trace_id()
+    extra = {"trace_id": trace_id} if trace_id else {}
     if perf is None:
         total_tokens_per_second = 0.0 if elapsed_seconds <= 0 else result.completion_tokens / elapsed_seconds
         logger.info(
@@ -238,6 +241,7 @@ def _log_generation_result(
             total_tokens_per_second,
             format_bytes(None if memory_before is None else memory_before.free_bytes),
             format_bytes(None if memory_after is None else memory_after.free_bytes),
+            extra=extra,
         )
         return
 
@@ -259,6 +263,7 @@ def _log_generation_result(
         format_bytes(None if memory_after is None else memory_after.free_bytes),
         format_bytes(None if memory_after is None else memory_after.allocated_bytes),
         format_bytes(None if memory_after is None else memory_after.reserved_bytes),
+        extra=extra,
     )
 
 
@@ -452,17 +457,73 @@ def _stream_sse_chat(
                 final_finish_reason = event.finish_reason or final_finish_reason
                 _close_iterator(events)
                 events_closed = True
-            payload = _chat_chunk_payload(
-                response_id=response_id,
-                created=created,
-                model=model,
-                content=event.text or "",
-                reasoning=event.reasoning_text or "",
-                tool_calls=None if event.tool_calls is None else [tool_call.to_openai_dict() for tool_call in event.tool_calls],
-                finish_reason=event.finish_reason,
-                usage=None if include_usage else _MISSING,
-            )
-            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            # OpenAI clients accumulate tool_calls across deltas. Prefer multi-phase
+            # streaming (name header, then argument fragments) when a complete call
+            # is available; keep finish_reason on a separate empty-delta chunk.
+            tool_call_phases: list[dict[str, object]] = []
+            if event.tool_calls:
+                for tool_call in event.tool_calls:
+                    to_stream = getattr(tool_call, "to_openai_stream_dicts", None)
+                    if callable(to_stream):
+                        tool_call_phases.extend(to_stream())
+                    else:
+                        tool_call_phases.append(tool_call.to_openai_dict())
+
+            content = event.text or ""
+            reasoning = event.reasoning_text or ""
+            finish_reason = event.finish_reason
+            # When this event only carries tool call deltas + finish, emit tool
+            # phases first (finish_reason=null) then a bare finish chunk.
+            if tool_call_phases and finish_reason is not None and not content and not reasoning:
+                for phase in tool_call_phases:
+                    payload = _chat_chunk_payload(
+                        response_id=response_id,
+                        created=created,
+                        model=model,
+                        content="",
+                        reasoning="",
+                        tool_calls=[phase],
+                        finish_reason=None,
+                        usage=None if include_usage else _MISSING,
+                    )
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                payload = _chat_chunk_payload(
+                    response_id=response_id,
+                    created=created,
+                    model=model,
+                    content="",
+                    reasoning="",
+                    tool_calls=None,
+                    finish_reason=finish_reason,
+                    usage=None if include_usage else _MISSING,
+                )
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            elif tool_call_phases and not finish_reason:
+                for phase in tool_call_phases:
+                    payload = _chat_chunk_payload(
+                        response_id=response_id,
+                        created=created,
+                        model=model,
+                        content=content if phase is tool_call_phases[0] else "",
+                        reasoning=reasoning if phase is tool_call_phases[0] else "",
+                        tool_calls=[phase],
+                        finish_reason=None,
+                        usage=None if include_usage else _MISSING,
+                    )
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            else:
+                payload = _chat_chunk_payload(
+                    response_id=response_id,
+                    created=created,
+                    model=model,
+                    content=content,
+                    reasoning=reasoning,
+                    tool_calls=None if not tool_call_phases else tool_call_phases,
+                    finish_reason=finish_reason,
+                    usage=None if include_usage else _MISSING,
+                )
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             if final_usage is not None:
                 break
     except AnnaEngineError as exc:
@@ -626,9 +687,20 @@ def _generation_config_from_payload(
     )
 
 
+def _ensure_engine_accepting(engine: object) -> None:
+    ensure = getattr(engine, "ensure_accepting_requests", None)
+    if callable(ensure):
+        ensure()
+
+
 @router.get("/healthz")
 def healthz(request: Request) -> dict:
-    return _engine(request).health()
+    payload = _engine(request).health()
+    trace_id = get_trace_id()
+    if trace_id:
+        payload = dict(payload)
+        payload["trace_id"] = trace_id
+    return payload
 
 
 @router.get("/v1/models")
@@ -652,6 +724,7 @@ def list_models(request: Request) -> dict:
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request, payload: ChatCompletionRequest):
     engine = _engine(request)
+    _ensure_engine_accepting(engine)
     config = _generation_config_from_payload(
         engine,
         payload,
@@ -747,6 +820,7 @@ async def chat_completions(request: Request, payload: ChatCompletionRequest):
 @router.post("/v1/completions")
 async def completions(request: Request, payload: CompletionRequest):
     engine = _engine(request)
+    _ensure_engine_accepting(engine)
     config = _generation_config_from_payload(
         engine,
         payload,

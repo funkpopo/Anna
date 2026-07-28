@@ -583,8 +583,12 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         memory_info = self.device_context.get_memory_info()
         service_metrics = self.service_metrics_snapshot()
         kv_cache_runtime_info = self._kv_cache_runtime_info()
+        admission = self._admission_gate().to_health_dict()
+        status = "ok" if admission.get("accepting_requests", True) else "degraded"
         return {
-            "status": "ok",
+            "status": status,
+            "accepting_requests": bool(admission.get("accepting_requests", True)),
+            "runtime_admission": admission,
             "model": self.default_model_id,
             "model_family": self.model_family,
             "device": str(self.device_context.device),
@@ -656,6 +660,7 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
                 "prompt_cache_entries": service_metrics.prompt_cache_entries,
                 "running_requests": service_metrics.running_requests,
                 "waiting_requests": service_metrics.waiting_requests,
+                "scheduler_queue_depth": service_metrics.scheduler_queue_depth,
                 "kv_cache_used_pages": service_metrics.kv_cache_used_pages,
                 "kv_cache_total_pages": service_metrics.kv_cache_total_pages,
                 "cache_compact_count": service_metrics.cache_compact_count,
@@ -674,5 +679,10 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
                 "scheduler_decode_batch_requests_max": service_metrics.scheduler_decode_batch_requests_max,
                 "scheduler_decode_batch_tokens_total": service_metrics.scheduler_decode_batch_tokens_total,
                 "scheduler_decode_batch_tokens_max": service_metrics.scheduler_decode_batch_tokens_max,
+                "ttft_histogram": service_metrics.ttft_histogram(),
+                "itl_histogram": service_metrics.itl_histogram(),
+                "ttft_count": service_metrics.ttft_count,
+                "itl_count": service_metrics.itl_count,
+                "kernel_strategy_hits": service_metrics.kernel_strategy_hits,
             },
         }

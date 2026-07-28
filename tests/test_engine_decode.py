@@ -297,11 +297,14 @@ def test_handle_runtime_failure_clears_runtime_caches_after_recover() -> None:
         def release_unused_memory(self) -> None:
             self.release_calls += 1
 
+    from anna.runtime.runtime_health import PROCESS_ADMISSION_GATE, RuntimeAdmissionGate
+
     engine = object.__new__(AnnaQwen3_5TextEngine)
     kv = DummyKV()
     engine._prompt_cache = OrderedDict({(1, 2): SimpleNamespace(past_key_values=kv)})
     engine.cache_allocator = DummyAllocator()
     engine.device_context = DummyDeviceContext()
+    engine.admission_gate = RuntimeAdmissionGate()
 
     error = engine._handle_runtime_failure(RuntimeError("UR_RESULT_ERROR_DEVICE_LOST"))
 
@@ -311,6 +314,11 @@ def test_handle_runtime_failure_clears_runtime_caches_after_recover() -> None:
     assert engine.cache_allocator.clear_calls == 1
     assert engine.device_context.recover_calls == 1
     assert engine.device_context.release_calls == 1
+    assert engine.admission_gate.accepting_requests is False
+    assert engine.admission_gate.snapshot().degradation_category == "device_lost"
+    # Do not leave the process gate degraded for later tests.
+    PROCESS_ADMISSION_GATE.clear_degraded()
+    engine.admission_gate.clear_degraded()
 
 
 def test_qwen_runtime_accepts_turboquant_kv_cache_quantization_when_available(monkeypatch: pytest.MonkeyPatch) -> None:

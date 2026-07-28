@@ -46,6 +46,7 @@ from anna.model.xpu_decode_profile import (
 )
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.memory_release import release_conversion_artifacts
+from anna.runtime.runtime_health import PROCESS_ADMISSION_GATE, RuntimeAdmissionGate
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
 from anna.runtime.streaming import IncrementalTextAssembler
 from anna.sampling.sampler import sample_next_token, sample_next_token_from_candidates
@@ -1555,13 +1556,36 @@ class AnnaQwen3_5TextEngine:
             )
         return replace(snapshot, **extra)  # type: ignore[arg-type]
 
+    def _admission_gate(self) -> RuntimeAdmissionGate:
+        gate = getattr(self, "admission_gate", None)
+        if isinstance(gate, RuntimeAdmissionGate):
+            return gate
+        return PROCESS_ADMISSION_GATE
+
+    def ensure_accepting_requests(self) -> None:
+        gate = self._admission_gate()
+        snap = gate.snapshot()
+        if snap.accepting_requests:
+            return
+        raise AnnaEngineError(
+            snap.degradation_reason
+            or "Runtime is degraded after a device failure and is not accepting new requests.",
+            status_code=503,
+            error_type="server_error",
+            code="runtime_degraded",
+        )
+
     def health(self) -> dict[str, Any]:
         quant_method = self.config.quantization_config.quant_method or "dense"
         memory_info = self.device_context.get_memory_info()
         service_metrics = self.service_metrics_snapshot()
         kv_cache_runtime_info = self._kv_cache_runtime_info()
+        admission = self._admission_gate().to_health_dict()
+        status = "ok" if admission.get("accepting_requests", True) else "degraded"
         return {
-            "status": "ok",
+            "status": status,
+            "accepting_requests": bool(admission.get("accepting_requests", True)),
+            "runtime_admission": admission,
             "model": self.default_model_id,
             "model_family": self.model_family,
             "device": str(self.device_context.device),
@@ -1660,6 +1684,7 @@ class AnnaQwen3_5TextEngine:
                 "queue_rejected_total": service_metrics.queue_rejected_total,
                 "running_requests": service_metrics.running_requests,
                 "waiting_requests": service_metrics.waiting_requests,
+                "scheduler_queue_depth": service_metrics.scheduler_queue_depth,
                 "kv_cache_used_pages": service_metrics.kv_cache_used_pages,
                 "kv_cache_total_pages": service_metrics.kv_cache_total_pages,
                 "cache_compact_count": service_metrics.cache_compact_count,
@@ -1679,6 +1704,11 @@ class AnnaQwen3_5TextEngine:
                 "scheduler_decode_batch_tokens_total": service_metrics.scheduler_decode_batch_tokens_total,
                 "scheduler_decode_batch_tokens_max": service_metrics.scheduler_decode_batch_tokens_max,
                 "scheduler_decode_profile": self._scheduler_decode_profile_snapshot(),
+                "ttft_histogram": service_metrics.ttft_histogram(),
+                "itl_histogram": service_metrics.itl_histogram(),
+                "ttft_count": service_metrics.ttft_count,
+                "itl_count": service_metrics.itl_count,
+                "kernel_strategy_hits": service_metrics.kernel_strategy_hits,
             },
         }
 
@@ -2791,24 +2821,37 @@ class AnnaQwen3_5TextEngine:
                 self._clear_runtime_caches_after_recover(reason=category)
             except Exception:  # pragma: no cover - best-effort recovery
                 logger.exception("Failed to recover device context after runtime failure.")
+            # Unified recovery: stop admitting new work until the operator confirms
+            # healthz / restarts. Device-lost and OOM both enter degraded mode.
+            if category in {"out_of_memory", "device_lost", "out_of_resources"}:
+                reason = (
+                    f"Runtime degraded after {category}: caches cleared; "
+                    "new requests are rejected until the process is restarted "
+                    "or the admission gate is cleared."
+                )
+                self._admission_gate().enter_degraded(category=category, reason=reason)
+                logger.error("Entered runtime degraded mode after %s.", category)
 
         if category == "out_of_memory":
             return AnnaEngineError(
-                "XPU out of memory during generation. Reduce prompt length, media size, batch size, or max_completion_tokens.",
+                "XPU out of memory during generation. Reduce prompt length, media size, batch size, or max_completion_tokens. "
+                "The service is not accepting new requests until recovery is confirmed.",
                 status_code=503,
                 error_type="server_error",
                 code="device_out_of_memory",
             )
         if category == "device_lost":
             return AnnaEngineError(
-                "XPU device was lost during generation. The runtime cache was cleared; retry the request after the device recovers.",
+                "XPU device was lost during generation. The runtime cache was cleared; "
+                "new requests are rejected until the device recovers and the process is restarted.",
                 status_code=503,
                 error_type="server_error",
                 code="device_lost",
             )
         if category == "out_of_resources":
             return AnnaEngineError(
-                "XPU runtime ran out of resources during generation. Reduce the request size and retry.",
+                "XPU runtime ran out of resources during generation. Reduce the request size and retry. "
+                "The service is not accepting new requests until recovery is confirmed.",
                 status_code=503,
                 error_type="server_error",
                 code="device_out_of_resources",
@@ -2846,15 +2889,31 @@ class AnnaQwen3_5TextEngine:
     def _split_chat_output(self, raw_text: str, *, enable_thinking: bool) -> tuple[str | None, str]:
         return self.tokenizer.split_assistant_reasoning(raw_text, enable_thinking=enable_thinking)
 
+    def _record_perf_latency(self, perf: GenerationPerfStats | None) -> None:
+        if perf is None:
+            return
+        metrics = getattr(self, "metrics", None)
+        if metrics is None or not hasattr(metrics, "record_generation_latency"):
+            return
+        metrics.record_generation_latency(
+            ttft_seconds=perf.ttft_seconds,
+            decode_seconds=perf.decode_seconds,
+            decode_tokens=perf.decode_tokens,
+        )
+
     def _generate(self, prepared: PreparedInputs, *, config: GenerationConfig) -> TextGenerationResult:
+        self.ensure_accepting_requests()
         if self._can_use_scheduler(prepared):
-            return self.scheduler.generate(prepared, config=config)
+            result = self.scheduler.generate(prepared, config=config)
+            self._record_perf_latency(getattr(result, "perf", None))
+            return result
         metrics = getattr(self, "metrics", None)
         if metrics is not None:
             metrics.record_request_submitted(waiting=False)
         success = False
         try:
             result = self._generate_direct(prepared, config=config)
+            self._record_perf_latency(result.perf)
             success = True
             return result
         finally:
@@ -2913,15 +2972,22 @@ class AnnaQwen3_5TextEngine:
         )
 
     def _stream(self, prepared: PreparedInputs, *, config: GenerationConfig) -> Iterator[StreamEvent]:
+        self.ensure_accepting_requests()
         if self._can_use_scheduler(prepared):
-            yield from self.scheduler.stream(prepared, config=config)
+            for event in self.scheduler.stream(prepared, config=config):
+                if event.finish_reason is not None and event.perf is not None:
+                    self._record_perf_latency(event.perf)
+                yield event
             return
         metrics = getattr(self, "metrics", None)
         if metrics is not None:
             metrics.record_request_submitted(waiting=False)
         success = False
         try:
-            yield from self._stream_direct(prepared, config=config)
+            for event in self._stream_direct(prepared, config=config):
+                if event.finish_reason is not None and event.perf is not None:
+                    self._record_perf_latency(event.perf)
+                yield event
             success = True
         finally:
             if metrics is not None:

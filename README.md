@@ -301,9 +301,9 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 
 ## API Routes
 
-- `GET /healthz`: runtime, model, memory, KV cache, and service metrics.
+- `GET /healthz`: runtime, model, memory, KV cache, service metrics (prefix hit rate, scheduler queue depth, TTFT/ITL histograms, kernel strategy hits), and runtime admission status after device-lost/OOM.
 - `GET /v1/models`: currently loaded model ID.
-- `POST /v1/chat/completions`: chat, multimodal chat, streaming output, and tool-call-compatible responses.
+- `POST /v1/chat/completions`: chat, multimodal chat, streaming output, and tool-call-compatible responses (OpenAI multi-phase `tool_calls` deltas on stream).
 - `POST /v1/completions`: text completion.
 - `POST /v1/audio/speech`: Qwen3-TTS speech synthesis.
 - `POST /v1/audio/transcriptions`: Qwen3-ASR speech recognition.
@@ -317,6 +317,7 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 - `--host HOST`: bind address, default `127.0.0.1`; use `0.0.0.0` for LAN access.
 - `--port PORT`: bind port, default `8000`.
 - `--log-level LEVEL`: logging level, default `info`.
+- `--log-format text|json`: `json` emits one structured JSON object per line; request `X-Request-Id` / generated `trace_id` is attached to logs and response headers.
 - `--device auto|cpu|xpu`: execution device; `auto` prefers XPU.
 - `--xpu-device-index N`: select a specific XPU on systems with multiple Intel GPUs.
 - `--no-xpu-env-defaults`: do not set Anna's recommended Level Zero environment variables.

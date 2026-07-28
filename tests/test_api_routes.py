@@ -858,7 +858,10 @@ def test_streaming_chat_emits_tool_call_deltas_and_tool_calls_finish_reason() ->
     )
 
     assert response.status_code == 200
-    assert '"tool_calls": [{"index": 0, "id": "call_123", "type": "function"' in response.text
+    # Multi-phase OpenAI tool streaming: header carries id/type/name.
+    assert '"id": "call_123"' in response.text
+    assert '"type": "function"' in response.text
+    assert '"name": "get_weather"' in response.text
     assert '"finish_reason": "tool_calls"' in response.text
 
 

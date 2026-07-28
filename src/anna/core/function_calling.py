@@ -57,6 +57,47 @@ class ToolCallDelta:
             payload["function"] = function
         return payload
 
+    def to_openai_stream_dicts(self) -> list[dict[str, object]]:
+        """Expand a complete tool call into OpenAI-style multi-phase stream deltas.
+
+        Clients that accumulate ``delta.tool_calls`` expect:
+        1. index + id + type + function.name (+ empty arguments)
+        2. subsequent chunks with only index + function.arguments fragments
+        """
+        if self.name is None and self.arguments is None:
+            return [self.to_openai_dict()]
+
+        phases: list[dict[str, object]] = []
+        # Phase 1: announce the call (id/type/name). Always include empty arguments
+        # so clients that only watch arguments still initialize the buffer.
+        header: dict[str, object] = {
+            "index": self.index,
+            "id": self.id,
+            "type": self.type,
+            "function": {
+                "name": self.name or "",
+                "arguments": "",
+            },
+        }
+        phases.append(header)
+
+        arguments = self.arguments or ""
+        if not arguments:
+            return phases
+
+        # Phase 2+: stream argument text in moderate chunks so clients can
+        # incrementally JSON-parse without waiting for the full block.
+        chunk_size = 32
+        for offset in range(0, len(arguments), chunk_size):
+            fragment = arguments[offset : offset + chunk_size]
+            phases.append(
+                {
+                    "index": self.index,
+                    "function": {"arguments": fragment},
+                }
+            )
+        return phases
+
 
 def compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))

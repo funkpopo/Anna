@@ -301,7 +301,7 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 
 ## API 路由
 
-- `GET /healthz`：运行时、模型、显存、KV cache 和服务指标。
+- `GET /healthz`：运行时、模型、显存、KV cache、服务指标（prefix 命中率、scheduler 队列深度、TTFT/ITL 直方图、kernel strategy 命中）以及 device-lost/OOM 后的准入状态。
 - `GET /v1/models`：当前加载的模型 ID。
 - `POST /v1/chat/completions`：Chat、多模态 Chat、流式输出、函数调用兼容响应。
 - `POST /v1/completions`：文本补全。
@@ -317,6 +317,7 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 - `--host HOST`：监听地址，默认 `127.0.0.1`；局域网访问可用 `0.0.0.0`。
 - `--port PORT`：监听端口，默认 `8000`。
 - `--log-level LEVEL`：日志级别，默认 `info`。
+- `--log-format text|json`：`json` 输出结构化单行日志；请求 `X-Request-Id` / 生成的 `trace_id` 会写入日志与响应头。
 - `--device auto|cpu|xpu`：执行设备；`auto` 优先使用 XPU。
 - `--xpu-device-index N`：多 Intel GPU 机器上选择指定 XPU。
 - `--no-xpu-env-defaults`：不设置 Anna 推荐的 Level Zero 默认环境变量。

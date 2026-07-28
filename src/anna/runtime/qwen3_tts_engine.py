@@ -436,12 +436,19 @@ class AnnaQwen3TTSEngine:
         return kwargs
 
     def _handle_runtime_failure(self, exc: RuntimeError) -> AnnaEngineError:
+        from anna.runtime.runtime_health import PROCESS_ADMISSION_GATE
+
         category = self.device_context.classify_runtime_error(exc)
         if self.device_context.should_recover(exc):
             try:
                 self.device_context.recover()
             except Exception:  # pragma: no cover - best-effort recovery
                 logger.exception("Failed to recover device context after Qwen3-TTS runtime failure.")
+            if category in {"out_of_memory", "device_lost", "out_of_resources"}:
+                PROCESS_ADMISSION_GATE.enter_degraded(
+                    category=category,
+                    reason=f"TTS runtime degraded after {category}; new requests rejected until restart.",
+                )
 
         if category == "out_of_memory":
             return AnnaEngineError(

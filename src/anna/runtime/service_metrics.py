@@ -4,8 +4,10 @@ import logging
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
+
+from anna.model.kernel_metrics import kernel_strategy_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +20,17 @@ def _quantile(samples: tuple[float, ...], q: float) -> float:
     ordered = sorted(samples)
     index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * q))))
     return ordered[index]
+
+
+def _latency_histogram(samples: tuple[float, ...]) -> dict[str, float | int]:
+    """p50/p95/p99 histogram summary in seconds (plus count/max)."""
+    return {
+        "count": len(samples),
+        "p50_seconds": _quantile(samples, 0.50),
+        "p95_seconds": _quantile(samples, 0.95),
+        "p99_seconds": _quantile(samples, 0.99),
+        "max_seconds": 0.0 if not samples else max(samples),
+    }
 
 
 @dataclass(slots=True)
@@ -52,6 +65,14 @@ class ServiceMetricsSnapshot:
     decode_step_count: int = 0
     decode_step_seconds_max: float = 0.0
     decode_step_recent_seconds: tuple[float, ...] = ()
+    ttft_seconds_total: float = 0.0
+    ttft_count: int = 0
+    ttft_seconds_max: float = 0.0
+    ttft_recent_seconds: tuple[float, ...] = ()
+    itl_seconds_total: float = 0.0
+    itl_count: int = 0
+    itl_seconds_max: float = 0.0
+    itl_recent_seconds: tuple[float, ...] = ()
     cache_stack_seconds_total: float = 0.0
     cache_stack_count: int = 0
     cache_stack_seconds_max: float = 0.0
@@ -71,12 +92,23 @@ class ServiceMetricsSnapshot:
     scheduler_decode_batch_requests_max: int = 0
     scheduler_decode_batch_tokens_total: int = 0
     scheduler_decode_batch_tokens_max: int = 0
+    kernel_strategy_hits: dict[str, int] = field(default_factory=dict)
 
     @property
     def kv_cache_usage_ratio(self) -> float:
         if self.kv_cache_total_pages <= 0:
             return 0.0
         return self.kv_cache_used_pages / self.kv_cache_total_pages
+
+    @property
+    def scheduler_queue_depth(self) -> int:
+        return max(0, int(self.waiting_requests))
+
+    def ttft_histogram(self) -> dict[str, float | int]:
+        return _latency_histogram(self.ttft_recent_seconds)
+
+    def itl_histogram(self) -> dict[str, float | int]:
+        return _latency_histogram(self.itl_recent_seconds)
 
 
 class AnnaServiceMetrics:
@@ -109,6 +141,14 @@ class AnnaServiceMetrics:
         self._decode_step_count = 0
         self._decode_step_seconds_max = 0.0
         self._decode_step_recent_seconds: deque[float] = deque(maxlen=_LATENCY_SAMPLE_LIMIT)
+        self._ttft_seconds_total = 0.0
+        self._ttft_count = 0
+        self._ttft_seconds_max = 0.0
+        self._ttft_recent_seconds: deque[float] = deque(maxlen=_LATENCY_SAMPLE_LIMIT)
+        self._itl_seconds_total = 0.0
+        self._itl_count = 0
+        self._itl_seconds_max = 0.0
+        self._itl_recent_seconds: deque[float] = deque(maxlen=_LATENCY_SAMPLE_LIMIT)
         self._cache_stack_seconds_total = 0.0
         self._cache_stack_count = 0
         self._cache_stack_seconds_max = 0.0
@@ -172,6 +212,33 @@ class AnnaServiceMetrics:
             self._decode_step_seconds_max = max(self._decode_step_seconds_max, normalized)
             self._decode_step_recent_seconds.append(normalized)
         self._activity_event.set()
+
+    def record_ttft(self, seconds: float) -> None:
+        """Record time-to-first-token for a completed request."""
+        normalized = max(0.0, float(seconds))
+        with self._lock:
+            self._ttft_seconds_total += normalized
+            self._ttft_count += 1
+            self._ttft_seconds_max = max(self._ttft_seconds_max, normalized)
+            self._ttft_recent_seconds.append(normalized)
+        self._activity_event.set()
+
+    def record_itl(self, seconds: float) -> None:
+        """Record inter-token latency sample (per decode token or mean ITL)."""
+        normalized = max(0.0, float(seconds))
+        with self._lock:
+            self._itl_seconds_total += normalized
+            self._itl_count += 1
+            self._itl_seconds_max = max(self._itl_seconds_max, normalized)
+            self._itl_recent_seconds.append(normalized)
+        self._activity_event.set()
+
+    def record_generation_latency(self, *, ttft_seconds: float, decode_seconds: float, decode_tokens: int) -> None:
+        """Record request-level TTFT and mean ITL from generation perf stats."""
+        self.record_ttft(ttft_seconds)
+        tokens = max(0, int(decode_tokens))
+        if tokens > 0:
+            self.record_itl(max(0.0, float(decode_seconds)) / tokens)
 
     def record_cache_stack(self, seconds: float) -> None:
         normalized = max(0.0, float(seconds))
@@ -317,6 +384,14 @@ class AnnaServiceMetrics:
                 decode_step_count=self._decode_step_count,
                 decode_step_seconds_max=self._decode_step_seconds_max,
                 decode_step_recent_seconds=tuple(self._decode_step_recent_seconds),
+                ttft_seconds_total=self._ttft_seconds_total,
+                ttft_count=self._ttft_count,
+                ttft_seconds_max=self._ttft_seconds_max,
+                ttft_recent_seconds=tuple(self._ttft_recent_seconds),
+                itl_seconds_total=self._itl_seconds_total,
+                itl_count=self._itl_count,
+                itl_seconds_max=self._itl_seconds_max,
+                itl_recent_seconds=tuple(self._itl_recent_seconds),
                 cache_stack_seconds_total=self._cache_stack_seconds_total,
                 cache_stack_count=self._cache_stack_count,
                 cache_stack_seconds_max=self._cache_stack_seconds_max,
@@ -336,6 +411,7 @@ class AnnaServiceMetrics:
                 scheduler_decode_batch_requests_max=self._scheduler_decode_batch_requests_max,
                 scheduler_decode_batch_tokens_total=self._scheduler_decode_batch_tokens_total,
                 scheduler_decode_batch_tokens_max=self._scheduler_decode_batch_tokens_max,
+                kernel_strategy_hits=kernel_strategy_snapshot(),
             )
 
 
@@ -443,15 +519,24 @@ class AnnaServiceMetricsLogger:
         decode_p50_ms = _quantile(decode_recent, 0.50) * 1000.0
         decode_p95_ms = _quantile(decode_recent, 0.95) * 1000.0
         decode_p99_ms = _quantile(decode_recent, 0.99) * 1000.0
+        ttft_hist = current.ttft_histogram()
+        itl_hist = current.itl_histogram()
+        kernel_hits = current.kernel_strategy_hits
+        kernel_summary = ",".join(f"{name}={count}" for name, count in list(kernel_hits.items())[:8]) or "none"
         return (
             "Engine metrics: Interval prompt: "
             f"{prompt_tokens_per_second:.1f} tok/s, Interval generation: "
             f"{generation_tokens_per_second:.1f} tok/s, Running: {current.running_requests} reqs, "
+            f"Queue depth: {current.scheduler_queue_depth}, "
             f"Queue wait avg/max: {queue_wait_avg_ms:.1f}/{current.queue_wait_seconds_max * 1000.0:.1f} ms, "
             f"Prefill step avg/max: {prefill_step_avg_ms:.1f}/{current.prefill_step_seconds_max * 1000.0:.1f} ms, "
             f"Prefill step p50/p95/p99: {prefill_p50_ms:.1f}/{prefill_p95_ms:.1f}/{prefill_p99_ms:.1f} ms, "
             f"Decode step avg/max: {decode_step_avg_ms:.1f}/{current.decode_step_seconds_max * 1000.0:.1f} ms, "
             f"Decode step p50/p95/p99: {decode_p50_ms:.1f}/{decode_p95_ms:.1f}/{decode_p99_ms:.1f} ms, "
+            f"TTFT p50/p95/p99: {float(ttft_hist['p50_seconds']) * 1000.0:.1f}/"
+            f"{float(ttft_hist['p95_seconds']) * 1000.0:.1f}/{float(ttft_hist['p99_seconds']) * 1000.0:.1f} ms, "
+            f"ITL p50/p95/p99: {float(itl_hist['p50_seconds']) * 1000.0:.1f}/"
+            f"{float(itl_hist['p95_seconds']) * 1000.0:.1f}/{float(itl_hist['p99_seconds']) * 1000.0:.1f} ms, "
             f"Cache stack avg/max: {cache_stack_avg_ms:.1f}/{current.cache_stack_seconds_max * 1000.0:.1f} ms, "
             f"Cache split avg/max: {cache_split_avg_ms:.1f}/{current.cache_split_seconds_max * 1000.0:.1f} ms, "
             f"Cache compact avg/max: {cache_compact_avg_ms:.1f}/{current.cache_compact_seconds_max * 1000.0:.1f} ms, "
@@ -465,7 +550,8 @@ class AnnaServiceMetricsLogger:
             f"Prompt cache hit rate: {prompt_cache_hit_rate:.1f}%, "
             f"Prefix block hit rate: {prefix_block_hit_rate:.1f}% "
             f"({current.prefix_block_hits_total}/{current.prefix_block_lookups_total}, "
-            f"entries={current.prefix_block_entries})"
+            f"entries={current.prefix_block_entries}), "
+            f"Kernel strategy hits: {kernel_summary}"
         )
 
     @staticmethod
@@ -491,6 +577,8 @@ class AnnaServiceMetricsLogger:
             current.queue_wait_count - previous.queue_wait_count,
             current.prefill_step_count - previous.prefill_step_count,
             current.decode_step_count - previous.decode_step_count,
+            current.ttft_count - previous.ttft_count,
+            current.itl_count - previous.itl_count,
             current.cache_stack_count - previous.cache_stack_count,
             current.cache_split_count - previous.cache_split_count,
             current.cache_compact_count - previous.cache_compact_count,

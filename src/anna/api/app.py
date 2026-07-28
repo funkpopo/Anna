@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import uuid
 from contextlib import asynccontextmanager
 from typing import Iterable
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from anna import __version__
 from anna.api.routes import router
+from anna.core.logging import clear_trace_id, set_trace_id
 from anna.runtime.qwen3_5_text_engine import AnnaEngineError
 
 _HTTP_METHOD_ORDER = {
@@ -20,6 +23,24 @@ _HTTP_METHOD_ORDER = {
     "DELETE": 5,
     "OPTIONS": 6,
 }
+
+_TRACE_HEADER = "x-request-id"
+
+
+class RequestTraceMiddleware(BaseHTTPMiddleware):
+    """Bind a request trace id for the full request lifetime (including streams)."""
+
+    async def dispatch(self, request: Request, call_next):
+        incoming = request.headers.get(_TRACE_HEADER) or request.headers.get("x-correlation-id")
+        trace_id = (incoming or "").strip() or f"req_{uuid.uuid4().hex}"
+        set_trace_id(trace_id)
+        request.state.trace_id = trace_id
+        try:
+            response = await call_next(request)
+        finally:
+            clear_trace_id()
+        response.headers[_TRACE_HEADER] = trace_id
+        return response
 
 
 def list_app_routes(app: FastAPI) -> list[tuple[str, str]]:
@@ -55,6 +76,7 @@ def create_app(engine, *, scheduler=None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(RequestTraceMiddleware)
     app.state.engine = engine
     app.state.scheduler = scheduler
     app.include_router(router)

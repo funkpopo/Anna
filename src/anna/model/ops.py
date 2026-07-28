@@ -17,6 +17,7 @@ from torch import nn
 from anna.model.prefix_block_cache import PrefixBlockPool
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig
 from anna.model.turboquant import VALID_KV_CACHE_QUANT_BITS, TurboQuantKVRow
+from anna.model.kernel_metrics import record_kernel_strategy
 from anna.model.fused_ops import (
     flashqla_prefill_unsupported_reason,
     loaded_fused_library_paths,
@@ -1674,6 +1675,7 @@ def single_token_gqa_decode(
         )
 
     if use_turboquant_cache:
+        record_kernel_strategy("gqa_decode", "turboquant")
         return past_key_values.turboquant_single_token_decode_attention(
             layer_idx,
             query_states,
@@ -1687,6 +1689,7 @@ def single_token_gqa_decode(
         paged_state = past_key_values.paged_attention_state(layer_idx)
         if paged_state is not None:
             key_pages, value_pages, page_table, _ = paged_state
+            record_kernel_strategy("gqa_decode", "paged")
             return paged_kv_single_token_decode_attention(
                 query_states,
                 key_pages,
@@ -1698,6 +1701,7 @@ def single_token_gqa_decode(
             )
 
     if query_states.device.type != "xpu":
+        record_kernel_strategy("gqa_decode", "fallback")
         return None
 
     resolved_key = key_states
@@ -1706,6 +1710,7 @@ def single_token_gqa_decode(
         resolved_key, resolved_value, _ = past_key_values._gather_layer_cache(layer_idx)
         if resolved_key is None or resolved_value is None:
             raise RuntimeError("Failed to materialize KV cache for Qwen single-token decode.")
+    record_kernel_strategy("gqa_decode", "dense_fused")
     return materialized_kv_single_token_decode_attention(
         query_states,
         resolved_key,
@@ -2538,6 +2543,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         recurrent_state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if query.device.type == "xpu":
+            record_kernel_strategy("gdn_decode", "fused")
             core_attn_out = run_gated_delta_decode_fused(
                 query=query,
                 key=key,
@@ -2547,6 +2553,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 state=recurrent_state,
             )
             return core_attn_out, recurrent_state
+        record_kernel_strategy("gdn_decode", "torch")
         return torch_recurrent_gated_delta_rule(
             query=query,
             key=key,

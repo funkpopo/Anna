@@ -164,6 +164,9 @@ class AnnaScheduler:
     def _submit(self, prepared: PreparedInputsLike, *, config: "GenerationConfig", stream: bool) -> SchedulerRequest:
         if self._fatal_error is not None:
             raise self._fatal_error
+        ensure = getattr(self.engine, "ensure_accepting_requests", None)
+        if callable(ensure):
+            ensure()
         metrics = getattr(self.engine, "metrics", None)
         with self._condition:
             if self.max_waiting_requests > 0 and len(self._pending) >= self.max_waiting_requests:

@@ -54,3 +54,7 @@ binding = "PyO3"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "arc_gdn: Arc GDN validate gate (optional; skips without Intel XPU)",
+    "xpu: requires Intel XPU hardware",
+]
