@@ -63,6 +63,9 @@ class TensorMigrationPolicy:
     cache_dtype: torch.dtype
     non_blocking: bool = True
     keep_cache_on_device: bool = True
+    # When True (offload_vision), leave pixel/video tensors on the preprocess host so the
+    # vision tower can run on CPU and only feature embeddings cross H2D.
+    keep_media_on_host: bool = False
 
 
 @dataclass(slots=True)
@@ -290,12 +293,24 @@ class DeviceContext:
         input_ids = self._move_tensor(prepared.input_ids, dtype=torch.long)
         attention_mask = self._move_tensor(prepared.attention_mask, dtype=torch.long)
         mm_token_type_ids = self._move_tensor(prepared.mm_token_type_ids, dtype=torch.int32)
-        pixel_values = self._move_tensor(prepared.pixel_values, dtype=self.dtype)
-        image_position_ids = self._move_tensor(prepared.image_position_ids, dtype=torch.long)
-        image_grid_thw = self._move_tensor(prepared.image_grid_thw, dtype=torch.long)
-        pixel_values_videos = self._move_tensor(prepared.pixel_values_videos, dtype=self.dtype)
-        video_position_ids = self._move_tensor(prepared.video_position_ids, dtype=torch.long)
-        video_grid_thw = self._move_tensor(prepared.video_grid_thw, dtype=torch.long)
+        keep_media_on_host = bool(self.migration_policy.keep_media_on_host)
+        if keep_media_on_host:
+            # Vision tower owns host→device staging for pixels; only move metadata grids if needed
+            # by the language-model side after feature injection.
+            pixel_values = prepared.pixel_values
+            pixel_values_videos = prepared.pixel_values_videos
+            image_position_ids = prepared.image_position_ids
+            video_position_ids = prepared.video_position_ids
+            # grid_thw travels with the vision tower (host) under offload_vision.
+            image_grid_thw = prepared.image_grid_thw
+            video_grid_thw = prepared.video_grid_thw
+        else:
+            pixel_values = self._move_tensor(prepared.pixel_values, dtype=self.dtype)
+            image_position_ids = self._move_tensor(prepared.image_position_ids, dtype=torch.long)
+            image_grid_thw = self._move_tensor(prepared.image_grid_thw, dtype=torch.long)
+            pixel_values_videos = self._move_tensor(prepared.pixel_values_videos, dtype=self.dtype)
+            video_position_ids = self._move_tensor(prepared.video_position_ids, dtype=torch.long)
+            video_grid_thw = self._move_tensor(prepared.video_grid_thw, dtype=torch.long)
         input_features = self._move_tensor(prepared.input_features, dtype=self.dtype)
         input_features_mask = self._move_tensor(prepared.input_features_mask, dtype=torch.bool)
         if (

@@ -321,3 +321,147 @@ def test_estimate_qwen_weight_bytes_from_gguf_includes_mmproj(tmp_path: Path) ->
         + sum(array.size * (4 if array.dtype == np.float32 else 2) for array in mmproj_arrays.values())
     )
     assert estimate_qwen3_5_text_model_weight_bytes(model_dir) == expected_bytes
+
+
+def test_gguf_vs_safetensors_alignment_matrix(tmp_path: Path) -> None:
+    """P1-2.5: GGUF and safetensors paths agree on config, tokenizer specials, and key weights."""
+    import json
+
+    from safetensors.torch import save_file
+
+    gguf_root = tmp_path / "gguf"
+    gguf_root.mkdir()
+    gguf_dir, main_arrays, mmproj_arrays = _build_test_gguf_model_dir(gguf_root)
+    gguf_config = load_qwen3_5_text_model_config(gguf_dir)
+    gguf_model, _ = build_qwen3_5_text_model(gguf_config, device=torch.device("cpu"), dtype=torch.float32)
+    load_qwen3_5_text_model_weights(gguf_model, gguf_dir)
+
+    st_dir = tmp_path / "safetensors"
+    st_dir.mkdir()
+    text = gguf_config.text_config
+    vision = gguf_config.vision_config
+    assert vision is not None
+    (st_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5",
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "tie_word_embeddings": True,
+                "image_token_id": int(gguf_config.image_token_id),
+                "video_token_id": int(gguf_config.video_token_id),
+                "vision_start_token_id": int(gguf_config.vision_start_token_id),
+                "vision_end_token_id": int(gguf_config.vision_end_token_id),
+                "text_config": {
+                    "hidden_size": text.hidden_size,
+                    "intermediate_size": text.intermediate_size,
+                    "num_hidden_layers": text.num_hidden_layers,
+                    "num_attention_heads": text.num_attention_heads,
+                    "num_key_value_heads": text.num_key_value_heads,
+                    "head_dim": text.head_dim,
+                    "linear_key_head_dim": text.linear_key_head_dim,
+                    "linear_value_head_dim": text.linear_value_head_dim,
+                    "linear_num_key_heads": text.linear_num_key_heads,
+                    "linear_num_value_heads": text.linear_num_value_heads,
+                    "vocab_size": text.vocab_size,
+                    "max_position_embeddings": text.max_position_embeddings,
+                    "layer_types": list(text.layer_types),
+                    "rms_norm_eps": text.rms_norm_eps,
+                    "full_attention_interval": getattr(text, "full_attention_interval", 4),
+                    "linear_conv_kernel_dim": text.linear_conv_kernel_dim,
+                    "moe_intermediate_size": text.moe_intermediate_size,
+                    "shared_expert_intermediate_size": text.shared_expert_intermediate_size,
+                    "num_experts": text.num_experts,
+                    "num_experts_per_tok": text.num_experts_per_tok,
+                    "decoder_sparse_step": text.decoder_sparse_step,
+                    "norm_topk_prob": text.norm_topk_prob,
+                    "rope_parameters": {
+                        "rope_type": text.rope_parameters.rope_type,
+                        "rope_theta": text.rope_parameters.rope_theta,
+                        "partial_rotary_factor": text.rope_parameters.partial_rotary_factor,
+                        "mrope_section": list(text.rope_parameters.mrope_section or []),
+                    },
+                },
+                "vision_config": {
+                    "depth": vision.depth,
+                    "hidden_size": vision.hidden_size,
+                    "intermediate_size": vision.intermediate_size,
+                    "num_heads": vision.num_heads,
+                    "in_channels": vision.in_channels,
+                    "patch_size": vision.patch_size,
+                    "spatial_merge_size": vision.spatial_merge_size,
+                    "temporal_patch_size": vision.temporal_patch_size,
+                    "out_hidden_size": vision.out_hidden_size,
+                    "num_position_embeddings": vision.num_position_embeddings,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    state: dict[str, torch.Tensor] = {}
+    seen_ptrs: set[int] = set()
+    for name, tensor in gguf_model.state_dict().items():
+        cpu = tensor.detach().cpu().contiguous()
+        # safetensors rejects shared storages (tied embed/lm_head); clone duplicates.
+        if cpu.data_ptr() in seen_ptrs:
+            cpu = cpu.clone()
+        seen_ptrs.add(cpu.data_ptr())
+        state[name] = cpu
+    save_file(state, str(st_dir / "model.safetensors"))
+
+    # --- config matrix ---
+    st_config = load_qwen3_5_text_model_config(st_dir)
+    assert st_config.text_config.hidden_size == gguf_config.text_config.hidden_size
+    assert st_config.text_config.num_hidden_layers == gguf_config.text_config.num_hidden_layers
+    assert st_config.text_config.layer_types == gguf_config.text_config.layer_types
+    assert st_config.text_config.num_experts == gguf_config.text_config.num_experts
+    assert st_config.text_config.linear_key_head_dim == gguf_config.text_config.linear_key_head_dim
+    assert st_config.vision_config is not None
+    assert st_config.vision_config.hidden_size == gguf_config.vision_config.hidden_size
+    assert st_config.vision_config.temporal_patch_size == gguf_config.vision_config.temporal_patch_size
+    assert st_config.image_token_id == gguf_config.image_token_id
+
+    # --- weight matrix (key tensors round-trip through safetensors loader) ---
+    st_model, _ = build_qwen3_5_text_model(st_config, device=torch.device("cpu"), dtype=torch.float32)
+    st_report = load_qwen3_5_text_model_weights(st_model, st_dir)
+    assert st_report.loaded > 0
+
+    assert torch.allclose(
+        st_model.model.language_model.embed_tokens.weight,
+        gguf_model.model.language_model.embed_tokens.weight,
+    )
+    assert torch.allclose(
+        st_model.model.language_model.layers[0].linear_attn.in_proj_qkv.weight,
+        gguf_model.model.language_model.layers[0].linear_attn.in_proj_qkv.weight,
+    )
+    assert torch.allclose(
+        st_model.model.language_model.layers[1].self_attn.q_proj.weight,
+        gguf_model.model.language_model.layers[1].self_attn.q_proj.weight,
+    )
+    assert torch.allclose(
+        st_model.model.visual.patch_embed.proj.weight,
+        gguf_model.model.visual.patch_embed.proj.weight,
+    )
+
+    # --- footprint matrix ---
+    gguf_bytes = estimate_qwen3_5_text_model_weight_bytes(gguf_dir)
+    st_bytes = estimate_qwen3_5_text_model_weight_bytes(st_dir)
+    assert gguf_bytes > 0
+    assert st_bytes > 0
+    # GGUF estimate counts raw file tensors (incl. mmproj); safetensors counts dumped state_dict.
+    # Both must be in the same order of magnitude for the toy fixture.
+    assert min(gguf_bytes, st_bytes) * 4 >= max(gguf_bytes, st_bytes)
+
+    # --- int4 placeholder path still loads from GGUF ---
+    int4_model, quantized = build_qwen3_5_text_model(
+        gguf_config,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        int4_placeholder_predicate=lambda module_name, _module: ".mlp.experts." in module_name,
+    )
+    assert quantized > 0
+    load_qwen3_5_text_model_weights(int4_model, gguf_dir)
+    assert isinstance(int4_model.model.language_model.layers[0].mlp.experts[0].gate_proj, XPUInt4Linear)
+
+    # Reference values from original GGUF arrays remain coherent.
+    assert main_arrays["token_embd.weight"].shape[1] == text.hidden_size
+    assert "v.patch_embd.weight" in mmproj_arrays

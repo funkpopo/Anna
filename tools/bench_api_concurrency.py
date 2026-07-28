@@ -157,7 +157,7 @@ def _run_one(
     base_url: str,
     route: str,
     model: str,
-    prompt: str,
+    prompt: str | list[dict[str, object]],
     system_prompt: str | None,
     max_tokens: int,
     temperature: float,
@@ -167,6 +167,17 @@ def _run_one(
 ) -> RequestResult:
     url = base_url.rstrip("/") + route
     if route.endswith("/v1/completions"):
+        if not isinstance(prompt, str):
+            return RequestResult(
+                False,
+                None,
+                "Multimodal content requires /v1/chat/completions",
+                0.0,
+                None,
+                0,
+                0,
+                (),
+            )
         payload: dict[str, Any] = {
             "model": model,
             "prompt": prompt,
@@ -175,7 +186,7 @@ def _run_one(
             "stream": stream,
         }
     else:
-        messages: list[dict[str, str]] = []
+        messages: list[dict[str, object]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
@@ -238,12 +249,39 @@ def _long_prompt() -> str:
     return "\n".join([paragraph for _ in range(24)])
 
 
-def _prompt_for_request(base_prompt: str, *, scenario: str, index: int) -> tuple[str, str | None]:
+def _multimodal_user_content(
+    prompt: str,
+    *,
+    image: str | None = None,
+    video: str | None = None,
+) -> list[dict[str, object]] | str:
+    if image is None and video is None:
+        return prompt
+    content: list[dict[str, object]] = [{"type": "text", "text": prompt}]
+    if image is not None:
+        content.append({"type": "image_url", "image_url": {"url": image}})
+    if video is not None:
+        content.append({"type": "video_url", "video_url": {"url": video}})
+    return content
+
+
+def _prompt_for_request(
+    base_prompt: str,
+    *,
+    scenario: str,
+    index: int,
+    image: str | None = None,
+    video: str | None = None,
+) -> tuple[str | list[dict[str, object]], str | None]:
+    """Return (user content, optional system prompt) for a concurrency scenario.
+
+    User content may be a plain string or OpenAI-style multimodal content parts.
+    """
     shared_system = (
         "你是一个严谨的系统性能分析助手。回答必须短、直接，并优先给出可验证的工程判断。"
     )
     if scenario == "custom":
-        return base_prompt, None
+        return _multimodal_user_content(base_prompt, image=image, video=video), None
     if scenario == "concurrent-short":
         return f"{base_prompt}\n请求编号 {index}：用三句话回答。", None
     if scenario == "single-long":
@@ -254,6 +292,40 @@ def _prompt_for_request(base_prompt: str, *, scenario: str, index: int) -> tuple
         return f"{base_prompt}\n请求编号 {index}：只输出 3 个要点。", None
     if scenario == "repeated-system":
         return f"{base_prompt}\n请求编号 {index}：保持回答在 60 字以内。", shared_system
+    if scenario == "multimodal-image":
+        if not image:
+            raise ValueError("--scenario=multimodal-image requires --image")
+        return (
+            _multimodal_user_content(
+                f"{base_prompt}\n请求编号 {index}：请结合图片简要回答。",
+                image=image,
+            ),
+            None,
+        )
+    if scenario == "multimodal-video":
+        if not video:
+            raise ValueError("--scenario=multimodal-video requires --video")
+        return (
+            _multimodal_user_content(
+                f"{base_prompt}\n请求编号 {index}：请结合视频简要回答。",
+                video=video,
+            ),
+            None,
+        )
+    if scenario == "mixed-text-multimodal":
+        # Alternate text-only and image requests so the server exercises VL isolation
+        # against concurrent text decode (P1-2.6 coexistence scenario).
+        if index % 2 == 0:
+            return f"{base_prompt}\n请求编号 {index}：只输出 3 个要点。", None
+        if not image:
+            raise ValueError("--scenario=mixed-text-multimodal requires --image")
+        return (
+            _multimodal_user_content(
+                f"{base_prompt}\n请求编号 {index}：结合图片给出一条建议。",
+                image=image,
+            ),
+            None,
+        )
     raise ValueError(f"Unsupported scenario: {scenario}")
 
 
@@ -330,9 +402,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-file", default=None, help="Read prompt text from a UTF-8 file.")
     parser.add_argument(
         "--scenario",
-        choices=("custom", "concurrent-short", "single-long", "mixed", "repeated-system"),
+        choices=(
+            "custom",
+            "concurrent-short",
+            "single-long",
+            "mixed",
+            "repeated-system",
+            "multimodal-image",
+            "multimodal-video",
+            "mixed-text-multimodal",
+        ),
         default="custom",
-        help="Built-in prompt scenario. repeated-system is useful with --prompt-cache-size on the server.",
+        help=(
+            "Built-in prompt scenario. repeated-system is useful with --prompt-cache-size on the server. "
+            "multimodal-* and mixed-text-multimodal exercise VL isolation against text decode."
+        ),
+    )
+    parser.add_argument(
+        "--image",
+        default=None,
+        help="Local path or URL for multimodal-image / mixed-text-multimodal / custom chat image content.",
+    )
+    parser.add_argument(
+        "--video",
+        default=None,
+        help="Local path or URL for multimodal-video / custom chat video content.",
     )
     parser.add_argument("--requests", type=int, default=16)
     parser.add_argument("--concurrency", type=int, default=4)
@@ -363,7 +457,13 @@ def main() -> int:
     results: list[RequestResult] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         request_prompts = [
-            _prompt_for_request(prompt, scenario=args.scenario, index=idx)
+            _prompt_for_request(
+                prompt,
+                scenario=args.scenario,
+                index=idx,
+                image=args.image,
+                video=args.video,
+            )
             for idx in range(args.requests)
         ]
         futures = [
@@ -394,6 +494,9 @@ def main() -> int:
         "base_url": args.base_url,
         "route": args.route,
         "model": args.model,
+        "scenario": args.scenario,
+        "image": args.image,
+        "video": args.video,
         "requests": args.requests,
         "concurrency": args.concurrency,
         "max_tokens": args.max_tokens,

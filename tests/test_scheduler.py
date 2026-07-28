@@ -210,13 +210,15 @@ class _FakeModel:
         )()
 
 
-def _prepared(prompt_tokens: list[int]) -> PreparedInputs:
+def _prepared(prompt_tokens: list[int], *, multimodal: bool = False) -> PreparedInputs:
     input_ids = torch.tensor([prompt_tokens], dtype=torch.long)
     return PreparedInputs(
         prompt="",
         input_ids=input_ids,
         attention_mask=torch.ones_like(input_ids, dtype=torch.long),
         mm_token_type_ids=torch.zeros_like(input_ids, dtype=torch.int32),
+        pixel_values=torch.randn(4, 8) if multimodal else None,
+        image_grid_thw=torch.tensor([[1, 2, 2]], dtype=torch.long) if multimodal else None,
     )
 
 
@@ -512,6 +514,132 @@ def test_scheduler_keeps_stable_decode_batches_without_cache_resplit() -> None:
         assert snapshot.scheduler_decode_batch_count == 3
         assert snapshot.scheduler_decode_batch_requests_total == 6
         assert snapshot.scheduler_decode_batch_requests_max == 2
+    finally:
+        scheduler.shutdown()
+
+
+def test_scheduler_marks_multimodal_requests_and_preserves_media() -> None:
+    config = Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            vocab_size=16,
+            eos_token_id=9,
+            pad_token_id=0,
+            cache_block_size=2,
+            layer_types=["full_attention"],
+        )
+    )
+    fake_model = _FakeModel(config)
+    engine = AnnaQwen3_5TextEngine(
+        model=fake_model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="fake",
+        device_context=_FakeDeviceContext(),
+    )
+    scheduler = AnnaScheduler(engine, max_batch_size=4, batch_wait_ms=0.0)
+    engine.set_scheduler(scheduler)
+    try:
+        mm_prepared = _prepared([4, 5], multimodal=True)
+        text_prepared = _prepared([6, 7])
+        mm_request = SchedulerRequest(prepared=mm_prepared, config=GenerationConfig(max_new_tokens=1), stream=False, is_multimodal=True)
+        text_request = SchedulerRequest(prepared=text_prepared, config=GenerationConfig(max_new_tokens=1), stream=False)
+        mm_request.prompt_length = 2
+        text_request.prompt_length = 2
+
+        batched_mm = scheduler._batch_text_inputs([mm_request])
+        assert batched_mm.pixel_values is not None
+        assert batched_mm.image_grid_thw is not None
+
+        accepted, deferred = scheduler._select_prefill_admission([mm_request, text_request, SchedulerRequest(
+            prepared=_prepared([8, 9], multimodal=True),
+            config=GenerationConfig(max_new_tokens=1),
+            stream=False,
+            is_multimodal=True,
+            prompt_length=2,
+        )])
+        assert len(accepted) == 2  # one multimodal + text
+        assert sum(1 for req in accepted if req.is_multimodal) == 1
+        assert len(deferred) == 1
+        assert deferred[0].is_multimodal
+    finally:
+        scheduler.shutdown()
+
+
+def test_scheduler_defers_multimodal_prefill_while_text_decode_is_hot() -> None:
+    config = Qwen3_5TextModelConfig(
+        text_config=Qwen3_5TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            vocab_size=16,
+            eos_token_id=9,
+            pad_token_id=0,
+            cache_block_size=2,
+            layer_types=["full_attention"],
+        )
+    )
+    fake_model = _FakeModel(config)
+    engine = AnnaQwen3_5TextEngine(
+        model=fake_model,
+        tokenizer=_FakeTokenizer(),
+        processor=object(),
+        model_id="fake",
+        device_context=_FakeDeviceContext(),
+    )
+    scheduler = AnnaScheduler(
+        engine,
+        max_batch_size=4,
+        batch_wait_ms=0.0,
+        prefill_interval_steps=1,
+        max_queue_wait_ms=0.0,
+    )
+    engine.set_scheduler(scheduler)
+    try:
+        text_decode = SchedulerRequest(
+            prepared=_prepared([4, 5]),
+            config=GenerationConfig(max_new_tokens=4),
+            stream=False,
+            prompt_length=2,
+            input_ids=torch.tensor([[1]], dtype=torch.long),
+            past_key_values=object(),
+        )
+        mm_pending = SchedulerRequest(
+            prepared=_prepared([6, 7], multimodal=True),
+            config=GenerationConfig(max_new_tokens=1),
+            stream=False,
+            is_multimodal=True,
+            prompt_length=2,
+        )
+        with scheduler._condition:
+            scheduler._pending.append(mm_pending)
+        scheduler._decode_steps_since_prefill = 1
+        assert scheduler._should_admit_prefill([text_decode]) is False
+
+        # Fairness timeout can still force VL admission.
+        scheduler.max_queue_wait_seconds = 0.0
+        mm_pending.queued_at = 0.0
+        scheduler.max_queue_wait_seconds = 0.001
+        import time as _time
+
+        mm_pending.queued_at = _time.perf_counter() - 1.0
+        assert scheduler._should_admit_prefill([text_decode]) is True
     finally:
         scheduler.shutdown()
 

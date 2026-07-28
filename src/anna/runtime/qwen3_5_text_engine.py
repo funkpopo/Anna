@@ -815,6 +815,9 @@ class AnnaQwen3_5TextEngine:
             report.quantized_replacements,
         )
 
+        if resolved_offload_vision:
+            device_context.migration_policy.keep_media_on_host = True
+
         engine = cls(
             model=model,
             tokenizer=tokenizer,
@@ -1175,6 +1178,68 @@ class AnnaQwen3_5TextEngine:
         budget_bytes = int(max(0, int(memory_info.free_bytes) - reserve_bytes) / budget_factor)
         return budget_bytes, reserve_bytes, budget_factor
 
+    @staticmethod
+    def select_resident_layers_by_heat(
+        *,
+        layer_candidates: list[tuple[int, int, float]],
+        budget_bytes: int,
+    ) -> tuple[int, ...]:
+        """Pick resident sparse layers under a byte budget, preferring higher routing heat.
+
+        ``layer_candidates`` is a list of ``(layer_idx, layer_bytes, heat)``.
+        When all heats are zero (cold start), falls back to sequential first-fit so
+        startup behaviour matches the historical front-N policy.
+        """
+        if budget_bytes <= 0 or not layer_candidates:
+            return ()
+
+        has_heat = any(heat > 0.0 for _, _, heat in layer_candidates)
+        if has_heat:
+            ordered = sorted(
+                layer_candidates,
+                key=lambda item: (item[2], -item[0]),
+                reverse=True,
+            )
+        else:
+            ordered = sorted(layer_candidates, key=lambda item: item[0])
+
+        selected: list[int] = []
+        consumed = 0
+        for layer_idx, layer_bytes, _heat in ordered:
+            if layer_bytes <= 0:
+                continue
+            if consumed + layer_bytes > budget_bytes:
+                continue
+            selected.append(int(layer_idx))
+            consumed += int(layer_bytes)
+        # Keep decoder order in the returned indices for stable logging/configure.
+        return tuple(sorted(selected))
+
+    @classmethod
+    def _collect_sparse_layer_candidates(
+        cls,
+        *,
+        model: Qwen3_5TextForConditionalGeneration,
+        expert_quant: str,
+        layer_heats: dict[int, float] | None = None,
+    ) -> list[tuple[int, int, float]]:
+        text_model = cls._text_model(model)
+        if text_model is None or not hasattr(text_model, "layers"):
+            return []
+        heats = layer_heats or {}
+        candidates: list[tuple[int, int, float]] = []
+        for layer_idx, layer in enumerate(text_model.layers):
+            if not isinstance(layer.mlp, Qwen3SparseMoeBlock):
+                continue
+            layer_bytes = (
+                estimate_module_xpu_int4_bytes(layer.mlp.experts)
+                if expert_quant == "int4"
+                else cls._module_nbytes(layer.mlp.experts)
+            )
+            heat = float(heats.get(layer_idx, getattr(layer.mlp, "_layer_heat", 0.0) or 0.0))
+            candidates.append((layer_idx, int(layer_bytes), heat))
+        return candidates
+
     @classmethod
     def _estimate_resident_expert_layer_indices(
         cls,
@@ -1182,6 +1247,7 @@ class AnnaQwen3_5TextEngine:
         model: Qwen3_5TextForConditionalGeneration,
         device_context: DeviceContext,
         expert_quant: str,
+        layer_heats: dict[int, float] | None = None,
     ) -> tuple[int, ...]:
         device_context.synchronize()
         memory_info = device_context.get_memory_info()
@@ -1209,35 +1275,35 @@ class AnnaQwen3_5TextEngine:
             )
             return ()
 
-        selected_indices: list[int] = []
-        consumed_bytes = 0
-        layer_sizes: list[tuple[int, int]] = []
-        for layer_idx, layer in enumerate(text_model.layers):
-            if not isinstance(layer.mlp, Qwen3SparseMoeBlock):
-                continue
-            layer_bytes = (
-                estimate_module_xpu_int4_bytes(layer.mlp.experts)
-                if expert_quant == "int4"
-                else cls._module_nbytes(layer.mlp.experts)
-            )
-            layer_sizes.append((layer_idx, layer_bytes))
-            if layer_bytes <= 0 or consumed_bytes + layer_bytes > budget_bytes:
-                break
-            selected_indices.append(layer_idx)
-            consumed_bytes += layer_bytes
+        layer_candidates = cls._collect_sparse_layer_candidates(
+            model=model,
+            expert_quant=expert_quant,
+            layer_heats=layer_heats,
+        )
+        selected_indices = cls.select_resident_layers_by_heat(
+            layer_candidates=layer_candidates,
+            budget_bytes=budget_bytes,
+        )
+        selected_set = set(selected_indices)
+        consumed_bytes = sum(layer_bytes for layer_idx, layer_bytes, _ in layer_candidates if layer_idx in selected_set)
+        heat_map = {layer_idx: heat for layer_idx, _bytes, heat in layer_candidates if heat > 0.0}
 
         logger.info(
-            "Auto resident expert placement: expert_quant=%s free=%s reserve=%s budget_factor=%.2f budget=%s selected_layers=%s selected_bytes=%s candidate_layer_bytes=%s",
+            "Auto resident expert placement: expert_quant=%s free=%s reserve=%s budget_factor=%.2f budget=%s selected_layers=%s selected_bytes=%s heat_guided=%s candidate_layer_bytes=%s",
             expert_quant,
             format_bytes(memory_info.free_bytes),
             format_bytes(reserve_bytes),
             budget_factor,
             format_bytes(budget_bytes),
-            selected_indices,
+            list(selected_indices),
             format_bytes(consumed_bytes),
-            {layer_idx: format_bytes(layer_bytes) for layer_idx, layer_bytes in layer_sizes[:8]},
+            bool(heat_map),
+            {
+                layer_idx: format_bytes(layer_bytes)
+                for layer_idx, layer_bytes, _heat in layer_candidates[:8]
+            },
         )
-        return tuple(selected_indices)
+        return selected_indices
 
     @classmethod
     def _estimate_cached_experts_per_layer(
@@ -1520,6 +1586,7 @@ class AnnaQwen3_5TextEngine:
             "resident_expert_layers": self.resident_expert_layers,
             "resident_expert_layer_indices": self._resident_expert_layer_indices(),
             "cached_experts_per_layer": self.cached_experts_per_layer,
+            "expert_offload": self.expert_offload_stats(),
             "full_attention_cache_mirror": self.full_attention_cache_mirror,
             "runtime_optimizations": {
                 "compile_mode": self.optimization_config.compile_mode,
@@ -1636,6 +1703,101 @@ class AnnaQwen3_5TextEngine:
             if getattr(mlp, "resident_experts", False):
                 indices.append(layer_idx)
         return indices
+
+    def expert_offload_stats(self) -> dict[str, object]:
+        """Aggregate MoE expert cache hit/prefetch stats across offloaded sparse layers."""
+        blocks = self._offloaded_sparse_moe_blocks(self.model)
+        if not blocks:
+            return {
+                "offloaded_layers": 0,
+                "lookups": 0,
+                "hits": 0,
+                "misses": 0,
+                "staged": 0,
+                "hit_rate": 0.0,
+                "prefetch_requests": 0,
+                "prefetch_hits": 0,
+                "prefetch_staged": 0,
+                "layer_heats": {},
+            }
+
+        lookups = hits = misses = staged = 0
+        prefetch_requests = prefetch_hits = prefetch_staged = 0
+        layer_heats: dict[str, float] = {}
+        for layer_idx, block in blocks:
+            stats = block.expert_cache_stats()
+            lookups += stats.lookups
+            hits += stats.hits
+            misses += stats.misses
+            staged += stats.staged
+            prefetch_requests += stats.prefetch_requests
+            prefetch_hits += stats.prefetch_hits
+            prefetch_staged += stats.prefetch_staged
+            layer_heats[str(layer_idx)] = float(stats.layer_heat)
+
+        return {
+            "offloaded_layers": len(blocks),
+            "lookups": lookups,
+            "hits": hits,
+            "misses": misses,
+            "staged": staged,
+            "hit_rate": 0.0 if lookups <= 0 else hits / lookups,
+            "prefetch_requests": prefetch_requests,
+            "prefetch_hits": prefetch_hits,
+            "prefetch_staged": prefetch_staged,
+            "layer_heats": layer_heats,
+        }
+
+    def sparse_moe_layer_heats(self) -> dict[int, float]:
+        text_model = self._text_model(self.model)
+        if text_model is None or not hasattr(text_model, "layers"):
+            return {}
+        heats: dict[int, float] = {}
+        for layer_idx, layer in enumerate(text_model.layers):
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, Qwen3SparseMoeBlock):
+                heats[layer_idx] = float(getattr(mlp, "_layer_heat", 0.0) or 0.0)
+        return heats
+
+    def rebalance_resident_experts_by_heat(self) -> tuple[int, ...]:
+        """Re-pin sparse MoE layers using observed routing heat under the current memory budget.
+
+        Safe to call after warmup traffic. No-op when expert offload is disabled.
+        """
+        if self.offload_mode != "experts":
+            return tuple(self._resident_expert_layer_indices())
+
+        selected = self._estimate_resident_expert_layer_indices(
+            model=self.model,
+            device_context=self.device_context,
+            expert_quant=self.expert_quant,
+            layer_heats=self.sparse_moe_layer_heats(),
+        )
+        current = tuple(self._resident_expert_layer_indices())
+        if selected == current:
+            return current
+
+        logger.info(
+            "Rebalancing resident expert layers by routing heat: previous=%s next=%s",
+            list(current),
+            list(selected),
+        )
+        self.model.configure_runtime(
+            self.device_context.device,
+            offload_experts=True,
+            offload_vision=self.offload_vision,
+            offload_token_io=False,
+            resident_expert_layers=0,
+            resident_expert_layer_indices=selected,
+            expert_quant=self.expert_quant,
+            cached_experts_per_layer=self.cached_experts_per_layer,
+            kv_cache_quantization=self.optimization_config.kv_cache_quantization,
+            kv_cache_quant_bits=self.optimization_config.kv_cache_quant_bits,
+            kv_cache_residual_len=self.optimization_config.kv_cache_residual_len,
+        )
+        self.resident_expert_layer_indices = tuple(selected)
+        self.resident_expert_layers = len(selected)
+        return selected
 
     def generate_text(self, prompt: str, *, config: GenerationConfig) -> TextGenerationResult:
         prepared = self.processor.encode_text(
@@ -1827,12 +1989,14 @@ class AnnaQwen3_5TextEngine:
         return self.device_context.device
 
     def _can_use_scheduler(self, prepared: PreparedInputs) -> bool:
-        return (
-            self.scheduler is not None
-            and prepared.pixel_values is None
-            and prepared.pixel_values_videos is None
-            and prepared.input_features is None
-        )
+        # Multimodal requests are admitted through the scheduler so vision prefill can
+        # interleave with text decode (see AnnaScheduler multimodal isolation).
+        # Audio features (Gemma path) still bypass until feature batching exists.
+        if self.scheduler is None:
+            return False
+        if prepared.input_features is not None:
+            return False
+        return True
 
     def _has_multimodal_inputs(self, prepared: PreparedInputs) -> bool:
         return any(getattr(prepared, key) is not None for key in self._forward_multimodal_input_keys())

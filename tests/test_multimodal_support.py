@@ -484,3 +484,49 @@ def test_qwen3_conditional_generation_uses_qwen_multimodal_grid_metadata() -> No
         )
 
     assert outputs.logits.shape == (1, input_ids.shape[1], config.text_config.vocab_size)
+
+
+def test_vision_tower_chunked_forward_matches_single_wave(monkeypatch) -> None:
+    config = _config()
+    assert config.vision_config is not None
+    vision = Qwen3_5TextForConditionalGeneration(config).model.visual
+    assert vision is not None
+    vision.eval()
+
+    # Two images, 1x4x4 patches each → 16 tokens each.
+    pixel_values = torch.randn(32, 3 * 2 * 2 * 2)
+    grid_thw = torch.tensor([[1, 4, 4], [1, 4, 4]], dtype=torch.long)
+
+    monkeypatch.setenv("ANNA_VISION_CHUNK_IMAGES", "0")
+    with torch.no_grad():
+        full = vision(pixel_values, grid_thw)
+
+    monkeypatch.setenv("ANNA_VISION_CHUNK_IMAGES", "1")
+    with torch.no_grad():
+        chunked = vision(pixel_values, grid_thw)
+
+    assert torch.allclose(full.pooler_output, chunked.pooler_output, atol=1e-5, rtol=1e-4)
+    assert torch.allclose(full.last_hidden_state, chunked.last_hidden_state, atol=1e-5, rtol=1e-4)
+
+
+def test_get_image_features_offload_pipeline_moves_to_output_device() -> None:
+    config = _config()
+    config.text_config.layer_types = ["full_attention"] * config.text_config.num_hidden_layers
+    model = Qwen3_5TextForConditionalGeneration(config).eval()
+    model.configure_runtime(torch.device("cpu"), offload_vision=True)
+    assert model.model.visual is not None
+    visual_device = next(model.model.visual.parameters()).device
+    assert visual_device.type == "cpu"
+
+    pixel_values = torch.randn(16, 24)
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+    with torch.no_grad():
+        features, split_sizes = model.model.get_image_features(
+            pixel_values,
+            image_grid_thw,
+            output_device=torch.device("cpu"),
+            output_dtype=torch.float32,
+        )
+    assert features.device.type == "cpu"
+    assert features.dtype == torch.float32
+    assert split_sizes == [4]

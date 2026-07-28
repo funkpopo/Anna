@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 _DONE = object()
 
 
+def _prepared_is_multimodal(prepared: PreparedInputsLike) -> bool:
+    return any(
+        getattr(prepared, key, None) is not None
+        for key in ("pixel_values", "pixel_values_videos", "input_features")
+    )
+
+
 @dataclass(slots=True)
 class SchedulerRequest:
     prepared: PreparedInputsLike
@@ -51,6 +58,7 @@ class SchedulerRequest:
     first_token_at: float | None = None
     queued_at: float = field(default_factory=time.perf_counter)
     cancelled: bool = False
+    is_multimodal: bool = False
 
 
 @dataclass(slots=True)
@@ -162,7 +170,12 @@ class AnnaScheduler:
                 if metrics is not None:
                     metrics.record_queue_rejected(1)
                 raise self._queue_full_error(waiting=len(self._pending))
-            request = SchedulerRequest(prepared=prepared, config=config, stream=stream)
+            request = SchedulerRequest(
+                prepared=prepared,
+                config=config,
+                stream=stream,
+                is_multimodal=_prepared_is_multimodal(prepared),
+            )
             self._pending.append(request)
             self._condition.notify()
         if metrics is not None:
@@ -239,14 +252,27 @@ class AnnaScheduler:
                             self._fail_requests(group.requests, self._normalize_error(exc))
 
                 if ready:
-                    for chunk in self._iter_decode_chunks(ready):
+                    # Prefer text decode progress over inserting a multimodal prefill mid-wave
+                    # so VL image/video encoding does not stall interactive text completions.
+                    text_ready = [request for request in ready if not request.is_multimodal]
+                    mm_ready = [request for request in ready if request.is_multimodal]
+                    decode_order = text_ready + mm_ready
+                    for chunk in self._iter_decode_chunks(decode_order):
                         try:
                             next_active.extend(self._decode_batch(chunk))
                             self._decode_steps_since_prefill += 1
                             decoded_any = True
                         except Exception as exc:  # pragma: no cover - worker-level best effort
                             self._fail_requests(chunk, self._normalize_error(exc))
-                    if prefill_groups and self._should_run_prefill_step():
+                    run_prefill_now = prefill_groups and self._should_run_prefill_step()
+                    if run_prefill_now and text_ready and any(
+                        req.is_multimodal for group in prefill_groups for req in group.requests
+                    ):
+                        # Defer VL prefill one more decode cycle when text decode is still live,
+                        # unless fairness already forced admission.
+                        if not self._should_force_prefill_for_fairness():
+                            run_prefill_now = False
+                    if run_prefill_now:
                         group = prefill_groups[0]
                         try:
                             next_active.extend(self._prefill_group_step(group))
@@ -332,13 +358,22 @@ class AnnaScheduler:
                 metrics.record_queue_wait(request.generation_started_at - request.queued_at)
 
         active: list[SchedulerRequest | SchedulerPrefillGroup | SchedulerDecodeGroup] = []
-        groups: dict[int, list[SchedulerRequest]] = defaultdict(list)
-        for request in requests:
-            groups[request.prompt_length].append(request)
+        # Never mix multimodal and text-only requests in one prefill group: vision media
+        # cannot be safely batched with plain text, and VL should not inflate text TTFT.
+        text_requests = [request for request in requests if not request.is_multimodal]
+        multimodal_requests = [request for request in requests if request.is_multimodal]
 
+        groups: dict[int, list[SchedulerRequest]] = defaultdict(list)
+        for request in text_requests:
+            groups[request.prompt_length].append(request)
         for _, group in sorted(groups.items()):
             for chunk in self._iter_prefill_group_chunks(group):
                 active.extend(self._prefill_same_length_group(chunk))
+
+        # Multimodal prefills run solo (one request per group) so media tensors stay intact
+        # and expensive vision towers do not share a batch with unrelated prompts.
+        for request in multimodal_requests:
+            active.extend(self._prefill_same_length_group([request]))
         return active
 
     def _ensure_request_initialized(self, request: SchedulerRequest) -> None:
@@ -399,18 +434,23 @@ class AnnaScheduler:
         requests: list[SchedulerRequest],
     ) -> tuple[list[SchedulerRequest], list[SchedulerRequest]]:
         max_prefill_tokens, _ = self._effective_token_budgets()
-        if max_prefill_tokens <= 0:
-            return requests, []
         accepted: list[SchedulerRequest] = []
         deferred: list[SchedulerRequest] = []
         used_tokens = 0
+        multimodal_admitted = 0
         for request in requests:
             prompt_tokens = max(1, int(request.prompt_length))
-            if accepted and used_tokens + prompt_tokens > max_prefill_tokens:
+            # Cap concurrent multimodal admissions per wave to protect text throughput.
+            if request.is_multimodal and multimodal_admitted >= 1 and accepted:
+                deferred.append(request)
+                continue
+            if max_prefill_tokens > 0 and accepted and used_tokens + prompt_tokens > max_prefill_tokens:
                 deferred.append(request)
                 continue
             accepted.append(request)
             used_tokens += prompt_tokens
+            if request.is_multimodal:
+                multimodal_admitted += 1
         return accepted, deferred
 
     def _requeue_front(self, requests: list[SchedulerRequest]) -> None:
@@ -456,6 +496,38 @@ class AnnaScheduler:
             return False
         return self._oldest_pending_wait_seconds() >= self.max_queue_wait_seconds
 
+    def _pending_head_is_multimodal(self) -> bool:
+        with self._condition:
+            if not self._pending:
+                return False
+            return bool(self._pending[0].is_multimodal)
+
+    def _active_has_text_decode(
+        self,
+        active: list[SchedulerRequest | SchedulerPrefillGroup | SchedulerDecodeGroup],
+    ) -> bool:
+        for item in active:
+            if isinstance(item, SchedulerDecodeGroup):
+                if any(not request.is_multimodal for request in item.requests):
+                    return True
+            elif isinstance(item, SchedulerRequest):
+                if (
+                    not item.is_multimodal
+                    and item.past_key_values is not None
+                    and item.input_ids is not None
+                ):
+                    return True
+        return False
+
+    def _active_has_multimodal_prefill(
+        self,
+        active: list[SchedulerRequest | SchedulerPrefillGroup | SchedulerDecodeGroup],
+    ) -> bool:
+        for item in active:
+            if isinstance(item, SchedulerPrefillGroup) and any(req.is_multimodal for req in item.requests):
+                return True
+        return False
+
     def _should_admit_prefill(
         self,
         active: list[SchedulerRequest | SchedulerPrefillGroup | SchedulerDecodeGroup],
@@ -463,6 +535,18 @@ class AnnaScheduler:
         if not self._pending:
             return False
         if any(isinstance(item, SchedulerPrefillGroup) for item in active):
+            return False
+        # Avoid letting a heavy VL prefill cut into an active text decode wave unless the
+        # queue head has waited long enough (fairness) or the GPU is otherwise ready.
+        if (
+            self._pending_head_is_multimodal()
+            and self._active_has_text_decode(active)
+            and not self._should_force_prefill_for_fairness()
+            and self._decode_steps_since_prefill < max(self.prefill_interval_steps, 4)
+        ):
+            return False
+        # At most one concurrent multimodal prefill group so VL does not monopolize the device.
+        if self._pending_head_is_multimodal() and self._active_has_multimodal_prefill(active):
             return False
         if self._decode_steps_since_prefill >= self.prefill_interval_steps:
             return True
@@ -487,11 +571,15 @@ class AnnaScheduler:
         self._guard_batch_memory(requests)
         prompt_length = int(batched.input_ids.shape[1])
         configured_chunk_size = int(getattr(self.engine.optimization_config, "prefill_chunk_size", 0))
-        past_key_values = (
-            self.engine._reserve_prefill_cache(batched)
-            if configured_chunk_size > 0 and prompt_length > configured_chunk_size
-            else None
+        # Multimodal prefills keep a single vision+text step: mrope / media injection is not
+        # safe to split across token chunks the way text-only prefill is.
+        is_multimodal_group = any(request.is_multimodal for request in requests)
+        use_chunked = (
+            not is_multimodal_group
+            and configured_chunk_size > 0
+            and prompt_length > configured_chunk_size
         )
+        past_key_values = self.engine._reserve_prefill_cache(batched) if use_chunked else None
         return self._prefill_group_step(
             SchedulerPrefillGroup(
                 requests=requests,
@@ -514,7 +602,11 @@ class AnnaScheduler:
             return []
         prompt_length = int(group.batched.input_ids.shape[1])
         configured_chunk_size = int(getattr(self.engine.optimization_config, "prefill_chunk_size", 0))
-        chunk_size = prompt_length if configured_chunk_size <= 0 else min(configured_chunk_size, prompt_length)
+        is_multimodal_group = any(request.is_multimodal for request in requests)
+        if is_multimodal_group or configured_chunk_size <= 0:
+            chunk_size = prompt_length
+        else:
+            chunk_size = min(configured_chunk_size, prompt_length)
         start_idx = group.next_start_idx
         end_idx = min(prompt_length, start_idx + chunk_size)
         is_final_chunk = end_idx >= prompt_length
@@ -1074,6 +1166,10 @@ class AnnaScheduler:
         )
 
     def _batch_text_inputs(self, requests: list[SchedulerRequest]) -> PreparedInputsLike:
+        # Single multimodal request: preserve media tensors for vision prefill.
+        if len(requests) == 1 and requests[0].is_multimodal:
+            return requests[0].prepared
+
         max_prompt_length = max(request.prompt_length for request in requests)
         text_config = self.engine.config.text_config
         pad_token_id = text_config.pad_token_id if 0 <= text_config.pad_token_id < text_config.vocab_size else 0
@@ -1087,7 +1183,8 @@ class AnnaScheduler:
             length = request.prompt_length
             input_ids[batch_idx, :length] = request.prepared.input_ids[0, :length]
             attention_mask[batch_idx, :length] = request.prepared.attention_mask[0, :length]
-            mm_token_type_ids[batch_idx, :length] = request.prepared.mm_token_type_ids[0, :length]
+            if request.prepared.mm_token_type_ids is not None:
+                mm_token_type_ids[batch_idx, :length] = request.prepared.mm_token_type_ids[0, :length]
 
         return prepared_type(
             prompt="",

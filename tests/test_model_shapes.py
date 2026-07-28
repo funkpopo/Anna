@@ -1058,6 +1058,68 @@ def test_engine_leaves_resident_expert_indices_for_auto_estimation_when_unspecif
     assert resolved is None
 
 
+def test_select_resident_layers_by_heat_falls_back_to_sequential_when_cold() -> None:
+    selected = AnnaQwen3_5TextEngine.select_resident_layers_by_heat(
+        layer_candidates=[(0, 100, 0.0), (2, 100, 0.0), (4, 100, 0.0)],
+        budget_bytes=250,
+    )
+    assert selected == (0, 2)
+
+
+def test_select_resident_layers_by_heat_prefers_hot_layers() -> None:
+    selected = AnnaQwen3_5TextEngine.select_resident_layers_by_heat(
+        layer_candidates=[(0, 100, 1.0), (2, 100, 9.0), (4, 100, 5.0)],
+        budget_bytes=200,
+    )
+    # Hottest first under budget: layer 2 then 4 (not sequential front).
+    assert selected == (2, 4)
+
+
+def test_sparse_moe_expert_cache_stats_and_prefetch() -> None:
+    block = Qwen3SparseMoeBlock(_tiny_moe_config())
+    block.configure_runtime(
+        torch.device("cpu"),
+        offload_experts=True,
+        cached_experts_per_layer=2,
+    )
+
+    prepared = block._prepare_cached_experts([0, 1])
+    assert set(prepared) == {0, 1}
+    stats = block.expert_cache_stats()
+    assert stats.lookups == 2
+    assert stats.hits == 0
+    assert stats.misses == 2
+    assert stats.staged == 2
+
+    prepared_again = block._prepare_cached_experts([0, 1])
+    assert set(prepared_again) == {0, 1}
+    stats = block.expert_cache_stats()
+    assert stats.lookups == 4
+    assert stats.hits == 2
+    assert stats.misses == 2
+    assert stats.hit_rate == 0.5
+
+    # Simulate routing heat favoring expert 3, then prefetch it synchronously.
+    block._expert_heat = [0.0, 0.1, 0.0, 5.0]
+    staged = block.prefetch_experts(async_copy=False)
+    assert staged >= 1
+    assert 3 in block._expert_cache
+    prefetch_stats = block.expert_cache_stats()
+    assert prefetch_stats.prefetch_requests >= 1
+    assert prefetch_stats.prefetch_staged >= 1
+
+
+def test_sparse_moe_forward_records_layer_heat() -> None:
+    with _temporary_torch_seed(0):
+        block = Qwen3SparseMoeBlock(_tiny_moe_config()).eval()
+        hidden = torch.randn(1, 2, block._config.hidden_size)
+    with torch.no_grad():
+        _ = block(hidden)
+    assert block._layer_heat > 0.0
+    assert block._routing_tokens == 2
+    assert any(heat > 0.0 for heat in block._expert_heat)
+
+
 def test_engine_runtime_weight_quantization_converts_dense_text_linears() -> None:
     model = Qwen3_5TextForCausalLM(_tiny_config())
     before_bytes = AnnaQwen3_5TextEngine._module_nbytes(model)

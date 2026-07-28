@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -2664,7 +2665,32 @@ class Qwen3MLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+@dataclass(slots=True)
+class ExpertCacheStats:
+    """Aggregate expert offload cache counters for health / metrics."""
+
+    lookups: int = 0
+    hits: int = 0
+    misses: int = 0
+    staged: int = 0
+    prefetch_requests: int = 0
+    prefetch_hits: int = 0
+    prefetch_staged: int = 0
+    routing_tokens: int = 0
+    layer_heat: float = 0.0
+
+    @property
+    def hit_rate(self) -> float:
+        if self.lookups <= 0:
+            return 0.0
+        return self.hits / self.lookups
+
+
 class Qwen3SparseMoeBlock(nn.Module):
+    # EMA decay for expert heat used by next-token prefetch and hot-layer selection.
+    _EXPERT_HEAT_DECAY = 0.9
+    _LAYER_HEAT_DECAY = 0.95
+
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
         self._config = config
@@ -2685,6 +2711,18 @@ class Qwen3SparseMoeBlock(nn.Module):
         self._host_prepacked_expert_cache: OrderedDict[int, Qwen3MLP] = OrderedDict()
         self._grouped_int4_lru: OrderedDict[int, None] = OrderedDict()
         self._grouped_int4_bank: _GroupedInt4ExpertBank | None = None
+        self._cache_lookups = 0
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_staged = 0
+        self._prefetch_requests = 0
+        self._prefetch_hits = 0
+        self._prefetch_staged = 0
+        self._routing_tokens = 0
+        self._layer_heat = 0.0
+        self._expert_heat = [0.0] * self.num_experts
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_pending: set[int] = set()
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList(
             [Qwen3MLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
@@ -2715,6 +2753,18 @@ class Qwen3SparseMoeBlock(nn.Module):
         self._grouped_int4_bank = None
         self.host_experts_pinned = False
         self.host_prepacked_experts_pinned = False
+        self._cache_lookups = 0
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_staged = 0
+        self._prefetch_requests = 0
+        self._prefetch_hits = 0
+        self._prefetch_staged = 0
+        self._routing_tokens = 0
+        self._layer_heat = 0.0
+        self._expert_heat = [0.0] * self.num_experts
+        with self._prefetch_lock:
+            self._prefetch_pending.clear()
 
         if resident_experts and self._should_use_xpu_int4():
             for expert in self.experts:
@@ -3068,6 +3118,9 @@ class Qwen3SparseMoeBlock(nn.Module):
                 cache_hits += 1
 
         missing = [int(expert_idx) for expert_idx in required_expert_indices if int(expert_idx) not in slots_by_expert]
+        self._cache_lookups += len(required_expert_indices)
+        self._cache_hits += cache_hits
+        self._cache_misses += len(missing)
         for expert_idx in missing:
             if self.offload_experts:
                 expert_layer = self._get_host_prepacked_expert(expert_idx)
@@ -3110,6 +3163,8 @@ class Qwen3SparseMoeBlock(nn.Module):
             )
             slots_by_expert[expert_idx] = free_slot
             staged += 1
+
+        self._cache_staged += staged
 
         if self.profile_runtime and hasattr(torch, "xpu"):
             torch.xpu.synchronize()
@@ -3339,7 +3394,131 @@ class Qwen3SparseMoeBlock(nn.Module):
         self._expert_cache[expert_idx] = cached
         return cached
 
-    def _prepare_cached_experts(self, required_expert_indices: list[int]) -> dict[int, Qwen3MLP]:
+    def expert_cache_stats(self) -> ExpertCacheStats:
+        return ExpertCacheStats(
+            lookups=self._cache_lookups,
+            hits=self._cache_hits,
+            misses=self._cache_misses,
+            staged=self._cache_staged,
+            prefetch_requests=self._prefetch_requests,
+            prefetch_hits=self._prefetch_hits,
+            prefetch_staged=self._prefetch_staged,
+            routing_tokens=self._routing_tokens,
+            layer_heat=self._layer_heat,
+        )
+
+    def reset_expert_cache_stats(self) -> None:
+        self._cache_lookups = 0
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_staged = 0
+        self._prefetch_requests = 0
+        self._prefetch_hits = 0
+        self._prefetch_staged = 0
+
+    def _record_routing_heat(self, usage: torch.Tensor, *, num_tokens: int) -> None:
+        """Update EMA expert/layer heat from this forward's router usage histogram."""
+        self._routing_tokens += max(0, int(num_tokens))
+        usage_host = usage.detach()
+        if usage_host.device.type != "cpu":
+            usage_host = usage_host.to(device="cpu")
+        usage_list = [int(value) for value in usage_host.tolist()]
+        total_routes = sum(usage_list)
+        decay = self._EXPERT_HEAT_DECAY
+        for expert_idx, count in enumerate(usage_list):
+            if expert_idx >= len(self._expert_heat):
+                break
+            self._expert_heat[expert_idx] = decay * self._expert_heat[expert_idx] + (1.0 - decay) * float(count)
+        self._layer_heat = self._LAYER_HEAT_DECAY * self._layer_heat + (1.0 - self._LAYER_HEAT_DECAY) * float(
+            total_routes
+        )
+
+    def predicted_hot_experts(self, *, limit: int | None = None) -> list[int]:
+        """Return expert indices ranked by recent routing heat (hottest first)."""
+        capacity = self.cached_experts_per_layer if limit is None else max(0, int(limit))
+        if capacity <= 0:
+            return []
+        ranked = sorted(
+            range(self.num_experts),
+            key=lambda expert_idx: (self._expert_heat[expert_idx], -expert_idx),
+            reverse=True,
+        )
+        hot = [expert_idx for expert_idx in ranked if self._expert_heat[expert_idx] > 0.0]
+        if not hot:
+            return []
+        return hot[: min(capacity, len(hot))]
+
+    def prefetch_experts(self, expert_indices: list[int] | None = None, *, async_copy: bool = True) -> int:
+        """Stage likely-next experts into the XPU cache without blocking the critical path hard.
+
+        When ``async_copy`` is True and a free slot exists, staging runs on a daemon thread so the
+        next decode step can hit the cache. Prefetch never evicts protected in-use experts; it only
+        fills free capacity or replaces cold LRU entries outside the requested set.
+        """
+        if (
+            not self.offload_experts
+            or self.execution_device is None
+            or self.cached_experts_per_layer <= 0
+        ):
+            return 0
+        targets = list(expert_indices) if expert_indices is not None else self.predicted_hot_experts()
+        if not targets:
+            return 0
+        # Deduplicate while preserving order.
+        seen: set[int] = set()
+        ordered: list[int] = []
+        for expert_idx in targets:
+            idx = int(expert_idx)
+            if idx < 0 or idx >= self.num_experts or idx in seen:
+                continue
+            seen.add(idx)
+            ordered.append(idx)
+        if not ordered:
+            return 0
+
+        self._prefetch_requests += len(ordered)
+        already_cached = [idx for idx in ordered if idx in self._expert_cache]
+        self._prefetch_hits += len(already_cached)
+        missing = [idx for idx in ordered if idx not in self._expert_cache]
+        if not missing:
+            return 0
+
+        free_slots = max(0, self.cached_experts_per_layer - len(self._expert_cache))
+        # Only prefetch what fits without thrashing the working set of the last wave.
+        to_stage = missing[: max(free_slots, min(len(missing), max(1, self.top_k)))]
+        if not to_stage:
+            return 0
+
+        with self._prefetch_lock:
+            to_stage = [idx for idx in to_stage if idx not in self._prefetch_pending and idx not in self._expert_cache]
+            if not to_stage:
+                return 0
+            self._prefetch_pending.update(to_stage)
+
+        def _stage() -> None:
+            try:
+                prepared = self._prepare_cached_experts(to_stage, record_stats=False)
+                self._prefetch_staged += len(prepared)
+            except Exception:
+                logger.debug("MoE expert prefetch failed for experts=%s", to_stage, exc_info=True)
+            finally:
+                with self._prefetch_lock:
+                    self._prefetch_pending.difference_update(to_stage)
+
+        if async_copy:
+            thread = threading.Thread(target=_stage, name="anna-moe-prefetch", daemon=True)
+            thread.start()
+            return len(to_stage)
+
+        _stage()
+        return len(to_stage)
+
+    def _prepare_cached_experts(
+        self,
+        required_expert_indices: list[int],
+        *,
+        record_stats: bool = True,
+    ) -> dict[int, Qwen3MLP]:
         if (
             not self.offload_experts
             or self.execution_device is None
@@ -3362,6 +3541,11 @@ class Qwen3SparseMoeBlock(nn.Module):
             cache_hits += 1
 
         missing = [expert_idx for expert_idx in required_expert_indices if expert_idx not in prepared]
+        if record_stats:
+            self._cache_lookups += len(required_expert_indices)
+            self._cache_hits += cache_hits
+            self._cache_misses += len(missing)
+
         if missing:
             free_slots = max(0, self.cached_experts_per_layer - len(self._expert_cache))
             evictions_needed = max(0, len(missing) - free_slots)
@@ -3391,6 +3575,9 @@ class Qwen3SparseMoeBlock(nn.Module):
                 self._expert_cache[expert_idx] = cached
                 prepared[expert_idx] = cached
                 staged += 1
+
+        if record_stats:
+            self._cache_staged += staged
 
         if self.profile_runtime and self.execution_device.type == "xpu" and hasattr(torch, "xpu"):
             torch.xpu.synchronize()
@@ -3660,6 +3847,7 @@ class Qwen3SparseMoeBlock(nn.Module):
             usage = usage.to(device=selected_experts.device)
             hit_experts = usage.nonzero(as_tuple=False).flatten()
             hit_expert_list = [int(expert_idx) for expert_idx in hit_experts.tolist()]
+            self._record_routing_heat(usage, num_tokens=num_tokens)
 
             sorted_token_idx, expert_offsets, compact_hidden_states, compact_routing_weights = self._dispatch_routing_inputs(
                 hidden_states,
@@ -3729,6 +3917,11 @@ class Qwen3SparseMoeBlock(nn.Module):
             if shared_expert_output.device != execution_device:
                 shared_expert_output = shared_expert_output.to(device=execution_device, dtype=hidden_states.dtype)
             final_hidden_states = final_hidden_states + shared_expert_output
+
+            # After the critical expert wave, asynchronously stage predicted next-token experts.
+            if self.offload_experts and sequence_length == 1:
+                self.prefetch_experts(async_copy=True)
+
             return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim), router_logits
 
         if self.profile_runtime:

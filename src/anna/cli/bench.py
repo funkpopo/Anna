@@ -27,13 +27,37 @@ def _non_negative_int(value: str) -> int:
     return parsed
 
 
+_BENCH_SCENARIOS = (
+    "custom",
+    "text-short",
+    "text-long",
+    "image",
+    "video",
+    "mixed-text-image",
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Benchmark Anna on a local model directory.")
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--model-name", default=None, help="Model name used in benchmark output and logs.")
-    parser.add_argument("--prompt", required=True)
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Prompt text. Required unless --scenario supplies a built-in prompt.",
+    )
     parser.add_argument("--image", default=None, help="Optional local image path.")
     parser.add_argument("--video", default=None, help="Optional local video path.")
+    parser.add_argument(
+        "--scenario",
+        choices=_BENCH_SCENARIOS,
+        default="custom",
+        help=(
+            "Built-in multimodal/text benchmark scenario. "
+            "'image'/'video'/'mixed-text-image' require --image/--video as noted; "
+            "'text-long' uses a long synthetic prompt for prefill stress."
+        ),
+    )
     parser.add_argument("--device", default="auto")
     add_xpu_environment_args(parser)
     parser.add_argument("--dtype", default="auto")
@@ -141,6 +165,50 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _long_bench_prompt() -> str:
+    paragraph = (
+        "Anna is measuring Qwen3.5 prefill and decode throughput on Intel Arc XPU. "
+        "Chunked prefill, continuous batching, int4 weights, TurboQuant KV, and fused GDN "
+        "kernels are the primary optimization surface for local OpenAI-compatible serving."
+    )
+    return "\n".join(paragraph for _ in range(32))
+
+
+def _resolve_scenario(
+    *,
+    scenario: str,
+    prompt: str | None,
+    image: str | None,
+    video: str | None,
+) -> tuple[str, str | None, str | None]:
+    """Return (prompt, image, video) for a named multimodal/text bench scenario."""
+    if scenario == "custom":
+        if not prompt:
+            raise SystemExit("--prompt is required when --scenario=custom")
+        return prompt, image, video
+    if scenario == "text-short":
+        return prompt or "用三句话总结 prefill 与 decode 分离的收益。", None, None
+    if scenario == "text-long":
+        return prompt or _long_bench_prompt() + "\n\n请列出 5 条关键优化点。", None, None
+    if scenario == "image":
+        if not image:
+            raise SystemExit("--scenario=image requires --image")
+        return prompt or "请简洁描述这张图片的主要内容。", image, None
+    if scenario == "video":
+        if not video:
+            raise SystemExit("--scenario=video requires --video")
+        return prompt or "请用三句话概括这段视频。", None, video
+    if scenario == "mixed-text-image":
+        if not image:
+            raise SystemExit("--scenario=mixed-text-image requires --image")
+        return (
+            prompt or "结合图片内容，给出两条可执行的工程优化建议。",
+            image,
+            None,
+        )
+    raise SystemExit(f"Unsupported scenario: {scenario}")
+
+
 def _build_messages(settings: BenchmarkSettings) -> list[dict]:
     if settings.image is None and settings.video is None:
         return [{"role": "user", "content": settings.prompt}]
@@ -168,11 +236,17 @@ def main() -> None:
             f"The selected model belongs to the {model_family_info.model_family} family. Benchmark support is limited to text-generation model families; use anna-speak, anna-transcribe, or anna-serve."
         )
     model_name = resolve_model_name(model_name=args.model_name, model_dir=model_dir)
-    settings = BenchmarkSettings(
-        model_dir=model_dir,
+    resolved_prompt, resolved_image, resolved_video = _resolve_scenario(
+        scenario=args.scenario,
         prompt=args.prompt,
         image=args.image,
         video=args.video,
+    )
+    settings = BenchmarkSettings(
+        model_dir=model_dir,
+        prompt=resolved_prompt,
+        image=resolved_image,
+        video=resolved_video,
         model_id=model_name,
         device=args.device,
         dtype=args.dtype,
@@ -271,6 +345,7 @@ def main() -> None:
     tokens_per_second = 0.0 if avg_latency <= 0 else avg_tokens / avg_latency
     mode = "multimodal" if settings.image or settings.video else "text"
 
+    print(f"scenario={args.scenario}")
     print(f"mode={mode}")
     print(f"device={engine.device_context.device}")
     print(f"compute_dtype={engine.device_context.dtype}")

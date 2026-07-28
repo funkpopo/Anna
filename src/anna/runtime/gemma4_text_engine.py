@@ -281,6 +281,8 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         )
         if resolved_default_max_completion_tokens is not None:
             resolved_default_max_completion_tokens = max(1, int(resolved_default_max_completion_tokens))
+        if resolved_offload_vision:
+            device_context.migration_policy.keep_media_on_host = True
         engine = cls(
             model=model,
             tokenizer=tokenizer,

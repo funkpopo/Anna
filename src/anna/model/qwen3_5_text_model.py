@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import itertools
+import logging
+import os
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 from anna.model.qwen3_5_text_config import Qwen3_5TextModelConfig, Qwen3_5TextConfig, Qwen3_5TextVisionConfig
 from anna.model.ops import (
@@ -495,14 +499,32 @@ class Qwen3VisionModel(nn.Module):
             patch_pos_embeds_permute.append(pos_embed)
         return torch.cat(patch_pos_embeds_permute)
 
-    def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> VisionModelOutput:
+    @staticmethod
+    def resolve_image_chunk_size() -> int:
+        """Max images/videos processed per vision forward wave (0 = all at once).
+
+        ``ANNA_VISION_CHUNK_IMAGES`` caps peak activation memory for multi-image /
+        multi-frame VL prefills on XPU and under ``offload_vision``.
+        """
+        raw = os.getenv("ANNA_VISION_CHUNK_IMAGES", "1").strip().lower()
+        if raw in {"", "0", "off", "none", "all"}:
+            return 0
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Invalid ANNA_VISION_CHUNK_IMAGES=%r; defaulting to 1", raw)
+            return 1
+
+    def _forward_single_wave(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> VisionModelOutput:
         hidden_states = self.patch_embed(pixel_values)
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
         position_embeddings = (rotary_pos_emb.cos(), rotary_pos_emb.sin())
 
-        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+            dim=0, dtype=torch.int32
+        )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
         for block in self.blocks:
@@ -510,6 +532,40 @@ class Qwen3VisionModel(nn.Module):
 
         merged_hidden_states = self.merger(hidden_states)
         return VisionModelOutput(last_hidden_state=hidden_states, pooler_output=merged_hidden_states)
+
+    def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> VisionModelOutput:
+        num_images = int(grid_thw.shape[0])
+        chunk_size = self.resolve_image_chunk_size()
+        if chunk_size <= 0 or num_images <= chunk_size:
+            return self._forward_single_wave(pixel_values, grid_thw)
+
+        # Process images in waves to bound peak vision activation memory.
+        tokens_per_image = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).tolist()
+        merge_unit = self.spatial_merge_size**2
+        last_hidden_parts: list[torch.Tensor] = []
+        pooler_parts: list[torch.Tensor] = []
+        token_offset = 0
+        for start in range(0, num_images, chunk_size):
+            end = min(num_images, start + chunk_size)
+            wave_tokens = sum(int(count) for count in tokens_per_image[start:end])
+            wave_pixels = pixel_values[token_offset : token_offset + wave_tokens]
+            wave_grid = grid_thw[start:end]
+            wave_out = self._forward_single_wave(wave_pixels, wave_grid)
+            last_hidden_parts.append(wave_out.last_hidden_state)
+            pooler_parts.append(wave_out.pooler_output)
+            token_offset += wave_tokens
+            # Sanity: merger collapses merge_unit patches per spatial group.
+            expected_pooler = sum(int(count) // merge_unit for count in tokens_per_image[start:end])
+            if int(wave_out.pooler_output.shape[0]) != expected_pooler:
+                raise RuntimeError(
+                    "Vision chunk pooler length mismatch: "
+                    f"got={wave_out.pooler_output.shape[0]} expected={expected_pooler}"
+                )
+
+        return VisionModelOutput(
+            last_hidden_state=torch.cat(last_hidden_parts, dim=0),
+            pooler_output=torch.cat(pooler_parts, dim=0),
+        )
 
 
 class Qwen3Model(nn.Module):
@@ -644,18 +700,57 @@ class Qwen3Model(nn.Module):
         rope_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, rope_deltas
 
-    def get_image_features(self, pixel_values: torch.Tensor, image_grid_thw: torch.LongTensor) -> tuple[torch.Tensor, list[int]]:
+    def get_image_features(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.LongTensor,
+        *,
+        output_device: torch.device | None = None,
+        output_dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, list[int]]:
         if self.visual is None:
             raise ValueError("The loaded model does not include a vision tower.")
-        visual_device = next(self.visual.parameters()).device
-        pixel_values = pixel_values.to(dtype=next(self.visual.parameters()).dtype, device=visual_device)
+        visual_param = next(self.visual.parameters())
+        visual_device = visual_param.device
+        visual_dtype = visual_param.dtype
+        # Host→vision staging: non_blocking when source is pinned / same-device no-op.
+        non_blocking = visual_device.type == "xpu" or (
+            pixel_values.device.type == "cpu" and bool(getattr(pixel_values, "is_pinned", lambda: False)())
+        )
+        pixel_values = pixel_values.to(dtype=visual_dtype, device=visual_device, non_blocking=non_blocking)
         image_grid_thw = _align_tensor_device(image_grid_thw, visual_device)
         vision_output = self.visual(pixel_values, grid_thw=image_grid_thw)
+        features = vision_output.pooler_output
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-        return vision_output.pooler_output, split_sizes
 
-    def get_video_features(self, pixel_values_videos: torch.Tensor, video_grid_thw: torch.LongTensor) -> tuple[torch.Tensor, list[int]]:
-        return self.get_image_features(pixel_values_videos, video_grid_thw)
+        # offload_vision pipeline: vision on CPU → copy features to execution device without
+        # keeping full pixel activations on XPU. Prefer non_blocking H2D when possible.
+        if output_device is not None or output_dtype is not None:
+            target_device = output_device if output_device is not None else features.device
+            target_dtype = output_dtype if output_dtype is not None else features.dtype
+            if features.device != target_device or features.dtype != target_dtype:
+                copy_non_blocking = (
+                    features.device.type == "cpu"
+                    and target_device.type in {"xpu", "cuda"}
+                    and bool(getattr(features, "is_pinned", lambda: False)())
+                ) or (features.device.type == target_device.type and features.device.type != "cpu")
+                features = features.to(device=target_device, dtype=target_dtype, non_blocking=copy_non_blocking)
+        return features, split_sizes
+
+    def get_video_features(
+        self,
+        pixel_values_videos: torch.Tensor,
+        video_grid_thw: torch.LongTensor,
+        *,
+        output_device: torch.device | None = None,
+        output_dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, list[int]]:
+        return self.get_image_features(
+            pixel_values_videos,
+            video_grid_thw,
+            output_device=output_device,
+            output_dtype=output_dtype,
+        )
 
     def get_placeholder_mask(
         self,
@@ -758,14 +853,22 @@ class Qwen3Model(nn.Module):
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
         if pixel_values is not None:
-            image_embeds, _ = self.get_image_features(pixel_values, image_grid_thw)
-            image_embeds = image_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            image_embeds, _ = self.get_image_features(
+                pixel_values,
+                image_grid_thw,
+                output_device=inputs_embeds.device,
+                output_dtype=inputs_embeds.dtype,
+            )
             image_mask, _ = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
-            video_embeds, _ = self.get_video_features(pixel_values_videos, video_grid_thw)
-            video_embeds = video_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            video_embeds, _ = self.get_video_features(
+                pixel_values_videos,
+                video_grid_thw,
+                output_device=inputs_embeds.device,
+                output_dtype=inputs_embeds.dtype,
+            )
             _, video_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
