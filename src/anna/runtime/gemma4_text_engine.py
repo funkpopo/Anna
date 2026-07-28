@@ -11,13 +11,14 @@ import torch
 from anna.core.format_utils import format_bytes
 from anna.mm.gemma4_text_processor import Gemma4TextProcessor
 from anna.mm.prepared_inputs import PreparedInputs
+from anna.model.gemma4_ops_parity import gemma4_ops_parity_summary
 from anna.model.gemma4_text_model import Gemma4DynamicCache, Gemma4ForConditionalGeneration
 from anna.model.quantization import (
     convert_module_linears_to_xpu_int4,
     resolve_xpu_int4_layout_cache_dir,
     weight_quant_auto_usage_threshold,
 )
-from anna.model.turboquant import turboquant_is_available
+from anna.model.turboquant import resolve_turboquant_runtime_settings, turboquant_is_available
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
 from anna.runtime.memory_release import release_conversion_artifacts
 from anna.runtime.qwen3_5_text_engine import (
@@ -25,7 +26,6 @@ from anna.runtime.qwen3_5_text_engine import (
     AnnaQwen3_5TextEngine,
     EngineOptimizationConfig,
     ReasoningFormat,
-    normalize_kv_cache_quantization,
     normalize_reasoning_format,
 )
 from anna.runtime.service_metrics import AnnaServiceMetrics
@@ -55,12 +55,19 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         if callable(info_getter):
             info = info_getter()
             if isinstance(info, dict):
+                info = dict(info)
+                if self.optimization_config.kv_cache_turboquant_preset is not None:
+                    info.setdefault(
+                        "turboquant_preset",
+                        self.optimization_config.kv_cache_turboquant_preset,
+                    )
                 return info
         return {
             "mode": self.optimization_config.kv_cache_quantization,
             "turboquant_enabled": self.optimization_config.kv_cache_quantization == "turboquant",
             "turboquant_bits": self.optimization_config.kv_cache_quant_bits,
             "turboquant_residual_len": self.optimization_config.kv_cache_residual_len,
+            "turboquant_preset": self.optimization_config.kv_cache_turboquant_preset,
             "shared_kv_state_mode": "unknown",
             "shared_kv_row_reuse_enabled": False,
         }
@@ -195,7 +202,6 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         asr_max_new_tokens: int = 512,
     ) -> "AnnaGemma4TextEngine":
         del asr_max_inference_batch_size, asr_max_new_tokens
-        del kv_cache_quant_bits_explicit, kv_cache_residual_len_explicit
         if offload_mode.lower() not in {"auto", "none"}:
             raise ValueError("Gemma4 text runtime does not support expert offload.")
         if expert_quant.lower() not in {"auto", "none"}:
@@ -218,8 +224,19 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         )
         if safety_policy is not None:
             device_context.safety_policy = safety_policy
-        resolved_kv_cache_quantization = cls._resolve_kv_cache_quantization(
+        weight_bytes = estimate_gemma4_text_model_weight_bytes(model_path)
+        (
+            resolved_kv_cache_quantization,
+            resolved_kv_cache_quant_bits,
+            resolved_kv_cache_residual_len,
+            turboquant_preset,
+        ) = cls._resolve_kv_cache_quantization(
             requested_mode=kv_cache_quantization,
+            requested_bits=kv_cache_quant_bits,
+            requested_residual_len=kv_cache_residual_len,
+            bits_explicit=kv_cache_quant_bits_explicit,
+            residual_explicit=kv_cache_residual_len_explicit,
+            weight_bytes=weight_bytes,
         )
 
         resolved_offload_mode = "none"
@@ -265,8 +282,8 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             offload_token_io=False,
             offload_per_layer_input_embeddings=resolved_offload_per_layer_input_embeddings,
             kv_cache_quantization=resolved_kv_cache_quantization,
-            kv_cache_quant_bits=kv_cache_quant_bits,
-            kv_cache_residual_len=kv_cache_residual_len,
+            kv_cache_quant_bits=resolved_kv_cache_quant_bits,
+            kv_cache_residual_len=resolved_kv_cache_residual_len,
         )
         model.eval()
         release_conversion_artifacts(device_context.device)
@@ -311,13 +328,14 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
                 prompt_cache_max_tokens=prompt_cache_max_tokens,
                 profile_runtime=profile_runtime,
                 kv_cache_quantization=resolved_kv_cache_quantization,
-                kv_cache_quant_bits=kv_cache_quant_bits,
-                kv_cache_residual_len=kv_cache_residual_len,
+                kv_cache_quant_bits=resolved_kv_cache_quant_bits,
+                kv_cache_residual_len=resolved_kv_cache_residual_len,
+                kv_cache_turboquant_preset=turboquant_preset,
             ),
             offload_per_layer_input_embeddings=resolved_offload_per_layer_input_embeddings,
         )
         logger.info(
-            "Loaded Gemma4 runtime %s on %s (compute=%s, requested=%s, offload_vision=%s, weight_quant=%s, kv_cache_quantization=%s, kv_cache_quant_bits=%s, kv_cache_residual_len=%s, weights=%s, offload_per_layer_input_embeddings=%s); tensors loaded=%s skipped=%s quantized=%s",
+            "Loaded Gemma4 runtime %s on %s (compute=%s, requested=%s, offload_vision=%s, weight_quant=%s, kv_cache_quantization=%s, kv_cache_quant_bits=%s, kv_cache_residual_len=%s, turboquant_preset=%s, weights=%s, offload_per_layer_input_embeddings=%s); tensors loaded=%s skipped=%s quantized=%s",
             resolved_model_id,
             device_context.device,
             device_context.dtype,
@@ -325,8 +343,9 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
             resolved_offload_vision,
             resolved_weight_quant,
             resolved_kv_cache_quantization,
-            kv_cache_quant_bits,
-            kv_cache_residual_len,
+            resolved_kv_cache_quant_bits,
+            resolved_kv_cache_residual_len,
+            turboquant_preset,
             build_device,
             resolved_offload_per_layer_input_embeddings,
             report.loaded,
@@ -335,11 +354,12 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         )
         kv_cache_info = engine._kv_cache_runtime_info()
         logger.info(
-            "Gemma4 KV cache runtime: mode=%s turboquant_enabled=%s turboquant_bits=%s turboquant_residual_len=%s shared_kv_state_mode=%s shared_kv_row_reuse_enabled=%s shared_kv_source_layers=%s shared_kv_consumer_layers=%s full_attention_layers=%s turboquant_quantized_layers=%s",
+            "Gemma4 KV cache runtime: mode=%s turboquant_enabled=%s turboquant_bits=%s turboquant_residual_len=%s turboquant_preset=%s shared_kv_state_mode=%s shared_kv_row_reuse_enabled=%s shared_kv_source_layers=%s shared_kv_consumer_layers=%s full_attention_layers=%s turboquant_quantized_layers=%s",
             kv_cache_info.get("mode"),
             kv_cache_info.get("turboquant_enabled"),
             kv_cache_info.get("turboquant_bits"),
             kv_cache_info.get("turboquant_residual_len"),
+            kv_cache_info.get("turboquant_preset"),
             kv_cache_info.get("shared_kv_state_mode"),
             kv_cache_info.get("shared_kv_row_reuse_enabled"),
             kv_cache_info.get("shared_kv_source_layers"),
@@ -386,13 +406,28 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         return "none"
 
     @staticmethod
-    def _resolve_kv_cache_quantization(*, requested_mode: str) -> str:
-        normalized = normalize_kv_cache_quantization(requested_mode)
-        if normalized == "turboquant" and not turboquant_is_available():
-            raise ValueError(
-                "TurboQuant KV-cache compression was requested, but the 'turboquant' dependency is not installed."
+    def _resolve_kv_cache_quantization(
+        *,
+        requested_mode: str,
+        requested_bits: int = 4,
+        requested_residual_len: int = 128,
+        bits_explicit: bool = False,
+        residual_explicit: bool = False,
+        weight_bytes: int | None = None,
+    ) -> tuple[str, int, int, str | None]:
+        """Resolve Gemma4 KV quantization using the shared TurboQuant size-tier presets."""
+        try:
+            return resolve_turboquant_runtime_settings(
+                requested_mode=requested_mode,
+                requested_bits=requested_bits,
+                requested_residual_len=requested_residual_len,
+                weight_bytes=weight_bytes,
+                bits_explicit=bits_explicit,
+                residual_explicit=residual_explicit,
+                turboquant_available=turboquant_is_available(),
             )
-        return normalized
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
 
     @classmethod
     def _apply_runtime_weight_quantization(
@@ -587,7 +622,10 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
                 "kv_cache_quantization": self.optimization_config.kv_cache_quantization,
                 "kv_cache_quant_bits": self.optimization_config.kv_cache_quant_bits,
                 "kv_cache_residual_len": self.optimization_config.kv_cache_residual_len,
+                "kv_cache_turboquant_preset": self.optimization_config.kv_cache_turboquant_preset,
+                "scheduler_attached": self.scheduler is not None,
             },
+            "ops_parity": gemma4_ops_parity_summary(),
             "kv_cache": kv_cache_runtime_info,
             "vision_enabled": self.config.vision_config is not None,
             "audio_enabled": self.config.audio_config is not None,

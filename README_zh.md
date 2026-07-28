@@ -410,8 +410,26 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 
 ### ASR 服务参数
 
-- `--asr-max-inference-batch-size N`：Qwen3-ASR 服务端每个 XPU batch 的音频 chunk 数。
+- `--asr-max-inference-batch-size N`：服务端将并发转写请求合批的上限（连续批），同时作为传给 `qwen-asr` 的内部 chunk batch 上限。
 - `--asr-max-new-tokens N`：Qwen3-ASR 每个 chunk 生成的最大文本 token 数。
+
+### TTS / ASR 封装边界
+
+Qwen3-TTS / Qwen3-ASR 以 **上游库封装** 方式接入（`qwen-tts` / `qwen-asr`）：
+
+- **Anna 负责：** OpenAI 兼容 API/CLI、ASR 的 XPU-only 加载策略、进程级设备执行门闩、指标与 OOM 映射、ASR 请求级连续合批。
+- **上游负责：** 音频编码 / talker / vocoder 内核与内部 generate。
+- **暂不迁移：** 在 Qwen3.5 文本仍是 Arc 主优化面时，不把 TTS/ASR 重计算段迁入 Anna SYCL 融合算子。
+- **进程隔离：** `anna-serve` 单进程单模型族。若同进程共驻音频与文本引擎，必须走进程设备门闩串行化（`DeviceExecutionGate`；`ANNA_XPU_SERIALIZE_ALL=1` 可强制文本引擎也进入同一门闩）。这是串行化，不是多租户显存分区。
+
+### Gemma4 压测基线
+
+Gemma4 复用 Qwen 文本引擎外壳（scheduler、采样、prompt cache、dense int4、full-attention TurboQuant 规模预设）。与 Qwen3.5 的刻意差距（paged KV、prefix block、GDN、MoE）见 `/healthz` → `ops_parity`。
+
+```powershell
+anna-bench --model-dir D:\Models\Gemma4 --scenario gemma-text-short --device xpu --runs 5
+python tools\bench_api_concurrency.py --scenario gemma-concurrent-short --concurrency 4 --requests 16 --healthz
+```
 
 ## `anna-generate` 参数说明
 

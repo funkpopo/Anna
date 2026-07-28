@@ -31,6 +31,9 @@ _BENCH_SCENARIOS = (
     "custom",
     "text-short",
     "text-long",
+    # Gemma4 serve baseline aliases (same prompts as text-*; documented for parity with Qwen).
+    "gemma-text-short",
+    "gemma-text-long",
     "image",
     "video",
     "mixed-text-image",
@@ -55,7 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Built-in multimodal/text benchmark scenario. "
             "'image'/'video'/'mixed-text-image' require --image/--video as noted; "
-            "'text-long' uses a long synthetic prompt for prefill stress."
+            "'text-long' uses a long synthetic prompt for prefill stress; "
+            "'gemma-text-short'/'gemma-text-long' are the Gemma4 serve baseline aliases "
+            "(same prompts as text-short/text-long)."
         ),
     )
     parser.add_argument("--device", default="auto")
@@ -186,9 +191,9 @@ def _resolve_scenario(
         if not prompt:
             raise SystemExit("--prompt is required when --scenario=custom")
         return prompt, image, video
-    if scenario == "text-short":
+    if scenario in {"text-short", "gemma-text-short"}:
         return prompt or "用三句话总结 prefill 与 decode 分离的收益。", None, None
-    if scenario == "text-long":
+    if scenario in {"text-long", "gemma-text-long"}:
         return prompt or _long_bench_prompt() + "\n\n请列出 5 条关键优化点。", None, None
     if scenario == "image":
         if not image:
@@ -346,6 +351,7 @@ def main() -> None:
     mode = "multimodal" if settings.image or settings.video else "text"
 
     print(f"scenario={args.scenario}")
+    print(f"model_family={getattr(engine, 'model_family', model_family_info.model_family)}")
     print(f"mode={mode}")
     print(f"device={engine.device_context.device}")
     print(f"compute_dtype={engine.device_context.dtype}")

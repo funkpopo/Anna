@@ -409,8 +409,35 @@ Validate the K=128 table with `python tools/validate_arc_gdn_decode.py --preset 
 
 ### ASR Serving Options
 
-- `--asr-max-inference-batch-size N`: number of Qwen3-ASR audio chunks per XPU inference batch.
+- `--asr-max-inference-batch-size N`: maximum number of concurrent transcription requests Anna will coalesce into one upstream XPU call (server-side continuous batch), and the chunk batch size passed to `qwen-asr`.
 - `--asr-max-new-tokens N`: maximum generated text tokens per Qwen3-ASR chunk.
+
+### TTS / ASR wrapper boundary
+
+Qwen3-TTS and Qwen3-ASR run as **upstream wrappers** (`qwen-tts` / `qwen-asr`):
+
+- **Anna owns:** OpenAI-compatible API/CLI, XPU-only load policy (ASR), process device execution gate, metrics, OOM/device-lost mapping, and ASR continuous request batching.
+- **Upstream owns:** audio encoder / talker / vocoder kernels and internal generate loops.
+- **Not planned:** porting TTS/ASR heavy kernels into Anna SYCL fused ops while Qwen3.5 text remains the primary Arc optimization surface.
+- **Process isolation:** `anna-serve` loads one model family per process. Co-resident audio+text engines must serialize on the process device gate (`DeviceExecutionGate`; set `ANNA_XPU_SERIALIZE_ALL=1` to force text engines onto the same gate). This is serialization, not multi-tenant VRAM partitioning.
+
+### Gemma4 serve baseline
+
+Gemma4 reuses the Qwen text engine shell (scheduler, sampling, prompt cache, int4 dense weights, TurboQuant size-tier presets on full-attention layers). Deliberate gaps vs Qwen3.5 (paged KV, prefix block pool, GDN, MoE) are listed under `/healthz` → `ops_parity`.
+
+Local throughput baseline (same prompts as Qwen text scenarios):
+
+```powershell
+anna-bench --model-dir D:\Models\Gemma4 --scenario gemma-text-short --device xpu --runs 5
+anna-bench --model-dir D:\Models\Gemma4 --scenario gemma-text-long --device xpu --runs 3
+```
+
+Serve concurrency baseline (start `anna-serve` with `--scheduler-profile interactive` or `throughput` first):
+
+```powershell
+python tools\bench_api_concurrency.py --scenario gemma-concurrent-short --concurrency 4 --requests 16 --healthz
+python tools\bench_api_concurrency.py --scenario gemma-mixed --concurrency 4 --requests 16
+```
 
 ## `anna-generate` Options
 
@@ -437,7 +464,7 @@ Validate the K=128 table with `python tools/validate_arc_gdn_decode.py --preset 
 - `--base-url URL`: Anna server URL.
 - `--route /v1/chat/completions|/v1/completions`: target route.
 - `--model NAME`: model ID in the request body.
-- `--scenario custom|concurrent-short|single-long|mixed|repeated-system`: built-in prompt scenario.
+- `--scenario custom|concurrent-short|single-long|mixed|repeated-system|gemma-concurrent-short|gemma-single-long|gemma-mixed|multimodal-*`: built-in prompt scenario (gemma-* aliases are the Gemma4 serve baseline).
 - `--requests N`: total request count.
 - `--concurrency N`: concurrent worker count.
 - `--max-tokens N`: output token cap per request.

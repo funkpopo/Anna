@@ -1,3 +1,11 @@
+"""Qwen3-TTS runtime: thin wrapper over ``qwen-tts`` (P1-2.8).
+
+**Wrapper boundary:** Anna owns API/CLI, sampling knobs, device recovery, and the
+process XPU execution gate. Upstream ``qwen-tts`` owns talker/subtalker generation
+and vocoder kernels. Migrating those kernels into Anna SYCL is not planned; Arc
+effort stays on Qwen3.5 text fused ops.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -10,6 +18,7 @@ from typing import Any
 import numpy as np
 
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
+from anna.runtime.device_execution import DeviceExecutionGate
 from anna.runtime.qwen3_5_text_engine import AnnaEngineError
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
 
@@ -52,6 +61,9 @@ class AnnaQwen3TTSEngine:
     default_max_completion_tokens = None
     default_enable_thinking = False
     reasoning_format = "none"
+    compute_backend = "upstream_wrapper"
+    compute_owner = "qwen-tts"
+    xpu_kernel_migration = "not_planned"
 
     def __init__(
         self,
@@ -71,6 +83,7 @@ class AnnaQwen3TTSEngine:
         self.tts_model_size = tts_model_size
         self.metrics = AnnaServiceMetrics()
         self.execution_lock = threading.Lock()
+        self.device_gate = DeviceExecutionGate(owner=f"tts:{model_id}")
 
     @classmethod
     def from_model_dir(
@@ -246,6 +259,13 @@ class AnnaQwen3TTSEngine:
             "supports_chat_completions": False,
             "supported_languages": supported_languages,
             "supported_speakers": supported_speakers,
+            "compute_backend": self.compute_backend,
+            "compute_owner": self.compute_owner,
+            "xpu_kernel_migration": self.xpu_kernel_migration,
+            "wrapper_boundary": {
+                "anna_owns": ["api_cli", "sampling_kwargs", "process_device_gate", "metrics", "device_recovery"],
+                "upstream_owns": ["talker_generate", "subtalker", "vocoder"],
+            },
             "memory": None
             if memory_info is None
             else {
@@ -254,6 +274,7 @@ class AnnaQwen3TTSEngine:
                 "allocated_bytes": memory_info.allocated_bytes,
                 "reserved_bytes": memory_info.reserved_bytes,
             },
+            "device_execution": self.device_gate.health_fields(),
             "service_metrics": {
                 "requests_total": service_metrics.requests_total,
                 "requests_in_flight": service_metrics.requests_in_flight,
@@ -282,17 +303,18 @@ class AnnaQwen3TTSEngine:
         success = False
         started_at = time.perf_counter()
         try:
-            with self.execution_lock:
-                result = self._synthesize_locked(
-                    normalized_text,
-                    config=config,
-                    language=language,
-                    speaker=speaker,
-                    instruct=instruct,
-                    ref_audio=ref_audio,
-                    ref_text=ref_text,
-                    x_vector_only_mode=x_vector_only_mode,
-                )
+            with self.device_gate.exclusive():
+                with self.execution_lock:
+                    result = self._synthesize_locked(
+                        normalized_text,
+                        config=config,
+                        language=language,
+                        speaker=speaker,
+                        instruct=instruct,
+                        ref_audio=ref_audio,
+                        ref_text=ref_text,
+                        x_vector_only_mode=x_vector_only_mode,
+                    )
             success = True
             return result
         finally:

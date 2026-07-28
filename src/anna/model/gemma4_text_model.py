@@ -515,6 +515,90 @@ class Gemma4DynamicCache:
             )
         return stacked
 
+    def compact_batch_rows(
+        self,
+        rows: list[int],
+        *,
+        release_unselected: bool = True,
+    ) -> "Gemma4DynamicCache":
+        """Keep selected batch rows in a smaller cache for continuous-batch decode.
+
+        Mirrors ``Qwen3DynamicCache.compact_batch_rows`` so ``AnnaScheduler`` can
+        drop finished rows without a full stack/split cycle.
+        """
+        batch_size = self.get_batch_size()
+        if not rows:
+            if release_unselected:
+                self.release()
+            return Gemma4DynamicCache(
+                self.config,
+                kv_cache_quantization=self.kv_cache_quantization,
+                kv_cache_quant_bits=self.kv_cache_quant_bits,
+                kv_cache_residual_len=self.kv_cache_residual_len,
+            )
+        if len(set(rows)) != len(rows):
+            raise ValueError("compact_batch_rows requires unique row indices.")
+        if any(row < 0 or row >= batch_size for row in rows):
+            raise IndexError(f"compact_batch_rows row indices out of range for batch size {batch_size}: {rows}")
+
+        if list(rows) == list(range(batch_size)):
+            return self
+
+        compacted = Gemma4DynamicCache(
+            self.config,
+            batch_size=len(rows),
+            kv_cache_quantization=self.kv_cache_quantization,
+            kv_cache_quant_bits=self.kv_cache_quant_bits,
+            kv_cache_residual_len=self.kv_cache_residual_len,
+        )
+        compacted.reserved_seq_capacity = self.reserved_seq_capacity
+        compacted.request_lengths = [self.request_lengths[row_idx] for row_idx in rows]
+        for layer_idx in range(self.config.num_hidden_layers):
+            for new_idx, old_idx in enumerate(rows):
+                key_row = self.key_rows[layer_idx][old_idx]
+                value_row = self.value_rows[layer_idx][old_idx]
+                if key_row is not None:
+                    # Move rows when the source cache will be released; otherwise clone.
+                    compacted.key_rows[layer_idx][new_idx] = (
+                        key_row if release_unselected else _clone_cache_row(key_row)
+                    )
+                if value_row is not None:
+                    compacted.value_rows[layer_idx][new_idx] = (
+                        value_row if release_unselected else _clone_cache_row(value_row)
+                    )
+                if release_unselected:
+                    self.key_rows[layer_idx][old_idx] = None
+                    self.value_rows[layer_idx][old_idx] = None
+
+        for layer_idx, shared in self.shared_layers.items():
+            if isinstance(shared, _Gemma4SharedLayerState):
+                key_parts: list[Gemma4CacheRow] = []
+                value_parts: list[Gemma4CacheRow] = []
+                visible_parts: list[int] = []
+                for row_idx in rows:
+                    selected = shared.select_batch(row_idx)
+                    key_parts.append(selected.key_rows[0])
+                    value_parts.append(selected.value_rows[0])
+                    visible_parts.append(selected.visible_lengths[0])
+                compacted.shared_layers[layer_idx] = _Gemma4SharedLayerState(
+                    key_rows=key_parts,
+                    value_rows=value_parts,
+                    visible_lengths=visible_parts,
+                )
+            else:
+                key_states, value_states, visible_lengths = shared
+                index = torch.tensor(rows, dtype=torch.long, device=key_states.device)
+                compacted.set_shared_layer(
+                    layer_idx,
+                    key_states.index_select(0, index).contiguous(),
+                    value_states.index_select(0, index).contiguous(),
+                    visible_lengths.index_select(0, index).contiguous(),
+                )
+
+        if release_unselected:
+            self.release()
+        return compacted
+
     def release(self) -> None:
         if self._released:
             return

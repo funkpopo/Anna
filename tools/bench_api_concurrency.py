@@ -282,11 +282,11 @@ def _prompt_for_request(
     )
     if scenario == "custom":
         return _multimodal_user_content(base_prompt, image=image, video=video), None
-    if scenario == "concurrent-short":
+    if scenario in {"concurrent-short", "gemma-concurrent-short"}:
         return f"{base_prompt}\n请求编号 {index}：用三句话回答。", None
-    if scenario == "single-long":
+    if scenario in {"single-long", "gemma-single-long"}:
         return _long_prompt() + "\n\n请总结其中的关键性能风险。", None
-    if scenario == "mixed":
+    if scenario in {"mixed", "gemma-mixed"}:
         if index % 4 == 0:
             return _long_prompt() + "\n\n请给出 5 条优化建议。", None
         return f"{base_prompt}\n请求编号 {index}：只输出 3 个要点。", None
@@ -408,6 +408,9 @@ def build_parser() -> argparse.ArgumentParser:
             "single-long",
             "mixed",
             "repeated-system",
+            "gemma-concurrent-short",
+            "gemma-single-long",
+            "gemma-mixed",
             "multimodal-image",
             "multimodal-video",
             "mixed-text-multimodal",
@@ -415,6 +418,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="custom",
         help=(
             "Built-in prompt scenario. repeated-system is useful with --prompt-cache-size on the server. "
+            "gemma-* aliases match concurrent-short/single-long/mixed for Gemma4 serve baselines. "
             "multimodal-* and mixed-text-multimodal exercise VL isolation against text decode."
         ),
     )

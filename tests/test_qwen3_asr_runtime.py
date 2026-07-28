@@ -6,7 +6,25 @@ import pytest
 import torch
 from torch import nn
 
+from anna.runtime.device_execution import DeviceExecutionGate
 from anna.runtime.qwen3_asr_engine import AnnaEngineError, AnnaQwen3ASREngine, Qwen3ASRTranscriptionConfig
+
+
+def _prime_asr_engine(engine: AnnaQwen3ASREngine, *, model_id: str = "asr-test") -> AnnaQwen3ASREngine:
+    engine.device_gate = DeviceExecutionGate(owner=f"asr:{model_id}")
+    engine.max_inference_batch_size = 1
+    engine.max_new_tokens = 512
+    engine.batch_wait_seconds = 0.0
+    engine.max_waiting_requests = 0
+    engine._batch_waves_total = 0
+    engine._batch_requests_total = 0
+    engine._batch_requests_max = 1
+    engine._queue_rejections_total = 0
+    engine._pending = __import__("collections").deque()
+    engine._queue_condition = __import__("threading").Condition()
+    engine._batch_leader = None
+    engine.execution_lock = __import__("threading").Lock()
+    return engine
 
 
 class _FakeDeviceContext:
@@ -201,7 +219,7 @@ def test_qwen3_asr_transcribe_passes_context_and_requires_xpu_forward(monkeypatc
             engine._xpu_forward_observed_count += 1
             return [_Result()]
 
-    engine = object.__new__(AnnaQwen3ASREngine)
+    engine = _prime_asr_engine(object.__new__(AnnaQwen3ASREngine))
     engine.model = _Model()
     engine.device_context = _FakeDeviceContext()
     engine._xpu_forward_observed_count = 0
@@ -230,7 +248,7 @@ def test_qwen3_asr_transcribe_rejects_missing_xpu_forward(monkeypatch, tmp_path:
         def transcribe(self, **_kwargs):
             return [{"text": "hello"}]
 
-    engine = object.__new__(AnnaQwen3ASREngine)
+    engine = _prime_asr_engine(object.__new__(AnnaQwen3ASREngine))
     engine.model = _Model()
     engine.device_context = _FakeDeviceContext()
     engine._xpu_forward_observed_count = 0
@@ -243,3 +261,70 @@ def test_qwen3_asr_transcribe_rejects_missing_xpu_forward(monkeypatch, tmp_path:
             config=Qwen3ASRTranscriptionConfig(),
             filename=None,
         )
+
+
+def test_qwen3_asr_continuous_batch_coalesces_compatible_requests(monkeypatch, tmp_path: Path) -> None:
+    class _Result:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.language = "English"
+            self.time_stamps = None
+
+    class _Model:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def transcribe(self, **kwargs):
+            self.calls.append(kwargs)
+            engine._xpu_forward_observed_count += 1
+            audio = kwargs["audio"]
+            if isinstance(audio, list):
+                return [_Result(f"t{idx}") for idx, _ in enumerate(audio)]
+            return [_Result("solo")]
+
+    from anna.runtime.service_metrics import AnnaServiceMetrics
+
+    engine = _prime_asr_engine(object.__new__(AnnaQwen3ASREngine))
+    engine.model = _Model()
+    engine.device_context = _FakeDeviceContext()
+    engine.metrics = AnnaServiceMetrics()
+    engine.default_model_id = "asr-test"
+    engine.max_inference_batch_size = 2
+    engine.batch_wait_seconds = 0.02
+    engine._xpu_forward_observed_count = 0
+    engine._last_xpu_elapsed_ms = None
+    monkeypatch.setattr(AnnaQwen3ASREngine, "_start_xpu_execution_probe", lambda _self: (None, None))
+    monkeypatch.setattr(AnnaQwen3ASREngine, "_finish_xpu_execution_probe", lambda *_args, **_kwargs: None)
+
+    audio_a = str(tmp_path / "a.wav")
+    audio_b = str(tmp_path / "b.wav")
+    Path(audio_a).write_bytes(b"RIFF")
+    Path(audio_b).write_bytes(b"RIFF")
+    config = Qwen3ASRTranscriptionConfig(language="English")
+
+    results: list = []
+    errors: list = []
+
+    def _worker(path: str) -> None:
+        try:
+            results.append(engine.transcribe_qwen3_asr_audio(path, config=config))
+        except Exception as exc:  # noqa: BLE001 - collect for assertion
+            errors.append(exc)
+
+    import threading
+
+    threads = [
+        threading.Thread(target=_worker, args=(audio_a,)),
+        threading.Thread(target=_worker, args=(audio_b,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert len(results) == 2
+    assert {result.text for result in results} == {"t0", "t1"}
+    assert engine._batch_waves_total >= 1
+    assert engine._batch_requests_max >= 2
+    assert any(isinstance(call.get("audio"), list) for call in engine.model.calls)

@@ -684,6 +684,8 @@ def test_gemma4_runtime_loader_builds_standalone_multimodal_engine(tmp_path) -> 
         kv_cache_quantization="turboquant",
         kv_cache_quant_bits=4,
         kv_cache_residual_len=32,
+        kv_cache_quant_bits_explicit=True,
+        kv_cache_residual_len_explicit=True,
     )
     health = engine.health()
 
@@ -786,6 +788,8 @@ def test_gemma4_runtime_loader_logs_kv_cache_runtime_details(tmp_path, caplog) -
             kv_cache_quantization="turboquant",
             kv_cache_quant_bits=4,
             kv_cache_residual_len=24,
+            kv_cache_quant_bits_explicit=True,
+            kv_cache_residual_len_explicit=True,
         )
 
     assert "Gemma4 KV cache runtime:" in caplog.text
