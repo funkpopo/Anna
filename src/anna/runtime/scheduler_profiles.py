@@ -24,6 +24,10 @@ class SchedulerProfile:
     # even if prefill_interval_steps has not been reached, when the oldest waiter
     # has waited longer than max_queue_wait_ms (0 disables age-based force).
     max_queue_wait_ms: float
+    # P2-#9: event-driven prefill insertion. When True, a waiting request is admitted
+    # after the current decode step instead of waiting out prefill_interval_steps
+    # (throughput profile: 4 steps ≈ ~320ms added TTFT per wave at 79ms/step).
+    event_driven_prefill_insert: bool
     description: str
 
 
@@ -41,6 +45,7 @@ SCHEDULER_PROFILES: dict[str, SchedulerProfile] = {
         dynamic_token_budget=True,
         skip_batch_wait_when_idle=True,
         max_queue_wait_ms=50.0,
+        event_driven_prefill_insert=False,
         description="Latency-first: small batches, short coalesce wait, frequent prefill inserts, TTFT-friendly idle admit.",
     ),
     "throughput": SchedulerProfile(
@@ -52,9 +57,13 @@ SCHEDULER_PROFILES: dict[str, SchedulerProfile] = {
         max_decode_tokens=4096,
         max_waiting_requests=128,
         dynamic_token_budget=True,
-        skip_batch_wait_when_idle=False,
+        # P2-#9: idle-skip inherited from interactive — waiting 8ms for coalescing
+        # when the GPU has no active work only adds queue wait (measured max 18.5ms).
+        skip_batch_wait_when_idle=True,
         max_queue_wait_ms=500.0,
-        description="Throughput-first: larger batches, longer coalesce wait, fewer prefill inserts, higher queue depth.",
+        # P2-#9: insert waiting prefills immediately instead of every 4th decode step.
+        event_driven_prefill_insert=True,
+        description="Throughput-first: larger batches, higher queue depth, idle-skip coalescing, event-driven prefill inserts.",
     ),
 }
 
@@ -90,6 +99,7 @@ def resolve_scheduler_settings(
     dynamic_token_budget: bool | None = None,
     skip_batch_wait_when_idle: bool | None = None,
     max_queue_wait_ms: float | None = None,
+    event_driven_prefill_insert: bool | None = None,
 ) -> dict[str, Any]:
     """Merge an optional named profile with explicit overrides.
 
@@ -106,6 +116,7 @@ def resolve_scheduler_settings(
         "dynamic_token_budget": False,
         "skip_batch_wait_when_idle": False,
         "max_queue_wait_ms": 0.0,
+        "event_driven_prefill_insert": False,
     }
     base: dict[str, Any] = dict(hard)
     if preset is not None:
@@ -120,6 +131,7 @@ def resolve_scheduler_settings(
                 "dynamic_token_budget": preset.dynamic_token_budget,
                 "skip_batch_wait_when_idle": preset.skip_batch_wait_when_idle,
                 "max_queue_wait_ms": preset.max_queue_wait_ms,
+                "event_driven_prefill_insert": preset.event_driven_prefill_insert,
             }
         )
     overrides: Mapping[str, Any] = {
@@ -132,6 +144,7 @@ def resolve_scheduler_settings(
         "dynamic_token_budget": dynamic_token_budget,
         "skip_batch_wait_when_idle": skip_batch_wait_when_idle,
         "max_queue_wait_ms": max_queue_wait_ms,
+        "event_driven_prefill_insert": event_driven_prefill_insert,
     }
     for key, value in overrides.items():
         if value is not None:
@@ -146,6 +159,7 @@ def resolve_scheduler_settings(
     base["dynamic_token_budget"] = bool(base["dynamic_token_budget"])
     base["skip_batch_wait_when_idle"] = bool(base["skip_batch_wait_when_idle"])
     base["max_queue_wait_ms"] = max(0.0, float(base["max_queue_wait_ms"]))
+    base["event_driven_prefill_insert"] = bool(base["event_driven_prefill_insert"])
     return base
 
 

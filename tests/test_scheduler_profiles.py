@@ -25,7 +25,12 @@ def test_interactive_and_throughput_profiles_differ() -> None:
     assert interactive.batch_wait_ms < throughput.batch_wait_ms
     assert interactive.prefill_interval_steps < throughput.prefill_interval_steps
     assert interactive.skip_batch_wait_when_idle is True
-    assert throughput.skip_batch_wait_when_idle is False
+    # P2-#9: throughput inherits idle-skip (idle coalescing only added queue wait).
+    assert throughput.skip_batch_wait_when_idle is True
+    # P2-#9: throughput inserts waiting prefills event-driven; interactive keeps
+    # its interval=1 cadence (already every-step).
+    assert throughput.event_driven_prefill_insert is True
+    assert interactive.event_driven_prefill_insert is False
 
 
 def test_resolve_scheduler_settings_profile_with_overrides() -> None:

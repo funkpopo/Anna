@@ -36,6 +36,16 @@ logger = logging.getLogger(__name__)
 _DONE = object()
 
 
+class _PromptCacheHitOutputs:
+    """Minimal outputs wrapper for prompt-cache hits: rank-3 logits as decode expects."""
+
+    __slots__ = ("logits", "past_key_values")
+
+    def __init__(self, logits: torch.Tensor) -> None:
+        self.logits = logits.view(1, 1, -1)
+        self.past_key_values = None
+
+
 class _PythonSchedulerLedger:
     """Pure-Python fallback mirror of the Rust SchedulerLedger.
 
@@ -206,6 +216,9 @@ class AnnaScheduler:
         # Interactive profile sets this True so an idle GPU starts the first wave immediately (TTFT).
         skip_batch_wait_when_idle: bool = False,
         max_queue_wait_ms: float = 0.0,
+        # P2-#9: event-driven prefill insertion - a waiting request is admitted after
+        # the current decode step instead of waiting out prefill_interval_steps.
+        event_driven_prefill_insert: bool = False,
         profile: str = "none",
     ) -> None:
         self.engine = engine
@@ -219,6 +232,7 @@ class AnnaScheduler:
         self.dynamic_token_budget = bool(dynamic_token_budget)
         self.skip_batch_wait_when_idle = bool(skip_batch_wait_when_idle)
         self.max_queue_wait_seconds = max(0.0, float(max_queue_wait_ms)) / 1000.0
+        self.event_driven_prefill_insert = bool(event_driven_prefill_insert)
         self.profile = str(profile or "none")
         self._decode_steps_since_prefill = 0
         # P0-#3: interference markers accumulated since the last decode step.
@@ -529,6 +543,13 @@ class AnnaScheduler:
             groups[request.prompt_length].append(request)
         for _, group in sorted(groups.items()):
             for chunk in self._iter_prefill_group_chunks(group):
+                # P2-#7: exact prompt cache lookup for single-request text waves.
+                # Under continuous batching the engine-direct prompt cache was never
+                # consulted, so --prompt-cache-size was dead in scheduler mode.
+                cached = self._try_prompt_cached_prefill(chunk)
+                if cached is not None:
+                    active.extend(cached)
+                    continue
                 active.extend(self._prefill_same_length_group(chunk))
 
         # Multimodal prefills run solo (one request per group) so media tensors stay intact
@@ -722,12 +743,90 @@ class AnnaScheduler:
             return False
         if self._decode_steps_since_prefill >= self.prefill_interval_steps:
             return True
+        # P2-#9: event-driven insertion - pending requests are admitted after the
+        # current decode step instead of waiting out prefill_interval_steps
+        # (throughput profile: 4 steps ≈ ~320ms added TTFT at 79ms/step).
+        if self.event_driven_prefill_insert and self._pending:
+            return True
         return self._should_force_prefill_for_fairness()
 
     def _should_run_prefill_step(self) -> bool:
         if self._decode_steps_since_prefill >= self.prefill_interval_steps:
             return True
+        if self.event_driven_prefill_insert and self._pending:
+            return True
         return self._should_force_prefill_for_fairness()
+
+    def _try_prompt_cached_prefill(self, requests: list[SchedulerRequest]) -> list[SchedulerRequest] | None:
+        """Reuse an exact prompt-cache entry for a single-request text wave (P2-#7).
+
+        Returns the request ready for decode (input_ids + KV cache populated), or
+        ``None`` when the wave is not cache eligible / there is no hit.
+        """
+        if len(requests) != 1:
+            return None
+        request = requests[0]
+        if request.is_multimodal or self._is_request_cancelled(request):
+            return None
+        lookup = getattr(self.engine, "lookup_prompt_cache", None)
+        if not callable(lookup):
+            return None
+        try:
+            hit = lookup(request.prepared)
+        except Exception:  # pragma: no cover - cache is best effort
+            logger.debug("Prompt cache lookup failed; falling back to prefill.", exc_info=True)
+            return None
+        if hit is None:
+            return None
+        _key, cached = hit
+        past_key_values = cached.past_key_values
+        if past_key_values is None:
+            return None
+        metrics = getattr(self.engine, "metrics", None)
+        if metrics is not None:
+            metrics.record_prompt_tokens(max(1, int(request.prompt_length)))
+        if request.generation_started_at is None:
+            request.generation_started_at = time.perf_counter()
+        if request.first_token_at is None:
+            request.first_token_at = time.perf_counter()
+        request.past_key_values = past_key_values
+        outputs = _PromptCacheHitOutputs(logits=cached.logits)
+        return self._consume_batch_outputs(
+            [request],
+            outputs,
+            batch_cache=past_key_values,
+            keep_batched_cache=False,
+            avoid_turboquant_clone=True,
+        )
+
+    def _remember_scheduler_prompt_cache(
+        self,
+        request: SchedulerRequest,
+        logits: torch.Tensor,
+        past_key_values: object | None,
+    ) -> None:
+        """Insert a finished single-request prefill into the exact prompt cache (P2-#7)."""
+        if request.is_multimodal or past_key_values is None:
+            return
+        remember = getattr(self.engine, "remember_prompt_cache", None)
+        key_getter = getattr(self.engine, "_prompt_cache_key", None)
+        if not callable(remember) or not callable(key_getter):
+            return
+        try:
+            key = key_getter(request.prepared)
+            if key is None:
+                return
+            # Cache tensors were produced under inference_mode; the clone inside the
+            # remember path must stay in the same mode (inplace copy on inference tensors).
+            with torch.inference_mode():
+                remember(
+                    key=key,
+                    logits=logits,
+                    past_key_values=past_key_values,
+                    prompt_tokens=max(1, int(request.prompt_length)),
+                )
+        except Exception:  # pragma: no cover - cache is best effort
+            logger.debug("Failed to remember prompt cache entry.", exc_info=True)
 
     def _prefill_same_length_group(
         self,
@@ -837,6 +936,10 @@ class AnnaScheduler:
         total_prompt_tokens = sum(request.prompt_length for request in requests)
         if metrics is not None and group.prompt_tokens_recorded < total_prompt_tokens:
             metrics.record_prompt_tokens(total_prompt_tokens - group.prompt_tokens_recorded)
+        # P2-#7: single-request text prefills feed the exact prompt cache so
+        # repeated prompts under continuous batching skip re-prefill entirely.
+        if len(requests) == 1 and hasattr(outputs, "logits") and outputs.past_key_values is not None:
+            self._remember_scheduler_prompt_cache(requests[0], outputs.logits[0, -1], outputs.past_key_values)
         return list(
             self._consume_batch_outputs(
                 requests,

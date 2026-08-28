@@ -67,6 +67,7 @@ class ServeSettings:
     scheduler_dynamic_token_budget: bool = False
     scheduler_skip_batch_wait_when_idle: bool = True
     scheduler_max_queue_wait_ms: float = 0.0
+    scheduler_event_driven_prefill_insert: bool = False
     warmup_prefill_tokens: int | None = None
     warmup_decode_steps: int = 8
     warmup_batch_size: int | None = None

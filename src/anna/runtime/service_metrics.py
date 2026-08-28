@@ -52,6 +52,8 @@ class ServiceMetricsSnapshot:
     waiting_requests: int = 0
     kv_cache_used_pages: int = 0
     kv_cache_total_pages: int = 0
+    kv_cache_turboquant_rows: int = 0
+    kv_cache_turboquant_tokens: int = 0
     prompt_cache_entries: int = 0
     queue_rejected_total: int = 0
     queue_wait_seconds_total: float = 0.0
@@ -544,6 +546,19 @@ class AnnaServiceMetricsLogger:
         prompt_cache_hit_rate = 0.0 if cache_queries <= 0 else (cache_hits / cache_queries) * 100.0
         prefix_block_hit_rate = 0.0 if prefix_lookups <= 0 else (prefix_hits / prefix_lookups) * 100.0
         kv_cache_usage = current.kv_cache_usage_ratio * 100.0
+        # P2-#7: under TurboQuant KV the paged storage is unused by design; report the
+        # live turboquant row usage instead of a misleading 0/0 pages.
+        if current.kv_cache_total_pages > 0:
+            kv_cache_summary = (
+                f"GPU KV cache usage: {kv_cache_usage:.1f}% "
+                f"({current.kv_cache_used_pages}/{current.kv_cache_total_pages} pages)"
+            )
+        else:
+            kv_cache_summary = (
+                "KV cache: paged storage idle "
+                f"(turboquant rows={current.kv_cache_turboquant_rows}, "
+                f"cached tokens={current.kv_cache_turboquant_tokens})"
+            )
         queue_wait_avg_ms = 0.0 if queue_wait_count <= 0 else (queue_wait_total / queue_wait_count) * 1000.0
         prefill_step_avg_ms = 0.0 if prefill_step_count <= 0 else (prefill_step_total / prefill_step_count) * 1000.0
         decode_step_avg_ms = 0.0 if decode_step_count <= 0 else (decode_step_total / decode_step_count) * 1000.0
@@ -604,8 +619,7 @@ class AnnaServiceMetricsLogger:
             f"Decode batch reqs avg/max: {decode_batch_requests_avg:.1f}/{current.scheduler_decode_batch_requests_max}, "
             f"Decode batch tokens avg/max: {decode_batch_tokens_avg:.1f}/{current.scheduler_decode_batch_tokens_max}, "
             f"Waiting: {current.waiting_requests} reqs, Queue rejected: {queue_rejected}, "
-            f"GPU KV cache usage: {kv_cache_usage:.1f}% "
-            f"({current.kv_cache_used_pages}/{current.kv_cache_total_pages} pages), "
+            f"{kv_cache_summary}, "
             f"Prompt cache hit rate: {prompt_cache_hit_rate:.1f}%, "
             f"Prefix block hit rate: {prefix_block_hit_rate:.1f}% "
             f"({current.prefix_block_hits_total}/{current.prefix_block_lookups_total}, "
@@ -631,6 +645,7 @@ class AnnaServiceMetricsLogger:
             current.prefix_block_entries - previous.prefix_block_entries,
             current.kv_cache_used_pages - previous.kv_cache_used_pages,
             current.kv_cache_total_pages - previous.kv_cache_total_pages,
+            current.kv_cache_turboquant_rows - previous.kv_cache_turboquant_rows,
             current.prompt_cache_entries - previous.prompt_cache_entries,
             current.queue_rejected_total - previous.queue_rejected_total,
             current.queue_wait_count - previous.queue_wait_count,

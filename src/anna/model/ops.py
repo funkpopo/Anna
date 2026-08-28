@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -262,6 +263,9 @@ class Qwen3PageAllocator:
         self.config = config
         self.block_size = max(1, int(config.cache_block_size))
         self.prefix_block_pool = PrefixBlockPool()
+        # P2-#7: weak registry of live Qwen3DynamicCache instances so KV usage
+        # metrics can report turboquant rows (which bypass the paged storage).
+        self._live_caches: list[weakref.ReferenceType] = []
         self.layers = [
             Qwen3PagedLayerAllocator(
                 self.block_size,
@@ -316,6 +320,25 @@ class Qwen3PageAllocator:
             key_template=key_template,
             value_template=value_template,
         )
+
+    def register_cache(self, cache: object) -> None:
+        """Track a live Qwen3DynamicCache (weakref; released caches drop out)."""
+        self._live_caches = [ref for ref in self._live_caches if ref() is not None]
+        self._live_caches.append(weakref.ref(cache))
+
+    def live_caches(self) -> list:
+        """Return live (non-released) tracked caches, pruning dead references."""
+        alive: list = []
+        kept: list[weakref.ReferenceType] = []
+        for ref in self._live_caches:
+            cache = ref()
+            if cache is None:
+                continue
+            kept.append(ref)
+            if not getattr(cache, "_released", False):
+                alive.append(cache)
+        self._live_caches = kept
+        return alive
 
     def trim(self) -> int:
         return sum(layer.trim() for layer in self.layers)
@@ -413,6 +436,10 @@ class Qwen3DynamicCache:
         self._prefill_input_ids: torch.LongTensor | None = None
         self._prompt_token_ids: list[int] | None = None
         self._prefix_kv_share = os.environ.get("ANNA_PREFIX_KV_SHARE", "1") != "0"
+        # P2-#7: register with the allocator so live KV usage (turboquant rows) is observable.
+        register = getattr(self.allocator, "register_cache", None)
+        if callable(register):
+            register(self)
 
     def attach_prefill_input_ids(self, input_ids: torch.LongTensor | None) -> None:
         self._prefill_input_ids = input_ids

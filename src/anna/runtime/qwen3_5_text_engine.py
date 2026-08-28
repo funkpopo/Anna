@@ -51,7 +51,7 @@ from anna.runtime.decode_executor import (
     normalize_decode_executor,
     resolve_decode_executor_mode,
 )
-from anna.runtime.memory_release import release_conversion_artifacts
+from anna.runtime.memory_release import AdaptiveMemoryReleaser, release_conversion_artifacts
 from anna.runtime.runtime_health import PROCESS_ADMISSION_GATE, RuntimeAdmissionGate
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
 from anna.runtime.streaming import IncrementalTextAssembler
@@ -329,6 +329,53 @@ class AnnaQwen3_5TextEngine:
         self.metrics = AnnaServiceMetrics()
         self._apply_runtime_optimizations()
         self._attach_prefix_share_gate()
+        # P2-#6: idle-time allocator fragmentation control (reserved >> allocated).
+        self._memory_releaser = self._create_memory_releaser()
+        self._memory_releaser.start()
+
+    def _create_memory_releaser(self) -> AdaptiveMemoryReleaser:
+        """Build the idle memory sweeper (XPU only; a no-op provider elsewhere)."""
+        if self.device_context.device.type != "xpu":
+            return AdaptiveMemoryReleaser(
+                snapshot_provider=lambda: None,
+                release_callback=lambda: None,
+                interval_seconds=0.0,
+            )
+        return AdaptiveMemoryReleaser(
+            snapshot_provider=self._adaptive_memory_release_snapshot,
+            release_callback=self._adaptive_memory_release_execute,
+        )
+
+    def _adaptive_memory_release_snapshot(self) -> dict[str, object] | None:
+        metrics = getattr(self, "metrics", None)
+        if metrics is not None:
+            snap = metrics.snapshot()
+            if snap.running_requests > 0 or snap.waiting_requests > 0:
+                return {"idle": False}
+        memory_info = self.device_context.get_memory_info()
+        if memory_info is None:
+            return None
+        return {
+            "idle": True,
+            "free_bytes": memory_info.free_bytes,
+            "total_bytes": memory_info.total_bytes,
+            "reserved_bytes": memory_info.reserved_bytes,
+            "allocated_bytes": memory_info.allocated_bytes,
+            "min_free_bytes": self.device_context.safety_policy.min_free_bytes,
+        }
+
+    def _adaptive_memory_release_execute(self) -> None:
+        """Release idle device memory: trim KV pages, evict prompt cache, empty_cache."""
+        prompt_cache = getattr(self, "_prompt_cache", None)
+        if prompt_cache:
+            for key, entry in list(prompt_cache.items()):
+                self._evict_prompt_cache_entry(key, entry)
+        trimmed_pages = self.cache_allocator.trim()
+        release_unused_memory = getattr(self.device_context, "release_unused_memory", None)
+        if callable(release_unused_memory):
+            release_unused_memory()
+        if trimmed_pages > 0:
+            logger.info("Adaptive memory release trimmed idle KV cache pages: released_pages=%s", trimmed_pages)
 
     @staticmethod
     def _normalize_optimization_config(config: EngineOptimizationConfig | None) -> EngineOptimizationConfig:
@@ -1462,12 +1509,34 @@ class AnnaQwen3_5TextEngine:
             if snapshot.running_requests > 0 or snapshot.waiting_requests > 0:
                 return
         trimmed_pages = self.cache_allocator.trim()
-        if trimmed_pages <= 0:
-            return
+        # P2-#6: adaptive release - when free memory is below the admission safety
+        # floor after a request finished, actively empty the device allocator cache
+        # instead of waiting for the idle sweeper (releases fragmented segments).
+        memory_info = None
+        get_memory_info = getattr(self.device_context, "get_memory_info", None)
+        if callable(get_memory_info):
+            memory_info = get_memory_info()
+        memory_pressure = (
+            memory_info is not None
+            and memory_info.free_bytes < self.device_context.safety_policy.min_free_bytes
+        )
         release_unused_memory = getattr(self.device_context, "release_unused_memory", None)
+        if trimmed_pages <= 0 and not memory_pressure:
+            return
         if callable(release_unused_memory):
             release_unused_memory()
-        logger.info("Trimmed idle KV cache pages: released_pages=%s", trimmed_pages)
+        if trimmed_pages > 0:
+            logger.info("Trimmed idle KV cache pages: released_pages=%s", trimmed_pages)
+        elif memory_info is not None:
+            reserved = memory_info.reserved_bytes
+            allocated = memory_info.allocated_bytes
+            if reserved is not None and allocated is not None:
+                logger.debug(
+                    "Memory pressure release: free=%.0fMiB reserved=%.2fGiB allocated=%.2fGiB",
+                    memory_info.free_bytes >> 20,
+                    (reserved - allocated) / (1 << 30),
+                    allocated / (1 << 30),
+                )
 
     def _reclaim_runtime_memory_for_admission(self) -> bool:
         released = False
@@ -1534,7 +1603,13 @@ class AnnaQwen3_5TextEngine:
     def set_scheduler(self, scheduler: object | None) -> None:
         self.scheduler = scheduler
 
-    def _kv_cache_page_counts(self) -> tuple[int, int]:
+    def _kv_cache_page_counts(self) -> tuple[int, int, int, int]:
+        """Return (used_pages, total_pages, turboquant_rows, turboquant_cached_tokens).
+
+        P2-#7: under TurboQuant KV the full-attention layers bypass the paged
+        allocator (quantized rows per request), so pages alone always read 0/0.
+        The live-cache registry makes the turboquant usage observable instead.
+        """
         used_pages = 0
         total_pages = 0
         for layer in getattr(self.cache_allocator, "layers", ()):
@@ -1545,7 +1620,28 @@ class AnnaQwen3_5TextEngine:
             free_pages = len(getattr(layer, "free_pages", ()))
             used_pages += max(0, min(capacity, capacity - free_pages))
             total_pages += capacity
-        return used_pages, total_pages
+        turboquant_rows = 0
+        turboquant_tokens = 0
+        live_caches = getattr(self.cache_allocator, "live_caches", None)
+        if callable(live_caches):
+            for cache in live_caches():
+                rows = getattr(cache, "turboquant_rows", None)
+                lengths = getattr(cache, "layer_lengths", None)
+                if rows is None or lengths is None:
+                    continue
+                uses_turboquant = getattr(cache, "uses_turboquant_for_layer", None)
+                for layer_idx, layer_rows in enumerate(rows):
+                    if callable(uses_turboquant) and not uses_turboquant(layer_idx):
+                        continue
+                    for batch_idx, row in enumerate(layer_rows):
+                        if row is None:
+                            continue
+                        turboquant_rows += 1
+                        try:
+                            turboquant_tokens += int(lengths[layer_idx][batch_idx])
+                        except (IndexError, TypeError, ValueError):
+                            pass
+        return used_pages, total_pages, turboquant_rows, turboquant_tokens
 
     def service_metrics_snapshot(self) -> ServiceMetricsSnapshot:
         metrics = getattr(self, "metrics", None)
@@ -1562,10 +1658,12 @@ class AnnaQwen3_5TextEngine:
                     entries=prefix_stats.entries,
                 )
         snapshot = metrics.snapshot() if metrics is not None else ServiceMetricsSnapshot(timestamp=time.perf_counter())
-        used_pages, total_pages = self._kv_cache_page_counts()
+        used_pages, total_pages, turboquant_rows, turboquant_tokens = self._kv_cache_page_counts()
         extra: dict[str, object] = {
             "kv_cache_used_pages": used_pages,
             "kv_cache_total_pages": total_pages,
+            "kv_cache_turboquant_rows": turboquant_rows,
+            "kv_cache_turboquant_tokens": turboquant_tokens,
             "prompt_cache_entries": len(getattr(self, "_prompt_cache", {})),
         }
         if prefix_stats is not None and metrics is None:
@@ -1715,6 +1813,8 @@ class AnnaQwen3_5TextEngine:
                 "scheduler_queue_depth": service_metrics.scheduler_queue_depth,
                 "kv_cache_used_pages": service_metrics.kv_cache_used_pages,
                 "kv_cache_total_pages": service_metrics.kv_cache_total_pages,
+                "kv_cache_turboquant_rows": service_metrics.kv_cache_turboquant_rows,
+                "kv_cache_turboquant_tokens": service_metrics.kv_cache_turboquant_tokens,
                 "cache_compact_count": service_metrics.cache_compact_count,
                 "cache_compact_seconds_total": service_metrics.cache_compact_seconds_total,
                 "scheduler_prefill_admitted_requests_total": (
@@ -2320,6 +2420,45 @@ class AnnaQwen3_5TextEngine:
             release = getattr(stale_entry.past_key_values, "release", None)
             if callable(release):
                 release()
+
+    def lookup_prompt_cache(self, prepared: PreparedInputs) -> tuple[tuple[int, ...], PromptPrefillResult] | None:
+        """Public exact prompt-cache lookup (scheduler path, P2-#7).
+
+        Returns ``(cache_key, PromptPrefillResult)`` on a hit, ``None`` on a miss or
+        when the prompt is not exact-cache eligible. Hit/miss counters are recorded
+        so the prompt-cache hit-rate metric stays meaningful under continuous batching.
+        """
+        key = self._prompt_cache_key(prepared)
+        if key is None:
+            return None
+        # Cache clones copy inference-mode tensors; keep the clone in the same mode.
+        with torch.inference_mode():
+            cached = self._clone_prompt_cache_entry(key)
+        metrics = getattr(self, "metrics", None)
+        if cached is not None:
+            if metrics is not None:
+                metrics.record_prompt_cache_lookup(hit=True)
+            logger.info("Prompt cache hit: prompt_tokens=%s", int(prepared.input_ids.shape[1]))
+            return key, cached
+        if metrics is not None:
+            metrics.record_prompt_cache_lookup(hit=False)
+        return None
+
+    def remember_prompt_cache(
+        self,
+        *,
+        key: tuple[int, ...] | None,
+        logits: torch.Tensor,
+        past_key_values: object | None,
+        prompt_tokens: int,
+    ) -> None:
+        """Public prompt-cache insert (scheduler path, P2-#7). Single-request caches only."""
+        self._remember_prompt_cache_entry(
+            key=key,
+            logits=logits,
+            past_key_values=past_key_values,
+            prompt_tokens=prompt_tokens,
+        )
 
     def _prefill_generation_prompt(self, prepared: PreparedInputs) -> PromptPrefillResult:
         started_at = time.perf_counter()

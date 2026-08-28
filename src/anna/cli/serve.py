@@ -16,6 +16,7 @@ from anna.runtime.device import RuntimeSafetyPolicy
 from anna.runtime.model_runtime_loader import load_model_runtime_from_model_dir
 from anna.runtime.scheduler import AnnaScheduler
 from anna.runtime.scheduler_profiles import resolve_scheduler_settings
+from anna.model.turboquant import turboquant_is_available
 from anna.runtime.service_metrics import AnnaServiceMetricsLogger
 
 logger = logging.getLogger(__name__)
@@ -211,6 +212,7 @@ def _build_scheduler(engine, settings: ServeSettings) -> AnnaScheduler | None:
         dynamic_token_budget=settings.scheduler_dynamic_token_budget,
         skip_batch_wait_when_idle=settings.scheduler_skip_batch_wait_when_idle,
         max_queue_wait_ms=settings.scheduler_max_queue_wait_ms,
+        event_driven_prefill_insert=settings.scheduler_event_driven_prefill_insert,
         profile=settings.scheduler_profile,
     )
     engine.set_scheduler(scheduler)
@@ -278,14 +280,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prompt-cache-size",
         type=_non_negative_int,
-        default=0,
-        help="Keep up to N text-only prompt KV caches resident for exact prompt reuse. Set 0 to disable.",
+        default=None,
+        help="Keep up to N text-only prompt KV caches resident for exact prompt reuse. "
+        "Default: auto (4 when TurboQuant KV cache is active, 0 otherwise - under TurboQuant the "
+        "paged prefix-block path is unused, so the exact cache is the only cross-request reuse). "
+        "Set 0 to disable explicitly.",
     )
     parser.add_argument(
         "--prompt-cache-max-tokens",
         type=_non_negative_int,
-        default=0,
-        help="Only cache prompts up to N tokens (reduces RAM/clone cost for long prompts). Set 0 for no limit.",
+        default=None,
+        help="Only cache prompts up to N tokens (reduces RAM/clone cost for long prompts). "
+        "Default: auto (2048 when the prompt cache is auto-enabled, 0 = no limit otherwise).",
     )
     parser.add_argument(
         "--no-inference-warmup",
@@ -608,6 +614,15 @@ def build_parser() -> argparse.ArgumentParser:
         "throughput=500.",
     )
     parser.add_argument(
+        "--scheduler-event-driven-prefill-insert",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="P2-#9: admit waiting prefills immediately after the current decode step instead of "
+        "waiting out --scheduler-prefill-interval-steps. Lowers TTFT for newly queued prompts at a "
+        "small per-step decode cost. Profile defaults: interactive=off (interval already 1), "
+        "throughput=on.",
+    )
+    parser.add_argument(
         "--metrics-log-interval-seconds",
         type=_non_negative_float,
         default=10.0,
@@ -636,7 +651,32 @@ def _resolve_serve_scheduler_knobs(args: argparse.Namespace) -> dict:
         max_waiting_requests=args.scheduler_max_waiting_requests,
         dynamic_token_budget=args.scheduler_dynamic_token_budget,
         max_queue_wait_ms=args.scheduler_max_queue_wait_ms,
+        event_driven_prefill_insert=args.scheduler_event_driven_prefill_insert,
     )
+
+
+def _resolve_prompt_cache_defaults(args: argparse.Namespace) -> tuple[int, int, bool]:
+    """Resolve --prompt-cache-size / --prompt-cache-max-tokens defaults (P2-#7).
+
+    Under TurboQuant KV cache the paged prefix-block path is structurally unused
+    (full-attention layers store quantized rows, not pages), so the exact prompt
+    cache is the only cross-request reuse channel and defaults ON with a modest
+    entry cap. On the paged (non-quantized) KV path prefix block sharing already
+    covers shared system prompts, so the exact cache stays opt-in to avoid dual
+    residency (``prefer_prompt_cache_over_prefix`` boundary).
+
+    Returns ``(prompt_cache_size, prompt_cache_max_tokens, auto_applied)``.
+    """
+    if args.prompt_cache_size is not None:
+        return int(args.prompt_cache_size), int(args.prompt_cache_max_tokens or 0), False
+    kv_mode = (args.kv_cache_quantization or "none").strip().lower()
+    turboquant_active = kv_mode == "turboquant" or (
+        kv_mode == "auto" and turboquant_is_available()
+    )
+    if turboquant_active:
+        max_tokens = 2048 if args.prompt_cache_max_tokens is None else int(args.prompt_cache_max_tokens)
+        return 4, max_tokens, True
+    return 0, int(args.prompt_cache_max_tokens or 0), True
 
 
 def main() -> None:
@@ -656,6 +696,15 @@ def main() -> None:
     # Size-tier TurboQuant defaults when bits/residual are omitted.
     kv_bits = 4 if args.kv_cache_quant_bits is None else int(args.kv_cache_quant_bits)
     kv_residual = 128 if args.kv_cache_residual_len is None else int(args.kv_cache_residual_len)
+    # P2-#7: exact prompt cache defaults on under TurboQuant KV (prefix pages unused there).
+    prompt_cache_size, prompt_cache_max_tokens, prompt_cache_auto = _resolve_prompt_cache_defaults(args)
+    if prompt_cache_auto:
+        logger.info(
+            "Prompt cache defaults applied: prompt_cache_size=%s prompt_cache_max_tokens=%s "
+            "(explicit override: --prompt-cache-size / --prompt-cache-max-tokens; 0 disables)",
+            prompt_cache_size,
+            prompt_cache_max_tokens,
+        )
     settings = ServeSettings(
         model_dir=model_dir,
         model_id=model_name,
@@ -664,8 +713,8 @@ def main() -> None:
         compile_mode=args.compile_mode,
         compile_fullgraph=args.compile_fullgraph,
         prefill_chunk_size=args.prefill_chunk_size,
-        prompt_cache_size=args.prompt_cache_size,
-        prompt_cache_max_tokens=args.prompt_cache_max_tokens,
+        prompt_cache_size=prompt_cache_size,
+        prompt_cache_max_tokens=prompt_cache_max_tokens,
         profile_runtime=args.profile_runtime,
         kv_cache_quantization=args.kv_cache_quantization,
         kv_cache_quant_bits=kv_bits,
@@ -700,6 +749,7 @@ def main() -> None:
         scheduler_dynamic_token_budget=bool(scheduler_knobs["dynamic_token_budget"]),
         scheduler_skip_batch_wait_when_idle=bool(scheduler_knobs["skip_batch_wait_when_idle"]),
         scheduler_max_queue_wait_ms=float(scheduler_knobs["max_queue_wait_ms"]),
+        scheduler_event_driven_prefill_insert=bool(scheduler_knobs["event_driven_prefill_insert"]),
         warmup_prefill_tokens=args.warmup_prefill_tokens,
         warmup_decode_steps=args.warmup_decode_steps,
         warmup_batch_size=args.warmup_batch_size,

@@ -554,8 +554,8 @@ class AnnaGemma4TextEngine(AnnaQwen3_5TextEngine):
         estimated = full_kv_bytes + sliding_kv_bytes + hidden_working_bytes + per_layer_input_bytes
         return int(estimated * self.device_context.safety_policy.generation_memory_safety_factor)
 
-    def _kv_cache_page_counts(self) -> tuple[int, int]:
-        return 0, 0
+    def _kv_cache_page_counts(self) -> tuple[int, int, int, int]:
+        return 0, 0, 0, 0
 
     @staticmethod
     def _resolve_per_layer_input_embedding_offload(
