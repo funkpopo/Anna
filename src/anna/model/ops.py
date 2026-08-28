@@ -393,6 +393,19 @@ class Qwen3DynamicCache:
         self.visible_cache_capacities: list[int] = [0 for _ in range(config.num_hidden_layers)]
         self.page_table_caches: list[torch.Tensor | None] = [None for _ in range(config.num_hidden_layers)]
         self.page_table_capacities: list[int] = [0 for _ in range(config.num_hidden_layers)]
+        # Device-resident mirrors of ``layer_lengths`` (one tensor per layer). Kept in
+        # sync by ``update()`` so the decode hot path avoids a host->device copy per
+        # layer per step. Invalidated whenever host-side lengths are mutated outside
+        # the uniform-append fast path.
+        self._device_lengths: list[torch.Tensor | None] = [
+            None for _ in range(config.num_hidden_layers)
+        ]
+        # Page-table revision counters: ``_page_table_revisions`` is bumped whenever a
+        # layer's page tables change; ``_page_table_sync_revisions`` records the last
+        # revision materialized into ``page_table_caches`` so unchanged decode steps
+        # skip the host->device page-table rebuild entirely.
+        self._page_table_revisions: list[int] = [0 for _ in range(config.num_hidden_layers)]
+        self._page_table_sync_revisions: list[int] = [-1 for _ in range(config.num_hidden_layers)]
         self.seen_tokens = 0
         self.rope_deltas: torch.Tensor | None = None
         self.reserved_seq_capacity = 0
@@ -433,9 +446,59 @@ class Qwen3DynamicCache:
             self.layer_lengths = [[0 for _ in range(batch_size)] for _ in range(self.config.num_hidden_layers)]
             self.page_tables = [[[] for _ in range(batch_size)] for _ in range(self.config.num_hidden_layers)]
             self.turboquant_rows = [[None for _ in range(batch_size)] for _ in range(self.config.num_hidden_layers)]
+            self._invalidate_device_lengths()
             return
         if len(self.layer_lengths[0]) != batch_size:
             raise ValueError(f"Cache batch size mismatch: expected {len(self.layer_lengths[0])}, got {batch_size}")
+
+    def _invalidate_device_lengths(self, layer_idx: int | None = None) -> None:
+        """Drop cached device length tensors after host-side length mutations."""
+
+        if layer_idx is None:
+            self._device_lengths = [None for _ in range(self.config.num_hidden_layers)]
+        else:
+            self._device_lengths[layer_idx] = None
+
+    def _device_lengths_for(self, layer_idx: int, device: torch.device) -> torch.Tensor:
+        """Return the device-resident per-row length tensor for ``layer_idx``.
+
+        Invariant: the returned tensor mirrors ``self.layer_lengths[layer_idx]``. It is
+        advanced on-device by the uniform-append fast path in ``update()`` and rebuilt
+        from the host list (one H2D copy) whenever invalidated.
+        """
+
+        tensor = self._device_lengths[layer_idx]
+        batch_size = len(self.layer_lengths[layer_idx])
+        if (
+            tensor is None
+            or tensor.device != device
+            or tensor.shape[0] != batch_size
+        ):
+            tensor = torch.tensor(self.layer_lengths[layer_idx], device=device, dtype=torch.long)
+            self._device_lengths[layer_idx] = tensor
+        return tensor
+
+    def _advance_device_lengths(
+        self,
+        layer_idx: int,
+        append_length: int,
+        previous_lengths: list[int],
+        device: torch.device,
+    ) -> None:
+        """Advance the device length tensor after a uniform ``append_length`` update.
+
+        Falls back to a rebuild from the host list when rows did not advance uniformly
+        (rare structural paths), trading one H2D copy for correctness.
+        """
+
+        tensor = self._device_lengths[layer_idx]
+        expected = [length + append_length for length in previous_lengths]
+        if tensor is not None and self.layer_lengths[layer_idx] == expected:
+            tensor.add_(append_length)
+        else:
+            self._device_lengths[layer_idx] = torch.tensor(
+                self.layer_lengths[layer_idx], device=device, dtype=torch.long
+            )
 
     def uses_turboquant_for_layer(self, layer_idx: int) -> bool:
         return layer_idx in self._turboquant_layer_index_set
@@ -578,7 +641,21 @@ class Qwen3DynamicCache:
         if required_blocks <= 0:
             self.page_table_caches[layer_idx] = None
             self.page_table_capacities[layer_idx] = 0
+            self._page_table_sync_revisions[layer_idx] = -1
             return None
+
+        cached = self.page_table_caches[layer_idx]
+        revision = self._page_table_revisions[layer_idx]
+        if (
+            revision == self._page_table_sync_revisions[layer_idx]
+            and cached is not None
+            and cached.device == device
+            and cached.shape[0] == batch_size
+            and cached.shape[1] >= required_blocks
+        ):
+            # Page tables unchanged since the last sync (the common decode case):
+            # reuse the device buffer instead of rebuilding it from host lists.
+            return cached[:, :required_blocks]
 
         page_table_buffer = self._ensure_page_table_layer_buffer(
             layer_idx,
@@ -586,11 +663,12 @@ class Qwen3DynamicCache:
             required_blocks=required_blocks,
             device=device,
         )
+        host_table = torch.full((batch_size, required_blocks), -1, dtype=torch.int32)
         for batch_idx, page_ids in enumerate(self.page_tables[layer_idx]):
-            if not page_ids:
-                continue
-            page_ids_tensor = torch.tensor(page_ids, device=device, dtype=page_table_buffer.dtype)
-            page_table_buffer[batch_idx, : page_ids_tensor.shape[0]].copy_(page_ids_tensor)
+            if page_ids:
+                host_table[batch_idx, : len(page_ids)] = torch.tensor(page_ids, dtype=torch.int32)
+        page_table_buffer[:, :required_blocks].copy_(host_table.to(device=device))
+        self._page_table_sync_revisions[layer_idx] = revision
         return page_table_buffer[:, :required_blocks]
 
     def _update_visible_layer_cache(
@@ -599,11 +677,17 @@ class Qwen3DynamicCache:
         *,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
-        past_lengths: torch.Tensor,
+        previous_lengths: list[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        visible_lengths = self.layer_lengths[layer_idx]
-        max_length = max(visible_lengths, default=0)
-        previous_max_length = int(past_lengths.max().item()) if past_lengths.numel() > 0 else 0
+        """Append key/value states into the dense mirror buffers.
+
+        Row positions come from the host-side ``previous_lengths`` snapshot captured
+        before ``update()`` advanced ``layer_lengths``, so this path performs no
+        device->host sync (the old implementation called ``.max().item()`` and
+        ``.tolist()`` once per layer per step).
+        """
+        max_length = max(self.layer_lengths[layer_idx], default=0)
+        previous_max_length = max(previous_lengths, default=0)
         key_buffer, value_buffer = self._ensure_visible_layer_buffers(
             layer_idx,
             key_states=key_states,
@@ -613,11 +697,19 @@ class Qwen3DynamicCache:
             previous_max_length=previous_max_length,
         )
 
-        for batch_idx, start_position in enumerate(past_lengths.tolist()):
-            append_length = key_states.shape[2]
+        append_length = key_states.shape[2]
+        if previous_lengths and all(start == previous_lengths[0] for start in previous_lengths):
+            # Uniform row positions (the steady-state decode/prefill case): a single
+            # vectorized copy instead of a per-row Python loop.
+            start_position = previous_lengths[0]
             end_position = start_position + append_length
-            key_buffer[batch_idx, :, start_position:end_position, :].copy_(key_states[batch_idx])
-            value_buffer[batch_idx, :, start_position:end_position, :].copy_(value_states[batch_idx])
+            key_buffer[:, :, start_position:end_position, :].copy_(key_states)
+            value_buffer[:, :, start_position:end_position, :].copy_(value_states)
+        else:
+            for batch_idx, start_position in enumerate(previous_lengths):
+                end_position = start_position + append_length
+                key_buffer[batch_idx, :, start_position:end_position, :].copy_(key_states[batch_idx])
+                value_buffer[batch_idx, :, start_position:end_position, :].copy_(value_states[batch_idx])
 
         return key_buffer[:, :, :max_length, :], value_buffer[:, :, :max_length, :]
 
@@ -631,7 +723,9 @@ class Qwen3DynamicCache:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
         batch_size = int(key_states.shape[0])
         self._ensure_batch_size(batch_size)
-        past_lengths = torch.tensor(self.layer_lengths[layer_idx], device=key_states.device, dtype=torch.long)
+        device_lengths = self._device_lengths_for(layer_idx, key_states.device)
+        previous_lengths = list(self.layer_lengths[layer_idx])
+        past_lengths = device_lengths.clone()
         materialized_keys: list[torch.Tensor] = []
         materialized_values: list[torch.Tensor] = []
 
@@ -658,7 +752,11 @@ class Qwen3DynamicCache:
         self.visible_cache_capacities[layer_idx] = 0
         self.page_table_caches[layer_idx] = None
         self.page_table_capacities[layer_idx] = 0
-        self.seen_tokens = max(self.get_seq_lengths().tolist(), default=0)
+        self._advance_device_lengths(layer_idx, int(key_states.shape[2]), previous_lengths, key_states.device)
+        self.seen_tokens = max(
+            (self._request_seq_length(idx) for idx in range(self.get_batch_size())),
+            default=0,
+        )
         if not require_dense_cache:
             return None, None, past_lengths
         padded_key = self._pad_cache_rows(materialized_keys, device=key_states.device, dtype=key_states.dtype)
@@ -683,7 +781,9 @@ class Qwen3DynamicCache:
             )
         batch_size, _, append_length, _ = key_states.shape
         self._ensure_batch_size(batch_size)
-        past_lengths = torch.tensor(self.layer_lengths[layer_idx], device=key_states.device, dtype=torch.long)
+        device_lengths = self._device_lengths_for(layer_idx, key_states.device)
+        previous_lengths = list(self.layer_lengths[layer_idx])
+        past_lengths = device_lengths.clone()
         reserved_length = max(append_length, self.reserved_seq_capacity)
         required_blocks_hint = (reserved_length + self.block_size - 1) // self.block_size
         if required_blocks_hint > 0:
@@ -699,8 +799,10 @@ class Qwen3DynamicCache:
             and batch_size == 1
             and self._prompt_token_ids is not None
         )
+        page_tables_changed = False
         for batch_idx in range(batch_size):
             if use_prefix_share:
+                page_count_before = len(self.page_tables[layer_idx][batch_idx])
                 self._update_paged_row_with_prefix_sharing(
                     key_states,
                     value_states,
@@ -708,6 +810,8 @@ class Qwen3DynamicCache:
                     batch_idx,
                     append_length,
                 )
+                if len(self.page_tables[layer_idx][batch_idx]) != page_count_before:
+                    page_tables_changed = True
                 continue
 
             current_length = self.layer_lengths[layer_idx][batch_idx]
@@ -724,6 +828,7 @@ class Qwen3DynamicCache:
                         value_template=value_states,
                     )
                 )
+                page_tables_changed = True
 
             self._write_pages(
                 layer_idx=layer_idx,
@@ -734,14 +839,20 @@ class Qwen3DynamicCache:
             )
             self.layer_lengths[layer_idx][batch_idx] = required_length
 
-        self.seen_tokens = max(self.get_seq_lengths().tolist(), default=0)
+        if page_tables_changed:
+            self._page_table_revisions[layer_idx] += 1
+        self._advance_device_lengths(layer_idx, append_length, previous_lengths, key_states.device)
+        self.seen_tokens = max(
+            (self._request_seq_length(idx) for idx in range(batch_size)),
+            default=0,
+        )
         self._sync_page_table_layer_buffer(layer_idx, batch_size=batch_size, device=key_states.device)
         if self._uses_contiguous_full_attention_mirror(layer_idx):
             mirrored_key, mirrored_value = self._update_visible_layer_cache(
                 layer_idx,
                 key_states=key_states,
                 value_states=value_states,
-                past_lengths=past_lengths,
+                previous_lengths=previous_lengths,
             )
             if require_dense_cache:
                 return mirrored_key, mirrored_value, past_lengths
@@ -884,7 +995,19 @@ class Qwen3DynamicCache:
         return max(self._request_seq_length(idx) for idx in range(batch_size))
 
     def get_seq_lengths(self, *, device: torch.device | None = None) -> torch.Tensor:
-        lengths = [self._request_seq_length(idx) for idx in range(self.get_batch_size())]
+        batch_size = self.get_batch_size()
+        if batch_size == 0:
+            return torch.zeros(0, dtype=torch.long, device=device)
+        # Fast path: reuse a device-resident length tensor when one already exists on
+        # the requested device (avoids a per-forward host->device copy for position_ids).
+        if device is not None:
+            for layer_idx, lengths in enumerate(self.layer_lengths):
+                if lengths and any(lengths):
+                    cached = self._device_lengths[layer_idx]
+                    if cached is not None and cached.device == device and cached.shape[0] == batch_size:
+                        return cached
+                    break
+        lengths = [self._request_seq_length(idx) for idx in range(batch_size)]
         return torch.tensor(lengths, dtype=torch.long, device=device)
 
     def _request_seq_length(self, batch_idx: int) -> int:
@@ -916,7 +1039,7 @@ class Qwen3DynamicCache:
         if layer.key_pages is None or layer.value_pages is None:
             return None
 
-        visible_lengths = torch.tensor(self.layer_lengths[layer_idx], dtype=torch.long, device=layer.key_pages.device)
+        visible_lengths = self._device_lengths_for(layer_idx, layer.key_pages.device)
         if visible_lengths.numel() == 0:
             return None
 
@@ -966,7 +1089,7 @@ class Qwen3DynamicCache:
             assert key_dtype is not None
             assert value_device is not None
             assert value_dtype is not None
-            visible_lengths = visible_lengths.to(device=key_device)
+            visible_lengths = self._device_lengths_for(layer_idx, key_device)
             return (
                 self._pad_cache_rows(materialized_keys, device=key_device, dtype=key_dtype),
                 self._pad_cache_rows(materialized_values, device=value_device, dtype=value_dtype),
@@ -979,8 +1102,10 @@ class Qwen3DynamicCache:
 
         key_buffer = self.visible_key_caches[layer_idx]
         value_buffer = self.visible_value_caches[layer_idx]
-        visible_lengths_device = None if key_buffer is None else key_buffer.device
-        visible_lengths = torch.tensor(self.layer_lengths[layer_idx], dtype=torch.long, device=visible_lengths_device)
+        if key_buffer is not None:
+            visible_lengths = self._device_lengths_for(layer_idx, key_buffer.device)
+        else:
+            visible_lengths = torch.tensor(self.layer_lengths[layer_idx], dtype=torch.long)
         max_length = max(self.layer_lengths[layer_idx], default=0)
         if max_length <= 0:
             return None, None, visible_lengths
@@ -1107,7 +1232,10 @@ class Qwen3DynamicCache:
         )
         for layer_idx in range(config.num_hidden_layers):
             stacked.layer_lengths[layer_idx] = [row.layer_lengths[layer_idx][0] for row in rows]
-        stacked.seen_tokens = max(stacked.get_seq_lengths().tolist(), default=0)
+        stacked.seen_tokens = max(
+            (stacked._request_seq_length(idx) for idx in range(stacked.get_batch_size())),
+            default=0,
+        )
         stacked.rope_deltas = None if rows[0].rope_deltas is None else torch.cat([row.rope_deltas for row in rows], dim=0)
         stacked.reserved_seq_capacity = max((row.reserved_seq_capacity for row in rows), default=0)
 
@@ -1303,7 +1431,10 @@ class Qwen3DynamicCache:
                 compacted.visible_key_caches[layer_idx] = key_cache.index_select(0, key_index)
                 compacted.visible_value_caches[layer_idx] = value_cache.index_select(0, value_index)
 
-        compacted.seen_tokens = max(compacted.get_seq_lengths().tolist(), default=0)
+        compacted.seen_tokens = max(
+            (compacted._request_seq_length(idx) for idx in range(len(rows))),
+            default=0,
+        )
         compacted._prefill_input_ids = None
         compacted._prompt_token_ids = None
 
@@ -1320,6 +1451,8 @@ class Qwen3DynamicCache:
             self.visible_cache_capacities[layer_idx] = 0
             self.page_table_caches[layer_idx] = None
             self.page_table_capacities[layer_idx] = 0
+            self._page_table_revisions[layer_idx] += 1
+        self._invalidate_device_lengths()
         self.seen_tokens = 0
         self.rope_deltas = None
         self.reserved_seq_capacity = 0
@@ -1409,7 +1542,10 @@ class Qwen3DynamicCache:
             self.visible_cache_capacities[layer_idx] = 0
             self.page_table_caches[layer_idx] = None
             self.page_table_capacities[layer_idx] = 0
+            self._page_table_revisions[layer_idx] += 1
+            self._page_table_sync_revisions[layer_idx] = -1
 
+        self._invalidate_device_lengths()
         self.seen_tokens = 0
         self.rope_deltas = None
         self.reserved_seq_capacity = 0

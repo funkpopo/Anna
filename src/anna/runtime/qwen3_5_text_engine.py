@@ -519,10 +519,7 @@ class AnnaQwen3_5TextEngine:
         resident_expert_layers: int | None = None,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         cached_experts_per_layer: int | None = None,
-        asr_max_inference_batch_size: int = 1,
-        asr_max_new_tokens: int = 512,
     ) -> "AnnaQwen3_5TextEngine":
-        del asr_max_inference_batch_size, asr_max_new_tokens
         model_path = Path(model_dir)
         config = load_qwen3_5_text_model_config(model_path)
         device_context = DeviceContext.resolve(
@@ -3133,6 +3130,11 @@ class AnnaQwen3_5TextEngine:
         device_tokens: list[torch.Tensor] = []
         finish_reason = "length"
         input_ids = None
+        # Deferred stop polling: accumulate an on-device EOS flag instead of a per-step
+        # host sync; the flag is materialized every N steps (and on the final step) with
+        # a single scalar transfer. Post-EOS tokens are trimmed after the final pull.
+        stop_sync_every = max(1, int(os.environ.get("ANNA_STOP_SYNC_EVERY_STEPS", "16")))
+        stop_hit: torch.Tensor | None = None
 
         try:
             with steady_decode_accumulation(enabled=self.optimization_config.profile_runtime, log=logger):
@@ -3209,9 +3211,15 @@ class AnnaQwen3_5TextEngine:
                     if first_token_at is None:
                         first_token_at = time.perf_counter()
 
-                    if self._is_stop_token_device(next_token, stop_tensor):
-                        finish_reason = "stop"
-                        break
+                    # Deferred on-device stop check (no per-step .item() sync).
+                    if stop_tensor is not None and stop_tensor.numel() > 0:
+                        step_stop = torch.isin(next_token.detach().reshape(-1)[:1], stop_tensor).reshape(())
+                        stop_hit = step_stop if stop_hit is None else (stop_hit | step_stop)
+                        if (step_idx + 1) % stop_sync_every == 0 or step_idx + 1 >= config.max_new_tokens:
+                            if bool(stop_hit.item()):
+                                finish_reason = "stop"
+                                break
+                            stop_hit = None
 
                     # Keep penalty history on-device (no per-step host id). Duplicate
                     # entries are harmless: apply_*_penalty runs torch.unique.
@@ -3236,6 +3244,12 @@ class AnnaQwen3_5TextEngine:
 
             if device_tokens:
                 completion_ids = token_ids_to_host(torch.stack(device_tokens))
+                if finish_reason == "stop" and stop_token_ids:
+                    # Trim any tokens generated between the last stop poll and the break.
+                    for token_offset, trimmed_id in enumerate(completion_ids):
+                        if trimmed_id in stop_token_ids:
+                            completion_ids = completion_ids[:token_offset]
+                            break
             else:
                 completion_ids = []
 
@@ -3402,15 +3416,18 @@ class AnnaQwen3_5TextEngine:
                     if first_token_at is None:
                         first_token_at = time.perf_counter()
 
-                    # On-device stop check before host materialization (avoids decoding EOS).
-                    if stop_tensor is not None and self._is_stop_token_device(next_token, stop_tensor):
+                    # Host-side stop check on the already-materialized token id: the
+                    # streaming path pulls the id for text assembly anyway, so an extra
+                    # device-side isin().item() sync per step would be pure overhead.
+                    # EOS is still never fed to the assembler (checked before feed_token).
+                    token_id = self._token_id_from_tensor(next_token)
+                    if token_id in stop_token_ids:
                         tail = _flush_tail()
                         if tail:
                             yield tail, None, False, None, prompt_length, len(completion_ids), None
                         yield _finish_event("stop")
                         return
 
-                    token_id = self._token_id_from_tensor(next_token)
                     completion_ids.append(token_id)
                     metrics = getattr(self, "metrics", None)
                     if metrics is not None:

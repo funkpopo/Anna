@@ -1,7 +1,7 @@
 """Process-level XPU execution serialization (P1-2.8).
 
 Anna ``anna-serve`` loads a single model family per process. When audio engines
-(ASR/TTS) and text engines are co-resident in one process (embedding / tests /
+(TTS) and text engines are co-resident in one process (embedding / tests /
 future multi-engine serve), they must not run concurrent XPU work or they will
 contend for the same Arc device memory pool.
 

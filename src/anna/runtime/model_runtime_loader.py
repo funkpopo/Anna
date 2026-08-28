@@ -6,7 +6,6 @@ from typing import Any
 from anna.core.model_family import inspect_model_family
 from anna.runtime.gemma4_text_engine import AnnaGemma4TextEngine
 from anna.runtime.qwen3_5_text_engine import AnnaQwen3_5TextEngine
-from anna.runtime.qwen3_asr_engine import AnnaQwen3ASREngine
 from anna.runtime.qwen3_tts_engine import AnnaQwen3TTSEngine
 
 
@@ -43,8 +42,6 @@ def _shared_from_model_dir_kwargs(
     resident_expert_layers: int | None = None,
     resident_expert_layer_indices: tuple[int, ...] | None = None,
     cached_experts_per_layer: int | None = None,
-    asr_max_inference_batch_size: int = 1,
-    asr_max_new_tokens: int = 512,
 ) -> dict[str, Any]:
     return {
         "model_id": model_id,
@@ -78,8 +75,6 @@ def _shared_from_model_dir_kwargs(
         "resident_expert_layers": resident_expert_layers,
         "resident_expert_layer_indices": resident_expert_layer_indices,
         "cached_experts_per_layer": cached_experts_per_layer,
-        "asr_max_inference_batch_size": asr_max_inference_batch_size,
-        "asr_max_new_tokens": asr_max_new_tokens,
     }
 
 
@@ -117,8 +112,6 @@ def load_model_runtime_from_model_dir(
     resident_expert_layers: int | None = None,
     resident_expert_layer_indices: tuple[int, ...] | None = None,
     cached_experts_per_layer: int | None = None,
-    asr_max_inference_batch_size: int = 1,
-    asr_max_new_tokens: int = 512,
 ):
     shared = _shared_from_model_dir_kwargs(
         model_id=model_id,
@@ -152,14 +145,10 @@ def load_model_runtime_from_model_dir(
         resident_expert_layers=resident_expert_layers,
         resident_expert_layer_indices=resident_expert_layer_indices,
         cached_experts_per_layer=cached_experts_per_layer,
-        asr_max_inference_batch_size=asr_max_inference_batch_size,
-        asr_max_new_tokens=asr_max_new_tokens,
     )
     model_family_info = inspect_model_family(model_dir)
     if model_family_info.model_family == "qwen3_tts":
         return AnnaQwen3TTSEngine.from_model_dir(model_dir, **shared)
-    if model_family_info.model_family == "qwen3_asr":
-        return AnnaQwen3ASREngine.from_model_dir(model_dir, **shared)
     if model_family_info.model_family == "gemma4":
         return AnnaGemma4TextEngine.from_model_dir(model_dir, **shared)
     return AnnaQwen3_5TextEngine.from_model_dir(model_dir, **shared)

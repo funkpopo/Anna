@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-Anna 是一个基于 PyTorch 的本地推理运行时，目标是在 Intel Arc / XPU 上提供高吞吐、低延迟的 OpenAI 兼容服务。当前重点支持 Qwen3.5 文本/多模态推理、Gemma4 文本运行时、Qwen3-TTS 语音合成和 Qwen3-ASR 语音识别。
+Anna 是一个基于 PyTorch 的本地推理运行时，目标是在 Intel Arc / XPU 上提供高吞吐、低延迟的 OpenAI 兼容服务。当前重点支持 Qwen3.5 文本/多模态推理、Gemma4 文本运行时和 Qwen3-TTS 语音合成。
 
 `models/` 目录中的模型用于本地测试、模型类型分析和架构理解；Anna 的运行逻辑不绑定这些具体目录。实际运行时只要求传入兼容的本地模型目录。
 
@@ -21,7 +21,6 @@ Anna 根据模型目录中的 `config.json` 判断模型族，不依赖目录名
 | `model_type` | 运行时 | 入口 |
 | --- | --- | --- |
 | `qwen3_tts` | Qwen3-TTS | `anna-speak`、`/v1/audio/speech` |
-| `qwen3_asr` | Qwen3-ASR | `anna-transcribe`、`/v1/audio/transcriptions` |
 | `gemma4` | Gemma4 | `anna-serve`、`anna-generate`、`anna-bench` |
 | 其它兼容配置 | Qwen3.5 text / VL | `anna-serve`、`anna-generate`、`anna-bench` |
 
@@ -279,26 +278,6 @@ anna-speak `
   --output out.wav
 ```
 
-### Qwen3-ASR
-
-```powershell
-anna-transcribe `
-  --model-dir D:\Models\Qwen3-ASR `
-  --audio input.wav `
-  --device xpu `
-  --language Chinese
-```
-
-通过 HTTP 上传音频：
-
-```powershell
-curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
-  -F model=qwen3-asr `
-  -F file=@input.wav `
-  -F language=Chinese `
-  -F response_format=verbose_json
-```
-
 ## API 路由
 
 - `GET /healthz`：运行时、模型、显存、KV cache、服务指标（prefix 命中率、scheduler 队列深度、TTFT/ITL 直方图、kernel strategy 命中）以及 device-lost/OOM 后的准入状态。
@@ -306,7 +285,6 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 - `POST /v1/chat/completions`：Chat、多模态 Chat、流式输出、函数调用兼容响应。
 - `POST /v1/completions`：文本补全。
 - `POST /v1/audio/speech`：Qwen3-TTS 语音合成。
-- `POST /v1/audio/transcriptions`：Qwen3-ASR 语音识别。
 
 ## `anna-serve` 参数说明
 
@@ -409,18 +387,13 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 - `--scheduler-max-decode-tokens N`：单个 decode batch 的 cached sequence token 预算；`0` 表示关闭。
 - `--metrics-log-interval-seconds S`：周期性输出聚合指标；`0` 表示关闭。
 
-### ASR 服务参数
+### TTS 封装边界
 
-- `--asr-max-inference-batch-size N`：服务端将并发转写请求合批的上限（连续批），同时作为传给 `qwen-asr` 的内部 chunk batch 上限。
-- `--asr-max-new-tokens N`：Qwen3-ASR 每个 chunk 生成的最大文本 token 数。
+Qwen3-TTS 以 **上游库封装** 方式接入（`qwen-tts`）：
 
-### TTS / ASR 封装边界
-
-Qwen3-TTS / Qwen3-ASR 以 **上游库封装** 方式接入（`qwen-tts` / `qwen-asr`）：
-
-- **Anna 负责：** OpenAI 兼容 API/CLI、ASR 的 XPU-only 加载策略、进程级设备执行门闩、指标与 OOM 映射、ASR 请求级连续合批。
+- **Anna 负责：** OpenAI 兼容 API/CLI、进程级设备执行门闩、指标与 OOM 映射。
 - **上游负责：** 音频编码 / talker / vocoder 内核与内部 generate。
-- **暂不迁移：** 在 Qwen3.5 文本仍是 Arc 主优化面时，不把 TTS/ASR 重计算段迁入 Anna SYCL 融合算子。
+- **暂不迁移：** 在 Qwen3.5 文本仍是 Arc 主优化面时，不把 TTS 重计算段迁入 Anna SYCL 融合算子。（Qwen3-ASR 支持已移除：上游 `qwen-asr` 依赖维护停滞。）
 - **进程隔离：** `anna-serve` 单进程单模型族。若同进程共驻音频与文本引擎，必须走进程设备门闩串行化（`DeviceExecutionGate`；`ANNA_XPU_SERIALIZE_ALL=1` 可强制文本引擎也进入同一门闩）。这是串行化，不是多租户显存分区。
 
 ### Gemma4 压测基线

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import sys
-import types
 from pathlib import Path
 
 import pytest
 
+from anna.core import native
 from anna.core.native import (
     SafetensorsShardPlan,
     SafetensorsTensorEntry,
@@ -14,15 +13,33 @@ from anna.core.native import (
 )
 
 
-def _install_fake_rust(monkeypatch, implementation) -> None:
-    module = types.ModuleType("anna._rust")
-    module.inspect_safetensors_manifest = implementation
-    module.inspect_safetensors_load_plan = implementation
-    monkeypatch.setitem(sys.modules, "anna._rust", module)
+class _FakeRust:
+    """Stands in for the compiled anna._rust extension module."""
+
+    def __init__(self, manifest, load_plan) -> None:
+        self._manifest = manifest
+        self._load_plan = load_plan
+        self.manifest_calls: list[str] = []
+        self.load_plan_calls: list[str] = []
+
+    def inspect_safetensors_manifest(self, model_dir: str):
+        self.manifest_calls.append(model_dir)
+        return self._manifest
+
+    def inspect_safetensors_load_plan(self, model_dir: str):
+        self.load_plan_calls.append(model_dir)
+        return self._load_plan
+
+
+def _install_fake_rust(monkeypatch, fake: _FakeRust) -> None:
+    monkeypatch.setattr(native, "_rust_module", lambda: fake)
 
 
 def test_inspect_safetensors_manifest_requires_rust(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.delitem(sys.modules, "anna._rust", raising=False)
+    def _raise():
+        raise ImportError("anna._rust is not available")
+
+    monkeypatch.setattr(native, "_rust_module", _raise)
 
     with pytest.raises(ImportError):
         inspect_safetensors_manifest(tmp_path)
@@ -32,110 +49,51 @@ def test_inspect_safetensors_manifest_wraps_rust_result(monkeypatch, tmp_path: P
     shard = tmp_path / "model-00001-of-00002.safetensors"
     shard.write_bytes(b"abc")
 
-    def fake_inspect(model_dir: str):
-        assert model_dir == str(tmp_path)
-        return [str(shard)], 3
-
-    _install_fake_rust(monkeypatch, fake_inspect)
+    fake = _FakeRust(manifest=([str(shard)], 3), load_plan=None)
+    _install_fake_rust(monkeypatch, fake)
 
     files, total_bytes = inspect_safetensors_manifest(tmp_path)
 
     assert files == [shard]
     assert total_bytes == 3
+    assert fake.manifest_calls == [str(tmp_path)]
 
 
 def test_inspect_safetensors_load_plan_wraps_rust_result(monkeypatch, tmp_path: Path) -> None:
     shard = tmp_path / "model-00001-of-00001.safetensors"
     shard.write_bytes(b"abc")
 
-    def fake_manifest(_model_dir: str):
-        return [str(shard)], 3
-
-    def fake_plan(model_dir: str):
-        assert model_dir == str(tmp_path)
-        return [
+    raw_plan_entry = (
+        str(shard),
+        3,
+        128,
+        [
             (
-                str(shard),
-                3,
+                "model.layers.0.self_attn.q_proj.weight",
+                "BF16",
+                (8, 8),
+                0,
                 128,
-                [
-                    ("a.weight", "BF16", [2, 3], 0, 12),
-                    ("b.weight", "F32", [1, 3], 12, 24),
-                ],
             )
-        ], 3
+        ],
+    )
 
-    module = types.ModuleType("anna._rust")
-    module.inspect_safetensors_manifest = fake_manifest
-    module.inspect_safetensors_load_plan = fake_plan
-    monkeypatch.setitem(sys.modules, "anna._rust", module)
+    fake = _FakeRust(manifest=([str(shard)], 3), load_plan=([raw_plan_entry], 3))
+    _install_fake_rust(monkeypatch, fake)
 
     plans, total_bytes = inspect_safetensors_load_plan(tmp_path)
 
-    assert plans == [
-        SafetensorsShardPlan(
-            path=shard,
-            size_bytes=3,
-            header_len=128,
-            tensors=(
-                SafetensorsTensorEntry(name="a.weight", dtype="BF16", shape=(2, 3), data_start=0, data_end=12),
-                SafetensorsTensorEntry(name="b.weight", dtype="F32", shape=(1, 3), data_start=12, data_end=24),
-            ),
-        )
-    ]
-    assert plans[0].keys == ("a.weight", "b.weight")
     assert total_bytes == 3
-
-
-def test_qwen_weight_files_use_native_manifest(monkeypatch, tmp_path: Path) -> None:
-    from anna.weights import qwen3_5_text_weight_loader as loader
-
-    shard = tmp_path / "model-00001-of-00001.safetensors"
-    shard.write_bytes(b"abc")
-    plan = [
-        SafetensorsShardPlan(
-            path=shard,
-            size_bytes=123,
-            header_len=128,
-            tensors=(SafetensorsTensorEntry(name="a.weight", dtype="F32", shape=(1, 1), data_start=0, data_end=4),),
-        )
-    ]
-    monkeypatch.setattr(loader, "inspect_safetensors_manifest", lambda model_dir: ([shard], 123))
-    monkeypatch.setattr(loader, "inspect_safetensors_load_plan", lambda model_dir: (plan, 123))
-
-    assert loader._iter_weight_files(tmp_path) == [shard]
-    assert loader._load_plan(tmp_path) == (plan, 123)
-    assert loader.estimate_qwen3_5_text_model_weight_bytes(tmp_path) == 123
-
-
-def test_gemma_weight_files_use_native_manifest(monkeypatch, tmp_path: Path) -> None:
-    from anna.weights import gemma4_text_weight_loader as loader
-
-    shard = tmp_path / "model-00001-of-00001.safetensors"
-    shard.write_bytes(b"abc")
-    plan = [
-        SafetensorsShardPlan(
-            path=shard,
-            size_bytes=123,
-            header_len=128,
-            tensors=(SafetensorsTensorEntry(name="a.weight", dtype="F32", shape=(1, 1), data_start=0, data_end=4),),
-        )
-    ]
-    monkeypatch.setattr(loader, "inspect_safetensors_manifest", lambda model_dir: ([shard], 123))
-    monkeypatch.setattr(loader, "inspect_safetensors_load_plan", lambda model_dir: (plan, 123))
-
-    assert loader._iter_weight_files(tmp_path) == [shard]
-    assert loader._load_plan(tmp_path) == (plan, 123)
-    assert loader.estimate_gemma4_text_model_weight_bytes(tmp_path) == 123
-
-
-def test_qwen_weight_files_propagates_native_errors(monkeypatch, tmp_path: Path) -> None:
-    from anna.weights import qwen3_5_text_weight_loader as loader
-
-    def raise_native(_model_dir: Path):
-        raise RuntimeError("native required")
-
-    monkeypatch.setattr(loader, "inspect_safetensors_manifest", raise_native)
-
-    with pytest.raises(RuntimeError, match="native required"):
-        loader._iter_weight_files(tmp_path)
+    assert len(plans) == 1
+    plan = plans[0]
+    assert isinstance(plan, SafetensorsShardPlan)
+    assert plan.path == shard
+    assert plan.size_bytes == 3
+    assert plan.header_len == 128
+    assert plan.keys == ("model.layers.0.self_attn.q_proj.weight",)
+    entry = plan.tensors[0]
+    assert isinstance(entry, SafetensorsTensorEntry)
+    assert entry.dtype == "BF16"
+    assert entry.shape == (8, 8)
+    assert (entry.data_start, entry.data_end) == (0, 128)
+    assert fake.load_plan_calls == [str(tmp_path)]

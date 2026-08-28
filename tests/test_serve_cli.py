@@ -104,10 +104,6 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
             "2048",
             "--scheduler-max-decode-tokens",
             "8192",
-            "--asr-max-inference-batch-size",
-            "2",
-            "--asr-max-new-tokens",
-            "128",
             "--metrics-log-interval-seconds",
             "3.5",
         ]
@@ -139,8 +135,6 @@ def test_serve_parser_accepts_memory_guard_arguments() -> None:
     assert args.scheduler_prefill_interval_steps == 3
     assert args.scheduler_max_prefill_tokens == 2048
     assert args.scheduler_max_decode_tokens == 8192
-    assert args.asr_max_inference_batch_size == 2
-    assert args.asr_max_new_tokens == 128
     assert args.metrics_log_interval_seconds == 3.5
 
 
@@ -358,4 +352,3 @@ def test_log_available_routes_reports_server_address_and_paths(caplog) -> None:
     assert "Route: /healthz, Methods: GET" in caplog.text
     assert "Route: /v1/chat/completions, Methods: POST" in caplog.text
     assert "Route: /v1/audio/speech, Methods: POST" in caplog.text
-    assert "Route: /v1/audio/transcriptions, Methods: POST" in caplog.text

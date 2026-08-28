@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-Anna is a PyTorch-based local inference runtime designed to provide high-throughput, low-latency OpenAI-compatible serving on Intel Arc / XPU. The current runtime focuses on Qwen3.5 text and multimodal inference, Gemma4 text inference, Qwen3-TTS speech synthesis, and Qwen3-ASR speech recognition.
+Anna is a PyTorch-based local inference runtime designed to provide high-throughput, low-latency OpenAI-compatible serving on Intel Arc / XPU. The current runtime focuses on Qwen3.5 text and multimodal inference, Gemma4 text inference, Qwen3-TTS speech synthesis.
 
 Models under `models/` are used for local testing, model-family analysis, and architecture inspection. Anna is not tied to those exact model directories. At runtime, pass any compatible local model directory.
 
@@ -21,7 +21,6 @@ Anna detects the model family from `config.json`; it does not rely on the direct
 | `model_type` | Runtime | Entry points |
 | --- | --- | --- |
 | `qwen3_tts` | Qwen3-TTS | `anna-speak`, `/v1/audio/speech` |
-| `qwen3_asr` | Qwen3-ASR | `anna-transcribe`, `/v1/audio/transcriptions` |
 | `gemma4` | Gemma4 | `anna-serve`, `anna-generate`, `anna-bench` |
 | Other compatible configs | Qwen3.5 text / VL | `anna-serve`, `anna-generate`, `anna-bench` |
 
@@ -279,26 +278,6 @@ anna-speak `
   --output out.wav
 ```
 
-### Qwen3-ASR
-
-```powershell
-anna-transcribe `
-  --model-dir D:\Models\Qwen3-ASR `
-  --audio input.wav `
-  --device xpu `
-  --language English
-```
-
-Upload audio through HTTP:
-
-```powershell
-curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
-  -F model=qwen3-asr `
-  -F file=@input.wav `
-  -F language=English `
-  -F response_format=verbose_json
-```
-
 ## API Routes
 
 - `GET /healthz`: runtime, model, memory, KV cache, service metrics (prefix hit rate, scheduler queue depth, TTFT/ITL histograms, kernel strategy hits), and runtime admission status after device-lost/OOM.
@@ -306,7 +285,6 @@ curl.exe http://127.0.0.1:8000/v1/audio/transcriptions `
 - `POST /v1/chat/completions`: chat, multimodal chat, streaming output, and tool-call-compatible responses (OpenAI multi-phase `tool_calls` deltas on stream).
 - `POST /v1/completions`: text completion.
 - `POST /v1/audio/speech`: Qwen3-TTS speech synthesis.
-- `POST /v1/audio/transcriptions`: Qwen3-ASR speech recognition.
 
 ## `anna-serve` Options
 
@@ -408,18 +386,13 @@ Validate the K=128 table with `python tools/validate_arc_gdn_decode.py --preset 
 - `--scheduler-max-queue-wait-ms MS`: fairness — force prefill admission when the oldest waiter exceeds this age, so long decodes cannot starve new prompts.
 - `--metrics-log-interval-seconds S`: emit aggregate runtime metrics periodically; `0` disables metrics logging. Logs include prompt-cache and prefix-block hit rates plus queue rejections.
 
-### ASR Serving Options
+### TTS wrapper boundary
 
-- `--asr-max-inference-batch-size N`: maximum number of concurrent transcription requests Anna will coalesce into one upstream XPU call (server-side continuous batch), and the chunk batch size passed to `qwen-asr`.
-- `--asr-max-new-tokens N`: maximum generated text tokens per Qwen3-ASR chunk.
+Qwen3-TTS runs as an **upstream wrapper** (`qwen-tts`):
 
-### TTS / ASR wrapper boundary
-
-Qwen3-TTS and Qwen3-ASR run as **upstream wrappers** (`qwen-tts` / `qwen-asr`):
-
-- **Anna owns:** OpenAI-compatible API/CLI, XPU-only load policy (ASR), process device execution gate, metrics, OOM/device-lost mapping, and ASR continuous request batching.
+- **Anna owns:** OpenAI-compatible API/CLI, process device execution gate, metrics, and OOM/device-lost mapping.
 - **Upstream owns:** audio encoder / talker / vocoder kernels and internal generate loops.
-- **Not planned:** porting TTS/ASR heavy kernels into Anna SYCL fused ops while Qwen3.5 text remains the primary Arc optimization surface.
+- **Not planned:** porting TTS heavy kernels into Anna SYCL fused ops while Qwen3.5 text remains the primary Arc optimization surface. (Qwen3-ASR support was removed: the upstream `qwen-asr` dependency is unmaintained.)
 - **Process isolation:** `anna-serve` loads one model family per process. Co-resident audio+text engines must serialize on the process device gate (`DeviceExecutionGate`; set `ANNA_XPU_SERIALIZE_ALL=1` to force text engines onto the same gate). This is serialization, not multi-tenant VRAM partitioning.
 
 ### Gemma4 serve baseline

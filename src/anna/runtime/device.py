@@ -8,6 +8,7 @@ import torch
 
 from anna.mm.prepared_inputs import PreparedInputsT, replace_prepared_inputs
 from anna.model.ops import Qwen3DynamicCache
+from anna.runtime.capability import DeviceCapability, capability_for_torch_device
 
 
 _DTYPE_ALIASES: dict[str, str] = {
@@ -97,6 +98,7 @@ class XPUDeviceInfo:
     is_arc_alchemist: bool = False
     is_acm_g10: bool = False
     is_arc_a770_or_a750: bool = False
+    capability: DeviceCapability | None = None
 
     def as_log_fields(self) -> dict[str, object]:
         return {
@@ -111,6 +113,7 @@ class XPUDeviceInfo:
             "is_arc_alchemist": self.is_arc_alchemist,
             "is_acm_g10": self.is_acm_g10,
             "is_arc_a770_or_a750": self.is_arc_a770_or_a750,
+            "capability": self.capability.as_log_fields() if self.capability is not None else None,
         }
 
 
@@ -182,6 +185,7 @@ def inspect_xpu_device(device: torch.device | None = None) -> XPUDeviceInfo | No
         is_arc_alchemist=is_arc,
         is_acm_g10=is_acm_g10,
         is_arc_a770_or_a750=is_a770_or_a750,
+        capability=capability_for_torch_device(torch.device("xpu", index)),
     )
 
 

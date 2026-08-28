@@ -114,6 +114,38 @@ def _align_tensor_device(tensor: torch.Tensor | None, device: torch.device) -> t
     return tensor.to(device=device)
 
 
+def _fill_xpu_int4_lm_head_from_embedding(lm_head: XPUInt4Linear, source_weight: torch.Tensor) -> bool:
+    """Fill a direct-int4 lm_head placeholder from the tied embedding weight.
+
+    Tied checkpoints (``tie_word_embeddings=true``) store no ``lm_head.weight``, so the
+    zero-initialized XPUInt4Linear placeholder created during low-memory loading would
+    otherwise stay all-zero (logits all zero). Quantize the embedding weight into the
+    placeholder payload instead.
+    """
+
+    weight = source_weight.detach().to(dtype=torch.float32, device=lm_head.qweight.device)
+    if tuple(weight.shape) != (lm_head.out_features, lm_head.in_features):
+        logger.warning(
+            "Skipping int4 lm_head tie fill: embedding weight shape %s does not match lm_head %s",
+            tuple(weight.shape),
+            (lm_head.out_features, lm_head.in_features),
+        )
+        return False
+    qweight, qscale, qzeros = XPUInt4Linear._quantize_weight(
+        weight,
+        group_size=lm_head.group_size,
+        padded_in_features=lm_head.padded_in_features,
+    )
+    with torch.no_grad():
+        lm_head.qweight.copy_(qweight.to(device=lm_head.qweight.device))
+        lm_head.qscale.copy_(qscale.to(device=lm_head.qscale.device))
+        lm_head.qzeros.copy_(qzeros.to(device=lm_head.qzeros.device))
+        if lm_head.bias is not None:
+            lm_head.bias.zero_()
+    lm_head.prepare_lm_head_topk_layout()
+    return True
+
+
 class Qwen3TextModel(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
@@ -938,8 +970,13 @@ class Qwen3_5TextForCausalLM(nn.Module):
         self.lm_head.to(torch.device("cpu") if offload_token_io else execution_device)
 
     def tie_weights(self) -> None:
-        if self.config.tie_word_embeddings and isinstance(self.lm_head, nn.Linear):
-            self.lm_head.weight = self.model.embed_tokens.weight
+        if not self.config.tie_word_embeddings:
+            return
+        embed_weight = self.model.embed_tokens.weight
+        if isinstance(self.lm_head, nn.Linear):
+            self.lm_head.weight = embed_weight
+        elif isinstance(self.lm_head, XPUInt4Linear):
+            _fill_xpu_int4_lm_head_from_embedding(self.lm_head, embed_weight)
 
     def forward(
         self,
@@ -1033,8 +1070,13 @@ class Qwen3_5TextForConditionalGeneration(nn.Module):
         self.lm_head.to(torch.device("cpu") if offload_token_io else execution_device)
 
     def tie_weights(self) -> None:
-        if self.config.tie_word_embeddings and isinstance(self.lm_head, nn.Linear):
-            self.lm_head.weight = self.model.language_model.embed_tokens.weight
+        if not self.config.tie_word_embeddings:
+            return
+        embed_weight = self.model.language_model.embed_tokens.weight
+        if isinstance(self.lm_head, nn.Linear):
+            self.lm_head.weight = embed_weight
+        elif isinstance(self.lm_head, XPUInt4Linear):
+            _fill_xpu_int4_lm_head_from_embedding(self.lm_head, embed_weight)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()

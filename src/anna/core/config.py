@@ -66,8 +66,6 @@ class ServeSettings:
     scheduler_dynamic_token_budget: bool = False
     scheduler_skip_batch_wait_when_idle: bool = True
     scheduler_max_queue_wait_ms: float = 0.0
-    asr_max_inference_batch_size: int = 1
-    asr_max_new_tokens: int = 512
     warmup_prefill_tokens: int = 2
     warmup_decode_steps: int = 1
     warmup_batch_size: int = 1

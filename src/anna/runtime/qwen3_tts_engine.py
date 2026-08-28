@@ -121,8 +121,6 @@ class AnnaQwen3TTSEngine:
         resident_expert_layers: int | None = None,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         cached_experts_per_layer: int | None = None,
-        asr_max_inference_batch_size: int = 1,
-        asr_max_new_tokens: int = 512,
     ) -> "AnnaQwen3TTSEngine":
         del (
             default_max_completion_tokens,
@@ -176,10 +174,6 @@ class AnnaQwen3TTSEngine:
             ignored_options.append(f"expert_quant={expert_quant}")
         if weight_quant != "auto":
             ignored_options.append(f"weight_quant={weight_quant}")
-        if asr_max_inference_batch_size != 1:
-            ignored_options.append(f"asr_max_inference_batch_size={asr_max_inference_batch_size}")
-        if asr_max_new_tokens != 512:
-            ignored_options.append(f"asr_max_new_tokens={asr_max_new_tokens}")
         if ignored_options:
             logger.info(
                 "Ignoring text-generation runtime options for qwen3_tts model load: %s",

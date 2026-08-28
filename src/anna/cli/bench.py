@@ -236,9 +236,9 @@ def main() -> None:
     )
     model_dir = resolve_model_dir(args.model_dir)
     model_family_info = inspect_model_family(model_dir)
-    if model_family_info.model_family in {"qwen3_tts", "qwen3_asr"}:
+    if model_family_info.model_family in {"qwen3_tts"}:
         raise SystemExit(
-            f"The selected model belongs to the {model_family_info.model_family} family. Benchmark support is limited to text-generation model families; use anna-speak, anna-transcribe, or anna-serve."
+            f"The selected model belongs to the {model_family_info.model_family} family. Benchmark support is limited to text-generation model families; use anna-speak or anna-serve."
         )
     model_name = resolve_model_name(model_name=args.model_name, model_dir=model_dir)
     resolved_prompt, resolved_image, resolved_video = _resolve_scenario(
