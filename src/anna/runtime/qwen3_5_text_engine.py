@@ -2116,6 +2116,12 @@ class AnnaQwen3_5TextEngine:
         cache_length = getattr(past_key_values, "get_seq_length", None)
         seen_tokens = cache_length() if callable(cache_length) else 0
         resolved_batch = int(batch_size) if batch_size is not None else int(input_ids.shape[0])
+        # P0-#1: wall time not covered by tracked GPU categories = kernel-launch
+        # gaps + host dispatch + untracked ops. The primary overhead signal.
+        launch_gap = ""
+        if component_ms and elapsed_seconds > 0:
+            gap_ms = max(0.0, elapsed_seconds * 1000.0 - float(sum(component_ms.values())))
+            launch_gap = f" cpu_launch_gap_ms={gap_ms:.3f}"
         extra = ""
         if stage.startswith("scheduler_decode"):
             per_req = _amortized_per_request_ms(component_ms or {}, resolved_batch) if component_ms else {}
@@ -2125,12 +2131,13 @@ class AnnaQwen3_5TextEngine:
                 f"steady={1 if steady_recorded else 0}"
             )
         logger.info(
-            "xpu_profile stage=%s input_tokens=%s cache_tokens=%s elapsed_seconds=%.6f "
+            "xpu_profile stage=%s input_tokens=%s cache_tokens=%s elapsed_seconds=%.6f%s "
             "free_before=%s free_after=%s stats_before=%s stats_after=%s%s",
             stage,
             int(input_ids.shape[-1]),
             seen_tokens,
             elapsed_seconds,
+            launch_gap,
             format_bytes(memory_before.free_bytes if memory_before is not None else None),
             format_bytes(memory_after.free_bytes if memory_after is not None else None),
             stats_before,
@@ -2494,6 +2501,8 @@ class AnnaQwen3_5TextEngine:
         prefill_tokens: int = 2,
         decode_steps: int = 1,
         batch_size: int = 1,
+        prefill_lengths: list[int] | None = None,
+        batch_sizes: list[int] | None = None,
     ) -> None:
         from anna.model.fused_ops import maybe_load_gated_delta_library, resolve_flashqla_gdn_prefill_mode
 
@@ -2508,30 +2517,39 @@ class AnnaQwen3_5TextEngine:
         prefill_tokens = max(2, int(prefill_tokens))
         decode_steps = max(1, int(decode_steps))
         batch_size = max(1, int(batch_size))
-        # Multi-shape prefill ladder reduces first-request SYCL JIT when FlashQLA (or fused GDN) is on.
+        # Multi-shape prefill ladder reduces first-request SYCL JIT when FlashQLA (or fused GDN) is on,
+        # and avoids recompile / lazy-kernel-init stalls on the first real request (P1-#4).
+        # ``prefill_lengths`` / ``batch_sizes`` (derived from the scheduler profile + chunk size by
+        # ``derive_warmup_shape_table``) take precedence over the single-shape arguments.
         flashqla_mode = resolve_flashqla_gdn_prefill_mode()
-        prefill_lengths = [2, 64, prefill_tokens]
-        chunk = int(getattr(self.optimization_config, "prefill_chunk_size", 0) or 0)
-        if chunk > 1:
-            prefill_lengths.append(chunk)
-        # Dedup, keep ascending, clamp to a sane upper bound for warmup.
-        # The resolved prefill chunk size is always kept: chunked long-prompt prefills
-        # run at exactly that shape, so warming it avoids a first-request stall
-        # regardless of --warmup-prefill-tokens.
-        prefill_lengths = sorted({max(2, int(length)) for length in prefill_lengths if int(length) > 1})
-        warmup_cap = max(prefill_tokens, 256)
-        prefill_lengths = [
-            length
-            for length in prefill_lengths
-            if length <= warmup_cap or (chunk > 1 and length == chunk)
-        ]
-        if prefill_tokens not in prefill_lengths:
-            prefill_lengths.append(prefill_tokens)
-            prefill_lengths.sort()
-        # Serving is dominated by bs=1 (single-stream requests), while the scheduler
-        # warms up at max_batch_size; warm both so neither shape compiles/JITs on the
-        # first real request.
-        warmup_batch_sizes = sorted({1, batch_size})
+        if prefill_lengths:
+            prefill_lengths = sorted({max(2, int(length)) for length in prefill_lengths if int(length) > 1})
+        else:
+            prefill_lengths = [2, 64, prefill_tokens]
+            chunk = int(getattr(self.optimization_config, "prefill_chunk_size", 0) or 0)
+            if chunk > 1:
+                prefill_lengths.append(chunk)
+            # Dedup, keep ascending, clamp to a sane upper bound for warmup.
+            # The resolved prefill chunk size is always kept: chunked long-prompt prefills
+            # run at exactly that shape, so warming it avoids a first-request stall
+            # regardless of --warmup-prefill-tokens.
+            prefill_lengths = sorted({max(2, int(length)) for length in prefill_lengths if int(length) > 1})
+            warmup_cap = max(prefill_tokens, 256)
+            prefill_lengths = [
+                length
+                for length in prefill_lengths
+                if length <= warmup_cap or (chunk > 1 and length == chunk)
+            ]
+            if prefill_tokens not in prefill_lengths:
+                prefill_lengths.append(prefill_tokens)
+                prefill_lengths.sort()
+        if batch_sizes:
+            warmup_batch_sizes = sorted({max(1, int(size)) for size in batch_sizes if int(size) > 0})
+        else:
+            # Serving is dominated by bs=1 (single-stream requests), while the scheduler
+            # warms up at max_batch_size; warm both so neither shape compiles/JITs on the
+            # first real request.
+            warmup_batch_sizes = sorted({1, batch_size})
         with torch.inference_mode():
             # Fused causal_conv1d_prefill / gated_delta_prefill require seq_len > 1 (see SYCL TORCH_CHECK).
             for warm_batch in warmup_batch_sizes:

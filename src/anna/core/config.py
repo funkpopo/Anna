@@ -67,9 +67,16 @@ class ServeSettings:
     scheduler_dynamic_token_budget: bool = False
     scheduler_skip_batch_wait_when_idle: bool = True
     scheduler_max_queue_wait_ms: float = 0.0
-    warmup_prefill_tokens: int = 2
-    warmup_decode_steps: int = 1
-    warmup_batch_size: int = 1
+    warmup_prefill_tokens: int | None = None
+    warmup_decode_steps: int = 8
+    warmup_batch_size: int | None = None
+    # Performance tuning knobs. ``None`` means "use the built-in default" (or the
+    # matching ANNA_* environment variable when explicitly set); a concrete value
+    # always overrides both. See docs/tuning.md for the full table.
+    xpu_int4_gemv_m_threshold: int | None = None
+    xpu_int4_cache_load_workers: int | None = None
+    weight_load_pipeline_workers: int | None = None
+    torchinductor_cache_dir: Path | None = None
     metrics_log_interval_seconds: float = 10.0
     host: str = "127.0.0.1"
     port: int = 8000

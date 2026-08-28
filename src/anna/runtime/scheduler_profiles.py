@@ -194,3 +194,60 @@ def compute_dynamic_token_budgets(
         prefill = int(prefill * 1.25)
 
     return max(0, prefill), max(0, decode)
+
+
+# P1-#4: warmup shape table. Real chat requests arrive at ~13 prompt tokens; the
+# legacy warmup (prefill_tokens=2, decode_steps=1) left the first request paying
+# recompile / lazy-kernel-init stalls (0.88s TTFT). Cover the shapes that
+# actually occur in serving, derived from the scheduler profile / chunk size
+# instead of fixed constants.
+_WARMUP_PREFILL_LADDER = (13, 64, 256, 2048)
+_WARMUP_DECODE_STEPS = 8
+
+
+def derive_warmup_shape_table(
+    *,
+    profile: str | None = None,
+    max_batch_size: int = 1,
+    chunk_size: int = 0,
+    prefill_tokens: int | None = None,
+    decode_steps: int | None = None,
+) -> dict[str, object]:
+    """Derive the post-load warmup shape table from scheduler profile / chunk size.
+
+    Returns ``{"prefill_lengths": [...], "batch_sizes": [...], "decode_steps": int}``.
+
+    - Prefill ladder: ``{13, 64, 256, 2048}`` (real chat shapes) always included;
+      the configured prefill chunk size is added when chunked prefill is enabled;
+      an explicit ``prefill_tokens`` override is always kept.
+    - Batch ladder: powers of two up to ``max_batch_size`` (plus 1) so batched
+      decode shapes are captured without warming shapes the scheduler never runs.
+    - Decode steps: default 8 (exercises multi-step steady-state decode, turboquant
+      dequant, and the fused LM-head top-k path).
+    """
+    chunk = max(0, int(chunk_size or 0))
+    lengths = set(_WARMUP_PREFILL_LADDER)
+    if chunk > 1:
+        lengths.add(chunk)
+    if prefill_tokens is not None and int(prefill_tokens) > 1:
+        lengths.add(int(prefill_tokens))
+    lengths = {max(2, int(length)) for length in lengths}
+    # Keep the full ladder: long-prompt (2048) coverage trades a few warmup
+    # seconds for eliminating the first long-prompt recompile stall.
+    prefill_lengths = sorted(lengths)
+
+    max_batch = max(1, int(max_batch_size or 1))
+    batch_sizes = {1}
+    power = 2
+    while power <= max_batch:
+        batch_sizes.add(power)
+        power *= 2
+    if max_batch > 1:
+        batch_sizes.add(max_batch)
+
+    resolved_decode_steps = _WARMUP_DECODE_STEPS if decode_steps is None else max(1, int(decode_steps))
+    return {
+        "prefill_lengths": prefill_lengths,
+        "batch_sizes": sorted(batch_sizes),
+        "decode_steps": resolved_decode_steps,
+    }

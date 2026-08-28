@@ -4269,7 +4269,8 @@ class Qwen3DecoderLayer(nn.Module):
         past_key_values: Qwen3DynamicCache | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        with xpu_profile_region("rmsnorm"):
+            hidden_states = self.input_layernorm(hidden_states)
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(hidden_states, cache_params=past_key_values, attention_mask=attention_mask)
         else:
@@ -4281,7 +4282,8 @@ class Qwen3DecoderLayer(nn.Module):
             )
         hidden_states = residual + hidden_states
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        with xpu_profile_region("rmsnorm"):
+            hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         if isinstance(hidden_states, tuple):
             hidden_states, _ = hidden_states

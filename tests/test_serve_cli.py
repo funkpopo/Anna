@@ -167,6 +167,101 @@ def test_configure_int4_kernel_environment_preserves_runtime_default(monkeypatch
     assert os.environ["ANNA_XPU_INT4_MATMUL"] == "dequant"
 
 
+def test_configure_int4_kernel_environment_applies_new_load_overrides(monkeypatch) -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--model-dir",
+            "model",
+            "--xpu-int4-cache-load-workers",
+            "4",
+            "--weight-load-pipeline-workers",
+            "1",
+        ]
+    )
+
+    monkeypatch.delenv("ANNA_XPU_INT4_CACHE_LOAD_WORKERS", raising=False)
+    monkeypatch.delenv("ANNA_WEIGHT_LOAD_PIPELINE_WORKERS", raising=False)
+
+    configure_int4_kernel_environment(args)
+
+    assert os.environ["ANNA_XPU_INT4_CACHE_LOAD_WORKERS"] == "4"
+    assert os.environ["ANNA_WEIGHT_LOAD_PIPELINE_WORKERS"] == "1"
+
+    # CLI omitted -> env untouched (built-in defaults stay in charge).
+    args = parser.parse_args(["--model-dir", "model"])
+    configure_int4_kernel_environment(args)
+    assert os.environ["ANNA_XPU_INT4_CACHE_LOAD_WORKERS"] == "4"
+    assert os.environ["ANNA_WEIGHT_LOAD_PIPELINE_WORKERS"] == "1"
+
+
+def test_configure_compile_cache_environment_overrides_torch_ephemeral_default(monkeypatch, tmp_path) -> None:
+    """--torchinductor-cache-dir must win over torch's import-time temp-dir injection."""
+    from anna.cli.serve import configure_compile_cache_environment
+
+    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    configure_compile_cache_environment(cache_dir=tmp_path / "inductor")
+    assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(tmp_path / "inductor")
+
+    # Simulate torch injecting its ephemeral temp-dir default after import:
+    # configure must replace it with the persistent location.
+    from anna.cli import serve as serve_module
+
+    ephemeral_dir = tmp_path / "torch-ephemeral"
+    monkeypatch.setattr(serve_module, "_torch_ephemeral_inductor_cache_dir", lambda: str(ephemeral_dir))
+
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(ephemeral_dir))
+    configure_compile_cache_environment(cache_dir=tmp_path / "inductor")
+    assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(tmp_path / "inductor")
+
+    # Same, but falling back to the built-in Anna default dir.
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(ephemeral_dir))
+    configure_compile_cache_environment(cache_dir=None)
+    assert Path(os.environ["TORCHINDUCTOR_CACHE_DIR"]) == Path.home() / ".anna" / "cache" / "torchinductor"
+
+    # A genuinely different pre-set value is respected.
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "custom"))
+    configure_compile_cache_environment(cache_dir=None)
+    assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(tmp_path / "custom")
+
+
+def test_serve_settings_tuning_fields_default_to_none() -> None:
+    settings = ServeSettings(model_dir=Path("model"))
+
+    assert settings.xpu_int4_gemv_m_threshold is None
+    assert settings.xpu_int4_cache_load_workers is None
+    assert settings.weight_load_pipeline_workers is None
+    assert settings.torchinductor_cache_dir is None
+
+    resolved = ServeSettings(
+        model_dir=Path("model"),
+        xpu_int4_gemv_m_threshold=4,
+        xpu_int4_cache_load_workers=2,
+        weight_load_pipeline_workers=1,
+        torchinductor_cache_dir=Path("cache"),
+    )
+    assert resolved.xpu_int4_gemv_m_threshold == 4
+    assert resolved.xpu_int4_cache_load_workers == 2
+    assert resolved.weight_load_pipeline_workers == 1
+    assert resolved.torchinductor_cache_dir == Path("cache")
+
+
+def test_weight_load_pipeline_workers_env_override(monkeypatch) -> None:
+    from anna.weights.qwen3_5_text_weight_loader import (
+        _WEIGHT_LOAD_PIPELINE_WORKERS_DEFAULT,
+        _weight_load_pipeline_workers,
+    )
+
+    monkeypatch.delenv("ANNA_WEIGHT_LOAD_PIPELINE_WORKERS", raising=False)
+    assert _weight_load_pipeline_workers() == _WEIGHT_LOAD_PIPELINE_WORKERS_DEFAULT == 2
+
+    monkeypatch.setenv("ANNA_WEIGHT_LOAD_PIPELINE_WORKERS", "4")
+    assert _weight_load_pipeline_workers() == 4
+
+    monkeypatch.setenv("ANNA_WEIGHT_LOAD_PIPELINE_WORKERS", "bogus")
+    assert _weight_load_pipeline_workers() == _WEIGHT_LOAD_PIPELINE_WORKERS_DEFAULT
+
+
 def test_configure_flashqla_environment_applies_cli_override(monkeypatch) -> None:
     parser = build_parser()
     args = parser.parse_args(["--model-dir", "model", "--enable-flashqla-gdn-prefill"])

@@ -323,12 +323,13 @@ anna-speak `
 
 ### 编译和预热
 
-- `--compile-mode none|auto|default|reduce-overhead|max-autotune`：`torch.compile` 模式；服务场景常用 `none` 或 `auto`。
+- `--compile-mode none|auto|default|reduce-overhead|max-autotune`：`torch.compile` 模式，默认 `auto`（XPU 上解析为 `reduce-overhead`）；配合持久 inductor 缓存二次启动可命中编译缓存。
 - `--compile-fullgraph`：启用 compile 时请求 fullgraph 捕获。
-- `--no-inference-warmup`：跳过加载后的 XPU 小预热。
-- `--warmup-prefill-tokens N`：预热 prefill token 数，默认 `2`。
-- `--warmup-decode-steps N`：预热 decode 步数，默认 `1`。
-- `--warmup-batch-size N`：预热 batch size，默认 `1`。
+- `--no-inference-warmup`：跳过加载后的 XPU 预热（不推荐服务场景）。
+- `--warmup-prefill-tokens N`：额外预热 prefill token 数；默认自动推导覆盖真实聊天形状 **13 / 64 / 256 / 2048**。
+- `--warmup-decode-steps N`：每个预热形状的 decode 步数，默认 `8`（覆盖稳态 decode 与 turboquant 解量化路径）。
+- `--warmup-batch-size N`：额外预热 batch size；默认自动覆盖 `{1,2,4,8} ∩ max_batch_size`。
+- 启动日志会打印实际生效的 `Warmup shape table`。全部调优参数见 [`docs/tuning.md`](docs/tuning.md)。
 
 ### 显存和权重策略
 
@@ -356,10 +357,14 @@ anna-speak `
 - `--enable-flashqla-gdn-prefill`：以 **strict** 模式启用 XPU SYCL Gated Delta prefill（不降级）。
 - `--flashqla-gdn-prefill-mode off|strict|prefer`：FlashQLA 策略。`strict` 在不支持的 device/shape/dtype/op 上硬失败；`prefer` 降级到默认 fused 或 torch prefill，并按 reason 一次性告警。环境变量 `ANNA_XPU_FLASHQLA_GDN_PREFILL` 取值相同（`1`/`true`/`on` ≡ `strict`）。
 - `--xpu-int4-matmul auto|torch|dequant|gemv`：XPU int4 dense linear 执行策略。
-  - **`auto`（默认）**：Arc 上走 PyTorch `int4pack`，**没有**按 M 行在 GEMV/dequant 间自动切换的阈值。
+  - **`auto`（默认）**：按 M 行路由——decode 小 M（≤ `--xpu-int4-gemv-m-threshold`，默认 2）走 SYCL GEMV，prefill 大 M 走 aten int4pack XMX GEMM（依据 `bench_logs/xpu_int4_m1_auto_vs_gemv_p0_2.csv`）。
   - **`torch`**：强制 int4pack。
-  - **`gemv`**：显式开启 SYCL GEMV（decode 实验）；不会被 auto 选中。
+  - **`gemv`**：强制 SYCL GEMV。
   - **`dequant`**：完整反量化 + `F.linear`（调试）。
+- `--xpu-int4-gemv-m-threshold N`：`auto` 路由阈值，默认 `2`；设 `0` 恢复旧的 auto=int4pack 行为。
+- `--xpu-int4-cache-load-workers N`：int4 layout cache 并行反序列化线程数，默认 `8`（原串行加载约 39s）。
+- `--weight-load-pipeline-workers N`：权重 shard 流水线并发 staging 线程数，默认 `2`（后台预读下一 shard，主线程同时拷贝当前 shard）。
+- `--torchinductor-cache-dir PATH`：持久 inductor 编译缓存目录，默认 `~/.anna/cache/torchinductor`（serve 启动自动设置；用户显式设置的 `TORCHINDUCTOR_CACHE_DIR` 优先，torch import 时自动注入的临时目录默认值会被识别并忽略）。
 - LM head int4 top-k fused 在 XPU int4 上**默认开启**（`top_k ≤ 16`）。用 `ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK=1` 关闭。兼容旧变量 `ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED=0|1` 强制关/开。
 - XPU int4 layout cache：首次 int4 转换写入 `{model}/.anna/xpu_int4_cache`（可用 `ANNA_XPU_INT4_CACHE_DIR` 覆盖）。版本/指纹不匹配自动重建；读写失败回退到现场量化。`ANNA_XPU_DISABLE_INT4_CACHE=1` 关闭。可用 `anna-xpu-int4-cache --model-dir ...` 检查。
 - `ANNA_GATED_DELTA_OP_LIB`：显式指定 fused op `.pyd` / `.so` 路径。

@@ -221,6 +221,10 @@ class AnnaScheduler:
         self.max_queue_wait_seconds = max(0.0, float(max_queue_wait_ms)) / 1000.0
         self.profile = str(profile or "none")
         self._decode_steps_since_prefill = 0
+        # P0-#3: interference markers accumulated since the last decode step.
+        # Recorded with the next decode step timing so periodic spikes can be
+        # attributed to prefill inserts / dynamic budget recomputes.
+        self._cycle_interference: set[str] = set()
         self._ledger = _create_scheduler_ledger()
         self._ledger_id_counter = 0
         self._ledger_stats_cache: dict[str, object] | None = None
@@ -550,6 +554,14 @@ class AnnaScheduler:
             stop_strings=request.config.stop_strings,
         )
 
+    def _pop_decode_classification(self) -> str:
+        """Return (and clear) the interference classification for the next decode step."""
+        if not self._cycle_interference:
+            return "pure_decode"
+        label = "pure_decode+" + "+".join(sorted(self._cycle_interference))
+        self._cycle_interference.clear()
+        return label
+
     def _effective_token_budgets(
         self,
         *,
@@ -561,6 +573,9 @@ class AnnaScheduler:
         if not self.dynamic_token_budget:
             return prefill, decode
 
+        # P0-#3: dynamic budgets recompute host-side state on the decode path;
+        # tag the next decode step so spikes can be attributed.
+        self._cycle_interference.add("budget_recompute")
         free_bytes = None
         total_bytes = None
         memory_info = self.engine.device_context.get_memory_info()
@@ -757,6 +772,9 @@ class AnnaScheduler:
             if callable(release):
                 release()
             return []
+        # P0-#3: a prefill chunk is being inserted between decode steps; tag the
+        # next decode step so its latency can be attributed to the insertion.
+        self._cycle_interference.add("prefill_insert")
         prompt_length = int(group.batched.input_ids.shape[1])
         configured_chunk_size = int(getattr(self.engine.optimization_config, "prefill_chunk_size", 0))
         is_multimodal_group = any(request.is_multimodal for request in requests)
@@ -878,7 +896,7 @@ class AnnaScheduler:
             raise self.engine._handle_runtime_failure(exc) from exc
 
         if metrics is not None:
-            metrics.record_decode_step(time.perf_counter() - started_at)
+            metrics.record_decode_step(time.perf_counter() - started_at, classification=self._pop_decode_classification())
 
         batch_cache = outputs.past_key_values if outputs.past_key_values is not None else batch_cache
         return self._consume_batch_outputs(
@@ -907,7 +925,7 @@ class AnnaScheduler:
             raise self.engine._handle_runtime_failure(exc) from exc
 
         if metrics is not None:
-            metrics.record_decode_step(time.perf_counter() - started_at)
+            metrics.record_decode_step(time.perf_counter() - started_at, classification=self._pop_decode_classification())
 
         batch_cache = outputs.past_key_values if outputs.past_key_values is not None else request.past_key_values
         request.past_key_values = None
@@ -954,7 +972,7 @@ class AnnaScheduler:
             raise self.engine._handle_runtime_failure(exc) from exc
 
         if metrics is not None:
-            metrics.record_decode_step(time.perf_counter() - started_at)
+            metrics.record_decode_step(time.perf_counter() - started_at, classification=self._pop_decode_classification())
 
         batch_cache = outputs.past_key_values if outputs.past_key_values is not None else group.past_key_values
         return self._consume_batch_outputs(
@@ -1014,6 +1032,7 @@ class AnnaScheduler:
         next_active: list[SchedulerRequest] = []
         next_input_ids: list[torch.Tensor] = []
         continuing_by_row: dict[int, SchedulerRequest] = {}
+        sample_started_at = time.perf_counter()
 
         active_rows: list[int] = []
         for row_idx, request in enumerate(requests):
@@ -1030,7 +1049,11 @@ class AnnaScheduler:
             return []
 
         next_tokens = self._sample_next_tokens_from_outputs(outputs, requests=requests, row_indices=active_rows)
+        # P0-#1/#12: the device→host sync in token_ids_to_host is a per-step CPU
+        # stall invisible to GPU component timers; track it as a decode phase.
         token_ids = token_ids_to_host(next_tokens)
+        if metrics is not None:
+            metrics.record_decode_phase("sampling", time.perf_counter() - sample_started_at)
         now = time.perf_counter()
 
         for sample_idx, row_idx in enumerate(active_rows):

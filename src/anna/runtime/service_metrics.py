@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -65,6 +65,10 @@ class ServiceMetricsSnapshot:
     decode_step_count: int = 0
     decode_step_seconds_max: float = 0.0
     decode_step_recent_seconds: tuple[float, ...] = ()
+    # P0-#3: per-step classification (pure_decode / prefill_insert / budget_recompute mixes).
+    decode_step_class_counts: dict[str, int] = field(default_factory=dict)
+    # P0-#1: host-side decode phases not covered by GPU component timers (sampling, etc).
+    decode_phase_seconds_total: dict[str, float] = field(default_factory=dict)
     ttft_seconds_total: float = 0.0
     ttft_count: int = 0
     ttft_seconds_max: float = 0.0
@@ -141,6 +145,9 @@ class AnnaServiceMetrics:
         self._decode_step_count = 0
         self._decode_step_seconds_max = 0.0
         self._decode_step_recent_seconds: deque[float] = deque(maxlen=_LATENCY_SAMPLE_LIMIT)
+        self._decode_step_class_counts: dict[str, int] = defaultdict(int)
+        self._decode_step_ewma_seconds = 0.0
+        self._decode_phase_seconds_total: dict[str, float] = defaultdict(float)
         self._ttft_seconds_total = 0.0
         self._ttft_count = 0
         self._ttft_seconds_max = 0.0
@@ -204,13 +211,48 @@ class AnnaServiceMetrics:
             self._prefill_step_recent_seconds.append(normalized)
         self._activity_event.set()
 
-    def record_decode_step(self, seconds: float) -> None:
+    _DECODE_SPIKE_EWMA_ALPHA = 0.05
+    _DECODE_SPIKE_WARMUP_STEPS = 64
+    _DECODE_SPIKE_MULTIPLE = 3.0
+
+    def record_decode_step(self, seconds: float, *, classification: str = "pure_decode") -> None:
         normalized = max(0.0, float(seconds))
+        spike = False
         with self._lock:
             self._decode_step_seconds_total += normalized
             self._decode_step_count += 1
             self._decode_step_seconds_max = max(self._decode_step_seconds_max, normalized)
             self._decode_step_recent_seconds.append(normalized)
+            self._decode_step_class_counts[str(classification) or "unknown"] += 1
+            # P0-#3 spike attribution: EWMA baseline; report steps far above the
+            # rolling average together with their step classification.
+            if self._decode_step_ewma_seconds <= 0.0:
+                self._decode_step_ewma_seconds = normalized
+            else:
+                self._decode_step_ewma_seconds += (
+                    self._DECODE_SPIKE_EWMA_ALPHA * (normalized - self._decode_step_ewma_seconds)
+                )
+            spike = (
+                self._decode_step_count > self._DECODE_SPIKE_WARMUP_STEPS
+                and normalized > self._DECODE_SPIKE_MULTIPLE * self._decode_step_ewma_seconds
+            )
+        if spike:
+            logger.warning(
+                "decode step spike: %.1f ms (>%.1fx rolling avg %.1f ms) classification=%s",
+                normalized * 1000.0,
+                self._DECODE_SPIKE_MULTIPLE,
+                self._decode_step_ewma_seconds * 1000.0,
+                classification,
+            )
+        self._activity_event.set()
+
+    def record_decode_phase(self, category: str, seconds: float) -> None:
+        """Accumulate a host-side decode phase (sampling, cache ops, ...) in seconds."""
+        normalized = max(0.0, float(seconds))
+        if not category or normalized <= 0.0:
+            return
+        with self._lock:
+            self._decode_phase_seconds_total[str(category)] += normalized
         self._activity_event.set()
 
     def record_ttft(self, seconds: float) -> None:
@@ -384,6 +426,8 @@ class AnnaServiceMetrics:
                 decode_step_count=self._decode_step_count,
                 decode_step_seconds_max=self._decode_step_seconds_max,
                 decode_step_recent_seconds=tuple(self._decode_step_recent_seconds),
+                decode_step_class_counts=dict(sorted(self._decode_step_class_counts.items())),
+                decode_phase_seconds_total=dict(sorted(self._decode_phase_seconds_total.items())),
                 ttft_seconds_total=self._ttft_seconds_total,
                 ttft_count=self._ttft_count,
                 ttft_seconds_max=self._ttft_seconds_max,
@@ -519,6 +563,19 @@ class AnnaServiceMetricsLogger:
         decode_p50_ms = _quantile(decode_recent, 0.50) * 1000.0
         decode_p95_ms = _quantile(decode_recent, 0.95) * 1000.0
         decode_p99_ms = _quantile(decode_recent, 0.99) * 1000.0
+        # P0-#3: step classification mix over the process lifetime so spike
+        # attribution (prefill-insert steps vs budget recompute) is visible in
+        # the periodic metrics line.
+        class_mix = current.decode_step_class_counts
+        class_summary = ",".join(f"{name}={count}" for name, count in class_mix.items()) or "none"
+        # P0-#1: host-side decode phases (sampling etc) accumulated this interval.
+        phase_deltas = {
+            name: max(0.0, value - previous.decode_phase_seconds_total.get(name, 0.0))
+            for name, value in current.decode_phase_seconds_total.items()
+        }
+        phase_summary = ",".join(
+            f"{name}={ms:.1f}ms" for name, ms in sorted(phase_deltas.items()) if ms > 0.0
+        ) or "none"
         ttft_hist = current.ttft_histogram()
         itl_hist = current.itl_histogram()
         kernel_hits = current.kernel_strategy_hits
@@ -533,6 +590,8 @@ class AnnaServiceMetricsLogger:
             f"Prefill step p50/p95/p99: {prefill_p50_ms:.1f}/{prefill_p95_ms:.1f}/{prefill_p99_ms:.1f} ms, "
             f"Decode step avg/max: {decode_step_avg_ms:.1f}/{current.decode_step_seconds_max * 1000.0:.1f} ms, "
             f"Decode step p50/p95/p99: {decode_p50_ms:.1f}/{decode_p95_ms:.1f}/{decode_p99_ms:.1f} ms, "
+            f"Decode step classes: {class_summary}, "
+            f"Decode phases (interval): {phase_summary}, "
             f"TTFT p50/p95/p99: {float(ttft_hist['p50_seconds']) * 1000.0:.1f}/"
             f"{float(ttft_hist['p95_seconds']) * 1000.0:.1f}/{float(ttft_hist['p99_seconds']) * 1000.0:.1f} ms, "
             f"ITL p50/p95/p99: {float(itl_hist['p50_seconds']) * 1000.0:.1f}/"
@@ -577,6 +636,8 @@ class AnnaServiceMetricsLogger:
             current.queue_wait_count - previous.queue_wait_count,
             current.prefill_step_count - previous.prefill_step_count,
             current.decode_step_count - previous.decode_step_count,
+            sum(current.decode_step_class_counts.values()) - sum(previous.decode_step_class_counts.values()),
+            sum(current.decode_phase_seconds_total.values()) - sum(previous.decode_phase_seconds_total.values()),
             current.ttft_count - previous.ttft_count,
             current.itl_count - previous.itl_count,
             current.cache_stack_count - previous.cache_stack_count,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from pathlib import Path
 
 import uvicorn
 
@@ -63,7 +64,22 @@ def _safety_factor(value: str) -> float:
 
 
 def configure_int4_kernel_environment(args: argparse.Namespace) -> None:
-    updates = {"ANNA_XPU_INT4_MATMUL": args.xpu_int4_matmul}
+    updates = {
+        "ANNA_XPU_INT4_MATMUL": args.xpu_int4_matmul,
+        "ANNA_XPU_INT4_GEMV_M_THRESHOLD": (
+            str(args.xpu_int4_gemv_m_threshold) if getattr(args, "xpu_int4_gemv_m_threshold", None) is not None else None
+        ),
+        "ANNA_XPU_INT4_CACHE_LOAD_WORKERS": (
+            str(args.xpu_int4_cache_load_workers)
+            if getattr(args, "xpu_int4_cache_load_workers", None) is not None
+            else None
+        ),
+        "ANNA_WEIGHT_LOAD_PIPELINE_WORKERS": (
+            str(args.weight_load_pipeline_workers)
+            if getattr(args, "weight_load_pipeline_workers", None) is not None
+            else None
+        ),
+    }
     applied: dict[str, str] = {}
     for name, value in updates.items():
         if value is None:
@@ -72,6 +88,48 @@ def configure_int4_kernel_environment(args: argparse.Namespace) -> None:
         applied[name] = value
     if applied:
         logger.info("Applied XPU int4 kernel CLI overrides: %s", applied)
+
+
+def _torch_ephemeral_inductor_cache_dir() -> str | None:
+    """Return torch's own ephemeral inductor cache default, if importable.
+
+    Importing torch (and some of its inductor helpers) eagerly writes
+    ``TORCHINDUCTOR_CACHE_DIR`` into the environment pointing at a temp dir, so
+    a naive "already set = explicit" check would keep the ephemeral location
+    and defeat the persistent cache. We treat that exact value as unset.
+    """
+    try:
+        from torch._inductor.runtime.cache_dir_utils import default_cache_dir
+
+        return default_cache_dir()
+    except Exception:  # pragma: no cover - torch internals may change
+        return None
+
+
+def configure_compile_cache_environment(cache_dir: Path | None = None) -> None:
+    """Persist the torch.inductor compile cache across restarts (P1-#5).
+
+    Without an explicit TORCHINDUCTOR_CACHE_DIR the cache location is ephemeral
+    in many setups, so the ~75s warmup compile cost is paid on every start.
+    ``cache_dir`` (from --torchinductor-cache-dir) overrides the default
+    ~/.anna/cache/torchinductor; a user-set TORCHINDUCTOR_CACHE_DIR wins, but
+    torch's own ephemeral temp-dir default does not (it is auto-injected at
+    import time).
+    """
+    explicit = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    ephemeral = _torch_ephemeral_inductor_cache_dir()
+    if explicit and (ephemeral is None or Path(explicit).resolve() != Path(ephemeral).resolve()):
+        logger.info("torch.inductor cache dir (explicit): %s", explicit)
+        return
+    if cache_dir is None:
+        cache_dir = Path.home() / ".anna" / "cache" / "torchinductor"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logger.warning("Could not create inductor cache dir %s; keeping torch defaults.", cache_dir)
+        return
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache_dir)
+    logger.info("torch.inductor cache dir (persistent): %s", cache_dir)
 
 
 def configure_flashqla_environment(args: argparse.Namespace) -> None:
@@ -237,20 +295,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--warmup-prefill-tokens",
         type=_positive_int,
-        default=2,
-        help="Number of text tokens used by the post-load XPU warmup prefill. Ignored with --no-inference-warmup.",
+        default=None,
+        help="Additional prefill token count kept in the warmup shape table. By default the table is "
+        "derived from the scheduler profile / chunk size (covers real chat shapes 13/64/256/2048). "
+        "Ignored with --no-inference-warmup.",
     )
     parser.add_argument(
         "--warmup-decode-steps",
         type=_positive_int,
-        default=1,
-        help="Number of single-token decode steps used by the post-load XPU warmup. Ignored with --no-inference-warmup.",
+        default=8,
+        help="Number of decode steps per warmup shape (8+ exercises steady-state decode and the "
+        "turboquant dequant path). Ignored with --no-inference-warmup.",
     )
     parser.add_argument(
         "--warmup-batch-size",
         type=_positive_int,
-        default=1,
-        help="Batch size used by the post-load XPU warmup. Ignored with --no-inference-warmup.",
+        default=None,
+        help="Additional batch size kept in the warmup shape table (default: derived from the scheduler "
+        "max batch size). Ignored with --no-inference-warmup.",
     )
     parser.add_argument(
         "--profile-runtime",
@@ -392,10 +454,39 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "XPU int4 dense linear execution strategy. "
-            "'auto' (default) uses PyTorch int4pack on Arc; 'gemv' is opt-in SYCL GEMV; "
-            "'dequant' fully dequantizes then runs F.linear (debug). "
-            "There is no auto M-row GEMV/dequant threshold — force gemv/dequant explicitly."
+            "'auto' (default) routes decode-shaped rows (M <= "
+            "--xpu-int4-gemv-m-threshold, default 2) to the SYCL GEMV and large-M prefill waves to the "
+            "aten int4pack XMX GEMM (P0-#2 evidence: bench_logs/xpu_int4_gemv_variant_sweep_median.txt); "
+            "'gemv' forces SYCL GEMV; 'dequant' fully dequantizes then runs F.linear (debug)."
         ),
+    )
+    parser.add_argument(
+        "--xpu-int4-gemv-m-threshold",
+        type=_non_negative_int,
+        default=None,
+        help="M-row threshold under which 'auto' int4 matmul routes to the SYCL GEMV kernel "
+        "(default 2, from P0-#2 bench evidence; 0 restores the legacy auto = torch int4pack policy).",
+    )
+    parser.add_argument(
+        "--xpu-int4-cache-load-workers",
+        type=_positive_int,
+        default=None,
+        help="Thread-pool width for parallel XPU int4 layout-cache deserialization at load time "
+        "(default 8). Lower it to bound CPU/RAM spikes on small machines.",
+    )
+    parser.add_argument(
+        "--weight-load-pipeline-workers",
+        type=_positive_int,
+        default=None,
+        help="Concurrent shard-staging threads for the weight load pipeline "
+        "(default 2: next shard is mmap-read while the current one copies to the device).",
+    )
+    parser.add_argument(
+        "--torchinductor-cache-dir",
+        type=Path,
+        default=None,
+        help="Persistent torch.inductor compile cache directory "
+        "(default ~/.anna/cache/torchinductor; a pre-set TORCHINDUCTOR_CACHE_DIR wins).",
     )
     parser.add_argument(
         "--resident-expert-layers",
@@ -558,6 +649,7 @@ def main() -> None:
     )
     configure_int4_kernel_environment(args)
     configure_flashqla_environment(args)
+    configure_compile_cache_environment(cache_dir=args.torchinductor_cache_dir)
     model_dir = resolve_model_dir(args.model_dir)
     model_name = resolve_model_name(model_name=args.model_name, model_dir=model_dir)
     scheduler_knobs = _resolve_serve_scheduler_knobs(args)
@@ -611,6 +703,10 @@ def main() -> None:
         warmup_prefill_tokens=args.warmup_prefill_tokens,
         warmup_decode_steps=args.warmup_decode_steps,
         warmup_batch_size=args.warmup_batch_size,
+        xpu_int4_gemv_m_threshold=args.xpu_int4_gemv_m_threshold,
+        xpu_int4_cache_load_workers=args.xpu_int4_cache_load_workers,
+        weight_load_pipeline_workers=args.weight_load_pipeline_workers,
+        torchinductor_cache_dir=args.torchinductor_cache_dir,
         metrics_log_interval_seconds=args.metrics_log_interval_seconds,
         host=args.host,
         port=args.port,
@@ -653,12 +749,33 @@ def main() -> None:
         decode_executor=settings.decode_executor,
     )
     if not args.no_inference_warmup and hasattr(engine, "warmup_inference_kernels"):
-        # TTFT: cover real continuous-batch shapes when the scheduler profile raises batch size.
-        warmup_batch = max(int(settings.warmup_batch_size), int(settings.scheduler_max_batch_size))
+        # P1-#4: derive the warmup shape table from the scheduler profile / chunk
+        # size so real serving shapes (13-token chat prompts, batched decode,
+        # chunked long prompts) are compiled/JIT-ed before the first request.
+        from anna.runtime.scheduler_profiles import derive_warmup_shape_table
+
+        warmup_plan = derive_warmup_shape_table(
+            profile=str(scheduler_knobs["profile"]),
+            max_batch_size=int(scheduler_knobs["max_batch_size"]),
+            chunk_size=int(getattr(args, "prefill_chunk_size", 0) or 0),
+            prefill_tokens=args.warmup_prefill_tokens,
+            decode_steps=args.warmup_decode_steps,
+        )
+        if args.warmup_batch_size is not None:
+            warmup_plan["batch_sizes"] = sorted(
+                {1, int(args.warmup_batch_size), int(scheduler_knobs["max_batch_size"])}
+            )
+        logger.info(
+            "Warmup shape table: prefill_lengths=%s batch_sizes=%s decode_steps=%s",
+            warmup_plan["prefill_lengths"],
+            warmup_plan["batch_sizes"],
+            warmup_plan["decode_steps"],
+        )
         engine.warmup_inference_kernels(
-            prefill_tokens=settings.warmup_prefill_tokens,
-            decode_steps=settings.warmup_decode_steps,
-            batch_size=warmup_batch,
+            prefill_lengths=warmup_plan["prefill_lengths"],
+            batch_sizes=warmup_plan["batch_sizes"],
+            decode_steps=warmup_plan["decode_steps"],
+            prefill_tokens=max(warmup_plan["prefill_lengths"]),
         )
     scheduler = _build_scheduler(engine, settings)
     metrics_logger = _build_metrics_logger(engine, settings)

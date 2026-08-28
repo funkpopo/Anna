@@ -1,8 +1,15 @@
 """Optional XPU decode stepping: accumulate GPU time per component via torch.xpu.Event.
 
 Used when ``EngineOptimizationConfig.profile_runtime`` is enabled. Categories:
-``attention``, ``moe``, ``gated_delta``, ``conv``. Percentages are relative to the
-sum of recorded categories (excludes layernorm, LM head, etc.).
+``attention``, ``moe``, ``gated_delta``, ``conv``, ``lm_head``, ``int4_matmul``,
+``rmsnorm``, ``rotary``, ``turboquant_dequant``. Percentages are relative to the
+sum of recorded categories.
+
+Derived CPU-launch-gap: ``DecodeProfileSession.cpu_launch_gap_ms(wall_ms)``
+returns the wall-clock time of the forward that is NOT covered by tracked GPU
+categories — kernel-launch gaps, host-side dispatch, sampling, and untracked
+ops. The engine logs it per profiled forward (``cpu_launch_gap_ms``), which is
+how the P0-#1 ~79ms decode-step breakdown is produced.
 
 When wrapped with ``steady_decode_accumulation`` during Qwen3.5 generation, the
 engine also logs **steady-state** averages over ``decode[2+]`` only (skips
@@ -96,6 +103,17 @@ class DecodeProfileSession:
             tracked,
         )
         return ms
+
+    @staticmethod
+    def cpu_launch_gap_ms(wall_seconds: float, component_ms: dict[str, float]) -> float:
+        """Wall-clock forward time not covered by tracked GPU component timers (ms).
+
+        Large gaps indicate CPU-side launch overhead / host stalls rather than
+        device bandwidth — the primary signal for P0-#1 decode-step analysis.
+        """
+        if wall_seconds <= 0:
+            return 0.0
+        return max(0.0, wall_seconds * 1000.0 - float(sum(component_ms.values())))
 
 
 def active_session() -> DecodeProfileSession | None:

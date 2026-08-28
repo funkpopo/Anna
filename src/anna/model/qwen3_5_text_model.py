@@ -263,7 +263,8 @@ class Qwen3TextModel(nn.Module):
             position_ids = position_ids + past_seen_tokens.view(-1, 1)
 
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        with xpu_profile_region("rotary"):
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         if past_key_values is not None and input_ids is not None:
             past_key_values.attach_prefill_input_ids(input_ids)

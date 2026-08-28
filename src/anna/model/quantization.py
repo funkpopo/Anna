@@ -26,17 +26,21 @@ _XPU_INT4_MATMUL_STRATEGIES = frozenset({"auto", "torch", "dequant", "gemv"})
 _XPU_INT4_LAYOUT_CACHE_VERSION = 2
 _XPU_INT4_LAYOUT_NAME = "anna_xpu_int4_linear_v1"
 _XPU_INT4_LM_HEAD_CACHE_TILE = 4
-# Arc auto policy for dense int4 matmul (Phase 3):
-# - auto: M-aware switch — when ANNA_XPU_INT4_GEMV_M_THRESHOLD is set to a
-#   positive value and the fused-op library exposes xpu_int4_gemv, decode-shaped
-#   rows (M <= threshold) route to the self-hosted SYCL int4 GEMV and prefill
-#   waves (large M) keep the aten int4pack batched GEMM (XMX path). Default 0
-#   preserves the legacy Arc policy (auto = torch int4pack) until the GEMV
-#   kernel is validated end-to-end on the target device.
+# Arc auto policy for dense int4 matmul (Phase 3 → P0-#2 done):
+# - auto: M-aware switch — decode-shaped rows (M <= threshold) route to the
+#   self-hosted SYCL int4 GEMV and prefill waves (large M) keep the aten
+#   int4pack batched GEMM (XMX path). Default threshold 2 is evidence-based:
+#   bench_logs/xpu_int4_gemv_variant_sweep_median.txt shows gemv_plain L32/L64
+#   beating torch_int4pack at M=1 (1.78-1.85x) and M=2 (1.37x), while losing at
+#   M>=4 (0.89x and below). Override with ANNA_XPU_INT4_GEMV_M_THRESHOLD
+#   (0 restores the legacy auto = torch int4pack policy).
 # - gemv → SYCL GEMV unconditionally; dequant → full dequant + F.linear (debug/fallback).
 _XPU_INT4_AUTO_MATMUL_BACKEND = "torch"
 _XPU_INT4_GEMV_M_THRESHOLD_ENV = "ANNA_XPU_INT4_GEMV_M_THRESHOLD"
-_XPU_INT4_GEMV_M_THRESHOLD_DEFAULT = 0
+_XPU_INT4_GEMV_M_THRESHOLD_DEFAULT = 2
+# Parallel workers for preloading persistent int4 layout cache files (P1-#5).
+_XPU_INT4_CACHE_LOAD_WORKERS_ENV = "ANNA_XPU_INT4_CACHE_LOAD_WORKERS"
+_XPU_INT4_CACHE_LOAD_WORKERS_DEFAULT = 8
 # weight-quant auto thresholds vs total XPU memory (see resolve helpers in engines)
 _WEIGHT_QUANT_AUTO_DENSE_USAGE_THRESHOLD = 0.85
 _WEIGHT_QUANT_AUTO_MOE_USAGE_THRESHOLD = 0.70
@@ -710,17 +714,31 @@ class XPUInt4Linear(nn.Module):
             return _XPU_INT4_GEMV_M_THRESHOLD_DEFAULT
 
     @staticmethod
+    def _cache_load_workers() -> int:
+        raw = os.getenv(_XPU_INT4_CACHE_LOAD_WORKERS_ENV, "").strip()
+        if not raw:
+            return _XPU_INT4_CACHE_LOAD_WORKERS_DEFAULT
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logger.warning(
+                "Ignoring unsupported %s=%r; using %d.",
+                _XPU_INT4_CACHE_LOAD_WORKERS_ENV,
+                raw,
+                _XPU_INT4_CACHE_LOAD_WORKERS_DEFAULT,
+            )
+            return _XPU_INT4_CACHE_LOAD_WORKERS_DEFAULT
+
+    @staticmethod
     def resolve_matmul_backend(strategy: str | None = None, *, rows: int | None = None) -> str:
         """Map configured strategy to the backend actually used on XPU.
 
-        ``auto`` is M-aware (Phase 3): when ``ANNA_XPU_INT4_GEMV_M_THRESHOLD``
-        is set to a positive value and the fused-op library exposes
-        ``xpu_int4_gemv``, decode-shaped inputs (``rows`` <= threshold) route
-        to the SYCL int4 GEMV; prefill-shaped inputs keep the aten int4pack
-        batched GEMM (XMX path). The default threshold of 0 preserves the
-        legacy Arc policy (auto = torch int4pack) until the GEMV kernel is
-        validated end-to-end. Explicit ``gemv`` / ``dequant`` / ``torch``
-        bypass the M threshold.
+        ``auto`` is M-aware: decode-shaped inputs (``rows`` <=
+        ``ANNA_XPU_INT4_GEMV_M_THRESHOLD``, default 2) route to the SYCL int4
+        GEMV when the fused-op library exposes ``xpu_int4_gemv``; prefill-shaped
+        inputs keep the aten int4pack batched GEMM (XMX path). A threshold of 0
+        restores the legacy auto = torch int4pack policy. Explicit ``gemv`` /
+        ``dequant`` / ``torch`` bypass the M threshold.
         """
         resolved = (strategy or XPUInt4Linear._matmul_strategy()).strip().lower()
         if resolved == "auto":
@@ -797,12 +815,15 @@ class XPUInt4Linear(nn.Module):
                 # The SYCL GEMV kernel requires unpadded inputs (last dim ==
                 # in_features); padded layouts keep the int4pack XMX path.
                 backend = "torch"
-            if backend == "dequant":
-                output = self._forward_dequant(x_padded)
-            elif backend == "gemv":
-                output = self._forward_xpu_int4_gemv(x_padded, load_library=True)
-            else:
-                output = self._forward_torch_xpu_int4(x_padded)
+            from anna.model.xpu_decode_profile import xpu_profile_region
+
+            with xpu_profile_region("int4_matmul"):
+                if backend == "dequant":
+                    output = self._forward_dequant(x_padded)
+                elif backend == "gemv":
+                    output = self._forward_xpu_int4_gemv(x_padded, load_library=True)
+                else:
+                    output = self._forward_torch_xpu_int4(x_padded)
         else:
             output = self._forward_dequant(x_padded)
         return output.reshape(*original_shape, self.out_features).to(dtype=x.dtype)
@@ -1011,6 +1032,27 @@ def estimate_module_xpu_int4_bytes(
     return total
 
 
+def _probe_int4_cache_for_linear(
+    child: nn.Module,
+    *,
+    module_name: str,
+    cache_dir: Path,
+    group_size: int,
+    compute_dtype: torch.dtype,
+    device: torch.device | str,
+) -> tuple[str | None, Path | None, "XPUInt4Linear | None"]:
+    """Compute the cache fingerprint and try loading a cached replacement (thread-safe)."""
+    fingerprint = _linear_cache_fingerprint(child, group_size=group_size, compute_dtype=compute_dtype)
+    cache_path = _cache_file_for_linear(cache_dir, module_name, fingerprint)
+    replacement = _load_xpu_int4_linear_from_cache(
+        cache_path,
+        device=device,
+        compute_dtype=compute_dtype,
+        fingerprint=fingerprint,
+    )
+    return fingerprint, cache_path, replacement
+
+
 def convert_module_linears_to_xpu_int4(
     module: nn.Module,
     *,
@@ -1027,6 +1069,9 @@ def convert_module_linears_to_xpu_int4(
     cache_hits = 0
     cache_misses = 0
     cache_save_failures = 0
+
+    # First pass: collect convertible modules with resolved quantization params.
+    candidates: list[tuple[str, nn.Module, int, torch.dtype]] = []
     module_names = [module_name for module_name, _child in module.named_modules() if module_name]
     for module_name in module_names:
         try:
@@ -1045,30 +1090,46 @@ def convert_module_linears_to_xpu_int4(
             continue
         resolved_group_size = int(getattr(child, "group_size", group_size))
         resolved_compute_dtype = compute_dtype or getattr(child, "compute_dtype", torch.bfloat16)
+        candidates.append((module_name, child, resolved_group_size, resolved_compute_dtype))
+
+    # P1-#5: probe + deserialize the persistent int4 layout cache concurrently
+    # (fingerprint hashing and torch.load release the GIL), instead of paying a
+    # serialized ~40s for 200+ files. Misses fall back to the inline conversion
+    # path below with identical semantics.
+    probes: dict[str, tuple[str | None, Path | None, XPUInt4Linear | None]] = {}
+    if resolved_cache_dir is not None and candidates:
+        from concurrent.futures import ThreadPoolExecutor
+
+        workers = XPUInt4Linear._cache_load_workers()
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="anna-int4-cache") as pool:
+            futures = {
+                module_name: pool.submit(
+                    _probe_int4_cache_for_linear,
+                    child,
+                    module_name=module_name,
+                    cache_dir=resolved_cache_dir,
+                    group_size=resolved_group_size,
+                    compute_dtype=resolved_compute_dtype,
+                    device=device,
+                )
+                for module_name, child, resolved_group_size, resolved_compute_dtype in candidates
+            }
+            for module_name, future in futures.items():
+                try:
+                    probes[module_name] = future.result()
+                except Exception:
+                    logger.warning("Failed to probe XPU int4 cache for module %s", module_name, exc_info=True)
+                    probes[module_name] = (None, None, None)
+
+    for module_name, child, resolved_group_size, resolved_compute_dtype in candidates:
         replacement = None
         cache_path = None
         fingerprint = None
         if resolved_cache_dir is not None:
-            try:
-                fingerprint = _linear_cache_fingerprint(
-                    child,
-                    group_size=resolved_group_size,
-                    compute_dtype=resolved_compute_dtype,
-                )
-                cache_path = _cache_file_for_linear(resolved_cache_dir, module_name, fingerprint)
-                replacement = _load_xpu_int4_linear_from_cache(
-                    cache_path,
-                    device=device,
-                    compute_dtype=resolved_compute_dtype,
-                    fingerprint=fingerprint,
-                )
-                if replacement is not None:
-                    cache_hits += 1
-                else:
-                    cache_misses += 1
-            except Exception:
-                logger.warning("Failed to probe XPU int4 cache for module %s", module_name, exc_info=True)
-                replacement = None
+            fingerprint, cache_path, replacement = probes.get(module_name, (None, None, None))
+            if replacement is not None:
+                cache_hits += 1
+            else:
                 cache_misses += 1
 
         if replacement is None:
@@ -1101,6 +1162,7 @@ def convert_module_linears_to_xpu_int4(
         elif gc_every > 0 and count % gc_every == 0:
             _release_cpu_memory_caches()
 
+    del candidates
     del module_names
     _release_cpu_memory_caches()
     if resolved_cache_dir is not None and count > 0:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,9 +24,29 @@ from anna.model.quantization import (
     replace_linear_modules,
     replace_linear_modules_with_xpu_int4_placeholders,
 )
-from anna.weights.safetensors_device import safetensors_pt_device_str
+from anna.weights.safetensors_device import safetensors_pt_device_str  # noqa: F401 (kept for API parity)
 
 logger = logging.getLogger(__name__)
+
+_WEIGHT_LOAD_PIPELINE_WORKERS_ENV = "ANNA_WEIGHT_LOAD_PIPELINE_WORKERS"
+_WEIGHT_LOAD_PIPELINE_WORKERS_DEFAULT = 2
+
+
+def _weight_load_pipeline_workers() -> int:
+    """Resolve the shard-staging pipeline width (explicit env > built-in default)."""
+    raw = os.getenv(_WEIGHT_LOAD_PIPELINE_WORKERS_ENV, "").strip()
+    if not raw:
+        return _WEIGHT_LOAD_PIPELINE_WORKERS_DEFAULT
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "Ignoring unsupported %s=%r; using %d.",
+            _WEIGHT_LOAD_PIPELINE_WORKERS_ENV,
+            raw,
+            _WEIGHT_LOAD_PIPELINE_WORKERS_DEFAULT,
+        )
+        return _WEIGHT_LOAD_PIPELINE_WORKERS_DEFAULT
 
 
 @dataclass(slots=True)
@@ -118,124 +139,149 @@ def load_qwen3_5_text_model_weights(model: Qwen3_5TextForConditionalGeneration, 
     load_plan, total_bytes = _load_plan(model_path)
     total_shards = len(load_plan)
     loaded_bytes = 0
-    st_device = safetensors_pt_device_str(tensor_targets)
 
     logger.info(
-        "Loading Qwen3.5 weights from %s shard(s), total=%s bytes, model_dir=%s, safetensors_device=%s",
+        "Loading Qwen3.5 weights from %s shard(s), total=%s bytes, model_dir=%s",
         total_shards,
         total_bytes,
         model_path,
-        st_device,
     )
 
-    for shard_idx, shard_plan in enumerate(load_plan, start=1):
-        weight_file = shard_plan.path
-        shard_size = shard_plan.size_bytes
+    # P1-#5: pipeline shard staging and device copies. A background thread reads
+    # the next shard into CPU RAM (safetensors mmap) while the main thread copies
+    # the previous shard into the device tensors, overlapping disk/CPU work with
+    # device transfers instead of serializing them.
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _collect_direct_int4_requests(shard_plan: SafetensorsShardPlan) -> list:
         tensor_entries = {entry.name: entry for entry in shard_plan.tensors}
-        logger.info(
-            "Loading Qwen3.5 weight shard %s/%s: %s (%s bytes)",
-            shard_idx,
-            total_shards,
-            weight_file.name,
-            shard_size,
-        )
-        with safe_open(str(weight_file), framework="pt", device=st_device) as handle:
-            direct_int4_requests = []
-            direct_int4_keys: set[str] = set()
-            for key in shard_plan.keys:
-                if key in tensor_targets or not key.endswith(".weight"):
-                    continue
-                module_name = key[: -len(".weight")]
-                module = module_targets.get(module_name)
-                if not isinstance(module, XPUInt4Linear):
-                    continue
-                tensor_entry = tensor_entries[key]
-                if tuple(tensor_entry.shape) != (module.out_features, module.in_features):
-                    raise ValueError(
-                        f"Shape mismatch for {key}: expected {(module.out_features, module.in_features)}, got {tuple(tensor_entry.shape)}"
-                    )
-                direct_int4_requests.append(
-                    (module_name, tensor_entry, module.group_size, module.padded_in_features)
+        direct_int4_requests = []
+        for key in shard_plan.keys:
+            if key in tensor_targets or not key.endswith(".weight"):
+                continue
+            module_name = key[: -len(".weight")]
+            module = module_targets.get(module_name)
+            if not isinstance(module, XPUInt4Linear):
+                continue
+            tensor_entry = tensor_entries[key]
+            if tuple(tensor_entry.shape) != (module.out_features, module.in_features):
+                raise ValueError(
+                    f"Shape mismatch for {key}: expected {(module.out_features, module.in_features)}, got {tuple(tensor_entry.shape)}"
                 )
-                direct_int4_keys.add(key)
-            direct_int4_payloads = {}
-            if direct_int4_requests:
-                for (
-                    module_name,
+            direct_int4_requests.append(
+                (module_name, tensor_entry, module.group_size, module.padded_in_features)
+            )
+        return direct_int4_requests
+
+    def _stage_shard(shard_plan: SafetensorsShardPlan, direct_int4_requests: list) -> tuple[dict, dict]:
+        """Read one shard fully into CPU RAM (plus int4 re-quant payloads)."""
+        staged: dict[str, torch.Tensor] = {}
+        with safe_open(str(shard_plan.path), framework="pt", device="cpu") as handle:
+            for key in shard_plan.keys:
+                if key in tensor_targets:
+                    staged[key] = handle.get_tensor(key)
+        direct_int4_payloads: dict[str, tuple] = {}
+        if direct_int4_requests:
+            for (
+                module_name,
+                qweight_bytes,
+                qscale_bytes,
+                qzeros_bytes,
+                out_features,
+                padded_in_features,
+                group_size,
+            ) in quantize_safetensors_linear_int4_batch(
+                shard_path=shard_plan.path,
+                header_len=shard_plan.header_len,
+                requests=direct_int4_requests,
+            ):
+                direct_int4_payloads[str(module_name)] = (
                     qweight_bytes,
                     qscale_bytes,
                     qzeros_bytes,
-                    out_features,
-                    padded_in_features,
-                    group_size,
-                ) in quantize_safetensors_linear_int4_batch(
-                    shard_path=weight_file,
-                    header_len=shard_plan.header_len,
-                    requests=direct_int4_requests,
-                ):
-                    direct_int4_payloads[str(module_name)] = (
-                        qweight_bytes,
-                        qscale_bytes,
-                        qzeros_bytes,
-                        int(out_features),
-                        int(padded_in_features),
-                        int(group_size),
-                    )
+                    int(out_features),
+                    int(padded_in_features),
+                    int(group_size),
+                )
+        return staged, direct_int4_payloads
 
+    with ThreadPoolExecutor(max_workers=_weight_load_pipeline_workers(), thread_name_prefix="anna-weight-load") as pool:
+        pending: deque[tuple[int, SafetensorsShardPlan, object]] = deque()
+        next_submit_idx = 0
+
+        def _submit_next() -> None:
+            nonlocal next_submit_idx
+            if next_submit_idx < total_shards:
+                plan = load_plan[next_submit_idx]
+                pending.append((next_submit_idx + 1, plan, pool.submit(_stage_shard, plan, _collect_direct_int4_requests(plan))))
+                next_submit_idx += 1
+
+        _submit_next()
+        while pending:
+            shard_idx, shard_plan, future = pending.popleft()
+            _submit_next()  # prefetch depth 1: next shard stages while this one copies
+            weight_file = shard_plan.path
+            shard_size = shard_plan.size_bytes
+            logger.info(
+                "Loading Qwen3.5 weight shard %s/%s: %s (%s bytes)",
+                shard_idx,
+                total_shards,
+                weight_file.name,
+                shard_size,
+            )
+            staged, direct_int4_payloads = future.result()
+            direct_int4_keys: set[str] = set()
             for key in shard_plan.keys:
-                if key not in tensor_targets:
-                    if key.endswith(".weight"):
-                        module_name = key[: -len(".weight")]
-                        module = module_targets.get(module_name)
-                        if isinstance(module, XPUInt4Linear) and key in direct_int4_keys:
-                            qweight_bytes, qscale_bytes, qzeros_bytes, out_features, padded_in_features, group_size = (
-                                direct_int4_payloads[module_name]
-                            )
-                            qweight = torch.frombuffer(qweight_bytes, dtype=torch.int32).reshape(
-                                out_features, padded_in_features // 8
-                            )
-                            qscale = torch.frombuffer(qscale_bytes, dtype=torch.float32).reshape(
-                                padded_in_features // group_size, out_features
-                            )
-                            qzeros = torch.frombuffer(qzeros_bytes, dtype=torch.int8).reshape(
-                                padded_in_features // group_size, out_features
-                            )
-                            with torch.no_grad():
-                                module.qweight.copy_(qweight.to(device=module.qweight.device))
-                                module.qscale.copy_(qscale.to(device=module.qscale.device))
-                                module.qzeros.copy_(qzeros.to(device=module.qzeros.device))
-                            del qweight, qscale, qzeros
-                            loaded += 1
-                            continue
-                    skipped += 1
-                    continue
-
-                source = handle.get_tensor(key)
-                target = tensor_targets[key]
-                if tuple(source.shape) != tuple(target.shape):
-                    raise ValueError(
-                        f"Shape mismatch for {key}: expected {tuple(target.shape)}, got {tuple(source.shape)}"
-                    )
-
-                with torch.no_grad():
-                    if source.device == target.device and source.dtype == target.dtype:
-                        target.copy_(source)
-                    else:
+                if key in tensor_targets:
+                    source = staged[key]
+                    target = tensor_targets[key]
+                    if tuple(source.shape) != tuple(target.shape):
+                        raise ValueError(
+                            f"Shape mismatch for {key}: expected {tuple(target.shape)}, got {tuple(source.shape)}"
+                        )
+                    with torch.no_grad():
                         target.copy_(source.to(device=target.device, dtype=target.dtype))
-                del source
-                loaded += 1
-        loaded_bytes += shard_size
-        _release_cpu_memory_caches()
-        logger.info(
-            "Loaded Qwen3.5 weight shard %s/%s: %s (cumulative_bytes=%s/%s, tensors_loaded=%s, tensors_skipped=%s)",
-            shard_idx,
-            total_shards,
-            weight_file.name,
-            loaded_bytes,
-            total_bytes,
-            loaded,
-            skipped,
-        )
+                    loaded += 1
+                    continue
+                if key.endswith(".weight"):
+                    module_name = key[: -len(".weight")]
+                    module = module_targets.get(module_name)
+                    if isinstance(module, XPUInt4Linear) and module_name in direct_int4_payloads:
+                        qweight_bytes, qscale_bytes, qzeros_bytes, out_features, padded_in_features, group_size = (
+                            direct_int4_payloads[module_name]
+                        )
+                        direct_int4_keys.add(key)
+                        qweight = torch.frombuffer(bytearray(qweight_bytes), dtype=torch.int32).reshape(
+                            out_features, padded_in_features // 8
+                        )
+                        qscale = torch.frombuffer(qscale_bytes, dtype=torch.float32).reshape(
+                            padded_in_features // group_size, out_features
+                        )
+                        qzeros = torch.frombuffer(qzeros_bytes, dtype=torch.int8).reshape(
+                            padded_in_features // group_size, out_features
+                        )
+                        with torch.no_grad():
+                            module.qweight.copy_(qweight.to(device=module.qweight.device))
+                            module.qscale.copy_(qscale.to(device=module.qscale.device))
+                            module.qzeros.copy_(qzeros.to(device=module.qzeros.device))
+                        del qweight, qscale, qzeros
+                        loaded += 1
+                        continue
+                skipped += 1
+            del staged
+            loaded_bytes += shard_size
+            _release_cpu_memory_caches()
+            logger.info(
+                "Loaded Qwen3.5 weight shard %s/%s: %s (cumulative_bytes=%s/%s, tensors_loaded=%s, tensors_skipped=%s)",
+                shard_idx,
+                total_shards,
+                weight_file.name,
+                loaded_bytes,
+                total_bytes,
+                loaded,
+                skipped,
+            )
 
     model.tie_weights()
     del tensor_targets

@@ -417,6 +417,39 @@ def test_xpu_int4_linear_gemv_strategy_matches_torch_int4pack(monkeypatch: pytes
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
+def test_xpu_int4_linear_auto_strategy_routes_gemv_at_decode_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0-#2: auto routes decode-shaped rows (M <= default threshold 2) to the SYCL GEMV."""
+    if not maybe_load_gated_delta_library() or not hasattr(torch.ops.anna, "xpu_int4_gemv"):
+        pytest.skip("Anna fused-op library is not built with xpu_int4_gemv")
+
+    torch.manual_seed(8)
+    dense = torch.nn.Linear(1024, 1024, bias=False, device="xpu", dtype=torch.float32)
+    quantized = XPUInt4Linear.from_linear(dense, group_size=128, compute_dtype=torch.bfloat16, device="xpu")
+    hidden_states = torch.randn(2, 1024, device="xpu", dtype=torch.bfloat16)
+
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "torch")
+    reference = quantized(hidden_states)
+
+    # auto + default threshold (2): M=2 routes to the gemv kernel.
+    monkeypatch.delenv("ANNA_XPU_INT4_GEMV_M_THRESHOLD", raising=False)
+    monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "auto")
+    assert quantized.resolve_matmul_backend(rows=1) == "gemv"
+    assert quantized.resolve_matmul_backend(rows=2) == "gemv"
+    output = quantized(hidden_states)
+
+    # Large M (prefill waves) keeps the aten int4pack XMX path.
+    assert quantized.resolve_matmul_backend(rows=8) == "torch"
+    # threshold=0 restores the legacy auto = torch policy for all M.
+    monkeypatch.setenv("ANNA_XPU_INT4_GEMV_M_THRESHOLD", "0")
+    assert quantized.resolve_matmul_backend(rows=1) == "torch"
+
+    torch.xpu.synchronize()
+    assert torch.allclose(output.cpu(), reference.cpu(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required for the SYCL custom op test")
 def test_xpu_int4_linear_auto_strategy_propagates_torch_int4pack_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -428,7 +461,9 @@ def test_xpu_int4_linear_auto_strategy_propagates_torch_int4pack_errors(
     def _raise_int4pack_error(_x_padded: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("int4pack failed")
 
+    # threshold=0 keeps auto on the torch int4pack path so its errors propagate.
     monkeypatch.setenv("ANNA_XPU_INT4_MATMUL", "auto")
+    monkeypatch.setenv("ANNA_XPU_INT4_GEMV_M_THRESHOLD", "0")
     monkeypatch.setattr(quantized, "_forward_torch_xpu_int4", _raise_int4pack_error)
 
     with pytest.raises(RuntimeError, match="int4pack failed"):

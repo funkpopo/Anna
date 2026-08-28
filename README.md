@@ -323,12 +323,13 @@ These values only apply when an API request omits the matching field.
 
 ### Compilation and Warmup
 
-- `--compile-mode none|auto|default|reduce-overhead|max-autotune`: `torch.compile` mode; serving usually uses `none` or `auto`.
+- `--compile-mode none|auto|default|reduce-overhead|max-autotune`: `torch.compile` mode, default `auto` (resolves to `reduce-overhead` on XPU); together with the persistent inductor cache, restarts hit the compile cache.
 - `--compile-fullgraph`: request fullgraph capture when compile is enabled.
-- `--no-inference-warmup`: skip the small post-load XPU warmup.
-- `--warmup-prefill-tokens N`: prefill token count used for warmup, default `2`.
-- `--warmup-decode-steps N`: decode steps used for warmup, default `1`.
-- `--warmup-batch-size N`: warmup batch size, default `1`.
+- `--no-inference-warmup`: skip the post-load XPU warmup (not recommended for serving).
+- `--warmup-prefill-tokens N`: extra prefill token count kept in the warmup shape table; by default derived to cover real chat shapes **13 / 64 / 256 / 2048**.
+- `--warmup-decode-steps N`: decode steps per warmup shape, default `8` (covers steady-state decode and the turboquant dequant path).
+- `--warmup-batch-size N`: extra warmup batch size; by default covers `{1,2,4,8} ∩ max_batch_size`.
+- The effective `Warmup shape table` is logged at startup. See [`docs/tuning.md`](docs/tuning.md) for the full tuning table.
 
 ### Memory and Weight Strategy
 
@@ -356,10 +357,14 @@ These values only apply when an API request omits the matching field.
 - `--enable-flashqla-gdn-prefill`: enable the XPU SYCL Gated Delta prefill path in **strict** mode (no fallback).
 - `--flashqla-gdn-prefill-mode off|strict|prefer`: FlashQLA policy. `strict` hard-fails on unsupported device/shape/dtype/op; `prefer` degrades to the default fused or torch prefill with a one-shot warning per reason. Env `ANNA_XPU_FLASHQLA_GDN_PREFILL` accepts the same values (`1`/`true`/`on` ≡ `strict`).
 - `--xpu-int4-matmul auto|torch|dequant|gemv`: XPU int4 dense linear execution strategy.
-  - **`auto` (default)**: PyTorch `int4pack` on Arc — no M-row GEMV/dequant threshold.
+  - **`auto` (default)**: M-row aware routing — decode-shaped rows (M ≤ `--xpu-int4-gemv-m-threshold`, default 2) use the SYCL GEMV, large-M prefill waves use the aten int4pack XMX GEMM (see `bench_logs/xpu_int4_m1_auto_vs_gemv_p0_2.csv`).
   - **`torch`**: force int4pack.
-  - **`gemv`**: opt-in SYCL GEMV (decode experiments); not selected by auto.
+  - **`gemv`**: force SYCL GEMV.
   - **`dequant`**: full dequant + `F.linear` (debug).
+- `--xpu-int4-gemv-m-threshold N`: M-row threshold for `auto` routing, default `2`; `0` restores the legacy auto = int4pack behavior.
+- `--xpu-int4-cache-load-workers N`: thread-pool width for parallel XPU int4 layout-cache deserialization, default `8` (serial loading used to take ~39s).
+- `--weight-load-pipeline-workers N`: concurrent shard-staging threads for the weight load pipeline, default `2` (the next shard is mmap-read while the current one copies to the device).
+- `--torchinductor-cache-dir PATH`: persistent inductor compile cache directory, default `~/.anna/cache/torchinductor` (set automatically at serve startup; a user-set `TORCHINDUCTOR_CACHE_DIR` wins, while the temp-dir default that torch injects at import time is detected and ignored).
 - LM head int4 top-k fused is **on by default** for XPU int4 (`top_k ≤ 16`). Disable with `ANNA_XPU_DISABLE_LM_HEAD_INT4_TOPK=1`. Legacy `ANNA_ENABLE_INT4_LM_HEAD_TOPK_FUSED=0|1` still forces off/on.
 - XPU int4 layout cache: on first int4 conversion Anna writes `{model}/.anna/xpu_int4_cache` (override with `ANNA_XPU_INT4_CACHE_DIR`). Version/fingerprint mismatch rebuilds; load/save failures fall back to live quantize. Disable with `ANNA_XPU_DISABLE_INT4_CACHE=1`. Inspect with `anna-xpu-int4-cache --model-dir ...`.
 - `ANNA_GATED_DELTA_OP_LIB`: explicitly point to a fused-op `.pyd` / `.so`.
