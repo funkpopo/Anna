@@ -321,16 +321,32 @@ class Qwen3PageAllocator:
             value_template=value_template,
         )
 
+    @_compiler_disable
     def register_cache(self, cache: object) -> None:
-        """Track a live Qwen3DynamicCache (weakref; released caches drop out)."""
-        self._live_caches = [ref for ref in self._live_caches if ref() is not None]
+        """Track a live Qwen3DynamicCache (weakref; released caches drop out).
+
+        Must never be traced by torch.compile: Dynamo's side-effect machinery
+        materializes the weakref back into the real ``_live_caches`` list as
+        ``None`` or the raw referent, which then crashes the next eager
+        registration (``'Qwen3DynamicCache' object is not callable``).
+        """
+        # Defensive: drop any non-weakref entries (e.g. left behind by a traced
+        # mutation) instead of failing on ``ref()``.
+        self._live_caches = [
+            ref
+            for ref in self._live_caches
+            if isinstance(ref, weakref.ReferenceType) and ref() is not None
+        ]
         self._live_caches.append(weakref.ref(cache))
 
+    @_compiler_disable
     def live_caches(self) -> list:
         """Return live (non-released) tracked caches, pruning dead references."""
         alive: list = []
         kept: list[weakref.ReferenceType] = []
         for ref in self._live_caches:
+            if not isinstance(ref, weakref.ReferenceType):
+                continue
             cache = ref()
             if cache is None:
                 continue
