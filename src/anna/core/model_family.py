@@ -29,9 +29,15 @@ def inspect_model_family(model_dir: str | Path) -> ModelFamilyInfo:
             raise RuntimeError("GGUF model inspection requires the optional 'gguf' dependency.") from exc
         reader = GGUFReader(str(files.model_file))
         architecture = str(reader.fields["general.architecture"].contents()).strip()
-        if architecture == "qwen35moe":
+        if architecture in ("qwen35", "qwen35moe"):
             return ModelFamilyInfo(
                 model_family="qwen3_5_text",
+                model_type=architecture,
+                architectures=(architecture,),
+            )
+        if architecture == "gemma4":
+            return ModelFamilyInfo(
+                model_family="gemma4",
                 model_type=architecture,
                 architectures=(architecture,),
             )

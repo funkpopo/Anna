@@ -13,7 +13,10 @@ from gguf.quants import dequantize
 from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers
 
 from anna.core.gguf_model import GGUFModelFiles, resolve_gguf_model_files
+from anna.model.gemma4_config import Gemma4Config, Gemma4RopeParameters, Gemma4TextConfig
+from anna.model.gemma4_text_model import Gemma4ForConditionalGeneration
 from anna.model.qwen3_5_text_config import Qwen3_5TextConfig, Qwen3_5TextModelConfig, Qwen3_5TextVisionConfig, RopeParameters, VisionPreprocessorConfig
+from anna.model.ops import Qwen3SparseMoeBlock
 from anna.model.qwen3_5_text_model import Qwen3_5TextForConditionalGeneration, Qwen3VisionModel
 from anna.model.quantization import DenseLinear, XPUInt4Linear
 from anna.weights.qwen3_5_text_weight_loader import WeightLoadReport
@@ -89,7 +92,7 @@ def load_qwen3_5_text_model_config_from_gguf(model_dir: str | Path) -> Qwen3_5Te
     files, mmproj_file = _resolve_qwen_gguf_files(model_dir)
     reader = GGUFReader(str(files.model_file))
     arch = str(_reader_field(reader, "general.architecture"))
-    if arch != "qwen35moe":
+    if arch not in _QWEN35_GGUF_ARCHS:
         raise ValueError(f"Unsupported GGUF architecture for Anna Qwen runtime: {arch}")
 
     tensors = _tensor_map(reader)
@@ -135,10 +138,31 @@ def load_qwen3_5_text_model_config_from_gguf(model_dir: str | Path) -> Qwen3_5Te
     endoftext_id = _token_id(tokens, "<|endoftext|>", 248044)
     pad_token_id = _reader_field(reader, "tokenizer.ggml.padding_token_id", endoftext_id)
 
+    # MoE keys are absent for dense exports (arch == "qwen35"); fall back to the
+    # dense feed-forward size so is_moe_model resolves to False.
+    num_experts = int(_reader_field(reader, f"{arch}.expert_count", 0))
+    num_experts_per_tok = int(_reader_field(reader, f"{arch}.expert_used_count", 0))
+    moe_intermediate_size = int(_reader_field(reader, f"{arch}.expert_feed_forward_length", 0))
+    shared_expert_intermediate_size = int(
+        _reader_field(reader, f"{arch}.expert_shared_feed_forward_length", 0)
+    )
+    dense_intermediate_size = int(_reader_field(reader, f"{arch}.feed_forward_length", 0))
+    if num_experts > 0:
+        if moe_intermediate_size <= 0:
+            raise ValueError(f"GGUF {arch} model declares {num_experts} experts without expert_feed_forward_length.")
+        intermediate_size = shared_expert_intermediate_size or dense_intermediate_size
+    else:
+        intermediate_size = dense_intermediate_size
+        if intermediate_size <= 0:
+            raise ValueError(f"GGUF {arch} model is missing feed_forward_length.")
+        moe_intermediate_size = 0
+        shared_expert_intermediate_size = 0
+        num_experts_per_tok = 0
+
     text_config = Qwen3_5TextConfig(
         model_type="qwen3_5_text",
         hidden_size=int(_reader_field(reader, f"{arch}.embedding_length")),
-        intermediate_size=int(_reader_field(reader, f"{arch}.expert_shared_feed_forward_length")),
+        intermediate_size=intermediate_size,
         num_hidden_layers=block_count,
         num_attention_heads=int(_reader_field(reader, f"{arch}.attention.head_count")),
         num_key_value_heads=int(_reader_field(reader, f"{arch}.attention.head_count_kv")),
@@ -164,10 +188,10 @@ def load_qwen3_5_text_model_config_from_gguf(model_dir: str | Path) -> Qwen3_5Te
         full_attention_interval=int(_reader_field(reader, f"{arch}.full_attention_interval", 4)),
         rope_parameters=_build_rope_parameters(reader, arch, head_dim=head_dim),
         decoder_sparse_step=1,
-        moe_intermediate_size=int(_reader_field(reader, f"{arch}.expert_feed_forward_length")),
-        shared_expert_intermediate_size=int(_reader_field(reader, f"{arch}.expert_shared_feed_forward_length")),
-        num_experts=int(_reader_field(reader, f"{arch}.expert_count")),
-        num_experts_per_tok=int(_reader_field(reader, f"{arch}.expert_used_count")),
+        moe_intermediate_size=moe_intermediate_size,
+        shared_expert_intermediate_size=shared_expert_intermediate_size,
+        num_experts=num_experts,
+        num_experts_per_tok=num_experts_per_tok,
         norm_topk_prob=True,
         router_aux_loss_coef=0.001,
         mlp_only_layers=[],
@@ -477,6 +501,13 @@ def _load_main_qwen35moe_weights_(
             loaded += 8
 
         mlp = layer.mlp
+        if not isinstance(mlp, Qwen3SparseMoeBlock):
+            # Dense feed-forward (arch == "qwen35").
+            _copy_matrix_to_linear_(mlp.gate_proj, tensors[f"{prefix}.ffn_gate.weight"])
+            _copy_matrix_to_linear_(mlp.up_proj, tensors[f"{prefix}.ffn_up.weight"])
+            _copy_matrix_to_linear_(mlp.down_proj, tensors[f"{prefix}.ffn_down.weight"])
+            loaded += 3
+            continue
         _copy_matrix_to_linear_(mlp.gate, tensors[f"{prefix}.ffn_gate_inp.weight"])
         _load_qwen_moe_expert_tensor_group_(mlp.experts, tensors[f"{prefix}.ffn_gate_exps.weight"], linear_name="gate_proj")
         _load_qwen_moe_expert_tensor_group_(mlp.experts, tensors[f"{prefix}.ffn_up_exps.weight"], linear_name="up_proj")
@@ -540,6 +571,275 @@ def _load_clip_mmproj_weights_(visual: Qwen3VisionModel, reader: GGUFReader) -> 
     loaded += 6
 
     return loaded
+
+
+# --- Gemma4 GGUF layout (text-only) ---
+#
+# general.architecture == "gemma4" maps to the Anna Gemma4 text runtime.
+# Metadata keys follow the llama.cpp conventions used by the Qwen35moe layout:
+#   gemma4.block_count / context_length / embedding_length / feed_forward_length
+#   gemma4.full_attention_interval (default 6)
+#   gemma4.attention.{head_count, head_count_kv, key_length, global_key_length,
+#                     global_head_count_kv, layer_norm_rms_epsilon, sliding_window,
+#                     k_eq_v, kv_shared_layers}
+#   gemma4.per_layer_input_length / vocab_per_layer_input_length
+#   gemma4.rope.{freq_base_sliding, freq_base_global, partial_rotary_factor,
+#                global_original_context_length}
+#   gemma4.final_logit_softcapping
+# Tensors:
+#   token_embd.weight / output_norm.weight / output.weight (optional, untied)
+#   token_embd_per_layer.weight / per_layer_model_proj.weight / per_layer_proj_norm.weight
+#   blk.N.{attn_norm, attn_post_norm, ffn_norm, ffn_post_norm}.weight
+#   blk.N.attn_{q,k,v,output}.weight + blk.N.attn_{q,k}_norm.weight
+#   blk.N.ffn_{gate,up,down}.weight
+#   blk.N.inp_gate.weight / per_layer_proj.weight / per_layer_post_norm.weight
+
+_GEMMA4_ARCH = "gemma4"
+_QWEN35_GGUF_ARCHS = ("qwen35", "qwen35moe")
+
+
+def _gemma4_layer_types(reader: GGUFReader, arch: str, block_count: int) -> list[str]:
+    interval = int(_reader_field(reader, f"{arch}.full_attention_interval", 6))
+    if interval <= 0:
+        interval = 1
+    layer_types = [
+        "full_attention" if (layer_idx + 1) % interval == 0 else "sliding_attention"
+        for layer_idx in range(block_count)
+    ]
+    if layer_types and layer_types[-1] != "full_attention":
+        layer_types[-1] = "full_attention"
+    return layer_types
+
+
+def _gemma4_layer_attention_head_dim(
+    tensors: dict[str, Any],
+    layer_types: list[str],
+    layer_type: str,
+    num_kv_heads: int,
+) -> int | None:
+    """Infer a per-layer-type head dim from the first matching layer's k projection."""
+    if layer_type not in layer_types:
+        return None
+    tensor = tensors.get(f"blk.{layer_types.index(layer_type)}.attn_k.weight")
+    if tensor is None or num_kv_heads <= 0:
+        return None
+    kv_out = _logical_shape(tensor)[0]
+    if kv_out % num_kv_heads != 0:
+        return None
+    return kv_out // num_kv_heads
+
+
+def load_gemma4_text_model_config_from_gguf(model_dir: str | Path) -> Gemma4Config:
+    files, _ = _resolve_qwen_gguf_files(model_dir)
+    reader = GGUFReader(str(files.model_file))
+    arch = str(_reader_field(reader, "general.architecture"))
+    if arch != _GEMMA4_ARCH:
+        raise ValueError(f"Unsupported GGUF architecture for Anna Gemma runtime: {arch}")
+
+    tensors = _tensor_map(reader)
+    tokens = [str(value) for value in _reader_field(reader, "tokenizer.ggml.tokens")]
+    block_count = int(_reader_field(reader, f"{arch}.block_count"))
+    hidden_size = int(_reader_field(reader, f"{arch}.embedding_length"))
+    num_heads = int(_reader_field(reader, f"{arch}.attention.head_count"))
+    num_kv_heads = int(_reader_field(reader, f"{arch}.attention.head_count_kv"))
+    layer_types = _gemma4_layer_types(reader, arch, block_count)
+
+    head_dim = int(_reader_field(reader, f"{arch}.attention.key_length", 0))
+    if head_dim <= 0:
+        head_dim = (
+            _gemma4_layer_attention_head_dim(tensors, layer_types, "sliding_attention", num_kv_heads)
+            or _gemma4_layer_attention_head_dim(tensors, layer_types, "full_attention", num_kv_heads)
+            or (hidden_size // max(1, num_heads))
+        )
+    global_head_dim = int(_reader_field(reader, f"{arch}.attention.global_key_length", 0))
+    if global_head_dim <= 0:
+        global_head_dim = (
+            _gemma4_layer_attention_head_dim(tensors, layer_types, "full_attention", num_kv_heads)
+            or head_dim
+        )
+    num_global_key_value_heads = int(_reader_field(reader, f"{arch}.attention.global_head_count_kv", num_kv_heads))
+
+    bos_token_id = int(_reader_field(reader, "tokenizer.ggml.bos_token_id", 2))
+    eos_token_id = int(_reader_field(reader, "tokenizer.ggml.eos_token_id", 1))
+    pad_token_id = int(_reader_field(reader, "tokenizer.ggml.padding_token_id", 0))
+    max_position_embeddings = int(_reader_field(reader, f"{arch}.context_length"))
+
+    hidden_size_per_layer_input = int(_reader_field(reader, f"{arch}.per_layer_input_length", 0))
+    vocab_size_per_layer_input = int(
+        _reader_field(reader, f"{arch}.vocab_per_layer_input_length", len(tokens))
+    )
+
+    original_max_position_embeddings = int(
+        _reader_field(reader, f"{arch}.rope.global_original_context_length", min(8_192, max_position_embeddings))
+    )
+    rope_factor = max(1.0, float(max_position_embeddings) / float(max(1, original_max_position_embeddings)))
+    rope_parameters = {
+        "sliding_attention": Gemma4RopeParameters(
+            rope_type="default",
+            rope_theta=float(_reader_field(reader, f"{arch}.rope.freq_base_sliding", 10_000.0)),
+        ),
+        "full_attention": Gemma4RopeParameters(
+            rope_type="proportional",
+            rope_theta=float(_reader_field(reader, f"{arch}.rope.freq_base_global", 1_000_000.0)),
+            partial_rotary_factor=float(_reader_field(reader, f"{arch}.rope.partial_rotary_factor", 0.25)),
+            factor=rope_factor,
+            original_max_position_embeddings=original_max_position_embeddings,
+        ),
+    }
+
+    softcapping = _reader_field(reader, f"{arch}.final_logit_softcapping", None)
+    text_config = Gemma4TextConfig(
+        model_type="gemma4_text",
+        vocab_size=len(tokens),
+        hidden_size=hidden_size,
+        intermediate_size=int(_reader_field(reader, f"{arch}.feed_forward_length")),
+        num_hidden_layers=block_count,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        head_dim=head_dim,
+        global_head_dim=global_head_dim,
+        hidden_activation="gelu_pytorch_tanh",
+        max_position_embeddings=max_position_embeddings,
+        rms_norm_eps=float(_reader_field(reader, f"{arch}.attention.layer_norm_rms_epsilon", 1e-6)),
+        pad_token_id=pad_token_id,
+        eos_token_ids=(eos_token_id,),
+        bos_token_id=bos_token_id,
+        tie_word_embeddings=True,
+        dtype="bfloat16",
+        sliding_window=int(_reader_field(reader, f"{arch}.attention.sliding_window", 512)),
+        layer_types=layer_types,
+        final_logit_softcapping=None if softcapping is None else float(softcapping),
+        vocab_size_per_layer_input=vocab_size_per_layer_input,
+        hidden_size_per_layer_input=hidden_size_per_layer_input,
+        num_global_key_value_heads=num_global_key_value_heads,
+        attention_k_eq_v=bool(_reader_field(reader, f"{arch}.attention.k_eq_v", False)),
+        num_kv_shared_layers=int(_reader_field(reader, f"{arch}.attention.kv_shared_layers", 0)),
+        rope_parameters=rope_parameters,
+    )
+
+    return Gemma4Config(
+        model_type="gemma4",
+        text_config=text_config,
+        vision_config=None,
+        audio_config=None,
+        tie_word_embeddings=True,
+        image_token_id=int(_token_id(tokens, "<image>", 258_880) or 258_880),
+        video_token_id=int(_token_id(tokens, "<video>", 258_884) or 258_884),
+        audio_token_id=int(_token_id(tokens, "<|audio|>", 258_881) or 258_881),
+        boi_token_id=int(_token_id(tokens, "<|image>", 255_999) or 255_999),
+        eoi_token_id=int(_token_id(tokens, "<image|>", 258_882) or 258_882),
+        boa_token_id=int(_token_id(tokens, "<|audio>", 256_000) or 256_000),
+        eoa_token_id=int(_token_id(tokens, "<audio|>", 258_883) or 258_883),
+    )
+
+
+def build_gemma4_text_tokenizer_backend_from_gguf(model_dir: str | Path) -> tuple[Tokenizer, dict[str, Any]]:
+    files, _ = _resolve_qwen_gguf_files(model_dir)
+    reader = GGUFReader(str(files.model_file))
+    tokens = [str(value) for value in _reader_field(reader, "tokenizer.ggml.tokens")]
+    scores = [float(value) for value in _reader_field(reader, "tokenizer.ggml.scores", [0.0] * len(tokens))]
+    token_types = [int(value) for value in _reader_field(reader, "tokenizer.ggml.token_type", [int(TokenType.NORMAL)] * len(tokens))]
+
+    token_set = set(tokens)
+    byte_fallback = all(f"<0x{value:02X}>" in token_set for value in range(256))
+    unk_token_id = _reader_field(reader, "tokenizer.ggml.unk_token_id", None)
+    backend = Tokenizer(
+        models.Unigram(
+            [(token, float(score)) for token, score in zip(tokens, scores)],
+            unk_id=None if unk_token_id is None else int(unk_token_id),
+            byte_fallback=byte_fallback,
+        )
+    )
+    backend.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="always")
+    backend.decoder = decoders.Metaspace(replacement="▁", prepend_scheme="always")
+
+    special_tokens = [
+        AddedToken(tokens[token_id], special=True, normalized=False)
+        for token_id, token_type in enumerate(token_types)
+        if token_type in _GGUF_SPECIAL_TOKEN_TYPES
+    ]
+    if special_tokens:
+        backend.add_special_tokens(special_tokens)
+
+    def _special_string(key: str, default_id: int, default_token: str) -> str:
+        token_id = _reader_field(reader, key, default_id)
+        if token_id is None or not 0 <= int(token_id) < len(tokens):
+            return tokens[default_id] if 0 <= default_id < len(tokens) else default_token
+        return tokens[int(token_id)]
+
+    metadata = {
+        "bos_token": _special_string("tokenizer.ggml.bos_token_id", 2, "<bos>"),
+        "eos_token": _special_string("tokenizer.ggml.eos_token_id", 1, "<eos>"),
+    }
+    return backend, metadata
+
+
+def estimate_gemma4_text_model_weight_bytes_from_gguf(model_dir: str | Path) -> int:
+    files, _ = _resolve_qwen_gguf_files(model_dir)
+    return _estimate_reader_weight_bytes(GGUFReader(str(files.model_file)))
+
+
+def load_gemma4_text_model_weights_from_gguf(
+    model: Gemma4ForConditionalGeneration,
+    model_dir: str | Path,
+) -> WeightLoadReport:
+    files, _ = _resolve_qwen_gguf_files(model_dir)
+    reader = GGUFReader(str(files.model_file))
+    tensors = _tensor_map(reader)
+    language_model = model.model.language_model
+    config = language_model.config
+    loaded = 0
+    skipped = 0
+
+    _copy_matrix_to_parameter_(language_model.embed_tokens.weight, tensors["token_embd.weight"])
+    loaded += 1
+    _copy_vector_(language_model.norm.weight, dequantize(tensors["output_norm.weight"].data, tensors["output_norm.weight"].tensor_type))
+    loaded += 1
+
+    if not (config.tie_word_embeddings or model.config.tie_word_embeddings) and model.lm_head is not None and "output.weight" in tensors:
+        _copy_matrix_to_parameter_(model.lm_head.weight, tensors["output.weight"])
+        loaded += 1
+    elif "output.weight" in tensors:
+        skipped += 1
+
+    if config.hidden_size_per_layer_input > 0:
+        _copy_matrix_to_parameter_(language_model.embed_tokens_per_layer.weight, tensors["token_embd_per_layer.weight"])
+        _copy_matrix_to_linear_(language_model.per_layer_model_projection, tensors["per_layer_model_proj.weight"])
+        _copy_vector_(language_model.per_layer_projection_norm.weight, dequantize(tensors["per_layer_proj_norm.weight"].data, tensors["per_layer_proj_norm.weight"].tensor_type))
+        loaded += 3
+
+    for layer_idx, layer in enumerate(language_model.layers):
+        prefix = f"blk.{layer_idx}"
+        self_attn = layer.self_attn
+        _copy_vector_(layer.input_layernorm.weight, dequantize(tensors[f"{prefix}.attn_norm.weight"].data, tensors[f"{prefix}.attn_norm.weight"].tensor_type))
+        _copy_vector_(layer.post_attention_layernorm.weight, dequantize(tensors[f"{prefix}.attn_post_norm.weight"].data, tensors[f"{prefix}.attn_post_norm.weight"].tensor_type))
+        _copy_vector_(layer.pre_feedforward_layernorm.weight, dequantize(tensors[f"{prefix}.ffn_norm.weight"].data, tensors[f"{prefix}.ffn_norm.weight"].tensor_type))
+        _copy_vector_(layer.post_feedforward_layernorm.weight, dequantize(tensors[f"{prefix}.ffn_post_norm.weight"].data, tensors[f"{prefix}.ffn_post_norm.weight"].tensor_type))
+        loaded += 4
+
+        _copy_matrix_to_linear_(self_attn.q_proj, tensors[f"{prefix}.attn_q.weight"])
+        _copy_matrix_to_linear_(self_attn.k_proj, tensors[f"{prefix}.attn_k.weight"])
+        if self_attn.v_proj is not None:
+            _copy_matrix_to_linear_(self_attn.v_proj, tensors[f"{prefix}.attn_v.weight"])
+        _copy_matrix_to_linear_(self_attn.o_proj, tensors[f"{prefix}.attn_output.weight"])
+        _copy_vector_(self_attn.q_norm.weight, dequantize(tensors[f"{prefix}.attn_q_norm.weight"].data, tensors[f"{prefix}.attn_q_norm.weight"].tensor_type))
+        _copy_vector_(self_attn.k_norm.weight, dequantize(tensors[f"{prefix}.attn_k_norm.weight"].data, tensors[f"{prefix}.attn_k_norm.weight"].tensor_type))
+        loaded += 5 + (1 if self_attn.v_proj is not None else 0)
+
+        mlp = layer.mlp
+        _copy_matrix_to_linear_(mlp.gate_proj, tensors[f"{prefix}.ffn_gate.weight"])
+        _copy_matrix_to_linear_(mlp.up_proj, tensors[f"{prefix}.ffn_up.weight"])
+        _copy_matrix_to_linear_(mlp.down_proj, tensors[f"{prefix}.ffn_down.weight"])
+        loaded += 3
+
+        if config.hidden_size_per_layer_input > 0:
+            _copy_matrix_to_linear_(layer.per_layer_input_gate, tensors[f"{prefix}.inp_gate.weight"])
+            _copy_matrix_to_linear_(layer.per_layer_projection, tensors[f"{prefix}.per_layer_proj.weight"])
+            _copy_vector_(layer.post_per_layer_input_norm.weight, dequantize(tensors[f"{prefix}.per_layer_post_norm.weight"].data, tensors[f"{prefix}.per_layer_post_norm.weight"].tensor_type))
+            loaded += 3
+
+    model.tie_weights()
+    return WeightLoadReport(loaded=loaded, skipped=skipped)
 
 
 def load_qwen3_5_text_model_weights_from_gguf(

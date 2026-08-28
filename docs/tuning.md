@@ -33,6 +33,8 @@ CLI 显式参数  >  ANNA_* 环境变量  >  代码内置默认值
 | env `ANNA_WEIGHT_LOAD_PIPELINE_WORKERS` | 未设置 | 同 `--weight-load-pipeline-workers` |
 | env `TORCHINDUCTOR_CACHE_DIR` | 未设置 | 显式设置时优先生效，`--torchinductor-cache-dir` 不覆盖它。注：torch import 时会自动注入临时目录默认值，Anna 会识别并忽略该注入值（视为未设置），只有用户真实设置的路径才会被尊重 |
 
+提示：inductor 缓存目录（默认 `~/.anna/cache/torchinductor`）只存编译产物，可直接删除回收磁盘；代价仅是下次启动重新编译一次 warmup（约 75s）。
+
 代码位置：`src/anna/model/quantization.py`、`src/anna/weights/qwen3_5_text_weight_loader.py`、`src/anna/cli/serve.py`（`configure_compile_cache_environment`）。
 
 ## 2b. 调度器（P2-9：单用户 TTFT 与公平性）

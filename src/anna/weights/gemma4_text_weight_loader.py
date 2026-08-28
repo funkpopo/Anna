@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
+from anna.core.gguf_model import has_gguf_model
 from anna.core.native import SafetensorsShardPlan, inspect_safetensors_load_plan, inspect_safetensors_manifest
 from anna.model.gemma4_config import Gemma4Config
 from anna.model.gemma4_text_model import Gemma4ForConditionalGeneration
@@ -23,6 +24,10 @@ def load_gemma4_text_model_config(model_dir: str | Path) -> Gemma4Config:
     model_path = Path(model_dir)
     config_path = model_path / "config.json"
     if not config_path.exists():
+        if has_gguf_model(model_path):
+            from anna.weights.gguf_support import load_gemma4_text_model_config_from_gguf
+
+            return load_gemma4_text_model_config_from_gguf(model_path)
         raise FileNotFoundError(f"Missing config file: {config_path}")
     return Gemma4Config.from_model_dir(model_path)
 
@@ -33,6 +38,10 @@ def _iter_weight_files(model_dir: Path) -> list[Path]:
 
 def estimate_gemma4_text_model_weight_bytes(model_dir: str | Path) -> int:
     model_path = Path(model_dir)
+    if has_gguf_model(model_path):
+        from anna.weights.gguf_support import estimate_gemma4_text_model_weight_bytes_from_gguf
+
+        return estimate_gemma4_text_model_weight_bytes_from_gguf(model_path)
     return inspect_safetensors_manifest(model_path)[1]
 
 
@@ -69,6 +78,10 @@ def load_gemma4_text_model_weights(
     model_dir: str | Path,
 ) -> WeightLoadReport:
     model_path = Path(model_dir)
+    if has_gguf_model(model_path):
+        from anna.weights.gguf_support import load_gemma4_text_model_weights_from_gguf
+
+        return load_gemma4_text_model_weights_from_gguf(model, model_path)
     tensor_targets = {name: tensor for name, tensor in model.named_parameters()}
     tensor_targets.update({name: tensor for name, tensor in model.named_buffers()})
     loaded = 0

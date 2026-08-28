@@ -5,6 +5,9 @@ import re
 from pathlib import Path
 from typing import Any
 
+from tokenizers import Tokenizer
+
+from anna.core.gguf_model import has_gguf_model
 from anna.core.function_calling import (
     DelimitedToolCallStreamParser,
     GemmaThinkingStreamParser,
@@ -17,7 +20,6 @@ from anna.core.function_calling import (
     parse_tool_response_content,
     select_tools_for_choice,
 )
-from tokenizers import Tokenizer
 
 
 class _GemmaStructuredValueParser:
@@ -154,6 +156,11 @@ class Gemma4Tokenizer:
         model_path = Path(model_dir)
         tokenizer_path = model_path / "tokenizer.json"
         if not tokenizer_path.exists():
+            if has_gguf_model(model_path):
+                from anna.weights.gguf_support import build_gemma4_text_tokenizer_backend_from_gguf
+
+                backend, metadata = build_gemma4_text_tokenizer_backend_from_gguf(model_path)
+                return cls(backend, metadata=metadata)
             raise FileNotFoundError(f"Missing tokenizer.json in {model_path}")
 
         metadata = None

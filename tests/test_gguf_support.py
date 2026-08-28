@@ -7,7 +7,15 @@ import torch
 from gguf import GGUFReader, GGUFValueType, GGUFWriter, TokenType
 from gguf.quants import dequantize
 
+from anna.core.model_family import inspect_model_family
 from anna.model.quantization import XPUInt4Linear
+from anna.weights.gemma4_text_weight_loader import (
+    build_gemma4_text_model,
+    estimate_gemma4_text_model_weight_bytes,
+    load_gemma4_text_model_config,
+    load_gemma4_text_model_weights,
+)
+from anna.weights.gemma4_tokenizer import Gemma4Tokenizer
 from anna.weights.qwen3_5_text_tokenizer import Qwen3_5TextTokenizer
 from anna.weights.qwen3_5_text_weight_loader import (
     build_qwen3_5_text_model,
@@ -465,3 +473,351 @@ def test_gguf_vs_safetensors_alignment_matrix(tmp_path: Path) -> None:
     # Reference values from original GGUF arrays remain coherent.
     assert main_arrays["token_embd.weight"].shape[1] == text.hidden_size
     assert "v.patch_embd.weight" in mmproj_arrays
+
+
+# --- Gemma4 GGUF support ---
+
+
+def _build_test_gemma4_gguf(model_dir: Path) -> dict[str, np.ndarray]:
+    path = model_dir / "toy-gemma.gguf"
+    writer = GGUFWriter(path, arch="gemma4")
+
+    tokens = [
+        "<pad>",
+        "<eos>",
+        "<bos>",
+        "<unk>",
+        "<turn|>",
+        "hello",
+        "▁hello",
+        "▁world",
+        "!",
+        "▁",
+    ]
+    token_types = [
+        int(TokenType.CONTROL),
+        int(TokenType.CONTROL),
+        int(TokenType.CONTROL),
+        int(TokenType.UNKNOWN),
+        int(TokenType.CONTROL),
+        int(TokenType.NORMAL),
+        int(TokenType.NORMAL),
+        int(TokenType.NORMAL),
+        int(TokenType.NORMAL),
+        int(TokenType.NORMAL),
+    ]
+    writer.add_tokenizer_model("spm")
+    writer.add_token_list(tokens)
+    writer.add_token_scores([0.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0, -9.0])
+    writer.add_token_types(token_types)
+    writer.add_bos_token_id(2)
+    writer.add_eos_token_id(1)
+    writer.add_key_value("tokenizer.ggml.unk_token_id", 3, GGUFValueType.INT32)
+    writer.add_key_value("tokenizer.ggml.padding_token_id", 0, GGUFValueType.INT32)
+
+    writer.add_key_value("gemma4.embedding_length", 8, GGUFValueType.UINT32)
+    writer.add_key_value("gemma4.block_count", 2, GGUFValueType.UINT32)
+    writer.add_key_value("gemma4.context_length", 32, GGUFValueType.UINT32)
+    writer.add_key_value("gemma4.feed_forward_length", 4, GGUFValueType.UINT32)
+    writer.add_key_value("gemma4.full_attention_interval", 2, GGUFValueType.UINT32)
+    writer.add_key_value("gemma4.attention.head_count", 2, GGUFValueType.UINT32)
+    writer.add_key_value("gemma4.attention.head_count_kv", 1, GGUFValueType.UINT32)
+    writer.add_key_value("gemma4.attention.key_length", 2, GGUFValueType.UINT32)
+    writer.add_key_value("gemma4.attention.global_key_length", 4, GGUFValueType.UINT32)
+    writer.add_key_value("gemma4.attention.sliding_window", 4, GGUFValueType.UINT32)
+    writer.add_key_value("gemma4.attention.layer_norm_rms_epsilon", 1e-6, GGUFValueType.FLOAT32)
+    writer.add_key_value("gemma4.per_layer_input_length", 2, GGUFValueType.UINT32)
+    writer.add_key_value("gemma4.vocab_per_layer_input_length", len(tokens), GGUFValueType.UINT32)
+    writer.add_key_value("gemma4.rope.freq_base_sliding", 10000.0, GGUFValueType.FLOAT32)
+    writer.add_key_value("gemma4.rope.freq_base_global", 1000000.0, GGUFValueType.FLOAT32)
+
+    offset = 1.0
+
+    def arr(shape: tuple[int, ...], *, scale: float = 0.1) -> np.ndarray:
+        nonlocal offset
+        size = int(np.prod(shape))
+        values = (np.arange(size, dtype=np.float32) + offset).reshape(shape) * scale
+        offset += size
+        return values
+
+    tensors_to_write: dict[str, np.ndarray] = {}
+    tensors_to_write["token_embd.weight"] = arr((len(tokens), 8))
+    tensors_to_write["output.weight"] = tensors_to_write["token_embd.weight"].copy()
+    tensors_to_write["output_norm.weight"] = arr((8,))
+    tensors_to_write["token_embd_per_layer.weight"] = arr((len(tokens), 4))
+    tensors_to_write["per_layer_model_proj.weight"] = arr((4, 8))
+    tensors_to_write["per_layer_proj_norm.weight"] = arr((2,))
+
+    # Layer 0: sliding_attention (head_dim 2), layer 1: full_attention (global_head_dim 4).
+    tensors_to_write["blk.0.attn_norm.weight"] = arr((8,))
+    tensors_to_write["blk.0.attn_q.weight"] = arr((4, 8))
+    tensors_to_write["blk.0.attn_k.weight"] = arr((2, 8))
+    tensors_to_write["blk.0.attn_v.weight"] = arr((2, 8))
+    tensors_to_write["blk.0.attn_output.weight"] = arr((8, 4))
+    tensors_to_write["blk.0.attn_q_norm.weight"] = arr((2,))
+    tensors_to_write["blk.0.attn_k_norm.weight"] = arr((2,))
+    tensors_to_write["blk.0.attn_post_norm.weight"] = arr((8,))
+    tensors_to_write["blk.0.ffn_norm.weight"] = arr((8,))
+    tensors_to_write["blk.0.ffn_gate.weight"] = arr((4, 8))
+    tensors_to_write["blk.0.ffn_up.weight"] = arr((4, 8))
+    tensors_to_write["blk.0.ffn_down.weight"] = arr((8, 4))
+    tensors_to_write["blk.0.ffn_post_norm.weight"] = arr((8,))
+    tensors_to_write["blk.0.inp_gate.weight"] = arr((2, 8))
+    tensors_to_write["blk.0.per_layer_proj.weight"] = arr((8, 2))
+    tensors_to_write["blk.0.per_layer_post_norm.weight"] = arr((8,))
+
+    tensors_to_write["blk.1.attn_norm.weight"] = arr((8,))
+    tensors_to_write["blk.1.attn_q.weight"] = arr((8, 8))
+    tensors_to_write["blk.1.attn_k.weight"] = arr((4, 8))
+    tensors_to_write["blk.1.attn_v.weight"] = arr((4, 8))
+    tensors_to_write["blk.1.attn_output.weight"] = arr((8, 8))
+    tensors_to_write["blk.1.attn_q_norm.weight"] = arr((4,))
+    tensors_to_write["blk.1.attn_k_norm.weight"] = arr((4,))
+    tensors_to_write["blk.1.attn_post_norm.weight"] = arr((8,))
+    tensors_to_write["blk.1.ffn_norm.weight"] = arr((8,))
+    tensors_to_write["blk.1.ffn_gate.weight"] = arr((4, 8))
+    tensors_to_write["blk.1.ffn_up.weight"] = arr((4, 8))
+    tensors_to_write["blk.1.ffn_down.weight"] = arr((8, 4))
+    tensors_to_write["blk.1.ffn_post_norm.weight"] = arr((8,))
+    tensors_to_write["blk.1.inp_gate.weight"] = arr((2, 8))
+    tensors_to_write["blk.1.per_layer_proj.weight"] = arr((8, 2))
+    tensors_to_write["blk.1.per_layer_post_norm.weight"] = arr((8,))
+
+    for name, array in tensors_to_write.items():
+        _write_tensor(writer, name, array)
+
+    _finalize_writer(writer, path)
+    return _read_expected_tensors(path)
+
+
+def _build_test_gemma4_gguf_dir(tmp_path: Path) -> tuple[Path, dict[str, np.ndarray]]:
+    model_dir = tmp_path / "toy-gemma-gguf"
+    model_dir.mkdir()
+    main_arrays = _build_test_gemma4_gguf(model_dir)
+    return model_dir, main_arrays
+
+
+def test_load_gemma4_config_and_tokenizer_from_gguf(tmp_path: Path) -> None:
+    model_dir, _ = _build_test_gemma4_gguf_dir(tmp_path)
+
+    config = load_gemma4_text_model_config(model_dir)
+    assert config.model_type == "gemma4"
+    assert config.text_config.hidden_size == 8
+    assert config.text_config.num_hidden_layers == 2
+    assert config.text_config.layer_types == ["sliding_attention", "full_attention"]
+    assert config.text_config.head_dim == 2
+    assert config.text_config.global_head_dim == 4
+    assert config.text_config.num_global_key_value_heads == 1
+    assert config.text_config.hidden_size_per_layer_input == 2
+    assert config.text_config.vocab_size_per_layer_input == 10
+    assert config.text_config.sliding_window == 4
+    assert config.text_config.eos_token_ids == (1,)
+    assert config.text_config.rope_parameters["sliding_attention"].rope_theta == 10000.0
+    assert config.text_config.rope_parameters["full_attention"].rope_theta == 1_000_000.0
+    assert config.text_config.rope_parameters["full_attention"].partial_rotary_factor == 0.25
+    assert config.vision_config is None
+
+    family = inspect_model_family(model_dir)
+    assert family.model_family == "gemma4"
+    assert family.model_type == "gemma4"
+
+    tokenizer = Gemma4Tokenizer.from_model_dir(model_dir)
+    assert tokenizer.bos_token == "<bos>"
+    assert tokenizer.eos_token == "<eos>"
+    assert tokenizer.encode("<bos>") == [2]
+    assert tokenizer.decode([2]) == "<bos>"
+    assert tokenizer.token_id("<eos>") == 1
+    assert tokenizer.eos_token_ids == {1, 4}
+    assert tokenizer.encode("▁hello") == [6]
+
+
+def test_load_gemma4_weights_from_gguf(tmp_path: Path) -> None:
+    model_dir, main_arrays = _build_test_gemma4_gguf_dir(tmp_path)
+    config = load_gemma4_text_model_config(model_dir)
+    model, _ = build_gemma4_text_model(config, device=torch.device("cpu"), dtype=torch.float32)
+
+    report = load_gemma4_text_model_weights(model, model_dir)
+    assert report.loaded > 0
+    # Tied embeddings: output.weight is present but skipped.
+    assert report.skipped == 1
+    assert model.lm_head is None
+
+    language_model = model.model.language_model
+    assert torch.allclose(language_model.embed_tokens.weight, torch.tensor(main_arrays["token_embd.weight"]))
+    assert torch.allclose(language_model.norm.weight, torch.tensor(main_arrays["output_norm.weight"]))
+    assert torch.allclose(
+        language_model.layers[0].self_attn.q_proj.weight,
+        torch.tensor(main_arrays["blk.0.attn_q.weight"]),
+    )
+    assert torch.allclose(
+        language_model.layers[1].self_attn.q_proj.weight,
+        torch.tensor(main_arrays["blk.1.attn_q.weight"]),
+    )
+    assert torch.allclose(
+        language_model.layers[1].self_attn.k_proj.weight,
+        torch.tensor(main_arrays["blk.1.attn_k.weight"]),
+    )
+    assert torch.allclose(
+        language_model.layers[0].self_attn.q_norm.weight,
+        torch.tensor(main_arrays["blk.0.attn_q_norm.weight"]),
+    )
+    assert torch.allclose(
+        language_model.layers[0].mlp.down_proj.weight,
+        torch.tensor(main_arrays["blk.0.ffn_down.weight"]),
+    )
+    assert torch.allclose(
+        language_model.embed_tokens_per_layer.weight,
+        torch.tensor(main_arrays["token_embd_per_layer.weight"]),
+    )
+    assert torch.allclose(
+        language_model.per_layer_model_projection.weight,
+        torch.tensor(main_arrays["per_layer_model_proj.weight"]),
+    )
+    assert torch.allclose(
+        language_model.layers[1].per_layer_input_gate.weight,
+        torch.tensor(main_arrays["blk.1.inp_gate.weight"]),
+    )
+    assert torch.allclose(
+        language_model.layers[1].per_layer_projection.weight,
+        torch.tensor(main_arrays["blk.1.per_layer_proj.weight"]),
+    )
+    assert torch.allclose(
+        language_model.layers[1].post_per_layer_input_norm.weight,
+        torch.tensor(main_arrays["blk.1.per_layer_post_norm.weight"]),
+    )
+    assert torch.allclose(
+        language_model.layers[0].pre_feedforward_layernorm.weight,
+        torch.tensor(main_arrays["blk.0.ffn_norm.weight"]),
+    )
+    assert torch.allclose(
+        language_model.layers[0].post_feedforward_layernorm.weight,
+        torch.tensor(main_arrays["blk.0.ffn_post_norm.weight"]),
+    )
+
+
+def test_estimate_gemma4_weight_bytes_from_gguf(tmp_path: Path) -> None:
+    model_dir, main_arrays = _build_test_gemma4_gguf_dir(tmp_path)
+    expected_bytes = sum(
+        array.size * (4 if array.dtype == np.float32 else 2) for array in main_arrays.values()
+    )
+    assert estimate_gemma4_text_model_weight_bytes(model_dir) == expected_bytes
+
+
+def _build_test_dense_qwen_gguf(model_dir: Path) -> dict[str, np.ndarray]:
+    """Dense Qwen3.5 export (arch == "qwen35"): no expert tensors, plain FFN names."""
+    path = model_dir / "toy-qwen-dense.gguf"
+    writer = GGUFWriter(path, arch="qwen35")
+
+    tokens = ["<|im_end|>", "<|endoftext|>", "<|im_start|>", "a", "b"]
+    writer.add_tokenizer_model("gpt2")
+    writer.add_tokenizer_pre("qwen35")
+    writer.add_token_list(tokens)
+    writer.add_token_merges([])
+    writer.add_token_types([int(TokenType.CONTROL)] * 3 + [int(TokenType.NORMAL)] * 2)
+    writer.add_bos_token_id(2)
+    writer.add_eos_token_id(0)
+    writer.add_key_value("tokenizer.ggml.padding_token_id", 2, GGUFValueType.INT32)
+
+    writer.add_key_value("qwen35.embedding_length", 8, GGUFValueType.UINT32)
+    writer.add_key_value("qwen35.block_count", 2, GGUFValueType.UINT32)
+    writer.add_key_value("qwen35.context_length", 32, GGUFValueType.UINT32)
+    writer.add_key_value("qwen35.full_attention_interval", 2, GGUFValueType.UINT32)
+    writer.add_key_value("qwen35.attention.head_count", 2, GGUFValueType.UINT32)
+    writer.add_key_value("qwen35.attention.head_count_kv", 1, GGUFValueType.UINT32)
+    writer.add_key_value("qwen35.attention.key_length", 2, GGUFValueType.UINT32)
+    writer.add_key_value("qwen35.attention.layer_norm_rms_epsilon", 1e-6, GGUFValueType.FLOAT32)
+    writer.add_key_value("qwen35.ssm.group_count", 2, GGUFValueType.UINT32)
+    writer.add_key_value("qwen35.ssm.conv_kernel", 2, GGUFValueType.UINT32)
+    writer.add_key_value("qwen35.rope.dimension_count", 1, GGUFValueType.UINT32)
+    writer.add_key_value("qwen35.rope.dimension_sections", [1, 1, 0], GGUFValueType.ARRAY, GGUFValueType.UINT32)
+    writer.add_key_value("qwen35.rope.freq_base", 10000.0, GGUFValueType.FLOAT32)
+    writer.add_key_value("qwen35.feed_forward_length", 4, GGUFValueType.UINT32)
+
+    offset = 1.0
+
+    def arr(shape: tuple[int, ...], *, scale: float = 0.1) -> np.ndarray:
+        nonlocal offset
+        size = int(np.prod(shape))
+        values = (np.arange(size, dtype=np.float32) + offset).reshape(shape) * scale
+        offset += size
+        return values
+
+    tensors_to_write: dict[str, np.ndarray] = {}
+    tensors_to_write["token_embd.weight"] = arr((len(tokens), 8))
+    tensors_to_write["output_norm.weight"] = arr((8,))
+
+    # Layer 0: linear_attention, layer 1: full_attention (interval=2).
+    tensors_to_write["blk.0.attn_norm.weight"] = arr((8,))
+    tensors_to_write["blk.0.post_attention_norm.weight"] = arr((8,))
+    tensors_to_write["blk.0.attn_qkv.weight"] = arr((16, 8))
+    tensors_to_write["blk.0.attn_gate.weight"] = arr((8, 8))
+    tensors_to_write["blk.0.ssm_alpha.weight"] = arr((4, 8))
+    tensors_to_write["blk.0.ssm_beta.weight"] = arr((4, 8))
+    tensors_to_write["blk.0.ssm_out.weight"] = arr((8, 8))
+    tensors_to_write["blk.0.ssm_conv1d.weight"] = arr((16, 2))
+    tensors_to_write["blk.0.ssm_dt.bias"] = arr((4,))
+    tensors_to_write["blk.0.ssm_a"] = -np.linspace(0.5, 2.0, 4, dtype=np.float32)
+    tensors_to_write["blk.0.ssm_norm.weight"] = arr((2,))
+
+    tensors_to_write["blk.1.attn_norm.weight"] = arr((8,))
+    tensors_to_write["blk.1.post_attention_norm.weight"] = arr((8,))
+    tensors_to_write["blk.1.attn_q.weight"] = arr((8, 8))
+    tensors_to_write["blk.1.attn_k.weight"] = arr((2, 8))
+    tensors_to_write["blk.1.attn_v.weight"] = arr((2, 8))
+    tensors_to_write["blk.1.attn_output.weight"] = arr((8, 4))
+    tensors_to_write["blk.1.attn_q_norm.weight"] = arr((2,))
+    tensors_to_write["blk.1.attn_k_norm.weight"] = arr((2,))
+
+    for layer_idx in range(2):
+        tensors_to_write[f"blk.{layer_idx}.ffn_gate.weight"] = arr((4, 8))
+        tensors_to_write[f"blk.{layer_idx}.ffn_up.weight"] = arr((4, 8))
+        tensors_to_write[f"blk.{layer_idx}.ffn_down.weight"] = arr((8, 4))
+
+    for name, array in tensors_to_write.items():
+        _write_tensor(writer, name, array)
+
+    _finalize_writer(writer, path)
+    return _read_expected_tensors(path)
+
+
+def test_load_dense_qwen_config_and_weights_from_gguf(tmp_path: Path) -> None:
+    model_dir = tmp_path / "toy-qwen-dense-gguf"
+    model_dir.mkdir()
+    main_arrays = _build_test_dense_qwen_gguf(model_dir)
+
+    family = inspect_model_family(model_dir)
+    assert family.model_family == "qwen3_5_text"
+    assert family.model_type == "qwen35"
+
+    config = load_qwen3_5_text_model_config(model_dir)
+    assert config.text_config.num_experts == 0
+    assert config.text_config.num_experts_per_tok == 0
+    assert config.text_config.intermediate_size == 4
+    assert not config.text_config.is_moe_model
+    assert config.text_config.layer_types == ["linear_attention", "full_attention"]
+
+    model, quantized = build_qwen3_5_text_model(config, device=torch.device("cpu"), dtype=torch.float32)
+    assert quantized == 0
+    from anna.model.ops import Qwen3SparseMoeBlock
+
+    assert not isinstance(model.model.language_model.layers[0].mlp, Qwen3SparseMoeBlock)
+
+    report = load_qwen3_5_text_model_weights(model, model_dir)
+    assert report.loaded > 0
+    assert report.skipped == 0
+
+    language_model = model.model.language_model
+    assert torch.allclose(language_model.embed_tokens.weight, torch.tensor(main_arrays["token_embd.weight"]))
+    for layer_idx in range(2):
+        assert torch.allclose(
+            language_model.layers[layer_idx].mlp.gate_proj.weight,
+            torch.tensor(main_arrays[f"blk.{layer_idx}.ffn_gate.weight"]),
+        )
+        assert torch.allclose(
+            language_model.layers[layer_idx].mlp.down_proj.weight,
+            torch.tensor(main_arrays[f"blk.{layer_idx}.ffn_down.weight"]),
+        )
+    assert torch.allclose(
+        language_model.layers[1].self_attn.q_proj.weight,
+        torch.tensor(main_arrays["blk.1.attn_q.weight"]),
+    )
