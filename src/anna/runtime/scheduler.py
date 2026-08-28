@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -35,6 +36,109 @@ logger = logging.getLogger(__name__)
 _DONE = object()
 
 
+class _PythonSchedulerLedger:
+    """Pure-Python fallback mirror of the Rust SchedulerLedger.
+
+    Used when the compiled ``anna._rust`` extension predates the ledger
+    (rebuild crates/anna-rust to get the native implementation).
+    """
+
+    def __init__(self) -> None:
+        self._costs: dict[int, int] = {}
+        self._finished: set[int] = set()
+        self._order: list[int] = []
+        self._finished_count = 0
+        self._decode_steps = 0
+
+    def register(self, request_id: int, cost: int) -> bool:
+        if request_id in self._costs:
+            return False
+        self._costs[request_id] = int(cost)
+        self._order.append(request_id)
+        return True
+
+    def unregister(self, request_id: int) -> bool:
+        if request_id not in self._costs:
+            return False
+        del self._costs[request_id]
+        self._order = [rid for rid in self._order if rid != request_id]
+        return True
+
+    def set_cost(self, request_id: int, cost: int) -> bool:
+        if request_id not in self._costs or request_id in self._finished:
+            return False
+        self._costs[request_id] = int(cost)
+        return True
+
+    def mark_finished(self, request_id: int) -> bool:
+        if request_id not in self._costs or request_id in self._finished:
+            return False
+        self._finished.add(request_id)
+        self._finished_count += 1
+        return True
+
+    def retain(self, ids: list[int]) -> None:
+        keep = set(int(i) for i in ids)
+        self._costs = {rid: cost for rid, cost in self._costs.items() if rid in keep}
+        self._finished = {rid for rid in self._finished if rid in keep}
+        self._order = [int(i) for i in ids]
+
+    def active_ids(self) -> list[int]:
+        return [rid for rid in self._order if rid in self._costs and rid not in self._finished]
+
+    def finished_ids(self) -> list[int]:
+        return [rid for rid in self._order if rid in self._finished]
+
+    def active_count(self) -> int:
+        return len([rid for rid in self._costs if rid not in self._finished])
+
+    def active_cost(self) -> int:
+        return sum(cost for rid, cost in self._costs.items() if rid not in self._finished)
+
+    def finished_count(self) -> int:
+        return self._finished_count
+
+    def decode_steps(self) -> int:
+        return self._decode_steps
+
+    def bump_decode_steps(self) -> None:
+        self._decode_steps += 1
+
+    def clear(self) -> None:
+        self._costs.clear()
+        self._finished.clear()
+        self._order.clear()
+        self._finished_count = 0
+        self._decode_steps = 0
+
+    def stats(self) -> tuple[int, int, int, int]:
+        return (
+            self.active_count(),
+            self.active_cost(),
+            self._finished_count,
+            self._decode_steps,
+        )
+
+
+def _create_scheduler_ledger() -> object | None:
+    """Build the hot-path ledger: Rust when available, Python fallback otherwise.
+
+    Disable with ``ANNA_SCHEDULER_LEDGER=off``.
+    """
+    flag = os.getenv("ANNA_SCHEDULER_LEDGER", "1").strip().lower()
+    if flag in ("0", "false", "off", "none"):
+        return None
+    try:
+        from anna import _rust
+
+        ledger = _rust.SchedulerLedger()
+        logger.info("Scheduler hot-path ledger: rust (anna._rust.SchedulerLedger).")
+        return ledger
+    except Exception:
+        logger.info("Scheduler hot-path ledger: python fallback (rebuild crates/anna-rust for the native ledger).")
+        return _PythonSchedulerLedger()
+
+
 def _prepared_is_multimodal(prepared: PreparedInputsLike) -> bool:
     return any(
         getattr(prepared, key, None) is not None
@@ -65,6 +169,9 @@ class SchedulerRequest:
     queued_at: float = field(default_factory=time.perf_counter)
     cancelled: bool = False
     is_multimodal: bool = False
+    # Hot-path ledger id (Phase 4): assigned by the scheduler at submit time and
+    # used as the key inside the Rust/python ledger for O(1) bookkeeping.
+    ledger_id: int = 0
 
 
 @dataclass(slots=True)
@@ -114,6 +221,9 @@ class AnnaScheduler:
         self.max_queue_wait_seconds = max(0.0, float(max_queue_wait_ms)) / 1000.0
         self.profile = str(profile or "none")
         self._decode_steps_since_prefill = 0
+        self._ledger = _create_scheduler_ledger()
+        self._ledger_id_counter = 0
+        self._ledger_stats_cache: dict[str, object] | None = None
         self._pending: deque[SchedulerRequest] = deque()
         self._condition = threading.Condition()
         self._stop = False
@@ -126,6 +236,27 @@ class AnnaScheduler:
             self._stop = True
             self._condition.notify_all()
         self._worker.join(timeout=5.0)
+
+    def ledger_stats(self) -> dict[str, object] | None:
+        """Phase 4 hot-path ledger snapshot (active/cost/finished/decode steps)."""
+        if self._ledger is None:
+            return None
+        try:
+            active, active_cost, finished, decode_steps = self._ledger.stats()
+        except RuntimeError:
+            # PyO3 borrow conflict: the worker thread is mutating the ledger
+            # right now. Serve the last successful snapshot instead.
+            return self._ledger_stats_cache
+        backend = "python" if isinstance(self._ledger, _PythonSchedulerLedger) else "rust"
+        snapshot: dict[str, object] = {
+            "backend": backend,
+            "active": active,
+            "active_cost": active_cost,
+            "finished": finished,
+            "decode_steps": decode_steps,
+        }
+        self._ledger_stats_cache = snapshot
+        return snapshot
 
     def generate(self, prepared: PreparedInputsLike, *, config: "GenerationConfig") -> "TextGenerationResult":
         request = self._submit(prepared, config=config, stream=False)
@@ -185,6 +316,8 @@ class AnnaScheduler:
                 stream=stream,
                 is_multimodal=_prepared_is_multimodal(prepared),
             )
+            request.ledger_id = self._ledger_id_counter
+            self._ledger_id_counter += 1
             self._pending.append(request)
             self._condition.notify()
         if metrics is not None:
@@ -223,7 +356,13 @@ class AnnaScheduler:
 
                 if pending_batch:
                     try:
-                        active.extend(self._prefill_batch(pending_batch))
+                        admitted = self._prefill_batch(pending_batch)
+                        active.extend(admitted)
+                        if self._ledger is not None:
+                            for item in admitted:
+                                if isinstance(item, SchedulerRequest):
+                                    max_tokens = getattr(item.config, "max_new_tokens", 0) or 0
+                                    self._ledger.register(item.ledger_id, int(max_tokens))
                     except Exception as exc:  # pragma: no cover - worker-level best effort
                         self._fail_requests(pending_batch, self._normalize_error(exc))
 
@@ -255,6 +394,8 @@ class AnnaScheduler:
                         try:
                             next_active.extend(self._decode_group(group))
                             self._decode_steps_since_prefill += 1
+                            if self._ledger is not None:
+                                self._ledger.bump_decode_steps()
                             decoded_any = True
                         except Exception as exc:  # pragma: no cover - worker-level best effort
                             self._release_decode_group_cache(group)
@@ -270,6 +411,8 @@ class AnnaScheduler:
                         try:
                             next_active.extend(self._decode_batch(chunk))
                             self._decode_steps_since_prefill += 1
+                            if self._ledger is not None:
+                                self._ledger.bump_decode_steps()
                             decoded_any = True
                         except Exception as exc:  # pragma: no cover - worker-level best effort
                             self._fail_requests(chunk, self._normalize_error(exc))
@@ -312,6 +455,11 @@ class AnnaScheduler:
                     next_active.extend(prefill_groups[1:])
 
                 active = next_active
+                if self._ledger is not None:
+                    # O(n) reconciliation in Rust: drop ids that left the active set.
+                    self._ledger.retain(
+                        [item.ledger_id for item in active if isinstance(item, SchedulerRequest)]
+                    )
         except BaseException as exc:  # pragma: no cover - catastrophic worker failure
             pending: list[SchedulerRequest] = []
             with self._condition:
@@ -1321,6 +1469,8 @@ class AnnaScheduler:
             request.events.put(StreamEvent(text=text, finish_reason=None))
 
     def _finish_request(self, request: SchedulerRequest, *, finish_reason: str) -> None:
+        if self._ledger is not None:
+            self._ledger.mark_finished(request.ledger_id)
         if self._is_request_cancelled(request):
             self._release_request_cache(request)
             return
@@ -1376,6 +1526,8 @@ class AnnaScheduler:
         if not self._is_request_cancelled(request):
             return False
         request.cancelled = True
+        if self._ledger is not None:
+            self._ledger.unregister(request.ledger_id)
         self._release_request_cache(request)
         if not request.done.is_set():
             request.error = self._cancelled_error()

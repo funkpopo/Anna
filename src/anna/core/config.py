@@ -52,6 +52,7 @@ class ServeSettings:
     resident_expert_layers: int | None = None
     resident_expert_layer_indices: tuple[int, ...] | None = None
     cached_experts_per_layer: int | None = None
+    decode_executor: str = "auto"
     min_free_memory_mib: int | None = None
     reserve_memory_mib: int | None = None
     max_estimated_usage_ratio: float | None = None
@@ -98,6 +99,7 @@ class GenerateSettings:
     resident_expert_layers: int | None = None
     resident_expert_layer_indices: tuple[int, ...] | None = None
     cached_experts_per_layer: int | None = None
+    decode_executor: str = "auto"
     max_new_tokens: int | None = None
     temperature: float = 0.7
     top_p: float = 0.8
@@ -158,6 +160,7 @@ class BenchmarkSettings:
     resident_expert_layers: int | None = None
     resident_expert_layer_indices: tuple[int, ...] | None = None
     cached_experts_per_layer: int | None = None
+    decode_executor: str = "auto"
     max_new_tokens: int | None = None
     temperature: float = 0.7
     top_p: float = 0.8

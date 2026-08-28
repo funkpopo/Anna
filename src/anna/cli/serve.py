@@ -415,6 +415,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max number of offloaded experts to keep cached on XPU per sparse MoE layer. Omit to auto-estimate; set 0 to disable.",
     )
     parser.add_argument(
+        "--decode-executor",
+        choices=("auto", "eager", "graph"),
+        default="auto",
+        help="Decode step executor: 'graph' captures the single-token decode forward as a replayable "
+        "device graph (CUDA graph / torch.xpu graph); 'eager' forces per-kernel dispatch; 'auto' enables "
+        "graph when a capture backend is detected. Graph failures fall back to eager automatically.",
+    )
+    parser.add_argument(
         "--min-free-memory-mib",
         type=_non_negative_int,
         default=None,
@@ -642,6 +650,7 @@ def main() -> None:
         resident_expert_layers=settings.resident_expert_layers,
         resident_expert_layer_indices=settings.resident_expert_layer_indices,
         cached_experts_per_layer=settings.cached_experts_per_layer,
+        decode_executor=settings.decode_executor,
     )
     if not args.no_inference_warmup and hasattr(engine, "warmup_inference_kernels"):
         # TTFT: cover real continuous-batch shapes when the scheduler profile raises batch size.

@@ -88,6 +88,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--offload-mode", choices=("auto", "none", "experts"), default="auto")
     parser.add_argument(
+        "--decode-executor",
+        choices=("auto", "eager", "graph"),
+        default="auto",
+        help="Decode step executor: 'graph' captures the single-token decode forward as a replayable "
+        "device graph; 'eager' forces per-kernel dispatch; 'auto' enables graph when a backend is detected.",
+    )
+    parser.add_argument(
         "--offload-vision",
         action="store_true",
         help="Keep the vision tower on CPU even when the execution device is XPU. Useful for text-only generation on tight memory budgets.",
@@ -171,6 +178,7 @@ def main() -> None:
         resident_expert_layers=args.resident_expert_layers,
         resident_expert_layer_indices=parse_resident_expert_layer_indices(args.resident_expert_layer_indices),
         cached_experts_per_layer=args.cached_experts_per_layer,
+        decode_executor=args.decode_executor,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
@@ -199,6 +207,7 @@ def main() -> None:
         resident_expert_layers=settings.resident_expert_layers,
         resident_expert_layer_indices=settings.resident_expert_layer_indices,
         cached_experts_per_layer=settings.cached_experts_per_layer,
+        decode_executor=settings.decode_executor,
     )
     result = engine.generate_text(
         settings.prompt,

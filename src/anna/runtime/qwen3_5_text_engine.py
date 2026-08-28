@@ -45,6 +45,12 @@ from anna.model.xpu_decode_profile import (
     steady_decode_accumulation,
 )
 from anna.runtime.device import DeviceContext, RuntimeSafetyPolicy
+from anna.runtime.decode_executor import (
+    DecodeGraphUnavailable,
+    DecodeGraphRunner,
+    normalize_decode_executor,
+    resolve_decode_executor_mode,
+)
 from anna.runtime.memory_release import release_conversion_artifacts
 from anna.runtime.runtime_health import PROCESS_ADMISSION_GATE, RuntimeAdmissionGate
 from anna.runtime.service_metrics import AnnaServiceMetrics, ServiceMetricsSnapshot
@@ -156,6 +162,9 @@ class EngineOptimizationConfig:
     # When True, skip paged prefix-block registration for prompts that are eligible
     # for exact prompt-cache reuse (avoids dual full-KV + page registry waste).
     prefer_prompt_cache_over_prefix: bool = True
+    # Phase 2: decode step graph execution. "auto" enables graph capture when a
+    # backend (CUDA graph / torch.xpu graph) is detected on the target device.
+    decode_executor: str = "auto"
 
 
 @dataclass(slots=True)
@@ -343,6 +352,7 @@ class AnnaQwen3_5TextEngine:
             kv_cache_residual_len=max(1, int(config.kv_cache_residual_len)),
             kv_cache_turboquant_preset=config.kv_cache_turboquant_preset,
             prefer_prompt_cache_over_prefix=bool(config.prefer_prompt_cache_over_prefix),
+            decode_executor=normalize_decode_executor(config.decode_executor),
         )
 
     def _resolve_prefill_chunk_size(self, requested_chunk_size: int) -> int:
@@ -433,6 +443,17 @@ class AnnaQwen3_5TextEngine:
         if compile_mode == "none" or not hasattr(torch, "compile") or not hasattr(self.model, "forward_text_only"):
             return
         # XPU-only: Inductor dynamic_shapes pulls in Triton kernels that use fp64 (unsupported on XPU).
+        # Give dynamo more cache slots so legitimate shape/batch variants (bs=1 vs scheduler max
+        # batch, different prefill lengths) are not evicted into eager fallback mid-request.
+        dynamo_config = getattr(getattr(torch, "_dynamo", None), "config", None)
+        if dynamo_config is not None:
+            try:
+                if int(getattr(dynamo_config, "cache_size_limit", 8)) < 32:
+                    dynamo_config.cache_size_limit = 32
+                if int(getattr(dynamo_config, "accumulated_cache_size_limit", 256)) < 512:
+                    dynamo_config.accumulated_cache_size_limit = 512
+            except (TypeError, ValueError):
+                pass
         self._compiled_text_forward = torch.compile(
             self.model.forward_text_only,
             mode=compile_mode,
@@ -519,6 +540,7 @@ class AnnaQwen3_5TextEngine:
         resident_expert_layers: int | None = None,
         resident_expert_layer_indices: tuple[int, ...] | None = None,
         cached_experts_per_layer: int | None = None,
+        decode_executor: str | None = None,
     ) -> "AnnaQwen3_5TextEngine":
         model_path = Path(model_dir)
         config = load_qwen3_5_text_model_config(model_path)
@@ -854,6 +876,7 @@ class AnnaQwen3_5TextEngine:
                 kv_cache_residual_len=kv_cache_residual_len,
                 kv_cache_turboquant_preset=turboquant_preset,
                 prefer_prompt_cache_over_prefix=prompt_cache_size > 0,
+                decode_executor=decode_executor or "auto",
             ),
         )
         kv_cache_info = engine._kv_cache_runtime_info()
@@ -2492,53 +2515,66 @@ class AnnaQwen3_5TextEngine:
         if chunk > 1:
             prefill_lengths.append(chunk)
         # Dedup, keep ascending, clamp to a sane upper bound for warmup.
+        # The resolved prefill chunk size is always kept: chunked long-prompt prefills
+        # run at exactly that shape, so warming it avoids a first-request stall
+        # regardless of --warmup-prefill-tokens.
         prefill_lengths = sorted({max(2, int(length)) for length in prefill_lengths if int(length) > 1})
-        prefill_lengths = [length for length in prefill_lengths if length <= max(prefill_tokens, 256)]
+        warmup_cap = max(prefill_tokens, 256)
+        prefill_lengths = [
+            length
+            for length in prefill_lengths
+            if length <= warmup_cap or (chunk > 1 and length == chunk)
+        ]
         if prefill_tokens not in prefill_lengths:
             prefill_lengths.append(prefill_tokens)
             prefill_lengths.sort()
+        # Serving is dominated by bs=1 (single-stream requests), while the scheduler
+        # warms up at max_batch_size; warm both so neither shape compiles/JITs on the
+        # first real request.
+        warmup_batch_sizes = sorted({1, batch_size})
         with torch.inference_mode():
             # Fused causal_conv1d_prefill / gated_delta_prefill require seq_len > 1 (see SYCL TORCH_CHECK).
-            past = None
-            for length in prefill_lengths:
-                if past is not None:
-                    release = getattr(past, "release", None)
-                    if callable(release):
-                        release()
-                    past = None
-                input_ids = torch.full((batch_size, length), token_id, device=device, dtype=torch.long)
-                attention_mask = torch.ones_like(input_ids)
-                outputs = self._forward_generation_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    past_key_values=None,
-                    model_kwargs={},
-                    use_cache=True,
-                    logits_to_keep=1,
-                )
-                past = outputs.past_key_values
-            if past is not None:
-                decode_ids = torch.full((batch_size, 1), token_id, device=device, dtype=torch.long)
-                for _ in range(decode_steps):
+            for warm_batch in warmup_batch_sizes:
+                past = None
+                for length in prefill_lengths:
+                    if past is not None:
+                        release = getattr(past, "release", None)
+                        if callable(release):
+                            release()
+                        past = None
+                    input_ids = torch.full((warm_batch, length), token_id, device=device, dtype=torch.long)
+                    attention_mask = torch.ones_like(input_ids)
                     outputs = self._forward_generation_model(
-                        input_ids=decode_ids,
-                        attention_mask=None,
-                        past_key_values=past,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        past_key_values=None,
                         model_kwargs={},
                         use_cache=True,
                         logits_to_keep=1,
                     )
                     past = outputs.past_key_values
-                past.release()
+                if past is not None:
+                    decode_ids = torch.full((warm_batch, 1), token_id, device=device, dtype=torch.long)
+                    for _ in range(decode_steps):
+                        outputs = self._forward_generation_model(
+                            input_ids=decode_ids,
+                            attention_mask=None,
+                            past_key_values=past,
+                            model_kwargs={},
+                            use_cache=True,
+                            logits_to_keep=1,
+                        )
+                        past = outputs.past_key_values
+                    past.release()
             if device.type == "xpu" and hasattr(torch, "xpu"):
                 torch.xpu.synchronize()
         logger.info(
             "XPU inference warmup finished (prefill_tokens=%s prefill_shapes=%s decode_steps=%s "
-            "batch_size=%s flashqla_mode=%s).",
+            "batch_sizes=%s flashqla_mode=%s).",
             prefill_tokens,
             prefill_lengths,
             decode_steps,
-            batch_size,
+            warmup_batch_sizes,
             flashqla_mode,
         )
 
@@ -3149,6 +3185,26 @@ class AnnaQwen3_5TextEngine:
                     device=current_logits.device,
                     dtype=torch.long,
                 )
+                # Phase 2: optional decode-step graph execution. Only the plain
+                # (non-topk) single-request forward is captured; sampling, stop
+                # checks, and the fused lm-head candidate path stay eager.
+                decode_graph_runner: DecodeGraphRunner | None = None
+                decode_graph_backend: str | None = None
+                if self.optimization_config.decode_executor != "eager":
+                    resolved_mode, decode_graph_backend = resolve_decode_executor_mode(
+                        self.optimization_config.decode_executor,
+                        current_logits.device,
+                    )
+                    if resolved_mode == "graph" and decode_graph_backend is not None:
+                        decode_graph_runner = DecodeGraphRunner(
+                            current_logits.device,
+                            backend=decode_graph_backend,
+                        )
+                        logger.info(
+                            "Decode step graph executor enabled (backend=%s, device=%s).",
+                            decode_graph_backend,
+                            current_logits.device,
+                        )
 
                 for step_idx in range(config.max_new_tokens):
                     self._raise_if_generation_cancelled(config)
@@ -3158,8 +3214,9 @@ class AnnaQwen3_5TextEngine:
                         try:
                             with self.execution_lock:
                                 candidate_count = self._fused_lm_head_candidate_count(config)
-                                outputs = (
-                                    self._forward_generation_model_topk(
+                                outputs = None
+                                if candidate_count is not None:
+                                    outputs = self._forward_generation_model_topk(
                                         input_ids=input_ids,
                                         attention_mask=None,
                                         past_key_values=past_key_values,
@@ -3167,9 +3224,22 @@ class AnnaQwen3_5TextEngine:
                                         logits_to_keep=1,
                                         top_k=candidate_count,
                                     )
-                                    if candidate_count is not None
-                                    else None
-                                )
+                                elif decode_graph_runner is not None:
+                                    try:
+                                        outputs = decode_graph_runner.step(
+                                            lambda static_ids: self._forward_generation_model(
+                                                input_ids=static_ids,
+                                                attention_mask=None,
+                                                past_key_values=past_key_values,
+                                                use_cache=True,
+                                                logits_to_keep=1,
+                                            ),
+                                            input_ids,
+                                        )
+                                    except DecodeGraphUnavailable:
+                                        # Permanent fallback for this generation: capture
+                                        # or replay failed (dynamic shape, driver limits...).
+                                        decode_graph_runner = None
                                 if outputs is None:
                                     outputs = self._profiled_forward_generation_model(
                                         stage=f"decode[{step_idx}]",
@@ -3355,6 +3425,24 @@ class AnnaQwen3_5TextEngine:
                     device=current_logits.device,
                     dtype=torch.long,
                 )
+                # Phase 2: optional decode-step graph execution (see the
+                # non-streaming loop for the fallback contract).
+                decode_graph_runner: DecodeGraphRunner | None = None
+                if self.optimization_config.decode_executor != "eager":
+                    resolved_mode, decode_graph_backend = resolve_decode_executor_mode(
+                        self.optimization_config.decode_executor,
+                        current_logits.device,
+                    )
+                    if resolved_mode == "graph" and decode_graph_backend is not None:
+                        decode_graph_runner = DecodeGraphRunner(
+                            current_logits.device,
+                            backend=decode_graph_backend,
+                        )
+                        logger.info(
+                            "Decode step graph executor enabled (backend=%s, device=%s).",
+                            decode_graph_backend,
+                            current_logits.device,
+                        )
 
                 for step_idx in range(config.max_new_tokens):
                     self._raise_if_generation_cancelled(config)
@@ -3364,8 +3452,9 @@ class AnnaQwen3_5TextEngine:
                         try:
                             with self.execution_lock:
                                 candidate_count = self._fused_lm_head_candidate_count(config)
-                                outputs = (
-                                    self._forward_generation_model_topk(
+                                outputs = None
+                                if candidate_count is not None:
+                                    outputs = self._forward_generation_model_topk(
                                         input_ids=input_ids,
                                         attention_mask=None,
                                         past_key_values=past_key_values,
@@ -3373,9 +3462,22 @@ class AnnaQwen3_5TextEngine:
                                         logits_to_keep=1,
                                         top_k=candidate_count,
                                     )
-                                    if candidate_count is not None
-                                    else None
-                                )
+                                elif decode_graph_runner is not None:
+                                    try:
+                                        outputs = decode_graph_runner.step(
+                                            lambda static_ids: self._forward_generation_model(
+                                                input_ids=static_ids,
+                                                attention_mask=None,
+                                                past_key_values=past_key_values,
+                                                use_cache=True,
+                                                logits_to_keep=1,
+                                            ),
+                                            input_ids,
+                                        )
+                                    except DecodeGraphUnavailable:
+                                        # Permanent fallback for this generation: capture
+                                        # or replay failed (dynamic shape, driver limits...).
+                                        decode_graph_runner = None
                                 if outputs is None:
                                     outputs = self._profiled_forward_generation_model(
                                         stage=f"decode[{step_idx}]",

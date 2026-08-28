@@ -112,6 +112,7 @@ def load_model_runtime_from_model_dir(
     resident_expert_layers: int | None = None,
     resident_expert_layer_indices: tuple[int, ...] | None = None,
     cached_experts_per_layer: int | None = None,
+    decode_executor: str | None = None,
 ):
     shared = _shared_from_model_dir_kwargs(
         model_id=model_id,
@@ -146,6 +147,10 @@ def load_model_runtime_from_model_dir(
         resident_expert_layer_indices=resident_expert_layer_indices,
         cached_experts_per_layer=cached_experts_per_layer,
     )
+    if decode_executor is not None:
+        # Qwen3.5 text engine only; the TTS/Gemma4 engines do not expose a
+        # decode-executor switch yet.
+        shared["decode_executor"] = decode_executor
     model_family_info = inspect_model_family(model_dir)
     if model_family_info.model_family == "qwen3_tts":
         return AnnaQwen3TTSEngine.from_model_dir(model_dir, **shared)

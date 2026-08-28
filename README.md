@@ -43,6 +43,12 @@ python -m pip install -U pip
 python -m pip install -e ".[dev]"
 ```
 
+TurboQuant KV-cache quantization is optional; install it with the `quant` extra when needed:
+
+```powershell
+python -m pip install -e ".[quant]"
+```
+
 Check XPU availability:
 
 ```powershell

@@ -26,12 +26,17 @@ _XPU_INT4_MATMUL_STRATEGIES = frozenset({"auto", "torch", "dequant", "gemv"})
 _XPU_INT4_LAYOUT_CACHE_VERSION = 2
 _XPU_INT4_LAYOUT_NAME = "anna_xpu_int4_linear_v1"
 _XPU_INT4_LM_HEAD_CACHE_TILE = 4
-# Arc auto policy for dense int4 matmul:
-# - auto/torch → PyTorch int4pack (best general throughput on Arc for M>=1)
-# - gemv → SYCL GEMV, opt-in for decode-like M=1 experiments; not selected by auto
-# - dequant → full dequant + F.linear, debug/fallback only
-# GEMV is never chosen by auto (no M-row threshold); force via ANNA_XPU_INT4_MATMUL=gemv.
+# Arc auto policy for dense int4 matmul (Phase 3):
+# - auto: M-aware switch — when ANNA_XPU_INT4_GEMV_M_THRESHOLD is set to a
+#   positive value and the fused-op library exposes xpu_int4_gemv, decode-shaped
+#   rows (M <= threshold) route to the self-hosted SYCL int4 GEMV and prefill
+#   waves (large M) keep the aten int4pack batched GEMM (XMX path). Default 0
+#   preserves the legacy Arc policy (auto = torch int4pack) until the GEMV
+#   kernel is validated end-to-end on the target device.
+# - gemv → SYCL GEMV unconditionally; dequant → full dequant + F.linear (debug/fallback).
 _XPU_INT4_AUTO_MATMUL_BACKEND = "torch"
+_XPU_INT4_GEMV_M_THRESHOLD_ENV = "ANNA_XPU_INT4_GEMV_M_THRESHOLD"
+_XPU_INT4_GEMV_M_THRESHOLD_DEFAULT = 0
 # weight-quant auto thresholds vs total XPU memory (see resolve helpers in engines)
 _WEIGHT_QUANT_AUTO_DENSE_USAGE_THRESHOLD = 0.85
 _WEIGHT_QUANT_AUTO_MOE_USAGE_THRESHOLD = 0.70
@@ -689,14 +694,43 @@ class XPUInt4Linear(nn.Module):
         return strategy
 
     @staticmethod
-    def resolve_matmul_backend(strategy: str | None = None) -> str:
+    def _gemv_m_threshold() -> int:
+        raw = os.getenv(_XPU_INT4_GEMV_M_THRESHOLD_ENV, "").strip()
+        if not raw:
+            return _XPU_INT4_GEMV_M_THRESHOLD_DEFAULT
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning(
+                "Ignoring unsupported %s=%r; using %d.",
+                _XPU_INT4_GEMV_M_THRESHOLD_ENV,
+                raw,
+                _XPU_INT4_GEMV_M_THRESHOLD_DEFAULT,
+            )
+            return _XPU_INT4_GEMV_M_THRESHOLD_DEFAULT
+
+    @staticmethod
+    def resolve_matmul_backend(strategy: str | None = None, *, rows: int | None = None) -> str:
         """Map configured strategy to the backend actually used on XPU.
 
-        Arc defaults (``auto``): PyTorch int4pack. GEMV is never selected by auto;
-        there is no M-row GEMV/dequant threshold — use explicit ``gemv`` / ``dequant``.
+        ``auto`` is M-aware (Phase 3): when ``ANNA_XPU_INT4_GEMV_M_THRESHOLD``
+        is set to a positive value and the fused-op library exposes
+        ``xpu_int4_gemv``, decode-shaped inputs (``rows`` <= threshold) route
+        to the SYCL int4 GEMV; prefill-shaped inputs keep the aten int4pack
+        batched GEMM (XMX path). The default threshold of 0 preserves the
+        legacy Arc policy (auto = torch int4pack) until the GEMV kernel is
+        validated end-to-end. Explicit ``gemv`` / ``dequant`` / ``torch``
+        bypass the M threshold.
         """
         resolved = (strategy or XPUInt4Linear._matmul_strategy()).strip().lower()
         if resolved == "auto":
+            gemv_threshold = XPUInt4Linear._gemv_m_threshold()
+            if gemv_threshold > 0 and rows is not None and int(rows) <= gemv_threshold:
+                op = _anna_xpu_int4_gemv_op()
+                if op is not None:
+                    return "gemv"
+                # Fused-op library not loaded (yet); fall through to the torch
+                # int4pack path rather than forcing a library load mid-step.
             return _XPU_INT4_AUTO_MATMUL_BACKEND
         if resolved in _XPU_INT4_MATMUL_STRATEGIES:
             return resolved
@@ -758,7 +792,11 @@ class XPUInt4Linear(nn.Module):
             x_padded = x_2d.to(dtype=self.compute_dtype)
 
         if uses_xpu_kernel:
-            backend = self.resolve_matmul_backend()
+            backend = self.resolve_matmul_backend(rows=x_2d.shape[0])
+            if backend == "gemv" and self.in_features != self.padded_in_features:
+                # The SYCL GEMV kernel requires unpadded inputs (last dim ==
+                # in_features); padded layouts keep the int4pack XMX path.
+                backend = "torch"
             if backend == "dequant":
                 output = self._forward_dequant(x_padded)
             elif backend == "gemv":

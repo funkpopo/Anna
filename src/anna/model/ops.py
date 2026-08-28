@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -1383,6 +1383,18 @@ class Qwen3DynamicCache:
             return self
 
         selected = set(rows)
+        # Phase 4: build the row-gather index once per device instead of per
+        # layer/per tensor; every index_select below reuses the same device
+        # kernel-sized index buffer.
+        row_index_by_device: dict[torch.device, torch.Tensor] = {}
+
+        def _row_index(device: torch.device) -> torch.Tensor:
+            index = row_index_by_device.get(device)
+            if index is None:
+                index = torch.tensor(rows, device=device, dtype=torch.long)
+                row_index_by_device[device] = index
+            return index
+
         compacted = Qwen3DynamicCache(
             self.config,
             allocator=self.allocator,
@@ -1393,8 +1405,7 @@ class Qwen3DynamicCache:
         )
         compacted.reserved_seq_capacity = self.reserved_seq_capacity
         if self.rope_deltas is not None:
-            index = torch.tensor(rows, device=self.rope_deltas.device, dtype=torch.long)
-            compacted.rope_deltas = self.rope_deltas.index_select(0, index)
+            compacted.rope_deltas = self.rope_deltas.index_select(0, _row_index(self.rope_deltas.device))
 
         for layer_idx in range(self.config.num_hidden_layers):
             compacted.layer_lengths[layer_idx] = [self.layer_lengths[layer_idx][row_idx] for row_idx in rows]
@@ -1417,19 +1428,15 @@ class Qwen3DynamicCache:
 
             conv_state = self.conv_states[layer_idx]
             if conv_state is not None:
-                index = torch.tensor(rows, device=conv_state.device, dtype=torch.long)
-                compacted.conv_states[layer_idx] = conv_state.index_select(0, index)
+                compacted.conv_states[layer_idx] = conv_state.index_select(0, _row_index(conv_state.device))
             recurrent_state = self.recurrent_states[layer_idx]
             if recurrent_state is not None:
-                index = torch.tensor(rows, device=recurrent_state.device, dtype=torch.long)
-                compacted.recurrent_states[layer_idx] = recurrent_state.index_select(0, index)
+                compacted.recurrent_states[layer_idx] = recurrent_state.index_select(0, _row_index(recurrent_state.device))
             key_cache = self.visible_key_caches[layer_idx]
             value_cache = self.visible_value_caches[layer_idx]
             if key_cache is not None and value_cache is not None:
-                key_index = torch.tensor(rows, device=key_cache.device, dtype=torch.long)
-                value_index = torch.tensor(rows, device=value_cache.device, dtype=torch.long)
-                compacted.visible_key_caches[layer_idx] = key_cache.index_select(0, key_index)
-                compacted.visible_value_caches[layer_idx] = value_cache.index_select(0, value_index)
+                compacted.visible_key_caches[layer_idx] = key_cache.index_select(0, _row_index(key_cache.device))
+                compacted.visible_value_caches[layer_idx] = value_cache.index_select(0, _row_index(value_cache.device))
 
         compacted.seen_tokens = max(
             (compacted._request_seq_length(idx) for idx in range(len(rows))),
@@ -1714,6 +1721,105 @@ def grouped_query_attention(
     attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
     attn_output = torch.matmul(attn_probs, value_states.unsqueeze(2))
     return attn_output.reshape(batch_size, num_heads, query_len, -1)
+
+
+def _prefill_flash_attention_env_enabled() -> bool:
+    """Phase 3: full-attention prefill path selector.
+
+    ``auto``/``on`` -> chunked flash (online softmax) when the KV length exceeds
+    the threshold; ``off`` keeps the materialized grouped path unconditionally.
+    """
+    value = os.getenv("ANNA_PREFILL_FLASH_ATTENTION", "auto").strip().lower()
+    if value in ("off", "0", "false", "none"):
+        return False
+    return True  # auto / on / 1 / true
+
+
+def _prefill_flash_kv_threshold() -> int:
+    try:
+        return max(1, int(os.getenv("ANNA_PREFILL_FLASH_KV_THRESHOLD", "1024")))
+    except ValueError:
+        return 1024
+
+
+def chunked_flash_gqa_attention(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    *,
+    scaling: float,
+    causal_mask: torch.Tensor | None = None,
+    visible_mask: torch.Tensor | None = None,
+    key_padding_mask: torch.Tensor | None = None,
+    kv_chunk_size: int = 512,
+) -> torch.Tensor:
+    """Causal flash attention over (possibly paged-derived) dense KV with online softmax.
+
+    Replaces the materialized ``[B, H, Lq, Skv]`` grouped path for cached prefill:
+    scores are computed per KV chunk (default 512 keys) so peak activation memory
+    scales with the chunk size instead of the full KV length, and the fp32 softmax
+    accumulator never materializes a full attention matrix.
+
+    Mask semantics match ``grouped_query_attention``:
+    - ``causal_mask`` ``[B, Lq, Skv]``: True = masked out;
+    - ``visible_mask`` ``[B, Skv]``: True = visible;
+    - ``key_padding_mask`` ``[B, Skv]``: True = valid.
+    """
+    batch_size, num_heads, query_len, _ = query_states.shape
+    num_key_value_heads = key_states.shape[1]
+    num_groups = num_heads // num_key_value_heads
+    kv_len = key_states.shape[-2]
+    value_dim = value_states.shape[-1]
+    device = query_states.device
+
+    grouped_q = query_states.unflatten(1, (num_key_value_heads, num_groups))  # [B, KvH, G, Lq, D]
+
+    combined_allowed = torch.ones(batch_size, kv_len, dtype=torch.bool, device=device)
+    if visible_mask is not None:
+        combined_allowed &= visible_mask
+    if key_padding_mask is not None:
+        combined_allowed &= key_padding_mask
+
+    out_acc = torch.zeros(
+        (batch_size, num_key_value_heads, num_groups, query_len, value_dim),
+        dtype=torch.float32,
+        device=device,
+    )
+    row_max = torch.full(
+        (batch_size, num_key_value_heads, num_groups, query_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    row_sum = torch.zeros_like(row_max)
+
+    neg_inf = float("-inf")
+    for chunk_start in range(0, kv_len, kv_chunk_size):
+        chunk_end = min(chunk_start + kv_chunk_size, kv_len)
+        k_chunk = key_states[:, :, chunk_start:chunk_end].unsqueeze(2)  # [B, KvH, 1, C, D]
+        v_chunk = value_states[:, :, chunk_start:chunk_end].unsqueeze(2)  # [B, KvH, 1, C, Dv]
+        scores = torch.matmul(grouped_q, k_chunk.transpose(-1, -2)).float() * scaling
+        if causal_mask is not None:
+            scores = scores.masked_fill(causal_mask[:, None, None, :, chunk_start:chunk_end], neg_inf)
+        chunk_allowed = combined_allowed[:, None, chunk_start:chunk_end]  # [B, 1, C]
+        scores = scores.masked_fill(~chunk_allowed[:, :, None, None, :], neg_inf)
+
+        block_max = scores.amax(dim=-1)  # [B, KvH, G, Lq]
+        new_max = torch.maximum(row_max, block_max)
+        # Clamp rows that are fully masked so far to avoid inf - inf = nan in exp().
+        safe_max = torch.where(torch.isneginf(new_max), torch.zeros_like(new_max), new_max)
+        probs = torch.exp(scores - safe_max[..., None])
+        block_sum = probs.sum(dim=-1)
+        rescale = torch.exp(row_max - safe_max)
+        # Accumulate in fp32; the p @ v matmul keeps v's native dtype for XMX.
+        out_acc = out_acc * rescale[..., None] + torch.matmul(probs.to(v_chunk.dtype), v_chunk).float()
+        row_sum = row_sum * rescale + block_sum
+        row_max = new_max
+
+    denom = torch.where(row_sum > 0, row_sum, torch.ones_like(row_sum))
+    out = out_acc / denom[..., None]
+    out = out.reshape(batch_size, num_heads, query_len, value_dim)
+    return out.to(dtype=query_states.dtype)
 
 
 def materialized_kv_single_token_decode_attention(
@@ -2201,15 +2307,34 @@ class Qwen3Attention(nn.Module):
                 if attention_mask is not None and past_key_values is None:
                     key_padding_mask = attention_mask.to(dtype=torch.bool)
 
-            attn_output = grouped_query_attention(
-                query_states,
-                key_states,
-                value_states,
-                scaling=self.scaling,
-                causal_mask=causal_mask,
-                visible_mask=visible_mask,
-                key_padding_mask=key_padding_mask,
+            attn_output = None
+            use_flash_prefill = (
+                seq_len > 1
+                and _prefill_flash_attention_env_enabled()
+                and key_states.shape[-2] >= _prefill_flash_kv_threshold()
             )
+            if use_flash_prefill:
+                record_kernel_strategy("full_attn_prefill", "flash_chunked")
+                attn_output = chunked_flash_gqa_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    scaling=self.scaling,
+                    causal_mask=causal_mask,
+                    visible_mask=visible_mask,
+                    key_padding_mask=key_padding_mask,
+                )
+            else:
+                record_kernel_strategy("full_attn_prefill", "materialized")
+                attn_output = grouped_query_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    scaling=self.scaling,
+                    causal_mask=causal_mask,
+                    visible_mask=visible_mask,
+                    key_padding_mask=key_padding_mask,
+                )
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)
@@ -2866,6 +2991,13 @@ class Qwen3SparseMoeBlock(nn.Module):
         self._expert_heat = [0.0] * self.num_experts
         self._prefetch_lock = threading.Lock()
         self._prefetch_pending: set[int] = set()
+        # Phase 4: persistent prefetch worker with a bounded double-buffered
+        # staging queue — while wave N is being staged, wave N+1 can already be
+        # enqueued by the scheduler instead of paying thread-spawn latency.
+        self._prefetch_queue: deque[list[int]] = deque()
+        self._prefetch_wakeup = threading.Condition()
+        self._prefetch_worker: threading.Thread | None = None
+        self._prefetch_queue_depth = 2
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList(
             [Qwen3MLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
@@ -3638,23 +3770,57 @@ class Qwen3SparseMoeBlock(nn.Module):
                 return 0
             self._prefetch_pending.update(to_stage)
 
-        def _stage() -> None:
-            try:
-                prepared = self._prepare_cached_experts(to_stage, record_stats=False)
-                self._prefetch_staged += len(prepared)
-            except Exception:
-                logger.debug("MoE expert prefetch failed for experts=%s", to_stage, exc_info=True)
-            finally:
-                with self._prefetch_lock:
-                    self._prefetch_pending.difference_update(to_stage)
-
         if async_copy:
-            thread = threading.Thread(target=_stage, name="anna-moe-prefetch", daemon=True)
-            thread.start()
+            self._enqueue_prefetch(to_stage)
             return len(to_stage)
 
-        _stage()
+        self._stage_prefetch_batch(to_stage)
         return len(to_stage)
+
+    def _ensure_prefetch_worker(self) -> None:
+        if self._prefetch_worker is not None and self._prefetch_worker.is_alive():
+            return
+        self._prefetch_worker = threading.Thread(
+            target=self._prefetch_worker_loop,
+            name="anna-moe-prefetch",
+            daemon=True,
+        )
+        self._prefetch_worker.start()
+
+    def _enqueue_prefetch(self, batch: list[int]) -> None:
+        """Queue a staging batch for the persistent worker (bounded depth).
+
+        The queue acts as a double buffer: while the worker stages batch N,
+        batch N+1 (next predicted wave) can already be enqueued. When the
+        queue is full the oldest pending batch is dropped in favor of the
+        newer prediction (newest-wave-wins) and its pending marks released.
+        """
+        self._ensure_prefetch_worker()
+        with self._prefetch_wakeup:
+            while len(self._prefetch_queue) >= self._prefetch_queue_depth:
+                dropped = self._prefetch_queue.popleft()
+                with self._prefetch_lock:
+                    self._prefetch_pending.difference_update(dropped)
+            self._prefetch_queue.append(batch)
+            self._prefetch_wakeup.notify()
+
+    def _prefetch_worker_loop(self) -> None:
+        while True:
+            with self._prefetch_wakeup:
+                while not self._prefetch_queue:
+                    self._prefetch_wakeup.wait()
+                batch = self._prefetch_queue.popleft()
+            self._stage_prefetch_batch(batch)
+
+    def _stage_prefetch_batch(self, batch: list[int]) -> None:
+        try:
+            prepared = self._prepare_cached_experts(batch, record_stats=False)
+            self._prefetch_staged += len(prepared)
+        except Exception:
+            logger.debug("MoE expert prefetch failed for experts=%s", batch, exc_info=True)
+        finally:
+            with self._prefetch_lock:
+                self._prefetch_pending.difference_update(batch)
 
     def _prepare_cached_experts(
         self,
@@ -4087,6 +4253,14 @@ class Qwen3DecoderLayer(nn.Module):
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    # Compile boundary: attention ops are already dynamo-disabled, so tracing this
+    # layer only yields tiny norm/MLP fragments — but its module structure differs
+    # per layer instance (linear_attn vs self_attn), so dynamo installs per-instance
+    # guards ("KeyError on self._modules['self_attn']") and recompiles once per layer
+    # until recompile_limit is hit, stalling the first prefill/decode of every new
+    # shape by seconds. Keep the layer eager; the compiled text graph degenerates to
+    # embeddings + final norm + lm_head, which is shape-stable and cheap.
+    @_compiler_disable
     def forward(
         self,
         hidden_states: torch.Tensor,

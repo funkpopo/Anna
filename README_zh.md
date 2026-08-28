@@ -43,6 +43,12 @@ python -m pip install -U pip
 python -m pip install -e ".[dev]"
 ```
 
+TurboQuant KV 量化为可选依赖，需要时用 `quant` extra 安装：
+
+```powershell
+python -m pip install -e ".[quant]"
+```
+
 检查 XPU：
 
 ```powershell

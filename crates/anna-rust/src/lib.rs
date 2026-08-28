@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -512,5 +512,231 @@ fn _rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(inspect_safetensors_load_plan, module)?)?;
     module.add_function(wrap_pyfunction!(quantize_safetensors_linear_int4, module)?)?;
     module.add_function(wrap_pyfunction!(quantize_safetensors_linear_int4_batch, module)?)?;
+    module.add_class::<SchedulerLedger>()?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: scheduler hot-path ledger.
+//
+// Continuous-batching bookkeeping (active request set, per-request decode
+// accounting, finished/cancelled transitions) moves out of the Python
+// scheduler tick into Rust. The Python side keeps ownership of the actual
+// request objects; the ledger only tracks u64 ids assigned at submit time.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct LedgerEntry {
+    cost: u64,
+    finished: bool,
+}
+
+#[pyclass]
+struct SchedulerLedger {
+    entries: HashMap<u64, LedgerEntry>,
+    order: Vec<u64>,
+    active_cost: u64,
+    finished_count: u64,
+    decode_steps: u64,
+}
+
+#[pymethods]
+impl SchedulerLedger {
+    #[new]
+    fn new() -> Self {
+        SchedulerLedger {
+            entries: HashMap::new(),
+            order: Vec::new(),
+            active_cost: 0,
+            finished_count: 0,
+            decode_steps: 0,
+        }
+    }
+
+    /// Register a request. Returns False if the id was already registered.
+    fn register(&mut self, request_id: u64, cost: u64) -> bool {
+        if self.entries.contains_key(&request_id) {
+            return false;
+        }
+        self.entries.insert(request_id, LedgerEntry { cost, finished: false });
+        self.order.push(request_id);
+        self.active_cost += cost;
+        true
+    }
+
+    /// Unregister a request. Returns False when the id was unknown.
+    fn unregister(&mut self, request_id: u64) -> bool {
+        let Some(entry) = self.entries.remove(&request_id) else {
+            return false;
+        };
+        if !entry.finished {
+            self.active_cost = self.active_cost.saturating_sub(entry.cost);
+        }
+        self.order.retain(|id| *id != request_id);
+        true
+    }
+
+    /// Update the token budget cost of a request (no-op when unknown).
+    fn set_cost(&mut self, request_id: u64, cost: u64) -> bool {
+        let Some(entry) = self.entries.get_mut(&request_id) else {
+            return false;
+        };
+        if entry.finished {
+            return false;
+        }
+        self.active_cost = self.active_cost - entry.cost + cost;
+        entry.cost = cost;
+        true
+    }
+
+    /// Mark a request finished: leaves the active set but keeps its id until
+    /// it is reaped via ``retain``/``unregister``. Returns False when unknown
+    /// or already finished.
+    fn mark_finished(&mut self, request_id: u64) -> bool {
+        let Some(entry) = self.entries.get_mut(&request_id) else {
+            return false;
+        };
+        if entry.finished {
+            return false;
+        }
+        entry.finished = true;
+        self.active_cost = self.active_cost.saturating_sub(entry.cost);
+        self.finished_count += 1;
+        true
+    }
+
+    /// Keep only the listed ids (in the given order); everything else is
+    /// unregistered. Used to reconcile the ledger after a scheduler tick.
+    fn retain(&mut self, ids: Vec<u64>) {
+        let keep: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        let mut active_cost = 0_u64;
+        self.entries.retain(|id, entry| {
+            if !keep.contains(id) {
+                return false;
+            }
+            if !entry.finished {
+                active_cost += entry.cost;
+            }
+            true
+        });
+        self.active_cost = active_cost;
+        self.order = ids;
+    }
+
+    fn active_ids(&self) -> Vec<u64> {
+        self.order
+            .iter()
+            .filter(|id| self.entries.get(id).is_some_and(|e| !e.finished))
+            .copied()
+            .collect()
+    }
+
+    fn finished_ids(&self) -> Vec<u64> {
+        self.order
+            .iter()
+            .filter(|id| self.entries.get(id).is_some_and(|e| e.finished))
+            .copied()
+            .collect()
+    }
+
+    fn active_count(&self) -> usize {
+        self.entries.values().filter(|e| !e.finished).count()
+    }
+
+    fn active_cost(&self) -> u64 {
+        self.active_cost
+    }
+
+    fn finished_count(&self) -> u64 {
+        self.finished_count
+    }
+
+    fn decode_steps(&self) -> u64 {
+        self.decode_steps
+    }
+
+    fn bump_decode_steps(&mut self) {
+        self.decode_steps += 1;
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.active_cost = 0;
+        self.finished_count = 0;
+        self.decode_steps = 0;
+    }
+
+    /// (active_count, active_cost, finished_count, decode_steps)
+    fn stats(&self) -> (usize, u64, u64, u64) {
+        (
+            self.entries.values().filter(|e| !e.finished).count(),
+            self.active_cost,
+            self.finished_count,
+            self.decode_steps,
+        )
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::SchedulerLedger;
+
+    #[test]
+    fn register_and_stats() {
+        let mut ledger = SchedulerLedger::new();
+        assert!(ledger.register(1, 100));
+        assert!(ledger.register(2, 50));
+        assert!(!ledger.register(1, 999), "duplicate register must be rejected");
+        assert_eq!(ledger.stats(), (2, 150, 0, 0));
+    }
+
+    #[test]
+    fn finish_moves_cost_out_of_active() {
+        let mut ledger = SchedulerLedger::new();
+        ledger.register(1, 100);
+        ledger.register(2, 50);
+        assert!(ledger.mark_finished(1));
+        assert!(!ledger.mark_finished(1), "double finish must be rejected");
+        assert_eq!(ledger.active_cost(), 50);
+        assert_eq!(ledger.active_ids(), vec![2]);
+        assert_eq!(ledger.finished_ids(), vec![1]);
+        assert_eq!(ledger.finished_count(), 1);
+    }
+
+    #[test]
+    fn unregister_and_reconcile() {
+        let mut ledger = SchedulerLedger::new();
+        ledger.register(1, 10);
+        ledger.register(2, 20);
+        ledger.register(3, 30);
+        assert!(ledger.unregister(2));
+        assert!(!ledger.unregister(2));
+        ledger.retain(vec![3, 1]);
+        assert_eq!(ledger.active_ids(), vec![3, 1]);
+        assert_eq!(ledger.active_cost(), 40);
+    }
+
+    #[test]
+    fn retain_drops_finished_cost_once() {
+        let mut ledger = SchedulerLedger::new();
+        ledger.register(1, 10);
+        ledger.register(2, 20);
+        ledger.mark_finished(2);
+        ledger.retain(vec![1]);
+        assert_eq!(ledger.active_cost(), 10);
+        assert_eq!(ledger.finished_count(), 1);
+        assert_eq!(ledger.stats(), (1, 10, 1, 0));
+    }
+
+    #[test]
+    fn decode_step_accounting() {
+        let mut ledger = SchedulerLedger::new();
+        ledger.register(1, 5);
+        ledger.bump_decode_steps();
+        ledger.bump_decode_steps();
+        assert_eq!(ledger.decode_steps(), 2);
+        ledger.clear();
+        assert_eq!(ledger.stats(), (0, 0, 0, 0));
+    }
 }

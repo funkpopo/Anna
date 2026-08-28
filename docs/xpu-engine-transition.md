@@ -80,7 +80,7 @@ Anna 目前是一个 **PyTorch-based** 的本地推理运行时，XPU 方向已�
 
 ### P2-8 其他不合理
 
-- `turboquant>=0.2,<0.3` 为硬依赖但又是可选功能（装不上时 auto 静默降级），依赖声明自相矛盾；
+- ~~`turboquant>=0.2,<0.3` 为硬依赖但又是可选功能（装不上时 auto 静默降级），依赖声明自相矛盾~~（已修复：移至 `anna[quant]` optional-dependencies）；
 - Rust crate 只做 manifest/量化，host 侧最热的地方（tokenizer、调度、token 流水）仍在 Python；
 - DPC++ 构建链要求手工 PowerShell 环境变量 + 手工 `.pyd` 路径，无法 CI 化；
 - `todo.md` 为空文件，路线图缺失。
@@ -128,7 +128,7 @@ Anna 目前是一个 **PyTorch-based** 的本地推理运行时，XPU 方向已�
 
 ### 依赖与工程治理（并行进行）
 
-- `turboquant` 移到 optional-dependencies（`anna[quant]`），核心路径不强依赖第三方黑盒；
+- [x] `turboquant` 移到 optional-dependencies（`anna[quant]`），核心路径不强依赖第三方黑盒；
 - DPC++ 构建接 CMake + `tools/build_*.py` 统一，产出符号化命名的库并支持 CI（GitHub runner 无 Intel GPU 时跑 CPU parity 测试，XPU gate 用 self-runner）；
 - `todo.md` 按本路线图填充。
 
