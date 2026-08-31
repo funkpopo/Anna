@@ -3249,6 +3249,26 @@ class AnnaQwen3_5TextEngine:
         return torch.cat([history_tensor, appended]), history_ids
 
     @staticmethod
+    def _append_repetition_penalty_token_device(
+        history_tensor: torch.Tensor | None,
+        next_token: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Device-only penalty-history append for deferred token-pull paths (P0-#12).
+
+        The host token id is not known yet, so the host-side dedup set cannot be
+        maintained here (it is backfilled when the bulk pull happens). Duplicate
+        entries are harmless: apply_*_penalty runs torch.unique.
+        """
+        if history_tensor is None:
+            return None
+        flat = next_token.detach().reshape(1)
+        if flat.device != history_tensor.device:
+            flat = flat.to(device=history_tensor.device)
+        if history_tensor.numel() == 0:
+            return flat
+        return torch.cat([history_tensor, flat])
+
+    @staticmethod
     def _token_id_from_tensor(next_token: torch.Tensor) -> int:
         return token_ids_to_host(next_token)[0]
 
@@ -3257,15 +3277,6 @@ class AnnaQwen3_5TextEngine:
         if not stop_token_ids:
             return torch.empty((0,), dtype=dtype, device=device)
         return torch.tensor(sorted(stop_token_ids), dtype=dtype, device=device)
-
-    @staticmethod
-    def _is_stop_token_device(next_token: torch.Tensor, stop_token_ids: torch.Tensor) -> bool:
-        if stop_token_ids.numel() == 0:
-            return False
-        flat = next_token.detach().reshape(-1)
-        # Keep the stop check on-device to avoid a host sync every decode step; the
-        # boolean result is a single scalar transfer only when needed by control flow.
-        return bool(torch.isin(flat[:1], stop_token_ids).item())
 
     def _raise_if_generation_cancelled(self, config: GenerationConfig) -> None:
         if config.cancellation_event is not None and config.cancellation_event.is_set():

@@ -115,6 +115,7 @@ CLI 显式参数  >  ANNA_* 环境变量  >  代码内置默认值
 | `ANNA_MEMORY_RELEASE_SWEEP_INTERVAL_S` | `30` | 空闲显存巡检周期（0 关闭） |
 | `ANNA_MEMORY_RELEASE_MIN_FREE_MIB` | 继承 `--min-free-memory-mib` | 空闲释放的 free 下限 |
 | `ANNA_MEMORY_RELEASE_MAX_GAP_MIB` | `1024` | 空闲 reserved-allocated 缺口触发阈值（0 关闭） |
+| `ANNA_SCHEDULER_TOKEN_SYNC_EVERY_STEPS` | `8` | 非 streaming 请求的 token 回传合并窗口（P0-#12）：非 streaming 行的采样 token 常驻 device，每 N 个 decode 步一次性批量 D2H 回传并做 EOS 检查（含到预算上限时的强制回传）；streaming 行与含 stop_strings 的行不受影响（仍逐步回传供文本组装）。`1` 恢复逐步回传。注意：命中 EOS 的行最迟在窗口边界被发现，期间最多多解码 N-1 步（吞吐换同步的折中） |
 
 ## 7. 编程接口（ServeSettings）
 

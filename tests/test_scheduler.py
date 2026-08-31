@@ -940,6 +940,9 @@ def test_scheduler_samples_decode_batch_in_one_vectorized_pass() -> None:
     scheduler._compact_cache_rows = lambda cache, rows: None  # type: ignore[method-assign]
     scheduler._split_cache = lambda cache, n, avoid_turboquant_clone=False: [None] * n  # type: ignore[method-assign]
     scheduler._make_decode_group_from_requests = lambda reqs: reqs  # type: ignore[method-assign]
+    # Legacy per-step pull for this test (object.__new__ default is already 1).
+    scheduler._deferred_pull_interval = 1
+    scheduler._deferred_pull_counter = 0
 
     active = scheduler._consume_batch_outputs(
         requests,
@@ -952,6 +955,95 @@ def test_scheduler_samples_decode_batch_in_one_vectorized_pass() -> None:
     assert [request.completion_ids[-1] for request in active] == [1, 0]
     assert all(request.input_ids is not None and request.input_ids.shape == (1, 1) for request in active)
     assert finished == []
+
+
+def test_scheduler_defers_non_streaming_token_pull_until_interval() -> None:
+    """P0-#12: non-streaming rows keep tokens on device and flush in one bulk pull."""
+    from types import MethodType
+
+    engine = object.__new__(AnnaQwen3_5TextEngine)
+    engine._append_repetition_penalty_token_device = staticmethod(
+        AnnaQwen3_5TextEngine._append_repetition_penalty_token_device
+    ).__func__  # type: ignore[attr-defined]
+    engine._stop_token_ids = MethodType(lambda self: {9}, engine)
+
+    scheduler = object.__new__(AnnaScheduler)
+    scheduler.engine = engine
+    scheduler._deferred_pull_interval = 2
+    scheduler._deferred_pull_counter = 0
+
+    def _outputs(row_tokens: list[int]):
+        vocab = 16
+        logits = torch.full((2, 1, vocab), -1000.0)
+        for row, token in enumerate(row_tokens):
+            logits[row, 0, token] = 1000.0
+        return type("Outputs", (), {"logits": logits})()
+
+    def _request() -> SchedulerRequest:
+        return SchedulerRequest(
+            prepared=_prepared([1]),
+            config=GenerationConfig(
+                max_new_tokens=8,
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                presence_penalty=0.0,
+                repetition_penalty=1.0,
+            ),
+            stream=False,
+            prompt_length=1,
+            assembler=None,
+        )
+
+    request_a = _request()
+    request_b = _request()
+    requests = [request_a, request_b]
+
+    finished: list[tuple[int, str]] = []
+
+    def _finish(request, *, finish_reason: str) -> None:
+        finished.append((request.completion_ids and request.completion_ids[-1] or -1, finish_reason))
+        request.done.set()
+
+    scheduler._finish_request = _finish  # type: ignore[method-assign]
+    scheduler._emit_text = lambda request, text: None  # type: ignore[method-assign]
+    scheduler._is_request_cancelled = lambda request: False  # type: ignore[method-assign]
+    scheduler._drop_cancelled_request = lambda request: False  # type: ignore[method-assign]
+    scheduler._compact_cache_rows = lambda cache, rows: None  # type: ignore[method-assign]
+    scheduler._split_cache = lambda cache, n, avoid_turboquant_clone=False: [None] * n  # type: ignore[method-assign]
+    scheduler._make_decode_group_from_requests = lambda reqs: reqs  # type: ignore[method-assign]
+
+    # Step 1 (window 1/2): tokens stay on device, no host ids yet.
+    active = scheduler._consume_batch_outputs(
+        requests,
+        _outputs([5, 7]),
+        batch_cache=None,
+        keep_batched_cache=False,
+        avoid_turboquant_clone=True,
+    )
+    assert active == [request_a, request_b]
+    assert request_a.completion_ids == [] and request_b.completion_ids == []
+    assert len(request_a.device_pending_tokens) == 1
+    assert len(request_b.device_pending_tokens) == 1
+    assert scheduler._deferred_pull_counter == 1
+    assert finished == []
+
+    # Step 2 (window 2/2): bulk flush pulls both rows with one transfer; row_b hits
+    # EOS (id 9) on its second token, so it finishes "stop" with the token kept.
+    active = scheduler._consume_batch_outputs(
+        [request_a, request_b],
+        _outputs([6, 9]),
+        batch_cache=None,
+        keep_batched_cache=False,
+        avoid_turboquant_clone=True,
+    )
+    assert request_a.completion_ids == [5, 6]
+    assert request_b.completion_ids == [7]
+    assert request_a.device_pending_tokens == []
+    assert request_b.device_pending_tokens == []
+    assert scheduler._deferred_pull_counter == 0
+    assert finished == [(7, "stop")]
+    assert active == [request_a]
 
 
 def test_scheduler_batching_preserves_prepared_input_dataclass_type() -> None:

@@ -182,6 +182,9 @@ class SchedulerRequest:
     # Hot-path ledger id (Phase 4): assigned by the scheduler at submit time and
     # used as the key inside the Rust/python ledger for O(1) bookkeeping.
     ledger_id: int = 0
+    # P0-#12: tokens sampled while the batch defers its device->host pull. They stay
+    # on device until the bulk pull (see AnnaScheduler._flush_deferred_tokens).
+    device_pending_tokens: list[torch.Tensor] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -201,6 +204,11 @@ class SchedulerDecodeGroup:
 
 
 class AnnaScheduler:
+    # P0-#12 class-level defaults keep object.__new__-constructed schedulers (tests)
+    # on the legacy per-step token pull; __init__ enables deferral via the env knob.
+    _deferred_pull_interval = 1
+    _deferred_pull_counter = 0
+
     def __init__(
         self,
         engine: "AnnaQwen3_5TextEngine",
@@ -234,6 +242,14 @@ class AnnaScheduler:
         self.max_queue_wait_seconds = max(0.0, float(max_queue_wait_ms)) / 1000.0
         self.event_driven_prefill_insert = bool(event_driven_prefill_insert)
         self.profile = str(profile or "none")
+        # P0-#12: deferred token pull for non-streaming rows. Non-streaming requests do
+        # not need their token ids until they finish, so sampled tokens accumulate on
+        # device and are pulled in ONE bulk D2H transfer every N decode steps together
+        # with the EOS check (N=1 restores the legacy per-step pull).
+        self._deferred_pull_interval = max(
+            1, int(os.environ.get("ANNA_SCHEDULER_TOKEN_SYNC_EVERY_STEPS", "8"))
+        )
+        self._deferred_pull_counter = 0
         self._decode_steps_since_prefill = 0
         # P0-#3: interference markers accumulated since the last decode step.
         # Recorded with the next decode step timing so periodic spikes can be
@@ -1127,8 +1143,11 @@ class AnnaScheduler:
         dominates small-token continuous batches.
 
         Sampling is vectorized across the batch (P2 hot-loop reduction): one multinomial /
-        argmax path plus a single device→host sync for all token ids, instead of per-row
-        Python sampling and per-row ``.cpu()`` round-trips.
+        argmax path instead of per-row Python sampling. Streaming rows (and rows with stop
+        strings) pull their token ids with a single device->host transfer per step; purely
+        non-streaming rows defer the pull entirely (P0-#12): tokens accumulate on device
+        and are copied to host in one bulk transfer every ``ANNA_SCHEDULER_TOKEN_SYNC_EVERY_STEPS``
+        decode steps together with the EOS check.
         """
         metrics = getattr(self.engine, "metrics", None)
         stop_token_ids = self.engine._stop_token_ids()
@@ -1152,47 +1171,117 @@ class AnnaScheduler:
             return []
 
         next_tokens = self._sample_next_tokens_from_outputs(outputs, requests=requests, row_indices=active_rows)
-        # P0-#1/#12: the device→host sync in token_ids_to_host is a per-step CPU
-        # stall invisible to GPU component timers; track it as a decode phase.
-        token_ids = token_ids_to_host(next_tokens)
         if metrics is not None:
             metrics.record_decode_phase("sampling", time.perf_counter() - sample_started_at)
         now = time.perf_counter()
 
+        # P0-#12: split active rows into "immediate" rows (host token ids are needed this
+        # step for streaming text assembly or stop-string matching) and "deferred" rows
+        # (non-streaming, no stop strings): their tokens stay on device and are pulled in
+        # ONE bulk device->host transfer every N decode steps together with the EOS check.
+        # Tuples carry the batch row index so finished rows can be mapped back by the caller.
+        deferred_samples: list[tuple[int, SchedulerRequest]] = []
+        immediate_samples: list[int] = []
+        for sample_idx, row_idx in enumerate(active_rows):
+            request = requests[row_idx]
+            if (
+                self._deferred_pull_interval > 1
+                and not request.stream
+                and not request.config.stop_strings
+            ):
+                deferred_samples.append((row_idx, request))
+            else:
+                immediate_samples.append(sample_idx)
+
+        token_ids: dict[int, int] = {}
+        if immediate_samples:
+            pull_started_at = time.perf_counter()
+            if len(immediate_samples) == len(active_rows):
+                pulled_ids = token_ids_to_host(next_tokens)
+            else:
+                pull_rows = torch.tensor(immediate_samples, dtype=torch.long, device=next_tokens.device)
+                pulled_ids = token_ids_to_host(next_tokens.index_select(0, pull_rows))
+            # P0-#1/#12: the device->host sync in token_ids_to_host is a CPU stall
+            # invisible to GPU component timers; track it as its own decode phase.
+            if metrics is not None:
+                metrics.record_decode_phase("token_pull", time.perf_counter() - pull_started_at)
+            token_ids = dict(zip(immediate_samples, pulled_ids))
+
+        force_flush_samples: list[tuple[int, SchedulerRequest]] = []
         for sample_idx, row_idx in enumerate(active_rows):
             request = requests[row_idx]
             next_token = next_tokens[sample_idx]
-            token_id = token_ids[sample_idx]
             if request.first_token_at is None:
                 request.first_token_at = now
-            if token_id in stop_token_ids:
-                self._finish_request(request, finish_reason="stop")
-                continue
+            token_id = token_ids.get(sample_idx)
+            if token_id is not None:
+                if token_id in stop_token_ids:
+                    self._finish_request(request, finish_reason="stop")
+                    continue
 
-            request.completion_ids.append(token_id)
-            if metrics is not None:
-                metrics.record_generation_tokens(1)
-            request.repetition_history, request.repetition_history_ids = self.engine._append_repetition_penalty_token(
-                history_tensor=request.repetition_history,
-                history_ids=request.repetition_history_ids,
-                next_token=next_token,
-                token_id=token_id,
-            )
-            delta, hit_stop = request.assembler.feed_token(token_id) if request.assembler is not None else ("", False)
-            if delta:
-                self._emit_text(request, delta)
-            if hit_stop:
-                self._finish_request(request, finish_reason="stop")
-                continue
+                request.completion_ids.append(token_id)
+                if metrics is not None:
+                    metrics.record_generation_tokens(1)
+                request.repetition_history, request.repetition_history_ids = self.engine._append_repetition_penalty_token(
+                    history_tensor=request.repetition_history,
+                    history_ids=request.repetition_history_ids,
+                    next_token=next_token,
+                    token_id=token_id,
+                )
+                delta, hit_stop = request.assembler.feed_token(token_id) if request.assembler is not None else ("", False)
+                if delta:
+                    self._emit_text(request, delta)
+                if hit_stop:
+                    self._finish_request(request, finish_reason="stop")
+                    continue
 
-            if len(request.completion_ids) >= request.config.max_new_tokens:
-                self._finish_request(request, finish_reason="length")
-                continue
+                if len(request.completion_ids) >= request.config.max_new_tokens:
+                    self._finish_request(request, finish_reason="length")
+                    continue
+            else:
+                # Deferred row: keep the sampled token on device; host ids and the stop
+                # check happen in the bulk pull below (no per-step sync for this row).
+                # Generation-token metrics are recorded when the ids are absorbed so
+                # post-EOS tokens are not counted (matches the immediate path).
+                request.device_pending_tokens.append(next_token.detach().reshape(1))
+                request.repetition_history = self.engine._append_repetition_penalty_token_device(
+                    history_tensor=request.repetition_history,
+                    next_token=next_token,
+                )
+                if len(request.completion_ids) + len(request.device_pending_tokens) >= request.config.max_new_tokens:
+                    # Token budget reached: force-flush this row after the loop so it
+                    # finishes by length exactly at max_new_tokens (no stranded ids).
+                    force_flush_samples.append((row_idx, request))
+                    continue
 
             request.input_ids = next_token.view(1, 1)
             next_input_ids.append(request.input_ids)
             continuing_by_row[row_idx] = request
             next_active.append(request)
+
+        # P0-#12: bulk pull for deferred rows - forced (token budget reached) and/or the
+        # regular every-N-steps window. One combined device->host transfer per pull.
+        flush_samples = force_flush_samples
+        if deferred_samples:
+            self._deferred_pull_counter += 1
+            if self._deferred_pull_counter >= self._deferred_pull_interval:
+                self._deferred_pull_counter = 0
+                flush_samples = flush_samples + deferred_samples
+        if flush_samples:
+            finished_rows = self._flush_deferred_tokens(flush_samples, stop_token_ids=stop_token_ids)
+            if finished_rows:
+                # Rows that hit EOS inside the window already finished; drop them
+                # from the continuing batch so cache compaction can reclaim them.
+                finished_requests = {id(requests[row_idx]) for row_idx in finished_rows}
+                continuing_by_row = {
+                    row_idx: request
+                    for row_idx, request in continuing_by_row.items()
+                    if id(request) not in finished_requests
+                }
+                next_active = [request for request in next_active if id(request) not in finished_requests]
+                next_input_ids = [request.input_ids for request in next_active]
+        elif not deferred_samples:
+            self._deferred_pull_counter = 0
 
         if batch_cache is None:
             return next_active
@@ -1247,6 +1336,84 @@ class AnnaScheduler:
         if keep_batched_cache and len(next_active) > 1:
             return [self._make_decode_group_from_requests(next_active)]
         return next_active
+
+    def _flush_deferred_tokens(
+        self,
+        deferred_samples: list[tuple[int, SchedulerRequest]],
+        *,
+        stop_token_ids: set[int],
+    ) -> list[int]:
+        """Bulk device->host pull of tokens accumulated by deferred rows (P0-#12).
+
+        All pending tokens of all deferred rows are concatenated into one device tensor
+        and copied to host with a SINGLE transfer per pull window. Returns the batch row
+        indices whose generation finished during this window (EOS hit inside the deferred
+        tokens); the caller must drop them from the continuing batch.
+        """
+        pending = [(sample_idx, request) for sample_idx, request in deferred_samples if request.device_pending_tokens]
+        if not pending:
+            return []
+        metrics = getattr(self.engine, "metrics", None)
+        pull_started_at = time.perf_counter()
+        counts = [len(request.device_pending_tokens) for _, request in pending]
+        flat = torch.cat([torch.stack(request.device_pending_tokens).reshape(-1) for _, request in pending])
+        pulled_ids = token_ids_to_host(flat)
+        if metrics is not None:
+            metrics.record_decode_phase("token_pull", time.perf_counter() - pull_started_at)
+
+        finished_rows: list[int] = []
+        offset = 0
+        for count, (sample_idx, request) in zip(counts, pending):
+            row_ids = pulled_ids[offset:offset + count]
+            offset += count
+            request.device_pending_tokens = []
+            if self._absorb_deferred_token_ids(request, row_ids, stop_token_ids=stop_token_ids):
+                finished_rows.append(sample_idx)
+        return finished_rows
+
+    def _absorb_deferred_token_ids(
+        self,
+        request: SchedulerRequest,
+        token_ids: list[int],
+        *,
+        stop_token_ids: set[int],
+    ) -> bool:
+        """Fold bulk-pulled token ids into a deferred request (completion list, assembler).
+
+        Returns True when the request finished inside this window (EOS or stop-string
+        hit); tokens generated after the finish point are trimmed so the result matches
+        the immediate per-step path exactly.
+        """
+        metrics = getattr(self.engine, "metrics", None)
+        finish_reason: str | None = None
+        cutoff = len(token_ids)
+        for offset, token_id in enumerate(token_ids):
+            if token_id in stop_token_ids:
+                cutoff = offset
+                finish_reason = "stop"
+                break
+        kept_ids = token_ids[:cutoff]
+        completion_base = len(request.completion_ids)
+        request.completion_ids.extend(kept_ids)
+        if metrics is not None and kept_ids:
+            metrics.record_generation_tokens(len(kept_ids))
+        if request.repetition_history_ids is not None:
+            request.repetition_history_ids.update(kept_ids)
+        for index, token_id in enumerate(kept_ids):
+            delta, hit_stop = request.assembler.feed_token(token_id) if request.assembler is not None else ("", False)
+            if delta:
+                self._emit_text(request, delta)
+            if hit_stop:
+                # Stop-string completed at this token; trim anything sampled after it.
+                request.completion_ids = request.completion_ids[: completion_base + index + 1]
+                finish_reason = "stop"
+                break
+        if finish_reason is None and len(request.completion_ids) >= request.config.max_new_tokens:
+            finish_reason = "length"
+        if finish_reason is not None:
+            self._finish_request(request, finish_reason=finish_reason)
+            return True
+        return False
 
     def _iter_decode_chunks(self, requests: list[SchedulerRequest]) -> Iterator[list[SchedulerRequest]]:
         _, max_decode_tokens = self._effective_token_budgets(active_requests=requests)
